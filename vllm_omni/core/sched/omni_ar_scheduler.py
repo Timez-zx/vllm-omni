@@ -62,7 +62,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     # Set once a stage has tracked at least one request, so that dropping back to zero can be
     # told apart from never having started. See _check_for_wedged_requests.
     _had_requests = 0
-    _empty_reported = False
+    _empty_reported_t = 0.0
+    _empty_since = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -102,6 +103,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 stage_id=getattr(model_config, "stage_id", 0),
                 async_chunk=False,
             )
+        # When each currently-tracked request was first seen with no sampled output, and which
+        # have already been reported as producing nothing. See _check_for_wedged_requests.
+        self._req_seen_t: dict[str, float] = {}
+        self._mute_reported: set[str] = set()
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
@@ -443,20 +448,49 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # It came up rolling a session: stage 0 shipped 133 payloads to stage 1 over the
             # 0->1 edge and stage 1 emitted nothing, and no diagnostic could say whether the
             # request was stuck or simply absent. Reported once per transition.
-            if self._had_requests and not self._empty_reported:
-                self._empty_reported = True
+            # REPEATS, rate-limited, rather than reporting once. A latching version of this
+            # hid the very answer it was added to find: at a session roll stage 1 went empty,
+            # reported once, and then stayed silent for two minutes while 370 payloads piled up
+            # on the 0->1 edge -- so "stage 1 emits nothing" looked like a stage with no
+            # diagnostics rather than a stage with no request. Staying empty is the finding, so
+            # it has to keep saying so.
+            if self._had_requests and now - self._empty_reported_t >= self._WEDGE_REPORT_AFTER_S:
+                self._empty_reported_t = now
                 logger.error(
-                    "[OmniARScheduler] stage %s now tracks ZERO requests, having tracked "
-                    "%d before. If payloads are still arriving for this stage, the request "
-                    "was dropped rather than stalled -- look upstream of the scheduler.",
-                    self.vllm_config.model_config.stage_id, self._had_requests,
+                    "[OmniARScheduler] stage %s tracks ZERO requests and has for %.0fs, "
+                    "having tracked %d before. If payloads are still arriving for this stage "
+                    "the request was DROPPED, not stalled -- look upstream of the scheduler.",
+                    self.vllm_config.model_config.stage_id,
+                    now - self._empty_since if self._empty_since else 0.0,
+                    self._had_requests,
                 )
+            if self._empty_since is None:
+                self._empty_since = now
             self._last_progress_t = now
             self._wedge_reported = False
             self._progress_fingerprint = None
             return
         self._had_requests = len(self.requests)
-        self._empty_reported = False
+        self._empty_since = None
+
+        # A request that is being scheduled but has never SAMPLED anything is its own failure,
+        # distinct from a stalled one, and the fingerprint below cannot tell them apart: it
+        # counts num_computed_tokens, which advances during prefill, so a request that prefills
+        # over and over looks exactly like one that is decoding. That distinction is the open
+        # question after a session roll -- stage 1 holds the request, the fingerprint keeps
+        # moving, and nothing is ever put on the 1->2 edge.
+        for rid, r in self.requests.items():
+            if len(getattr(r, "output_token_ids", ()) or ()):
+                self._mute_reported.discard(rid)
+                self._req_seen_t.pop(rid, None)
+                continue
+            t0 = self._req_seen_t.setdefault(rid, now)
+            if now - t0 >= self._WEDGE_REPORT_AFTER_S and rid not in self._mute_reported:
+                self._mute_reported.add(rid)
+                self._log_request_table(
+                    f"req={rid} has been tracked for {now - t0:.0f}s and has sampled ZERO "
+                    f"output tokens -- being scheduled but producing nothing"
+                )
 
         fingerprint = tuple(
             sorted(
