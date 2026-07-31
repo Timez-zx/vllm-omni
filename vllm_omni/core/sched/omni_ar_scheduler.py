@@ -11,7 +11,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStat
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.core.sched.request_queue import create_request_queue
+from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
@@ -232,10 +232,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         upstream's own convention for it: status WAITING_FOR_STREAMING_REQ, routed through
         ``_enqueue_waiting_request``, which sends any "blocked waiting" status to
         ``skipped_waiting`` rather than ``waiting`` (see ``_is_blocked_waiting_status``). That
-        is where upstream itself parks such a request in ``_handle_stopped_request``, and it
-        is why the waiting loop never trips over one: parked sessions are not in ``waiting``
-        at all. ``_update_request_as_session`` already un-parks them when real input arrives,
-        so nothing else has to change.
+        is where upstream itself parks such a request in ``_handle_stopped_request``, and its
+        waiting loop cannot then trip over one: when it reaches a blocked status it calls
+        ``_try_promote_blocked_waiting_request``, which for WAITING_FOR_STREAMING_REQ returns
+        False unconditionally, so the request is deferred again instead of being scheduled.
+        ``_update_request_as_session`` un-parks it when real input actually arrives, so
+        nothing else has to change.
 
         Re-queueing through the helper rather than by hand matters: dropping the request from
         ``waiting`` without adding it back anywhere would strand it in no queue, which fails
@@ -247,24 +249,37 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         the top of ``schedule()`` already expects to find and drop. Both branches log, because
         this should be rare and silently swallowing it would hide a real bug.
         """
-        parked: list[Request] = []
-        aborted: list[Request] = []
-        for request in list(self.waiting):
-            if getattr(request, "status", None) != RequestStatus.WAITING:
-                continue
-            if request.num_tokens - request.num_computed_tokens > 0:
-                continue
-            if getattr(request, "resumable", False):
-                parked.append(request)
-            else:
-                aborted.append(request)
+        # BOTH queues, not just ``waiting``. Upstream defers a request it cannot schedule
+        # this pass into ``skipped_waiting`` while LEAVING its status at WAITING (five sites
+        # in its waiting loop do ``step_skipped_waiting.prepend_request(request)``, merged
+        # into ``self.skipped_waiting`` at the end of ``schedule()``), and
+        # ``_select_waiting_queue_for_scheduling`` then draws from that queue FIRST under
+        # FCFS. So a session deferred once is never in ``waiting`` again, and sweeping only
+        # ``waiting`` misses exactly the request that goes on to trip the assert -- measured:
+        # with the sweep over ``waiting`` alone, teardown still killed stage 1.
+        parked: list[tuple[Request, RequestQueue]] = []
+        aborted: list[tuple[Request, RequestQueue]] = []
+        for queue in (self.waiting, self.skipped_waiting):
+            for request in list(queue):
+                if getattr(request, "status", None) != RequestStatus.WAITING:
+                    continue
+                if request.num_tokens - request.num_computed_tokens > 0:
+                    continue
+                if getattr(request, "resumable", False):
+                    parked.append((request, queue))
+                else:
+                    aborted.append((request, queue))
 
-        for request in parked:
-            self.waiting.remove_requests((request,))
+        for request, queue in parked:
+            queue.remove_requests((request,))
             request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
             self.num_waiting_for_streaming_input += 1
             self._enqueue_waiting_request(request)
-            logger.debug(
+            # INFO, not DEBUG: this fires on a transition only -- parking sets a status the
+            # sweep above skips, and only ``_update_request_as_session`` sets it back to
+            # WAITING -- so it costs a line or two per turn, and at DEBUG there is no way to
+            # tell a working fix from a fix that never runs.
+            logger.info(
                 "[OmniARScheduler] parked req=%s (stage %s): nothing to compute yet "
                 "(num_tokens=%d == num_computed_tokens=%d), waiting for the next payload",
                 request.request_id,
@@ -273,8 +288,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 request.num_computed_tokens,
             )
 
-        for request in aborted:
-            self.waiting.remove_requests((request,))
+        for request, queue in aborted:
+            queue.remove_requests((request,))
             request.status = RequestStatus.FINISHED_ABORTED
             logger.warning(
                 "[OmniARScheduler] aborting req=%s (stage %s): not resumable and has nothing "
