@@ -411,6 +411,50 @@ class StreamingVideoSessionConfig(BaseModel):
             "after 50 short-answer turns but 102% after 27 verbose ones."
         ),
     )
+    session_roll_at_talker_tokens: int | None = Field(
+        default=None,
+        description=(
+            "ROLL the session when the talker's estimated tokens reach this, instead of ending "
+            "it: close the engine request and open a fresh one seeded with the recent text "
+            "transcript, so the conversation continues indefinitely. Set this BELOW "
+            "session_talker_token_budget -- rolling keeps the session alive, the budget only "
+            "stops it dying badly, so the roll should always get there first.\n\n"
+            "The cost is one cold turn per roll: the new request has to prefill the seed, and "
+            "the accumulated visual KV is gone. What survives is text. Frames already in the "
+            "buffer are re-sent with the first post-roll turn, so the model still sees the "
+            "present -- it loses the older visual detail, which is the documented tradeoff "
+            "measured for text-only memory elsewhere in this study (recall of spoken content "
+            "held at 8/8; fine visual detail did not survive)."
+        ),
+    )
+    session_roll_settle_s: float = Field(
+        default=1.0,
+        ge=0.0,
+        description=(
+            "Seconds to wait after retiring the old engine request before submitting the first "
+            "chunk of the new one.\n\n"
+            "WORKAROUND, not a fix, and it is here because of a measured failure. The API "
+            "server orders the teardown correctly -- the old request is aborted and the "
+            "orchestrator confirms it before the new one is added -- but each stage is a "
+            "SEPARATE OS PROCESS, so stage 1 can process 'add new' before it processes 'abort "
+            "old', and the abort's cleanup touches adapter state. Observed: the first roll "
+            "submitted its seeded chunk, stage 0 produced a complete 329-output answer, and "
+            "stage 1 produced NOTHING at all, so the turn never closed. Costs one wait per "
+            "roll, i.e. once every few thousand tokens of speech. The real fix belongs "
+            "upstream, in making a stage's request teardown observable so this can be awaited "
+            "instead of slept on."
+        ),
+    )
+    session_roll_history_turns: int = Field(
+        default=8,
+        ge=0,
+        description=(
+            "How many recent turns of TEXT to carry across a roll. Bounded on purpose: the "
+            "seed is prefilled into the new request, so an unbounded transcript would grow "
+            "every roll until the seed alone approached the wall the roll exists to avoid. "
+            "This is what makes the session unbounded in TIME while bounded in MEMORY."
+        ),
+    )
 
 
 class OmniStreamingVideoHandler:
@@ -505,6 +549,11 @@ class OmniStreamingVideoHandler:
                 "turn_idx": 0,
                 "first_sent": False,
                 "fatal": None,
+                # Seed for a roll, and the query awaiting its answer so the two can be paired
+                # when the turn closes. See session_roll_at_talker_tokens.
+                "transcript": [],
+                "pending_query": None,
+                "rolls": 0,
             }
             session_request_id = f"video-sess-{uuid.uuid4().hex[:12]}"
 
@@ -618,10 +667,31 @@ class OmniStreamingVideoHandler:
                                     sess.get("talker_tokens", 0)
                                     + _TALKER_TOKENS_PER_AUDIO_CHUNK * st["audio_chunks"]
                                 )
-                                # message_history is deliberately NOT updated: under session
-                                # mode the conversation lives in the engine request's KV, and
-                                # a second copy in the entrypoint would be dead state that
-                                # future readers would mistake for the source of truth.
+                                # `message_history` is still deliberately NOT updated: under
+                                # session mode the conversation lives in the engine request's
+                                # KV, and a second copy claiming to be the conversation would
+                                # be dead state that future readers mistake for the source of
+                                # truth.
+                                #
+                                # `sess["transcript"]` is a different thing and exists for one
+                                # purpose: it is the SEED for a roll. When the talker nears its
+                                # max_model_len the engine request has to be replaced, and text
+                                # is the only part of the context that can be carried into the
+                                # new one -- the visual KV cannot. Kept only when rolling is
+                                # enabled, and trimmed to the configured window, so it cannot
+                                # quietly become an unbounded second history.
+                                if config.session_roll_at_talker_tokens:
+                                    text = "".join(st["text_parts"]).strip()
+                                    q = sess.get("pending_query") or ""
+                                    if q:
+                                        sess["transcript"].append({"role": "user", "content": q})
+                                    if text:
+                                        sess["transcript"].append(
+                                            {"role": "assistant", "content": text}
+                                        )
+                                    keep = 2 * max(0, config.session_roll_history_turns)
+                                    if keep and len(sess["transcript"]) > keep:
+                                        del sess["transcript"][:-keep]
                                 st = _new_turn_state()
                                 sess["turn_done"].set()
                         else:
@@ -706,10 +776,23 @@ class OmniStreamingVideoHandler:
                 # In session mode the buffer's only job is to hold frames that have not been
                 # submitted yet, so it can simply be drained -- which also means it stays a
                 # handful of frames long and the eviction path never fires at all.
+                # Roll BEFORE building the chunk, so this turn is the rolled request's first
+                # one and carries the seed. Rolling after would waste a turn.
+                roll_at = config.session_roll_at_talker_tokens
+                if roll_at and sess.get("talker_tokens", 0) >= roll_at:
+                    await _roll_session()
+                    if sess["fatal"]:
+                        await self._send_error(
+                            websocket, f"Session failed: {sess['fatal']}"
+                        )
+                        return
+
                 new_frames = list(frame_buffer)
+                seed = list(sess["transcript"]) if not sess["first_sent"] else None
                 chunk = await self._build_session_chunk(
                     config, new_frames, audio_buffer, query_text, frame_pil_cache,
                     is_first=not sess["first_sent"],
+                    seed_history=seed,
                 )
                 audio_buffer.clear()
                 if chunk is None:
@@ -782,6 +865,9 @@ class OmniStreamingVideoHandler:
                     return
                 interrupt_event.clear()
                 sess["turn_done"].clear()
+                # Held so the output loop can pair this query with its answer in the
+                # transcript, which is the seed a roll carries into the next request.
+                sess["pending_query"] = query_text
                 if sess["gen_task"] is None:
                     sess["gen_task"] = asyncio.create_task(_session_output_loop())
                 sess["first_sent"] = True
@@ -803,6 +889,72 @@ class OmniStreamingVideoHandler:
                     await self._send_error(websocket, "Turn boundary lost")
                     return
                 sess["turn_idx"] += 1
+
+            async def _roll_session() -> None:
+                """Replace the engine request, carrying the recent text across.
+
+                The session's real limit is stage 1's `max_model_len`: the talker's stored
+                token array grows every segment by the delta PLUS the audio codes it just
+                generated, and crossing the limit does not fail cleanly -- it either kills the
+                stage-1 engine core on a numpy broadcast or makes the scheduler skip the
+                request silently forever. See session_talker_token_budget for the measurements.
+
+                So the request is retired while it is still healthy and a fresh one takes over.
+                What crosses is TEXT; the accumulated visual KV does not, which is the whole
+                cost of the mechanism together with one cold prefill. Frames still in the
+                buffer are submitted with the first post-roll turn, so the model is not blind
+                to the present -- it has lost the older visual detail only.
+
+                Cancelling rather than sending the terminal sentinel is the same choice
+                `_close_session_request` documents. Doing it MID-session is only safe because
+                of the fix in `1aed4032`: before that, ending a resumable request left an
+                aborted entry in `skipped_waiting` that upstream's waiting loop picked up and
+                asserted on, taking the stage down -- which is exactly what a roll would have
+                triggered every single time.
+                """
+                nonlocal session_request_id
+                prev_id = session_request_id
+                prev_tokens = sess.get("talker_tokens", 0)
+
+                task = sess["gen_task"]
+                if task is not None and not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+
+                # A fresh queue, not the old one drained: the cancelled generator may have
+                # been suspended mid-item, and reusing the queue would feed the new request a
+                # chunk built for the old one's context.
+                sess["queue"] = asyncio.Queue(maxsize=4)
+                sess["gen_task"] = None
+                sess["first_sent"] = False        # next chunk carries system + seed
+                sess["cum_tokens"] = 0            # new request, new context
+                sess["talker_tokens"] = 0
+                sess["rolls"] = sess.get("rolls", 0) + 1
+                session_request_id = f"video-sess-{uuid.uuid4().hex[:12]}"
+
+                # Let the stages finish retiring the old request before the new one arrives.
+                # See session_roll_settle_s: the ordering is right on this side, but the stages
+                # are separate processes and getting 'add new' before 'abort old' cost a whole
+                # roll -- stage 0 answered in full and stage 1 produced nothing.
+                if config.session_roll_settle_s > 0:
+                    await asyncio.sleep(config.session_roll_settle_s)
+
+                logger.info(
+                    "[session] ROLL #%d at turn=%d: talker was at ~%d tokens, retiring "
+                    "req=%s for req=%s, carrying %d transcript message(s). This turn pays a "
+                    "cold prefill; the accumulated visual context is gone and the text is not.",
+                    sess["rolls"], sess["turn_idx"], prev_tokens,
+                    prev_id, session_request_id, len(sess["transcript"]),
+                )
+                try:
+                    await websocket.send_json(
+                        {"type": "session.rolled", "turn": sess["turn_idx"],
+                         "rolls": sess["rolls"],
+                         "carried_messages": len(sess["transcript"])}
+                    )
+                except Exception:
+                    # The client not understanding this event must not end the session.
+                    logger.debug("[session] could not send session.rolled", exc_info=True)
 
             async def _close_session_request() -> None:
                 """End the session by CANCELLING, deliberately not by the finish sentinel.
@@ -1248,6 +1400,7 @@ class OmniStreamingVideoHandler:
         prewarmed_frames: dict[str, tuple[Any, str]],
         *,
         is_first: bool,
+        seed_history: list[dict[str, Any]] | None = None,
     ) -> Any:
         """Render one per-turn delta into an engine prompt, or None if it would be empty.
 
@@ -1317,6 +1470,13 @@ class OmniStreamingVideoHandler:
         # block interleaved with the conversation.
         if is_first and config.system_prompt:
             messages.append({"role": "system", "content": config.system_prompt})
+        # Carried text from before a roll. It goes between the system block and this turn, so
+        # the new request reads as one conversation rather than a fresh one. Only ever set on
+        # the first chunk of a rolled request -- appearing mid-session would put completed
+        # turns after the current one and make the model answer the wrong question.
+        if seed_history:
+            assert is_first, "seed_history belongs to the first chunk of a request only"
+            messages.extend(seed_history)
         messages.append({"role": "user", "content": user_content})
 
         request_kwargs: dict[str, Any] = {

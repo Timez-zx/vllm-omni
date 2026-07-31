@@ -59,6 +59,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     # so this has to be well inside that to be useful but far outside normal think time.
     _WEDGE_REPORT_AFTER_S = 45.0
 
+    # Set once a stage has tracked at least one request, so that dropping back to zero can be
+    # told apart from never having started. See _check_for_wedged_requests.
+    _had_requests = 0
+    _empty_reported = False
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Track requests that need KV cache transfer when finished
@@ -432,10 +437,26 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         """
         now = time()
         if not self.requests:
+            # "No tracked requests" is normal at startup and between clients, but a stage that
+            # HAD requests and now has none while work is still arriving is its own failure --
+            # and it is invisible, because every other branch here needs a request to describe.
+            # It came up rolling a session: stage 0 shipped 133 payloads to stage 1 over the
+            # 0->1 edge and stage 1 emitted nothing, and no diagnostic could say whether the
+            # request was stuck or simply absent. Reported once per transition.
+            if self._had_requests and not self._empty_reported:
+                self._empty_reported = True
+                logger.error(
+                    "[OmniARScheduler] stage %s now tracks ZERO requests, having tracked "
+                    "%d before. If payloads are still arriving for this stage, the request "
+                    "was dropped rather than stalled -- look upstream of the scheduler.",
+                    self.vllm_config.model_config.stage_id, self._had_requests,
+                )
             self._last_progress_t = now
             self._wedge_reported = False
             self._progress_fingerprint = None
             return
+        self._had_requests = len(self.requests)
+        self._empty_reported = False
 
         fingerprint = tuple(
             sorted(
