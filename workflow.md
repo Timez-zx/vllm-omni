@@ -8,7 +8,8 @@ per change, in the order it was added, each written as: **scenario → what used
 happens now**.
 
 The code is in this repository, branch `live-agent`. Every new capability is **off by default** — an
-unconfigured deployment behaves exactly like the original.
+unconfigured deployment behaves like the original, with **one exception**: section 10 changes what one
+model stage hands another, and it is **on** by default. `VLLM_OMNI_TALKER_TEXT_ONLY=0` turns it off.
 
 ---
 
@@ -250,6 +251,50 @@ only be guessed at.
 
 ---
 
+## 10. The speech stage was carrying pictures it never looks at
+
+*2026-07-31 16:45 · `796795ac`*
+
+**Scenario.** A conversation cannot run forever: eventually the part that produces speech runs out
+of room, and the whole request has to be swapped out (section 5). So the question is what actually
+fills that room up.
+
+**What used to happen.** Two things fill it — what the user showed the camera, and what the model
+itself said. The first one is the surprise: **the speech stage is handed one slot for every piece of
+every picture.** One sharp frame is 880 slots. It gets them even though **it never looks at
+pictures** — its job is only to know which words to pronounce. And those slots are never given back.
+
+*Example, from a real turn:* three pictures in the turn, and the speech stage was carrying **817
+slots**. The words themselves accounted for about 24 of them. Everything else was pictures and sound
+it had no use for.
+
+**What happens now.** The pictures and the recording are simply **not handed to the speech stage**.
+It gets the words: what the user asked, and what the model is about to say. That same turn now costs
+**33 slots instead of 817** — about **25× less**.
+
+**Why we think this is safe.** Two reasons, one borrowed and one measured:
+
+- Another team's model built the same way (MiniCPM-o 4.5) gives its speech part **only the words and
+  no pictures whatsoever**. So the design does not require them.
+- Measured here, five turns each way: **every single turn still produced speech**, on both settings.
+  The two halves of the bookkeeping agreed exactly every time, which is the thing that would
+  otherwise go wrong quietly.
+
+**What we do not know.** Two honest gaps:
+
+- **Whether the voice sounds different.** Five turns, one conversation each way, and nobody listened
+  to the audio. This test can catch "it stopped talking"; it cannot catch "it sounds a little flat".
+  This model was trained *with* the pictures present, so a small loss is possible.
+- **How much longer a conversation can now run.** Not measured yet. In the test the model happened to
+  answer about twice as wordily on the new setting, and **the model's own speech fills the same
+  room** — so the extra talking ate half of the saving. Needs a rerun with the model's randomness
+  turned off, so both runs say the same thing.
+
+**Reversible.** One setting puts the old behaviour back. It is kept deliberately, so that the
+comparison stays reproducible rather than becoming a story about how things used to be.
+
+---
+
 ## Where things stand
 
 **Working**
@@ -259,12 +304,15 @@ only be guessed at.
 - The conversation **can run indefinitely** (automatic request swap, invisible to the user)
 - Warning before the limit, and the distance to it visible every turn
 - Three kinds of silent freeze now report themselves
+- The speech stage no longer carries the pictures — **25× less to hold per turn**
 
 **Verified**
 
 - 40 turns with 2 swaps: no crash, no freeze. Same settings **without swapping ended at turn 27**
 - 50 turns without swapping: all 50 completed, clean shutdown
 - Memory in a long conversation did not get worse (**as long as no swap happens**)
+- Speech still produced on **every** turn with the pictures withheld from the speech stage
+  (5 turns each way)
 
 **Explicitly not done or not measured**
 
@@ -274,15 +322,21 @@ only be guessed at.
 - **Single user only.** Several people using it at once is completely untouched.
 - There is a self-heal that recovers a stuck job, but **why it gets stuck that way is still unknown.**
 - The broken count is only **worked around** here; it has **not been fixed upstream.**
+- **Nobody has listened to the audio** since the pictures were withheld from the speech stage, and
+  **how much longer a conversation now runs is not measured** (section 10).
 
 ---
 
 ## Appendix: settings and where the code is
 
 The italic line under each section heading is that change's date and commits.
-Everything is on this repository's `live-agent` branch: 23 commits, 6 files, about 1,600 lines.
+Everything is on this repository's `live-agent` branch: 26 commits, 8 files, about 1,700 lines.
 
-The new settings all live in `session.config`, with these defaults:
+Section 10 is the one setting that is *not* in `session.config` — it changes what one model stage
+hands another, below the level a per-conversation setting can reach, so it is an environment
+variable: `VLLM_OMNI_TALKER_TEXT_ONLY`, **on by default**, and `=0` restores the original behaviour.
+
+The rest all live in `session.config`, with these defaults:
 
 `max_frame_width` / `max_frame_height` = no shrinking · `frame_jpeg_quality` = 90 ·
 `frame_filter_min_gap` / `max_gap` = unbounded · `session_scoped_request` = off ·
