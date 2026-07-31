@@ -1150,13 +1150,23 @@ class Orchestrator:
         request_id: str,
         tx_ms: float,
     ) -> None:
-        """Emit per-edge transfer_tx_s + transfer_size_bytes histograms.
+        """Emit the per-edge transfer_tx_s histogram.
 
-        ``tx_ms`` is the orchestrator-side wall-clock spent in ``next_pool.
-        submit_*`` (serialize + queue submit to the receiving worker). Best-
-        effort size_bytes left at 0 — orchestrator doesn't have a cheap handle
-        on the serialized payload size; a follow-up can plumb that from the
-        connector adapter.
+        ``tx_ms`` is the orchestrator-side wall-clock spent in ``next_pool.submit_*``
+        (serialize + queue submit to the receiving worker).
+
+        The size histogram is deliberately NOT observed here. It used to be fed a literal
+        0 on every transfer, which is worse than reporting nothing: a histogram of zeros
+        reads as "every payload is empty", so transfer_size_bytes had a p50 of 0 while real
+        payloads on this edge can run to hundreds of megabytes. Anyone reading the metric
+        would have concluded the edge was free.
+
+        The real size is known in ``OmniChunkTransferAdapter._send_single_request``, where
+        ``connector.put`` returns it, and is now accumulated there (see ``tx_totals()``).
+        That adapter is constructed by the scheduler and therefore lives in the engine-core
+        process, which has no route to this aggregator, so the value cannot simply be read
+        from here -- carrying it across would mean adding a field to the engine-core output.
+        Until that exists, emitting nothing is the honest option.
         """
         if self._transfer_emitter is None:
             return
@@ -1164,7 +1174,6 @@ class Orchestrator:
         if to_replica is None:
             return
         try:
-            self._transfer_emitter.observe_size(from_stage, from_replica, to_stage, to_replica, 0)
             self._transfer_emitter.observe_tx_time(from_stage, from_replica, to_stage, to_replica, tx_ms / 1000.0)
         except Exception:
             logger.debug(

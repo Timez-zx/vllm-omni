@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+import os
+import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -18,6 +20,11 @@ from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
 
 logger = get_connector_logger(__name__)
+
+# Emit one INFO line per chunk per stage edge with its size and timings. Off by default
+# because this is a hot path; the running totals in `_tx_totals` are accumulated either way,
+# so a caller can read them without turning logging on.
+_LOG_TRANSFER = os.environ.get("VLLM_OMNI_LOG_TRANSFER", "0") not in ("0", "false", "False", "")
 
 
 class OmniChunkTransferAdapter(OmniTransferAdapterBase):
@@ -65,6 +72,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             module_path, func_name = custom_process_next_stage_input_func.rsplit(".", 1)
             module = importlib.import_module(module_path)
             self.custom_process_next_stage_input_func = getattr(module, func_name)
+        # Accumulated transfer cost per request: bytes sent on this stage's outgoing edge
+        # plus the time spent building and putting each payload. Read via tx_totals().
+        self._tx_totals: dict[str, dict[str, Any]] = {}
         # mapping for request id and chunk id
         self.put_req_chunk: dict[str, int] = defaultdict(int)
         self.get_req_chunk: dict[str, int] = defaultdict(int)
@@ -291,6 +301,70 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         return False
 
+    def _record_tx(
+        self,
+        *,
+        external_req_id: str,
+        stage_id: int,
+        next_stage_id: int,
+        chunk_id: int,
+        size: int,
+        build_ms: float,
+        put_ms: float,
+    ) -> None:
+        """Record what a stage-to-stage payload actually cost to build and send.
+
+        Until now nothing measured this edge. ``StageRequestStats`` hardcodes
+        ``rx_transfer_bytes=0`` / ``rx_decode_time_ms=0.0``, and
+        ``Orchestrator._emit_tx_edge`` passes a literal 0 to the size histogram with a
+        docstring noting that a follow-up should "plumb that from the connector adapter".
+        This is that measurement, taken where the numbers already exist: ``connector.put``
+        returns the serialized size, and both phases can be timed in place.
+
+        Why it is worth measuring rather than assuming negligible: for a multi-stage omni
+        pipeline the payload is per-position, not per-request. The Qwen3-Omni thinker ships
+        the prompt's embeddings *and* last-layer hidden states to the talker -- two
+        [L, hidden] bf16 tensors, i.e. 4 * hidden bytes per prompt token. At hidden=2048
+        that is 8 KB/token, so a 35k-token prompt is ~290 MB on a single edge, for a single
+        turn. Measured on one H100 at roughly 225 MB/s effective (detach+cpu, serialize,
+        shared-memory write), that is over a second of wall clock sitting between the
+        thinker's last token and the talker's first -- which the logs previously reported
+        as ``transfers=[0->1=0.00ms]``.
+
+        Kept deliberately cheap: two ``perf_counter`` calls per chunk and a dict update.
+        The per-chunk log line is opt-in via ``VLLM_OMNI_LOG_TRANSFER=1`` because this runs
+        once per chunk per stage edge; the running totals are always accumulated so a
+        caller can read them without turning logging on.
+        """
+        acc = self._tx_totals.setdefault(external_req_id, {"bytes": 0, "build_ms": 0.0, "put_ms": 0.0, "chunks": 0})
+        acc["bytes"] += int(size or 0)
+        acc["build_ms"] += float(build_ms)
+        acc["put_ms"] += float(put_ms)
+        acc["chunks"] += 1
+        if _LOG_TRANSFER:
+            logger.info(
+                "[OmniTransfer] req=%s edge=%d->%d chunk=%d bytes=%d build_ms=%.2f put_ms=%.2f "
+                "cum_bytes=%d cum_put_ms=%.1f",
+                external_req_id,
+                stage_id,
+                next_stage_id,
+                chunk_id,
+                int(size or 0),
+                build_ms,
+                put_ms,
+                acc["bytes"],
+                acc["put_ms"],
+            )
+
+    def tx_totals(self, external_req_id: str) -> dict[str, Any] | None:
+        """Accumulated transfer cost for a request, or None if nothing was sent for it.
+
+        Exposed so a caller that does have a metrics handle can report a real size instead
+        of the placeholder zero. The adapter itself lives in the engine-core process and has
+        no route to the orchestrator's aggregator, which is why the plumbing stops here.
+        """
+        return self._tx_totals.get(external_req_id)
+
     def _send_single_request(self, task: dict):
         raw_mm = task["multimodal_output"]
         multimodal_output = unflatten_payload(raw_mm) if isinstance(raw_mm, Mapping) else raw_mm
@@ -304,6 +378,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
         # Process payload in save_loop thread
         payload_data: OmniPayloadStruct | None = None
+        _t_build0 = time.perf_counter()
         if self.custom_process_next_stage_input_func:
             try:
                 payload_data = self.custom_process_next_stage_input_func(
@@ -316,6 +391,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
             except Exception as e:
                 logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
+        _build_ms = (time.perf_counter() - _t_build0) * 1000.0
 
         if payload_data is None:
             if not (is_segment_finished or is_finished):
@@ -328,15 +404,26 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
         payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
 
+        _t_put0 = time.perf_counter()
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
             to_stage=str(next_stage_id),
             put_key=connector_put_key,
             data=payload_data,
         )
+        _put_ms = (time.perf_counter() - _t_put0) * 1000.0
 
         if success:
             self.put_req_chunk[external_req_id] += 1
+            self._record_tx(
+                external_req_id=external_req_id,
+                stage_id=stage_id,
+                next_stage_id=next_stage_id,
+                chunk_id=chunk_id,
+                size=size,
+                build_ms=_build_ms,
+                put_ms=_put_ms,
+            )
             logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
             # Sender uses struct attr access here; the receive path in
             # `_load_one_request` / `_update_request_payload` reads dict keys.
@@ -411,6 +498,18 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.code_prompt_token_ids.pop(external_req_id, None)
         self.requests_num_chunks_sent.pop(external_req_id, None)
         self._pending_streaming_prefills.pop(external_req_id, None)
+        # Log the request's total before dropping it -- for a long streaming session this is
+        # the only place the accumulated cost of the edge is ever visible.
+        totals = self._tx_totals.pop(external_req_id, None)
+        if _LOG_TRANSFER and totals:
+            logger.info(
+                "[OmniTransfer] req=%s TOTAL chunks=%d bytes=%d build_ms=%.1f put_ms=%.1f",
+                external_req_id,
+                totals["chunks"],
+                totals["bytes"],
+                totals["build_ms"],
+                totals["put_ms"],
+            )
 
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:
