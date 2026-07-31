@@ -4,6 +4,7 @@
 """Inference-only Qwen3-Omni-Moe unified model (thinker + talker + code2wav)."""
 
 import asyncio
+import time as _time
 from collections.abc import AsyncGenerator, Iterable
 from functools import cached_property
 from typing import Any
@@ -36,6 +37,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import Embeddings, HiddenStates, Ids, OmniPayload, OmniPayloadMeta
+from vllm_omni.distributed.omni_connectors.adapter import TALKER_TEXT_ONLY
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -47,6 +49,10 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
 )
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
 from vllm_omni.platforms import current_omni_platform
+
+# Heartbeat interval for the talker-text-only length report. Matches the omni scheduler's
+# heartbeat: often enough to prove the check is running, rare enough not to be noise.
+_TALKER_TEXT_ONLY_LOG_EVERY_S = 10.0
 
 # Special token IDs for Qwen3 Omni MoE
 # Reference: https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/main/tokenizer_config.json
@@ -95,9 +101,18 @@ class Qwen3OmniMoeForConditionalGeneration(
     - Talker: Text embeddings → RVQ codec codes
     - Code2Wav: RVQ codes → audio waveform
 
+    Talker input note: when `TALKER_TEXT_ONLY` is set (the default here, inverting upstream),
+    the user blocks' image/audio positions are dropped from the talker's input instead of
+    being projected into it. See `adapter.TALKER_TEXT_ONLY` for the evidence and the limits.
+
     Usage:
         Set `model_stage` in vllm_config to one of: "thinker", "talker", "code2wav"
     """
+
+    # Class-attribute default so the heartbeat works without threading state through
+    # __init__; the first log writes a per-instance value over it.
+    _talker_text_only_last_log: float = 0.0
+
 
     realtime_max_tokens = 64
 
@@ -871,6 +886,30 @@ class Qwen3OmniMoeForConditionalGeneration(
             tts_pad_thinker=tts_pad_thinker,
         )
 
+        if TALKER_TEXT_ONLY:
+            # A mismatch here is silent by nature -- the worker clamps with
+            # `seg_len = min(span_len, req_embeds.shape[0])` and the audio comes out
+            # conditioned on a prefix with no exception raised. So a mismatch ALWAYS logs.
+            #
+            # The healthy line is rate-limited rather than dropped. This is the default path
+            # now, so one line per prefill would be noise, but silence would be worse: the
+            # only way to know the filter still agrees with the placeholder adapter.py sized
+            # is to see both numbers. A heartbeat reports presence; absence of a warning
+            # would prove nothing.
+            short = req_embeds.shape[0] < end_index
+            now = _time.monotonic()
+            if short or now - self._talker_text_only_last_log >= _TALKER_TEXT_ONLY_LOG_EVERY_S:
+                self._talker_text_only_last_log = now
+                (logger.warning if short else logger.info)(
+                    "[talker-text-only] built %d talker prefill rows, span wants [%d,%d) "
+                    "of them (%d requested)%s",
+                    req_embeds.shape[0],
+                    start_index,
+                    end_index,
+                    input_embeds.shape[0],
+                    "  <-- SHORT: placeholder and embeddings disagree" if short else "",
+                )
+
         # Queue trailing_text_hidden for decode (drop first for next steps),
         try:
             if isinstance(trailing_text_hidden, torch.Tensor) and trailing_text_hidden.numel() > 0:
@@ -982,7 +1021,16 @@ class Qwen3OmniMoeForConditionalGeneration(
                     im_start_index, segment_end_index, multimodal_mask, thinker_hidden, thinker_embed
                 )
                 talker_input_embeds.append(talker_user_part)
-                talker_input_ids.append(thinker_result_ids[im_start_index:segment_end_index])
+                seg_ids = thinker_result_ids[im_start_index:segment_end_index]
+                if TALKER_TEXT_ONLY:
+                    # Same filter `_get_talker_user_parts` applied to the embeddings, and the
+                    # same one `compute_talker_prompt_ids_length` applies to the placeholder.
+                    # All three must agree; the ids are clamped to the embedding rows below
+                    # so a drift shortens both together rather than misaligning them.
+                    seg_ids = seg_ids[~multimodal_mask[im_start_index:segment_end_index]][
+                        : talker_user_part.shape[0]
+                    ]
+                talker_input_ids.append(seg_ids)
             # Take assistant output (for now)
             elif (role_token == self.config.assistant_token_id).item() and i == len(im_start_indexes) - 2:
                 talker_assistant_embeds, talker_assistant_ids, trailing_text_hidden = self._get_talker_assistant_parts(
@@ -1128,6 +1176,21 @@ class Qwen3OmniMoeForConditionalGeneration(
         )
 
         user_mm_mask = multimodal_mask[im_start_index:segment_end_index]
+
+        if TALKER_TEXT_ONLY:
+            # Drop the image/video/audio positions rather than projecting them, so the
+            # talker's array grows only by the text of each turn. Returning a SHORTER
+            # tensor is the point -- blanking the values in place would leave 880 rows per
+            # 720p frame occupying stage 1's max_model_len exactly as before.
+            #
+            # `compute_talker_prompt_ids_length` (adapter.py) filters the placeholder with
+            # the same rule from the token ids. Those two are the contract; if they drift,
+            # nothing raises -- the worker clamps with
+            # `seg_len = min(span_len, req_embeds.shape[0])` and the audio is conditioned on
+            # a prefix. `talker_preprocess_prefill` logs both lengths for that reason.
+            text_only_embed = thinker_embed[im_start_index:segment_end_index][~user_mm_mask]
+            return self.talker.text_projection(text_only_embed).to(thinker_hidden.device)
+
         # Multimodal data exists
         if user_mm_mask.any():
             user_thinker_hidden_mm = thinker_hidden[im_start_index:segment_end_index][user_mm_mask]
