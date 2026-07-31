@@ -886,9 +886,18 @@ class OmniStreamingVideoHandler:
                         # the multimodal hash and the prompt all see one consistent version.
                         # Doing it later would leave the filter comparing full-resolution
                         # frames while the model reads reduced ones.
+                        #
+                        # In a thread, for the same reason the prewarm below decodes in one:
+                        # this coroutine also forwards generated audio to the client, so CPU
+                        # spent inline here lands in somebody's time-to-first-audio. Decoding,
+                        # resizing and re-encoding a frame is strictly more work than the bare
+                        # decode upstream already judged worth offloading. Awaiting cannot
+                        # reorder frames -- this loop reads one message at a time, so the next
+                        # frame is not picked up until this one has been buffered.
                         if config.max_frame_width and config.max_frame_height:
                             try:
-                                shrunk = _downscale_frame_bytes(
+                                shrunk = await asyncio.to_thread(
+                                    _downscale_frame_bytes,
                                     raw_bytes,
                                     config.max_frame_width,
                                     config.max_frame_height,
