@@ -209,107 +209,82 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return False
 
-    def _park_waiting_requests_with_nothing_to_compute(self) -> None:
-        """Keep a streaming session out of the WAITING queue while it has no new tokens.
+    def _log_request_table(self, why: str) -> None:
+        """Dump every tracked request's scheduling state.
 
-        Upstream's waiting path computes ``num_new_tokens = request.num_tokens -
-        num_computed_tokens`` and then asserts it is positive. For a downstream stage of a
-        resumable (streaming-input) request that assertion is reachable, and when it fires
-        it takes down the whole engine-core process.
+        Upstream's ``assert num_new_tokens > 0`` carries no context and kills the whole
+        engine-core process, so a bare traceback says only that SOME request had nothing to
+        compute -- not which, not in which queue, not with what token counts. Two rounds of
+        fixing this by deduction produced a guard that never fired (first over ``waiting``,
+        then over ``waiting`` and ``skipped_waiting``), which is a sign that the request is
+        not where reading the code says it should be. This prints the state instead.
 
-        How it is reached. For stages other than 0, ``_update_request_as_session`` moves the
-        session to WAITING and re-enqueues it *without* extending its prompt -- deliberately,
-        because the prompt for a downstream stage is populated later, when the connector
-        delivers a payload carrying ``ids.prompt`` (see the comment there, and
-        ``construct_next_stage_streaming_input_prompt``, which returns early when the payload
-        has no prompt ids). So between "resume polling" and "a real payload arrived" the
-        session legitimately sits in WAITING with nothing to compute. If a schedule pass
-        lands in that window -- which ending a session reliably produces, because the
-        terminal ``resumable=False`` update and the abort path both poke the scheduler while
-        the last payload carries only finish markers and no ids -- the assert trips.
-
-        The fix puts the session into the state that already describes this situation, using
-        upstream's own convention for it: status WAITING_FOR_STREAMING_REQ, routed through
-        ``_enqueue_waiting_request``, which sends any "blocked waiting" status to
-        ``skipped_waiting`` rather than ``waiting`` (see ``_is_blocked_waiting_status``). That
-        is where upstream itself parks such a request in ``_handle_stopped_request``, and its
-        waiting loop cannot then trip over one: when it reaches a blocked status it calls
-        ``_try_promote_blocked_waiting_request``, which for WAITING_FOR_STREAMING_REQ returns
-        False unconditionally, so the request is deferred again instead of being scheduled.
-        ``_update_request_as_session`` un-parks it when real input actually arrives, so
-        nothing else has to change.
-
-        Re-queueing through the helper rather than by hand matters: dropping the request from
-        ``waiting`` without adding it back anywhere would strand it in no queue, which fails
-        as a client that hangs forever with no error.
-
-        A non-resumable request with nothing to compute cannot make progress at all, so it is
-        marked FINISHED_ABORTED instead of parked; leaving it in WAITING would trip the same
-        assert next pass, and parking it forever would leak. That status is what the sweep at
-        the top of ``schedule()`` already expects to find and drop. Both branches log, because
-        this should be rare and silently swallowing it would hide a real bug.
+        Note the queues are printed as they are AT THE MOMENT OF THE FAILURE, which is inside
+        ``super().schedule()``: the chunk transfer adapter removes requests waiting on a chunk
+        from both queues before that call and restores them after, and waiting admission may
+        have been swapped out for an empty queue, so a request can be tracked in
+        ``self.requests`` while appearing in none of the queues here. That is a finding, not a
+        gap in the dump -- it is exactly the case a queue sweep cannot see.
         """
-        # BOTH queues, not just ``waiting``. Upstream defers a request it cannot schedule
-        # this pass into ``skipped_waiting`` while LEAVING its status at WAITING (five sites
-        # in its waiting loop do ``step_skipped_waiting.prepend_request(request)``, merged
-        # into ``self.skipped_waiting`` at the end of ``schedule()``), and
-        # ``_select_waiting_queue_for_scheduling`` then draws from that queue FIRST under
-        # FCFS. So a session deferred once is never in ``waiting`` again, and sweeping only
-        # ``waiting`` misses exactly the request that goes on to trip the assert -- measured:
-        # with the sweep over ``waiting`` alone, teardown still killed stage 1.
-        parked: list[tuple[Request, RequestQueue]] = []
-        aborted: list[tuple[Request, RequestQueue]] = []
-        for queue in (self.waiting, self.skipped_waiting):
-            for request in list(queue):
-                if getattr(request, "status", None) != RequestStatus.WAITING:
-                    continue
-                if request.num_tokens - request.num_computed_tokens > 0:
-                    continue
-                if getattr(request, "resumable", False):
-                    parked.append((request, queue))
-                else:
-                    aborted.append((request, queue))
-
-        for request, queue in parked:
-            queue.remove_requests((request,))
-            request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
-            self.num_waiting_for_streaming_input += 1
-            self._enqueue_waiting_request(request)
-            # INFO, not DEBUG: this fires on a transition only -- parking sets a status the
-            # sweep above skips, and only ``_update_request_as_session`` sets it back to
-            # WAITING -- so it costs a line or two per turn, and at DEBUG there is no way to
-            # tell a working fix from a fix that never runs.
-            logger.info(
-                "[OmniARScheduler] parked req=%s (stage %s): nothing to compute yet "
-                "(num_tokens=%d == num_computed_tokens=%d), waiting for the next payload",
-                request.request_id,
-                self.vllm_config.model_config.stage_id,
-                request.num_tokens,
-                request.num_computed_tokens,
+        def describe(request: Any) -> str:
+            sq = getattr(request, "streaming_queue", None)
+            return (
+                f"id={getattr(request, 'request_id', '?')} "
+                f"status={getattr(getattr(request, 'status', None), 'name', '?')} "
+                f"num_tokens={getattr(request, 'num_tokens', '?')} "
+                f"computed={getattr(request, 'num_computed_tokens', '?')} "
+                f"prompt={getattr(request, 'num_prompt_tokens', '?')} "
+                f"output={len(getattr(request, 'output_token_ids', ()) or ())} "
+                f"resumable={getattr(request, 'resumable', None)} "
+                f"streaming_queue={len(sq) if sq is not None else None} "
+                f"preemptions={getattr(request, 'num_preemptions', '?')}"
             )
 
-        for request, queue in aborted:
-            queue.remove_requests((request,))
-            request.status = RequestStatus.FINISHED_ABORTED
-            logger.warning(
-                "[OmniARScheduler] aborting req=%s (stage %s): not resumable and has nothing "
-                "to compute (num_tokens=%d == num_computed_tokens=%d), so it can never make "
-                "progress",
-                request.request_id,
-                self.vllm_config.model_config.stage_id,
-                request.num_tokens,
-                request.num_computed_tokens,
-            )
+        logger.error("[OmniARScheduler] %s (stage %s)", why,
+                     self.vllm_config.model_config.stage_id)
+        queued: set[int] = set()
+        for name, queue in (("waiting", self.waiting),
+                            ("skipped_waiting", self.skipped_waiting),
+                            ("running", self.running)):
+            items = list(queue)
+            logger.error("[OmniARScheduler]   %s: %d", name, len(items))
+            for request in items:
+                queued.add(id(request))
+                logger.error("[OmniARScheduler]     %s", describe(request))
+        # Anything tracked but in no queue -- see the docstring; this is the interesting row.
+        orphans = [r for r in self.requests.values() if id(r) not in queued]
+        logger.error("[OmniARScheduler]   tracked but in NO queue: %d", len(orphans))
+        for request in orphans:
+            logger.error("[OmniARScheduler]     %s", describe(request))
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
         # async abort (e.g. client disconnect during TTS streaming) to leave
         # requests in the waiting/running queues temporarily.
-        for queue in (self.waiting, self.running):
-            for req in list(queue):
-                if getattr(req, "status", None) == RequestStatus.FINISHED_ABORTED:
-                    queue.remove(req)
+        #
+        # `skipped_waiting` is swept too, and leaving it out is what killed a stage whenever a
+        # streaming session ended. An aborted request parked there was never dropped, and
+        # upstream's waiting loop draws from `skipped_waiting` BEFORE `waiting` under FCFS
+        # (`_select_waiting_queue_for_scheduling`), so it picked the aborted session up, found
+        # num_tokens == num_computed_tokens, and tripped `assert num_new_tokens > 0` -- which
+        # takes down the whole engine-core process. Measured, from the state dump below:
+        #   skipped_waiting: 1
+        #     status=FINISHED_ABORTED num_tokens=4592 computed=4592 resumable=True
+        #
+        # Via `remove_requests` rather than `remove`, which is also a latent fix: `remove` is
+        # available only because FCFSRequestQueue happens to subclass deque. Under the
+        # PRIORITY policy `self.waiting` is a PriorityRequestQueue, which has no `remove` at
+        # all, so the original line would have raised AttributeError on the first async abort.
+        # `remove_requests` is the RequestQueue interface and works for both.
+        for req in [r for r in self.running
+                    if getattr(r, "status", None) == RequestStatus.FINISHED_ABORTED]:
+            self.running.remove(req)
+        for queue in (self.waiting, self.skipped_waiting):
+            doomed = [r for r in queue
+                      if getattr(r, "status", None) == RequestStatus.FINISHED_ABORTED]
+            if doomed:
+                queue.remove_requests(doomed)
         self._consume_pending_connector_output(model_mode="ar")
         self._process_pending_input_timeouts()
 
@@ -318,7 +293,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.waiting, self.running, scheduler_requests=self.requests
             )
 
-        self._park_waiting_requests_with_nothing_to_compute()
 
         original_waiting = None
         if self._should_defer_waiting_admission():
@@ -327,6 +301,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         try:
             scheduler_output = super().schedule(throttle_prefills)
+        except AssertionError:
+            # Upstream asserts kill the engine-core process. Dump the state before it dies,
+            # or the only evidence is a traceback with no request in it.
+            self._log_request_table("upstream schedule() raised AssertionError")
+            raise
         finally:
             if original_waiting is not None:
                 deferred_waiting = list(self.waiting)
