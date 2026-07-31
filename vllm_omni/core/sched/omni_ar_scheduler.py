@@ -13,6 +13,7 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMSchedu
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
+from vllm.v1.core.sched.scheduler import PauseState
 from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.perf import PerfStats
@@ -393,6 +394,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                       if getattr(r, "status", None) == RequestStatus.FINISHED_ABORTED]
             if doomed:
                 queue.remove_requests(doomed)
+        self._recover_orphaned_requests()
         self._consume_pending_connector_output(model_mode="ar")
         self._process_pending_input_timeouts()
 
@@ -1201,8 +1203,21 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         adapter = self.chunk_transfer_adapter
         if adapter is None:
             return False
+        # `_finished_load_reqs` is the load-bearing one and it is NOT interchangeable with the
+        # deques. A COMPLETED load lives there, and only `_process_chunk_queue*` -- reached from
+        # `schedule()` -- moves the request back into a queue and consumes it. If the loop parks
+        # while that set is non-empty, the payload is already in hand and nothing will ever pick
+        # it up.
+        #
+        # It is also the field that separates a deadlock from healthy idling, which matters
+        # because the two look nearly identical. Between turns a session legitimately sits with
+        # `origin_status=1` and the queues empty, and the loop SHOULD park until the client
+        # speaks again -- keying on `origin_status` would spin a core forever. Measured, stage 1,
+        # same run: at 11:45:30 (healthy, parked between turns) finished_load=0; at 11:55:29
+        # (deadlocked, turn never completed) finished_load=1 with every queue empty.
         return bool(
-            getattr(adapter, "waiting_for_chunk_waiting_requests", None)
+            getattr(adapter, "_finished_load_reqs", None)
+            or getattr(adapter, "waiting_for_chunk_waiting_requests", None)
             or getattr(adapter, "waiting_for_chunk_running_requests", None)
         )
 
@@ -1219,6 +1234,63 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if not result and self.requests:
             self._report_starved_loop()
         return result
+
+    def _recover_orphaned_requests(self) -> None:
+        """Re-enqueue a tracked, unfinished request that belongs to no queue and no holder.
+
+        A request in `self.requests` that is not finished must be in `waiting`,
+        `skipped_waiting`, `running`, or held deliberately by the chunk transfer adapter. Being
+        in none of them means nothing will ever schedule it and nothing will ever restore it: the
+        session stops mid-turn and the client waits out its timeout.
+
+        Measured, stage 1, turn 17 of a 40-turn session, with the engine loop still stepping
+        (heartbeats continued, so this is not the parked-loop failure):
+
+            tracked but in NO queue: 1
+              status=WAITING num_tokens=40670 computed=40669   (one token short)
+            adapter: _finished_load_reqs 1[...]  requests_origin_status 1[...]
+                     waiting_for_chunk_waiting_requests 0   waiting_for_chunk_running_requests 0
+
+        `restore_queues` had already returned it to `waiting` and cleared its deques -- the
+        orphaned `requests_origin_status` entry is what proves it passed through -- and something
+        then removed it from `waiting` without placing it anywhere. Which path does that is still
+        unknown, so this repairs the INVARIANT rather than the cause, and says so loudly. The
+        guard is narrow on purpose: a request the adapter is genuinely holding sits in one of its
+        deques or in `_held_non_active`, and is left alone.
+        """
+        if not self.requests:
+            return
+        queued: set[int] = set()
+        for container in (self.waiting, self.skipped_waiting, self.running):
+            for request in container:
+                queued.add(id(request))
+        adapter = self.chunk_transfer_adapter
+        if adapter is not None:
+            for name in ("waiting_for_chunk_waiting_requests",
+                         "waiting_for_chunk_running_requests", "_held_non_active"):
+                for request in getattr(adapter, name, ()) or ():
+                    queued.add(id(request))
+
+        for request in list(self.requests.values()):
+            if id(request) in queued:
+                continue
+            if getattr(request, "is_finished", None) and request.is_finished():
+                continue
+            logger.error(
+                "[OmniARScheduler] stage %s recovering ORPHANED req=%s status=%s "
+                "num_tokens=%s computed=%s -- tracked but in no queue and held by nothing, so "
+                "nothing would ever schedule it. Re-enqueueing to waiting.",
+                self.vllm_config.model_config.stage_id, request.request_id,
+                getattr(getattr(request, "status", None), "name", "?"),
+                getattr(request, "num_tokens", "?"),
+                getattr(request, "num_computed_tokens", "?"),
+            )
+            if adapter is not None:
+                # Drop the stale bookkeeping that says the adapter is holding it, or the next
+                # pass will believe the request is parked when it is not.
+                getattr(adapter, "requests_origin_status", {}).pop(request.request_id, None)
+            request.status = RequestStatus.WAITING
+            self._enqueue_waiting_request(request)
 
     def get_num_unfinished_requests(self) -> int:
         """Derive the streaming-parked count from the queues instead of trusting a counter.
@@ -1245,27 +1317,39 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         rather than chased through every path that might cause it. The repair is logged, because
         a silent correction would hide a real upstream defect.
         """
-        actual = 0
+        if self._pause_state == PauseState.PAUSED_ALL:
+            return 0
+        if self._pause_state == PauseState.PAUSED_NEW:
+            return len(self.running)
+
+        num_waiting = 0
+        parked = 0
         for queue in (self.waiting, self.skipped_waiting):
             for request in queue:
                 if getattr(request, "status", None) == RequestStatus.WAITING_FOR_STREAMING_REQ:
-                    actual += 1
-        if actual != self.num_waiting_for_streaming_input:
+                    parked += 1
+                else:
+                    num_waiting += 1
+
+        # The counter is NOT written back. An earlier version of this repaired it to the derived
+        # value, and that made things worse: while the chunk adapter is holding a parked request
+        # OUT of both queues the derived count is legitimately 0, so the repair zeroed a counter
+        # that upstream then decremented anyway, leaving it at -1. Reporting the disagreement is
+        # useful; mutating another component's bookkeeping from a read-only accessor is not.
+        if parked != self.num_waiting_for_streaming_input:
             now = time()
             if now - self._counter_repaired_t >= self._STARVED_REPORT_EVERY_S:
                 self._counter_repaired_t = now
-                logger.error(
-                    "[OmniARScheduler] stage %s num_waiting_for_streaming_input is %d but only "
-                    "%d request(s) are actually parked for streaming input -- repairing. A high "
-                    "counter subtracts real work from get_num_unfinished_requests() and parks "
-                    "the engine loop; waiting=%d skipped_waiting=%d running=%d tracked=%d",
+                logger.warning(
+                    "[OmniARScheduler] stage %s num_waiting_for_streaming_input is %d but %d "
+                    "request(s) in the queues are actually parked for streaming input. Using the "
+                    "derived count. waiting=%d skipped_waiting=%d running=%d tracked=%d",
                     self.vllm_config.model_config.stage_id,
-                    self.num_waiting_for_streaming_input, actual,
+                    self.num_waiting_for_streaming_input, parked,
                     len(self.waiting), len(self.skipped_waiting), len(self.running),
                     len(self.requests),
                 )
-            self.num_waiting_for_streaming_input = actual
-        return super().get_num_unfinished_requests()
+        return num_waiting + len(self.running)
 
     def _report_starved_loop(self) -> None:
         """Say so when this scheduler tells the engine loop there is nothing to do while it is
