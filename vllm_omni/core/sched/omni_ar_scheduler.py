@@ -53,6 +53,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     core scheduling logic.
     """
 
+    # How long a stage may schedule nothing, while still tracking requests, before it is
+    # reported as wedged (see _check_for_wedged_requests). Generous on purpose: a streaming
+    # session is legitimately idle between turns, and the client's own turn timeout is 240s,
+    # so this has to be well inside that to be useful but far outside normal think time.
+    _WEDGE_REPORT_AFTER_S = 45.0
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Track requests that need KV cache transfer when finished
@@ -359,10 +365,50 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             init_logger(__name__).exception("Failed to wrap scheduled_new_reqs with OmniNewRequestData")
             finished_reqs = {}
 
+        self._check_for_wedged_requests(scheduler_output)
+
         # Wrap in omni scheduler output to carry transfer metadata.
         return self._wrap_omni_scheduler_output(
             scheduler_output,
             finished_requests_needing_kv_transfer=finished_reqs,
+        )
+
+    def _check_for_wedged_requests(self, scheduler_output: SchedulerOutput) -> None:
+        """Dump state once if a stage stops scheduling anything while requests are tracked.
+
+        A stage that CRASHES leaves a traceback. A stage that quietly stops scheduling leaves
+        nothing at all, and that is the observed failure mode of a long streaming session: at
+        turn 31 of a 50-turn run, stage 1 and stage 2 emitted no further log lines of any kind
+        while stage 0 kept generating and kept shipping payloads across the 0->1 edge
+        (chunk=3686 was still being put). The client sat waiting for audio that never came,
+        and nothing anywhere said which request was stuck or in what state.
+
+        `total_num_scheduled_tokens == 0` on every pass is what being wedged looks like from
+        in here. Idle is normal and expected between turns, so this is time-based and fires
+        once per wedge, not once per pass -- the flag resets as soon as anything is scheduled
+        again, so a long quiet gap between turns costs one line at most and a genuine wedge is
+        reported with the full request table behind it.
+        """
+        scheduled = getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0
+        now = time()
+        if scheduled:
+            self._last_progress_t = now
+            self._wedge_reported = False
+            return
+        if not self.requests:
+            self._last_progress_t = now
+            return
+        if getattr(self, "_wedge_reported", False):
+            return
+        since = now - getattr(self, "_last_progress_t", now)
+        if since < self._WEDGE_REPORT_AFTER_S:
+            if not hasattr(self, "_last_progress_t"):
+                self._last_progress_t = now
+            return
+        self._wedge_reported = True
+        self._log_request_table(
+            f"nothing scheduled for {since:.0f}s while {len(self.requests)} request(s) are "
+            f"still tracked -- this stage looks WEDGED, not idle"
         )
 
     def update_from_output(
