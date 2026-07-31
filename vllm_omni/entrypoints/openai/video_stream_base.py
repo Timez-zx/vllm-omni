@@ -30,6 +30,7 @@ import base64
 import hashlib
 import io
 import json
+import os
 import time as _time
 import uuid
 import wave
@@ -101,6 +102,135 @@ def _downscale_frame_bytes(
     buf = io.BytesIO()
     resized.save(buf, format="JPEG", quality=jpeg_quality)
     return buf.getvalue()
+
+
+
+# ======================================================================================
+# SESSION-SCOPED REQUESTS: one engine request per websocket session, not one per turn.
+# Enabled per session via StreamingVideoSessionConfig.session_scoped_request.
+#
+# WHY. Today `_start_query_turn` mints a fresh request id every turn
+# (`request_id = f"video-{uuid4().hex[:12]}"`) and calls generate() once per turn. Two
+# costs follow, and the second is much the larger:
+#
+#   1. The thinker re-prefills the whole prompt. Mitigated by its prefix cache, which is
+#      why a cached token costs 1.26 ms/1k against 79.2 for a new one.
+#   2. The connector re-ships the WHOLE prompt's per-position embeddings AND last-layer
+#      hidden states from stage 0 to stage 1, every turn. Two [L, 2048] bf16 tensors, so
+#      8 KB per prompt position: 29 MB at 16 frames, 291 MB at 160. Measured at ~225
+#      MB/s, that is 1.3 s of pure memory copy at turn 60, and it is 57-77% of the
+#      talker's entire cost. It is invisible in the logs because rx_transfer_bytes and
+#      rx_decode_time_ms are hardcoded to 0 in engine/stage_pool.py.
+#
+# Both collapse under one condition. In stage_input_processors/qwen3_omni.py the full
+# payload is shipped only when `chunk_id == 0`; otherwise, if `request.resumable`, it
+# calls `_construct_thinker2talker_streaming_input_async_chunk`, which ships
+#     new_prompt_len = thinker_emb.shape[0]                 # only THIS forward's rows
+#     ids.prompt     = request.prompt_token_ids[-new_prompt_len:]
+# i.e. delta-sized tensors AND delta-sized token ids, so the talker's placeholder prompt
+# also becomes delta-sized with no further change. `chunk_id` comes from
+# `put_req_chunk[external_req_id]`, which is never reset per segment -- with one request
+# id for the whole session it therefore keeps incrementing, so every turn after the first
+# takes the delta branch.
+#
+# The engine side needs nothing new: `_update_request_as_session` extends the live
+# request's prompt in place, leaves num_computed_tokens untouched, rebases the new
+# multimodal features' offsets, and never frees the KV, so this is genuine incremental
+# prefill rather than a prefix-cache re-hit.
+#
+# HOW. `generate()` already accepts an AsyncGenerator of StreamingInput
+# (async_omni.py:398); that branch submits the first chunk with resumable=True and every
+# later chunk through add_streaming_update_async. So the entrypoint has to become:
+# one native async generator per session feeding per-turn deltas, one long-lived output
+# loop, and per-turn websocket events driven off segment boundaries instead of off the
+# end of the loop.
+#
+# WHAT IS NOT DONE HERE, stated plainly. Frames are still turned into tokens at QUERY
+# time, not on arrival. Doing it on arrival would move the remaining work off the
+# critical path, but it needs a frames-only chunk, and every chunk the engine accepts
+# also runs the talker, which would emit audio nobody asked for. The deferred saving is
+# small: at ~2.5 new frames per turn the delta is ~550 tokens, about 44 ms of prefill
+# plus ~20 ms of copy, against the ~1,900 ms this change is aimed at.
+#
+# ======================================================================================
+
+# Per-output diagnostic for the session output loop. Off during measurement arms: it logs
+# once per engine output, which is hundreds of lines per turn.
+#
+# It exists because the FIRST bring-up attempt failed on exactly the question it answers.
+# `output.finished` is never True under session mode, so the segment boundary was never
+# detected: the turn never completed, the client timed out, and -- because the per-turn
+# accumulator therefore never reset -- `drained` kept growing and turns 2+ emitted no audio
+# at all. The cause is structural: orchestrator._route_output computes
+#     request_finished = final_output_stage_ids.issubset(finished_final_output_stage_ids)
+# with final_output_stage_ids == {0, 2}, while upstream vLLM force-clears `finished` on
+# stage-0 outputs for streaming-input requests, so stage 0 never joins that set. Guessing
+# the replacement signal through three layers of wrapping is how a wrong fix gets shipped,
+# so this dumps what the outputs actually carry.
+_LOG_SESSION_OUTPUTS = os.environ.get("VLLM_OMNI_LOG_SESSION_OUTPUTS", "0") not in ("0", "false", "False", "")
+
+# <|im_end|>\n . Every delta after the first must start with these two tokens. The
+# scheduler folds the previous segment's generated tokens into the prompt but drops the
+# last sampled one, and for the thinker that dropped token is the EOS <|im_end|> -- so
+# without this the previous assistant turn is left unterminated and the chat structure
+# that _compute_talker_prompt_ids_length relies on is broken.
+_IM_END_NEWLINE = [151645, 198]
+
+
+def _segment_finish_reason(output: Any) -> Any:
+    """Per-SEGMENT finish marker, which is the only usable turn boundary in session mode.
+
+    Measured on a 2-turn session with per-output logging (264 outputs):
+
+        out.finished  == False on ALL 264            <- unusable
+        ro.finished   == False on ALL 264            <- unusable
+        finish_reason == "stop" on exactly 4:
+            #141 text/stage0   #162 audio/stage2     <- turn 1 ends
+            #250 text/stage0   #263 audio/stage2     <- turn 2 ends
+
+    `output.finished` is the ORCHESTRATOR's aggregate, computed in _route_output as
+    `final_output_stage_ids.issubset(finished_final_output_stage_ids)` with
+    final_output_stage_ids == {0, 2}. Upstream vLLM force-clears `finished` on stage-0
+    outputs for streaming-input requests, so stage 0 never joins that set and the
+    aggregate can never become true. That is by design -- it is what keeps generate()
+    alive across turns -- but it means the boundary has to come from the per-segment
+    finish_reason instead, which the scheduler still populates on every segment stop.
+
+    The audio one arrives last, so it is the one that closes a turn.
+    """
+    ro = getattr(output, "request_output", None)
+    if ro is None:
+        return None
+    outs = getattr(ro, "outputs", None)
+    if not outs:
+        return None
+    return getattr(outs[0], "finish_reason", None)
+
+
+def _shift_mm_placeholders(engine_prompt: Any, shift: int) -> None:
+    """Move every multimodal placeholder offset by `shift` tokens, in place.
+
+    Needed because prepending <|im_end|>\\n to a rendered chunk moves every image and
+    audio span. Written defensively: placeholders may be dataclasses with `.offset`, or
+    plain dicts, depending on the vLLM version, and getting this wrong is silent -- the
+    model would read image tokens at the wrong positions rather than raise.
+    """
+    if shift == 0 or not isinstance(engine_prompt, dict):
+        return
+    ph = engine_prompt.get("mm_placeholders")
+    if not ph:
+        return
+    groups = ph.values() if isinstance(ph, dict) else [ph]
+    for group in groups:
+        for item in group if isinstance(group, (list, tuple)) else [group]:
+            if isinstance(item, dict):
+                if "offset" in item:
+                    item["offset"] = int(item["offset"]) + shift
+            elif hasattr(item, "offset"):
+                try:
+                    object.__setattr__(item, "offset", int(item.offset) + shift)
+                except Exception:
+                    logger.warning("[session] could not shift a placeholder offset")
 
 
 @runtime_checkable
@@ -229,6 +359,20 @@ class StreamingVideoSessionConfig(BaseModel):
             "of the configuration rather than of what the camera happens to be pointed at."
         ),
     )
+    session_scoped_request: bool = Field(
+        default=False,
+        description=(
+            "Submit the whole session as ONE resumable engine request, feeding each turn as "
+            "an incremental update, instead of a fresh request per turn. Each turn then "
+            "prefills only its new frames, and the stage-0 -> stage-1 connector ships only "
+            "the delta rather than re-copying the entire prompt's embeddings and hidden "
+            "states every turn. Trades a per-turn blast radius for a per-session one: a "
+            "failure ends the conversation rather than one turn, barge-in becomes "
+            "drain-only because aborting would destroy the accumulated KV, and the "
+            "session's context is bounded by max_model_len with no eviction. See the "
+            "SESSION-SCOPED REQUESTS note at the top of this module."
+        ),
+    )
 
 
 class OmniStreamingVideoHandler:
@@ -315,6 +459,264 @@ class OmniStreamingVideoHandler:
             query_task: asyncio.Task[Any] | None = None
 
             msg_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=_MAX_MSG_QUEUE)
+            # ---------------------------------------------------------------- PA_SESSION
+            sess: dict[str, Any] = {
+                "queue": asyncio.Queue(maxsize=4),
+                "gen_task": None,
+                "turn_done": asyncio.Event(),
+                "frames_sent": 0,   # cursor: how many buffered frames have been submitted
+                "turn_idx": 0,
+                "first_sent": False,
+                "fatal": None,
+            }
+            session_request_id = f"video-sess-{uuid.uuid4().hex[:12]}"
+
+            async def _chunk_stream():
+                """Native async generator of per-turn deltas.
+
+                MUST be a real `async def ... yield` generator. async_omni.py:398 branches
+                on `isinstance(prompt, collections.abc.AsyncGenerator)`, whose
+                __subclasshook__ requires asend/athrow/aclose as well as __aiter__ and
+                __anext__, so a hand-rolled iterator class silently falls through to the
+                one-shot per-turn path: no error raised, and the entire change becomes a
+                no-op that looks like a null result.
+                """
+                from vllm.engine.protocol import StreamingInput
+
+                while True:
+                    item = await sess["queue"].get()
+                    if item is None:
+                        return
+                    yield StreamingInput(prompt=item)
+
+            def _new_turn_state() -> dict[str, Any]:
+                return {
+                    "text_parts": [], "prev_text": "", "text_done_sent": False,
+                    "audio_chunks": 0, "drained": 0, "started": False,
+                    "t0": _time.monotonic(), "t_first_text": None, "t_first_audio": None,
+                }
+
+            async def _session_output_loop() -> None:
+                """ONE generate() for the whole session, demultiplexed back into turns.
+
+                In per-turn mode the wire events response.audio.done / response.text.done
+                are emitted AFTER the `async for` loop exits. Here the loop only exits at
+                session end, so every per-turn event has to be driven off a segment
+                boundary detected inside the loop instead.
+
+                The boundary is `output.finished` on an audio output. That works because
+                only stage 0 has a detokenizer: stages 1 and 2 are routed to
+                `_process_mm_only_outputs`, which sets `finished` from the per-segment
+                `finish_reason`, whereas upstream vLLM force-clears `finished` for
+                streaming-input requests on stage 0. The same asymmetry is why per-request
+                StageRequestStats keeps being emitted once per TURN for the talker and
+                code2wav under session mode, and only stage 0's per-turn table is lost.
+                """
+                st = _new_turn_state()
+                try:
+                    result_gen = self._engine_client.generate(
+                        prompt=_chunk_stream(),
+                        request_id=session_request_id,
+                        output_modalities=config.modalities,
+                    )
+                    async for output in result_gen:
+                        if not isinstance(output, OmniRequestOutput):
+                            continue
+                        if _LOG_SESSION_OUTPUTS:
+                            ro = getattr(output, "request_output", None)
+                            co = None
+                            if ro is not None:
+                                outs = getattr(ro, "outputs", None)
+                                co = outs[0] if outs else None
+                            logger.info(
+                                "[session-out] type=%s stage=%s out.finished=%s ro.finished=%s "
+                                "finish_reason=%s ntok=%s audio_n=%s",
+                                getattr(output, "final_output_type", "?"),
+                                getattr(output, "stage_id", "?"),
+                                getattr(output, "finished", None),
+                                getattr(ro, "finished", None) if ro is not None else None,
+                                getattr(co, "finish_reason", None) if co is not None else None,
+                                len(getattr(co, "token_ids", ()) or ()) if co is not None else None,
+                                (len(output.audio_data) if isinstance(getattr(output, "audio_data", None), list)
+                                 else ("1" if getattr(output, "audio_data", None) is not None else "0")),
+                            )
+                        if interrupt_event.is_set():
+                            continue
+                        if not st["started"]:
+                            await websocket.send_json({"type": "response.start"})
+                            st["started"] = True
+
+                        if getattr(output, "final_output_type", "text") == "audio":
+                            if not st["text_done_sent"]:
+                                await websocket.send_json(
+                                    {"type": "response.text.done",
+                                     "text": "".join(st["text_parts"])}
+                                )
+                                st["text_done_sent"] = True
+                            if st["t_first_audio"] is None:
+                                st["t_first_audio"] = _time.monotonic()
+                            st["audio_chunks"] += 1
+                            b64, st["drained"] = self._extract_audio_delta_b64(output, st["drained"])
+                            if b64:
+                                await websocket.send_json(
+                                    {"type": "response.audio.delta", "data": b64, "format": "wav"}
+                                )
+                            if _segment_finish_reason(output) is not None:
+                                await websocket.send_json({"type": "response.audio.done"})
+                                logger.info(
+                                    "[session] turn=%d done first_text=%.3fs "
+                                    "first_audio=%.3fs audio_chunks=%d chars=%d",
+                                    sess["turn_idx"],
+                                    (st["t_first_text"] - st["t0"]) if st["t_first_text"] else -1.0,
+                                    (st["t_first_audio"] - st["t0"]) if st["t_first_audio"] else -1.0,
+                                    st["audio_chunks"], len("".join(st["text_parts"])),
+                                )
+                                # message_history is deliberately NOT updated: under session
+                                # mode the conversation lives in the engine request's KV, and
+                                # a second copy in the entrypoint would be dead state that
+                                # future readers would mistake for the source of truth.
+                                st = _new_turn_state()
+                                sess["turn_done"].set()
+                        else:
+                            delta, st["prev_text"] = self._extract_text_delta(output, st["prev_text"])
+                            if delta:
+                                if st["t_first_text"] is None:
+                                    st["t_first_text"] = _time.monotonic()
+                                st["text_parts"].append(delta)
+                                await websocket.send_json(
+                                    {"type": "response.text.delta", "delta": delta}
+                                )
+                            if _segment_finish_reason(output) is not None:
+                                # The text segment ended. Audio normally closes the turn a
+                                # little later; for a text-only session there would be no
+                                # audio output at all, so close here instead.
+                                if "audio" not in (config.modalities or []):
+                                    if not st["text_done_sent"]:
+                                        await websocket.send_json(
+                                            {"type": "response.text.done",
+                                             "text": "".join(st["text_parts"])}
+                                        )
+                                    st = _new_turn_state()
+                                    sess["turn_done"].set()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    logger.exception("[session] output loop failed")
+                    sess["fatal"] = str(e)
+                    sess["turn_done"].set()   # never leave a turn waiting forever
+
+            async def _run_session_turn(*, query_text: str) -> None:
+                """Queue this turn's delta, then wait for its audio to finish.
+
+                Strictly turn-by-turn: the client waits for response.audio.done before
+                sending the next query, so pipelining would buy nothing here and would
+                complicate the segment bookkeeping.
+                """
+                if sess["fatal"]:
+                    await self._send_error(websocket, f"Session failed: {sess['fatal']}")
+                    return
+
+                new_frames = frame_buffer[sess["frames_sent"]:]
+                sess["frames_sent"] = len(frame_buffer)
+                chunk = await self._build_session_chunk(
+                    config, new_frames, audio_buffer, query_text, frame_pil_cache,
+                    is_first=not sess["first_sent"],
+                )
+                audio_buffer.clear()
+                if chunk is None:
+                    await self._send_error(websocket, "Nothing new to submit this turn")
+                    return
+
+                ids = (chunk.get("prompt_token_ids") or ()) if isinstance(chunk, dict) else ()
+                ntok = len(ids)
+                sess["cum_tokens"] = sess.get("cum_tokens", 0) + ntok
+                # Session mode loses StageRequestStats entirely -- those tables are printed
+                # when a request FINISHES, and a resumable session request never does. So
+                # the two quantities the measurement needs have to be logged here instead:
+                #
+                #   cum   the thinker's accumulated prompt length, i.e. the x-axis. It is
+                #         the running sum of the deltas, because nothing else reports it.
+                #   tlen  what the talker's placeholder will be for this delta, from the
+                #         SAME function the connector uses. This is the direct check that
+                #         the delta-shipping branch is doing its job: tlen must stay small
+                #         and roughly constant while cum grows.
+                tlen = -1
+                try:
+                    from vllm_omni.distributed.omni_connectors.adapter import (
+                        compute_talker_prompt_ids_length,
+                    )
+                    tlen = compute_talker_prompt_ids_length(list(ids))
+                except Exception:
+                    pass
+                logger.info(
+                    "[session] turn=%d queue delta: %d new frames, %d tokens, "
+                    "cum=%d, talker_placeholder=%d, first=%s",
+                    sess["turn_idx"], len(new_frames), ntok,
+                    sess["cum_tokens"], tlen, not sess["first_sent"],
+                )
+                interrupt_event.clear()
+                sess["turn_done"].clear()
+                if sess["gen_task"] is None:
+                    sess["gen_task"] = asyncio.create_task(_session_output_loop())
+                sess["first_sent"] = True
+                await sess["queue"].put(chunk)
+                # Bounded wait. A lost segment boundary must surface as an error rather
+                # than a hang: the first bring-up attempt used an unusable boundary signal
+                # and the symptom was the client sitting in its own timeout with no server
+                # log to explain it. The bound is generous because a static-content turn
+                # can legitimately produce ~105 s of speech.
+                try:
+                    await asyncio.wait_for(sess["turn_done"].wait(), timeout=240.0)
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "[session] turn=%d boundary NEVER ARRIVED after 240s -- the "
+                        "segment-finish signal is wrong for this configuration",
+                        sess["turn_idx"],
+                    )
+                    sess["fatal"] = "turn boundary lost"
+                    await self._send_error(websocket, "Turn boundary lost")
+                    return
+                sess["turn_idx"] += 1
+
+            async def _close_session_request() -> None:
+                """End the session by CANCELLING, deliberately not by the finish sentinel.
+
+                The obvious wind-down is to let the chunk generator return, which makes
+                async_omni send a terminal `resumable=False` update. That KILLS THE TALKER:
+                the sentinel prompt is `TokensPrompt(prompt_token_ids=[0])`, so stage 1's
+                placeholder length comes out 0 and its scheduler trips
+                `assert num_new_tokens > 0`, taking down the engine core process. Observed
+                on the second bring-up: three turns completed correctly and then the
+                sentinel crashed stage 1.
+
+                `handle_inputs` sends that sentinel only `if not cancelled`
+                (async_omni.py), and generate()'s own CancelledError handler already
+                cancels the input-stream task and calls `_abort_internal_requests`. So
+                cancelling the outer task is both the clean path and the one that skips the
+                sentinel. Abort at session end is safe -- unlike a mid-session abort, which
+                would destroy the accumulated KV this whole mode exists to preserve.
+                """
+                task = sess["gen_task"]
+                if task is None:
+                    return
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                # NO second abort here. generate()'s own CancelledError handler already
+                # calls _abort_internal_requests, and adding another abort only doubles it.
+                #
+                # KNOWN UPSTREAM FRAGILITY, measured: ending a resumable session request
+                # takes down the stage-1 engine core process with
+                # `assert num_new_tokens > 0` in its scheduler. Both ways of ending it do
+                # it -- the terminal resumable=False sentinel (whose prompt is
+                # TokensPrompt([0]), giving the talker a zero-length placeholder) and the
+                # abort. It happens strictly AFTER the last turn has been delivered, so no
+                # turn is affected, but the stage-1 process is gone afterwards, which means
+                # a second session on the same server would fail. The experiment therefore
+                # runs one server boot per session rather than four sessions per boot.
+                # Fixing it properly belongs upstream, in stage 1's handling of a resumable
+                # request that is ending.
+
 
             async def _reader() -> None:
                 """Receive WebSocket messages and enqueue them."""
@@ -374,6 +776,17 @@ class OmniStreamingVideoHandler:
             async def _start_query_turn(*, query_text: str) -> None:
                 """Schedule a new inference turn from the current buffers."""
                 nonlocal active_request_id, prev_request_id, prev_was_interrupted, query_task
+
+                if config.session_scoped_request:
+                    # Run as a task, as the per-turn path does, so the processor keeps
+                    # draining msg_queue and frames arriving during the turn are still
+                    # buffered. `active_request_id` intentionally stays None: that makes
+                    # every abort site in this file a no-op, which is exactly the
+                    # drain-only barge-in behaviour session mode needs. A mid-session
+                    # abort would pop the engine request and destroy the accumulated KV
+                    # that is the entire point of this mode.
+                    query_task = asyncio.create_task(_run_session_turn(query_text=query_text))
+                    return
 
                 await _cancel_active_query()
 
@@ -593,6 +1006,11 @@ class OmniStreamingVideoHandler:
                     await reader_task
                 except (asyncio.CancelledError, Exception):
                     pass
+                if config.session_scoped_request:
+                    # Wind the session request down before anything else cancels tasks:
+                    # the terminal resumable=False update is the only thing that finishes
+                    # a resumable request, and it is sent when the chunk generator returns.
+                    await _close_session_request()
                 for t in list(prewarm_tasks):
                     t.cancel()
                 if prewarm_tasks:
@@ -681,6 +1099,113 @@ class OmniStreamingVideoHandler:
             prewarmed_frames,
         )
 
+
+    # ------------------------------------------------------------------
+    # PA_SESSION: build ONE per-turn delta
+    # ------------------------------------------------------------------
+
+    async def _build_session_chunk(
+        self,
+        config: StreamingVideoSessionConfig,
+        new_frames: list[str],
+        audio_buffer: bytearray,
+        query_text: str,
+        prewarmed_frames: dict[str, tuple[Any, str]],
+        *,
+        is_first: bool,
+    ) -> Any:
+        """Render one per-turn delta into an engine prompt, or None if it would be empty.
+
+        The delta must be a SELF-CONTAINED chatml unit:
+
+            <|im_start|>user\\n {frames}{audio}{text} <|im_end|>\\n<|im_start|>assistant\\n
+
+        Both halves are load-bearing and neither fails loudly:
+
+        * Without the `<|im_start|>user` header, `compute_talker_prompt_ids_length`
+          (adapter.py) finds no im_start, returns 0, and the caller wraps it in
+          `max(1, ...)` -- so the talker gets a ONE-token placeholder and the worker's
+          `seg_len = min(span_len, req_embeds.shape[0])` silently keeps one row of
+          conditioning and discards the rest. No exception, wrong audio.
+        * Without the trailing assistant header the same function loses its +9 and
+          mis-sizes the placeholder.
+
+        `add_generation_prompt=True` produces exactly that shape, and the Qwen3-Omni chat
+        template emits no default system block when messages[0] is not a system message,
+        which is what lets chunks 2..N carry only a user block.
+
+        Empty chunks are refused: the waiting-path scheduler asserts num_new_tokens > 0,
+        so a turn contributing nothing would take down the engine core.
+        """
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionRequest,
+        )
+
+        prewarmed = prewarmed_frames or {}
+        user_content: list[dict] = []
+        for frame_b64 in new_frames:
+            cached = prewarmed.get(frame_b64)
+            if cached is _BAD_FRAME:
+                continue
+            if cached is not None:
+                pil, pil_uuid = cached
+                user_content.append({"type": "image_pil", "image_pil": pil, "uuid": pil_uuid})
+            else:
+                user_content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"},
+                    }
+                )
+
+        has_audio = len(audio_buffer) > 0
+        if has_audio:
+            user_content.append(
+                {
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": self._pcm_to_wav_b64(bytes(audio_buffer)),
+                        "format": "wav",
+                    },
+                }
+            )
+        if query_text:
+            user_content.append({"type": "text", "text": query_text})
+
+        if not user_content:
+            return None
+
+        messages: list[dict[str, Any]] = []
+        # The system block belongs to the session, so it is sent exactly once. Repeating
+        # it per chunk would put it in the middle of the sequence, where
+        # compute_talker_prompt_ids_length skips it and the model sees an instruction
+        # block interleaved with the conversation.
+        if is_first and config.system_prompt:
+            messages.append({"role": "system", "content": config.system_prompt})
+        messages.append({"role": "user", "content": user_content})
+
+        request_kwargs: dict[str, Any] = {
+            "model": config.model or "default",
+            "messages": messages,
+            "stream": True,
+            "modalities": config.modalities,
+            "add_generation_prompt": True,
+            "continue_final_message": False,
+            "add_special_tokens": False,
+        }
+        if config.use_audio_in_video and has_audio:
+            request_kwargs["mm_processor_kwargs"] = {"use_audio_in_video": True}
+
+        chat_request = ChatCompletionRequest(**request_kwargs)
+        engine_prompt = await self._preprocess_to_engine_prompt(chat_request)
+
+        if not is_first and isinstance(engine_prompt, dict):
+            ids = engine_prompt.get("prompt_token_ids")
+            if ids is not None:
+                engine_prompt["prompt_token_ids"] = list(_IM_END_NEWLINE) + list(ids)
+                _shift_mm_placeholders(engine_prompt, len(_IM_END_NEWLINE))
+
+        return engine_prompt
     # ------------------------------------------------------------------
     # Engine-client path (async_chunk audio streaming)
     # ------------------------------------------------------------------
