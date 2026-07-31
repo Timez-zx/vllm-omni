@@ -207,6 +207,28 @@ class StreamingVideoSessionConfig(BaseModel):
         le=100,
         description="JPEG quality used when re-encoding a downscaled frame.",
     )
+    frame_filter_max_gap: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Retain a frame unconditionally once this many consecutive frames have been "
+            "dropped by the similarity filter. 0 disables. Bounds BLINDNESS: the filter's "
+            "metric is a whole-frame MSE on a 64x64 thumbnail, which barely moves when only "
+            "a small region changes, so a screen share can go minutes without retaining "
+            "anything even as its content changes completely."
+        ),
+    )
+    frame_filter_min_gap: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Refuse to retain again until this many frames have passed, however different "
+            "they look. 0 disables. Bounds the BLOWUP: handheld camera motion makes almost "
+            "every frame look new, so the filter retains most of them and the prompt grows "
+            "without limit. Together the two bounds make video tokens per turn a property "
+            "of the configuration rather than of what the camera happens to be pointed at."
+        ),
+    )
 
 
 class OmniStreamingVideoHandler:
@@ -280,6 +302,9 @@ class OmniStreamingVideoHandler:
             frame_filter = (
                 FrameSimilarityFilter(threshold=config.frame_filter_threshold) if config.enable_frame_filter else None
             )
+            # Frames dropped by the similarity filter since the last retain. Drives
+            # frame_filter_min_gap / frame_filter_max_gap.
+            frames_since_retained = 0
             audio_buffer = bytearray()  # raw PCM16 16kHz mono
             message_history: Any = self.create_message_history(config)
             active_request_id: str | None = None
@@ -396,6 +421,7 @@ class OmniStreamingVideoHandler:
             async def _processor() -> None:
                 """Process enqueued messages."""
                 nonlocal active_request_id, prev_request_id, prev_was_interrupted, query_task
+                nonlocal frames_since_retained
 
                 while True:
                     msg = await msg_queue.get()
@@ -449,8 +475,27 @@ class OmniStreamingVideoHandler:
                                 frame_data = base64.b64encode(shrunk).decode("ascii")
                         if frame_filter is not None:
                             try:
+                                # Bracket the GAP between retained frames, in frames. The
+                                # similarity filter itself is untouched; these two bounds only
+                                # constrain how often it is allowed to say yes or no.
+                                #
+                                # Counting frames rather than seconds keeps the behaviour
+                                # independent of whatever rate the client happens to send at.
+                                #
+                                # MIN_GAP is checked first and short-circuits, so a burst of
+                                # genuinely different frames cannot flood the prompt. MAX_GAP
+                                # then forces a retain by clearing the filter's reference
+                                # frame, which is what makes the next comparison succeed --
+                                # calling should_retain() with a stale reference is exactly
+                                # how a static-looking stream stays invisible.
+                                frames_since_retained += 1
+                                if config.frame_filter_min_gap and frames_since_retained < config.frame_filter_min_gap:
+                                    continue
+                                if config.frame_filter_max_gap and frames_since_retained >= config.frame_filter_max_gap:
+                                    frame_filter.force_next_retain()
                                 if not frame_filter.should_retain(raw_bytes):
                                     continue
+                                frames_since_retained = 0
                             except Exception:
                                 await self._send_error(websocket, "Invalid image data")
                                 continue
