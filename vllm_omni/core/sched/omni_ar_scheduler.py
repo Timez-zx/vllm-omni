@@ -286,6 +286,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         for name in ("requests_with_ready_chunks", "waiting_for_chunk_waiting_requests",
                      "waiting_for_chunk_running_requests", "_finished_load_reqs",
                      "_active_streams", "_held_non_active", "finished_requests",
+                     # `segment_finished_requests` gates `is_done_receiving_chunks`, which the
+                     # RECEIVER consults as well as the scheduler. While a request sits in it,
+                     # stage 1 neither pulls a chunk nor schedules, and only a streaming update
+                     # clears it -- so if the update lands before the previous segment's final
+                     # payload sets the flag, the wakeup is lost and the stage is silent for
+                     # good while stage 0 keeps pushing payloads onto the edge. That is the
+                     # shape of the observed wedge, and it is invisible without this row.
+                     "segment_finished_requests",
                      "requests_origin_status"):
             logger.error("[OmniARScheduler]     %-36s %s", name,
                          ids(getattr(adapter, name, None)))
