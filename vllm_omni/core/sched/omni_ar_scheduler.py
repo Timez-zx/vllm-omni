@@ -225,6 +225,30 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return False
 
+    def add_request(self, request: Request) -> None:
+        """Log every admission, then admit.
+
+        There is no other way to tell "the request never reached this stage" from "it reached
+        it and was removed again", and those have completely different causes. The question is
+        live: rolling a session mints a new engine request, the API server logs sending it to
+        all three stages, stage 0 accepts it and streams 370 payloads at stage 1 -- and stage 1
+        behaves exactly as though it has no request at all. Upstream's `EngineCore.add_request`
+        calls straight through to here, so a line here means the message arrived; its absence
+        means it did not. Note the `abort_immediately` flag, which upstream honours by aborting
+        the request on the very next line after this call.
+        """
+        logger.info(
+            "[OmniARScheduler] stage %s ADMIT req=%s resumable=%s prompt_tokens=%s "
+            "abort_immediately=%s (tracked before this: %d)",
+            self.vllm_config.model_config.stage_id,
+            getattr(request, "request_id", "?"),
+            getattr(request, "resumable", None),
+            getattr(request, "num_prompt_tokens", "?"),
+            getattr(request, "abort_immediately", None),
+            len(self.requests),
+        )
+        super().add_request(request)
+
     def _log_request_table(self, why: str) -> None:
         """Dump every tracked request's scheduling state.
 
@@ -955,6 +979,24 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # TODO(wzliu)! for offline mode, we should not end process until all data is transferred
         """Mark a request as finished and free its resources."""
         assert request.is_finished()
+
+        # Say WHY, once per request. A request leaving the scheduler is the moment that decides
+        # whether a stage goes quiet, and until this line existed the reason was unrecoverable
+        # after the fact: rolling a session admitted the new request on stage 1 and then dropped
+        # it within a pass or two, and the only visible trace was the stage reporting zero
+        # tracked requests for the next 126s while payloads piled up on the 0->1 edge. The
+        # status distinguishes an abort from a stop from a length cap, and those have nothing to
+        # do with each other.
+        logger.info(
+            "[OmniARScheduler] stage %s FREE req=%s status=%s prompt_tokens=%s output=%d "
+            "computed=%s",
+            self.vllm_config.model_config.stage_id,
+            request.request_id,
+            getattr(getattr(request, "status", None), "name", "?"),
+            getattr(request, "num_prompt_tokens", "?"),
+            len(getattr(request, "output_token_ids", ()) or ()),
+            getattr(request, "num_computed_tokens", "?"),
+        )
 
         self._omits_kv_transfer_cache.pop(request.request_id, None)
 
