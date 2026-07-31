@@ -66,6 +66,43 @@ def _decode_frame_bytes(raw_bytes: bytes) -> Any:
     return Image.open(io.BytesIO(raw_bytes)).convert("RGB")
 
 
+def _downscale_frame_bytes(
+    raw_bytes: bytes,
+    max_width: int,
+    max_height: int,
+    jpeg_quality: int,
+) -> bytes | None:
+    """Shrink a frame to fit within max_width x max_height, preserving aspect ratio.
+
+    Returns re-encoded JPEG bytes, or None if the frame already fits (so the caller can
+    keep the original bytes untouched and avoid a needless re-encode).
+
+    WHY THIS BELONGS ON THE SERVER. For a vision-language model the cost of a frame is the
+    number of tokens it becomes, and that is set by its pixel dimensions: Qwen3-Omni emits
+    (W/32) * (H/32) tokens per frame, so 1280x704 is 880 tokens and 640x352 is 220 --
+    exactly 4x less for a halved edge. With a 16-frame prompt that is the difference between
+    ~14,100 and ~3,500 video tokens, and prompt length is what the per-turn cost tracks.
+    Leaving this to the client means every client has to know the model's patch geometry and
+    get it right, and one client sending full-resolution frames degrades latency for
+    everyone sharing the server.
+
+    Downscale only, never upscale: a client that sends small frames should not have them
+    interpolated up into more tokens than it asked for.
+    """
+    img = _decode_frame_bytes(raw_bytes)
+    w, h = img.size
+    if w <= max_width and h <= max_height:
+        return None
+    scale = min(max_width / float(w), max_height / float(h))
+    new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+    # BILINEAR rather than LANCZOS: this is on the per-frame arrival path at the client's
+    # frame rate, and the result is fed to a vision encoder that will downsample it again.
+    resized = img.resize(new_size, Image.BILINEAR)
+    buf = io.BytesIO()
+    resized.save(buf, format="JPEG", quality=jpeg_quality)
+    return buf.getvalue()
+
+
 @runtime_checkable
 class VideoStreamPipelineHooks(Protocol):
     """Pipeline-specific hooks for streaming video handlers."""
@@ -146,6 +183,29 @@ class StreamingVideoSessionConfig(BaseModel):
         ge=0.0,
         le=1.0,
         description="EVS similarity threshold (higher = keep more frames).",
+    )
+    max_frame_width: int | None = Field(
+        default=None,
+        ge=32,
+        le=8192,
+        description=(
+            "Downscale arriving frames to fit within this width, preserving aspect ratio. "
+            "None disables it. A frame becomes (W/32)*(H/32) tokens, so halving each edge "
+            "cuts a frame's prompt cost 4x; this is the cheapest lever on per-turn latency "
+            "for a video stream. Downscale only -- smaller frames are never upscaled."
+        ),
+    )
+    max_frame_height: int | None = Field(
+        default=None,
+        ge=32,
+        le=8192,
+        description="Companion to max_frame_width. Both must be set for downscaling to apply.",
+    )
+    frame_jpeg_quality: int = Field(
+        default=90,
+        ge=1,
+        le=100,
+        description="JPEG quality used when re-encoding a downscaled frame.",
     )
 
 
@@ -367,6 +427,26 @@ class OmniStreamingVideoHandler:
                         except Exception:
                             await self._send_error(websocket, "Invalid image data")
                             continue
+
+                        # Downscale BEFORE anything else looks at the frame, so that the
+                        # similarity filter, the prewarm PIL cache (keyed on these bytes),
+                        # the multimodal hash and the prompt all see one consistent version.
+                        # Doing it later would leave the filter comparing full-resolution
+                        # frames while the model reads reduced ones.
+                        if config.max_frame_width and config.max_frame_height:
+                            try:
+                                shrunk = _downscale_frame_bytes(
+                                    raw_bytes,
+                                    config.max_frame_width,
+                                    config.max_frame_height,
+                                    config.frame_jpeg_quality,
+                                )
+                            except Exception:
+                                logger.debug("Frame downscale failed; keeping original", exc_info=True)
+                                shrunk = None
+                            if shrunk is not None:
+                                raw_bytes = shrunk
+                                frame_data = base64.b64encode(shrunk).decode("ascii")
                         if frame_filter is not None:
                             try:
                                 if not frame_filter.should_retain(raw_bytes):
