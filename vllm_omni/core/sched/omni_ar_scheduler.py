@@ -209,6 +209,83 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return False
 
+    def _park_waiting_requests_with_nothing_to_compute(self) -> None:
+        """Keep a streaming session out of the WAITING queue while it has no new tokens.
+
+        Upstream's waiting path computes ``num_new_tokens = request.num_tokens -
+        num_computed_tokens`` and then asserts it is positive. For a downstream stage of a
+        resumable (streaming-input) request that assertion is reachable, and when it fires
+        it takes down the whole engine-core process.
+
+        How it is reached. For stages other than 0, ``_update_request_as_session`` moves the
+        session to WAITING and re-enqueues it *without* extending its prompt -- deliberately,
+        because the prompt for a downstream stage is populated later, when the connector
+        delivers a payload carrying ``ids.prompt`` (see the comment there, and
+        ``construct_next_stage_streaming_input_prompt``, which returns early when the payload
+        has no prompt ids). So between "resume polling" and "a real payload arrived" the
+        session legitimately sits in WAITING with nothing to compute. If a schedule pass
+        lands in that window -- which ending a session reliably produces, because the
+        terminal ``resumable=False`` update and the abort path both poke the scheduler while
+        the last payload carries only finish markers and no ids -- the assert trips.
+
+        The fix puts the session into the state that already describes this situation, using
+        upstream's own convention for it: status WAITING_FOR_STREAMING_REQ, routed through
+        ``_enqueue_waiting_request``, which sends any "blocked waiting" status to
+        ``skipped_waiting`` rather than ``waiting`` (see ``_is_blocked_waiting_status``). That
+        is where upstream itself parks such a request in ``_handle_stopped_request``, and it
+        is why the waiting loop never trips over one: parked sessions are not in ``waiting``
+        at all. ``_update_request_as_session`` already un-parks them when real input arrives,
+        so nothing else has to change.
+
+        Re-queueing through the helper rather than by hand matters: dropping the request from
+        ``waiting`` without adding it back anywhere would strand it in no queue, which fails
+        as a client that hangs forever with no error.
+
+        A non-resumable request with nothing to compute cannot make progress at all, so it is
+        marked FINISHED_ABORTED instead of parked; leaving it in WAITING would trip the same
+        assert next pass, and parking it forever would leak. That status is what the sweep at
+        the top of ``schedule()`` already expects to find and drop. Both branches log, because
+        this should be rare and silently swallowing it would hide a real bug.
+        """
+        parked: list[Request] = []
+        aborted: list[Request] = []
+        for request in list(self.waiting):
+            if getattr(request, "status", None) != RequestStatus.WAITING:
+                continue
+            if request.num_tokens - request.num_computed_tokens > 0:
+                continue
+            if getattr(request, "resumable", False):
+                parked.append(request)
+            else:
+                aborted.append(request)
+
+        for request in parked:
+            self.waiting.remove_requests((request,))
+            request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+            self.num_waiting_for_streaming_input += 1
+            self._enqueue_waiting_request(request)
+            logger.debug(
+                "[OmniARScheduler] parked req=%s (stage %s): nothing to compute yet "
+                "(num_tokens=%d == num_computed_tokens=%d), waiting for the next payload",
+                request.request_id,
+                self.vllm_config.model_config.stage_id,
+                request.num_tokens,
+                request.num_computed_tokens,
+            )
+
+        for request in aborted:
+            self.waiting.remove_requests((request,))
+            request.status = RequestStatus.FINISHED_ABORTED
+            logger.warning(
+                "[OmniARScheduler] aborting req=%s (stage %s): not resumable and has nothing "
+                "to compute (num_tokens=%d == num_computed_tokens=%d), so it can never make "
+                "progress",
+                request.request_id,
+                self.vllm_config.model_config.stage_id,
+                request.num_tokens,
+                request.num_computed_tokens,
+            )
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
@@ -225,6 +302,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.chunk_transfer_adapter.process_pending_chunks(
                 self.waiting, self.running, scheduler_requests=self.requests
             )
+
+        self._park_waiting_requests_with_nothing_to_compute()
 
         original_waiting = None
         if self._should_defer_waiting_admission():
