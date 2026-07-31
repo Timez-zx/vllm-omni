@@ -263,6 +263,35 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         for request in orphans:
             logger.error("[OmniARScheduler]     %s", describe(request))
 
+        # The chunk transfer adapter's state, because half the ways a downstream stage can
+        # stop making progress live in there rather than in the queues. In particular
+        # `requests_with_ready_chunks` is only ever cleared by `_clear_chunk_ready`, which
+        # keys off requests appearing in a scheduler_output -- so a request that is in that
+        # set and never gets scheduled is skipped by `_process_chunk_queue` on every
+        # subsequent pass (it `continue`s before load_async), and no further chunk is ever
+        # loaded for it. That is indistinguishable from "idle" without printing the set.
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        if adapter is None:
+            return
+        def ids(value: Any) -> str:
+            if value is None:
+                return "-"
+            try:
+                items = [getattr(r, "request_id", r) for r in value]
+            except TypeError:
+                return repr(value)[:120]
+            return f"{len(items)}{items[:4]}"
+
+        logger.error("[OmniARScheduler]   chunk adapter state:")
+        for name in ("requests_with_ready_chunks", "waiting_for_chunk_waiting_requests",
+                     "waiting_for_chunk_running_requests", "_finished_load_reqs",
+                     "_active_streams", "_held_non_active", "finished_requests",
+                     "requests_origin_status"):
+            logger.error("[OmniARScheduler]     %-36s %s", name,
+                         ids(getattr(adapter, name, None)))
+        logger.error("[OmniARScheduler]     %-36s %s", "_active_window",
+                     getattr(adapter, "_active_window", "?"))
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
