@@ -65,6 +65,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     _empty_reported_t = 0.0
     _empty_since = None
 
+    # Heartbeat cadence for the presence check at the top of schedule().
+    _HEARTBEAT_EVERY_S = 10.0
+    _last_heartbeat_t = 0.0
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Track requests that need KV cache transfer when finished
@@ -335,6 +339,27 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                      getattr(adapter, "_active_window", "?"))
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        # Heartbeat, rate-limited. Every other diagnostic in this class lives at the END of
+        # this method, so all of them go quiet together if the engine's busy loop stops calling
+        # it -- and their silence then gets read as "nothing is wrong with the request", which
+        # is the opposite of the truth. Upstream's loop blocks while
+        # `not self.scheduler.has_requests()`, and has_requests() counts `waiting`/`running`,
+        # NOT `self.requests`; the chunk transfer adapter takes a request OUT of those queues
+        # while its payload load is pending. So a request can be tracked, unschedulable, and
+        # invisible to every check below, with the loop parked. This line is the only way to
+        # tell that state from a healthy idle stage, because it reports presence rather than
+        # absence.
+        _hb_now = time()
+        if _hb_now - self._last_heartbeat_t >= self._HEARTBEAT_EVERY_S:
+            self._last_heartbeat_t = _hb_now
+            logger.info(
+                "[OmniARScheduler] stage %s heartbeat: tracked=%d waiting=%d skipped=%d "
+                "running=%d",
+                self.vllm_config.model_config.stage_id,
+                len(self.requests), len(self.waiting), len(self.skipped_waiting),
+                len(self.running),
+            )
+
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
         # async abort (e.g. client disconnect during TTS streaming) to leave
@@ -1150,10 +1175,39 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             return False
         return True
 
+    def _has_requests_awaiting_chunk(self) -> bool:
+        """True while the chunk transfer adapter is holding a request out of the queues.
+
+        This has to count as work, or the engine deadlocks. The adapter takes a request OUT of
+        both `waiting` and `running` while its payload load is in flight, and upstream's
+        `has_requests()` only looks at those two queues -- so the loop concludes it has nothing
+        to do and blocks. But noticing that the load has COMPLETED happens in
+        `process_pending_chunks`, which only runs from `schedule()`, which only runs if the loop
+        does not block. Nothing breaks the cycle, because the only thing that wakes the loop is
+        new client input.
+
+        Measured, rolling a session: after the new request was admitted, stage 1 logged not one
+        scheduler heartbeat for 125 seconds -- while 274 payloads arrived for it on the 0->1
+        edge -- and was finally freed with num_computed_tokens still 0. Ordinary turns escape
+        this only because each turn's own `add_request` happens to wake the loop; the first turn
+        of a rolled request has no such event, since the client is waiting on that very turn.
+        """
+        adapter = self.chunk_transfer_adapter
+        if adapter is None:
+            return False
+        return bool(
+            getattr(adapter, "waiting_for_chunk_waiting_requests", None)
+            or getattr(adapter, "waiting_for_chunk_running_requests", None)
+        )
+
     def has_requests(self) -> bool:
         """Check if there are any requests to process, including KV transfers."""
         # [Omni] Also check for pending KV transfers
         if self.requests_needing_kv_transfer or self.active_kv_transfers or self.waiting_for_transfer_free:
+            return True
+        # ... and for requests the chunk transfer adapter is holding. Same reasoning as the KV
+        # transfer check above: work is pending, so the loop must not be allowed to quiesce.
+        if self._has_requests_awaiting_chunk():
             return True
         return super().has_requests()
 
@@ -1169,6 +1223,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # MUST verify waiting_for_transfer_free and active_kv_transfers
         # Otherwise engine loop might exit before transfer Ack is received.
         if self.requests_needing_kv_transfer or self.active_kv_transfers or self.waiting_for_transfer_free:
+            return True
+        # A request awaiting a chunk payload is unfinished by any reading, and the loop must keep
+        # stepping or it will never observe the payload arriving. See _has_requests_awaiting_chunk.
+        if self._has_requests_awaiting_chunk():
             return True
         return super().has_unfinished_requests()
 
