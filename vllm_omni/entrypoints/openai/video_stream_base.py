@@ -605,6 +605,40 @@ class OmniStreamingVideoHandler:
                     sess["turn_done"].set()   # never leave a turn waiting forever
 
             async def _run_session_turn(*, query_text: str) -> None:
+                """Serialise turns, and refuse to overlap two of them.
+
+                Every query arrives as its own task, and nothing here stopped a second
+                turn from starting while the first was still waiting for its segment
+                boundary. A 30-turn run hit exactly that: turn 28's boundary never came,
+                the client gave up after ~127s and sent the next query, and the second
+                call re-entered this function with ``turn_idx`` still 28. It logged the
+                same turn number twice, swept the 32 frames that had piled up during the
+                stall into one 8,768-token delta, and shared ``turn_done`` and the segment
+                accumulator with the call still in flight. Nothing raised.
+
+                Two turns cannot both be served correctly out of per-session state shaped
+                like this, so a query that arrives mid-turn fails the session loudly
+                instead of producing a turn whose bookkeeping is already wrong. It also
+                keeps the diagnosis honest: the overlap was a consequence of the stall,
+                not its cause, and letting it through buried the real event under a turn
+                index that appeared twice with two different frame counts.
+                """
+                if sess.get("turn_busy"):
+                    logger.error(
+                        "[session] turn=%d is still in flight and another query "
+                        "arrived -- refusing to overlap turns",
+                        sess["turn_idx"],
+                    )
+                    sess["fatal"] = "overlapping turn"
+                    await self._send_error(websocket, "Overlapping turn")
+                    return
+                sess["turn_busy"] = True
+                try:
+                    await _run_session_turn_body(query_text=query_text)
+                finally:
+                    sess["turn_busy"] = False
+
+            async def _run_session_turn_body(*, query_text: str) -> None:
                 """Queue this turn's delta, then wait for its audio to finish.
 
                 Strictly turn-by-turn: the client waits for response.audio.done before
