@@ -411,29 +411,42 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         )
 
     def _check_for_wedged_requests(self, scheduler_output: SchedulerOutput) -> None:
-        """Dump state once if a stage stops scheduling anything while requests are tracked.
+        """Dump state once if a stage stops making PROGRESS while requests are tracked.
 
-        A stage that CRASHES leaves a traceback. A stage that quietly stops scheduling leaves
-        nothing at all, and that is the observed failure mode of a long streaming session: at
-        turn 31 of a 50-turn run, stage 1 and stage 2 emitted no further log lines of any kind
-        while stage 0 kept generating and kept shipping payloads across the 0->1 edge
-        (chunk=3686 was still being put). The client sat waiting for audio that never came,
-        and nothing anywhere said which request was stuck or in what state.
+        A stage that CRASHES leaves a traceback. A stage that quietly stops leaves nothing at
+        all, and that is the observed failure mode of a long streaming session: the client
+        receives a turn's text and then no audio, forever, while stage 0 keeps generating.
 
-        `total_num_scheduled_tokens == 0` on every pass is what being wedged looks like from
-        in here. Idle is normal and expected between turns, so this is time-based and fires
-        once per wedge, not once per pass -- the flag resets as soon as anything is scheduled
-        again, so a long quiet gap between turns costs one line at most and a genuine wedge is
-        reported with the full request table behind it.
+        PROGRESS, not "anything scheduled". The first version of this keyed on
+        `total_num_scheduled_tokens == 0` and did not fire on a reproduction that stalled for
+        126s -- comfortably past its 45s threshold -- which says the stalled stage was still
+        being handed work every pass and simply never produced anything from it. Silence in the
+        log is not evidence either way, because a healthy stage 1 logs nothing per step; that
+        only looked like evidence in an earlier run where transfer logging happened to be on.
+
+        So progress is defined per request as the pair (num_computed_tokens, output length),
+        and the stage is considered stuck when NO tracked request has moved either number for
+        `_WEDGE_REPORT_AFTER_S`. That covers both shapes: nothing scheduled at all, and
+        scheduled repeatedly without advancing. Being idle between turns is still fine -- with
+        no requests tracked the timer is simply held at the current time.
         """
-        scheduled = getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0
         now = time()
-        if scheduled:
-            self._last_progress_t = now
-            self._wedge_reported = False
-            return
         if not self.requests:
             self._last_progress_t = now
+            self._wedge_reported = False
+            self._progress_fingerprint = None
+            return
+
+        fingerprint = tuple(
+            sorted(
+                (rid, r.num_computed_tokens, len(getattr(r, "output_token_ids", ()) or ()))
+                for rid, r in self.requests.items()
+            )
+        )
+        if fingerprint != getattr(self, "_progress_fingerprint", None):
+            self._progress_fingerprint = fingerprint
+            self._last_progress_t = now
+            self._wedge_reported = False
             return
         if getattr(self, "_wedge_reported", False):
             return
@@ -443,9 +456,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self._last_progress_t = now
             return
         self._wedge_reported = True
+        scheduled = getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0
         self._log_request_table(
-            f"nothing scheduled for {since:.0f}s while {len(self.requests)} request(s) are "
-            f"still tracked -- this stage looks WEDGED, not idle"
+            f"no request advanced for {since:.0f}s while {len(self.requests)} are tracked "
+            f"(this pass scheduled {scheduled} tokens) -- this stage looks WEDGED, not idle"
         )
 
     def update_from_output(
