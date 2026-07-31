@@ -69,6 +69,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     _HEARTBEAT_EVERY_S = 10.0
     _last_heartbeat_t = 0.0
 
+    # Cadence for the starved-loop report in has_requests(), which is called every loop
+    # iteration and so must be rate-limited hard.
+    _STARVED_REPORT_EVERY_S = 5.0
+    _starved_reported_t = 0.0
+    _counter_repaired_t = 0.0
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Track requests that need KV cache transfer when finished
@@ -1209,7 +1215,102 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # transfer check above: work is pending, so the loop must not be allowed to quiesce.
         if self._has_requests_awaiting_chunk():
             return True
-        return super().has_requests()
+        result = super().has_requests()
+        if not result and self.requests:
+            self._report_starved_loop()
+        return result
+
+    def get_num_unfinished_requests(self) -> int:
+        """Derive the streaming-parked count from the queues instead of trusting a counter.
+
+        Upstream computes
+
+            num_waiting = len(waiting) + len(skipped_waiting) - num_waiting_for_streaming_input
+
+        and `num_waiting_for_streaming_input` is a hand-maintained counter: incremented when a
+        request parks for streaming input, decremented when a parked request receives an update
+        or is finished while still parked. Every decrement is guarded by
+        `status == WAITING_FOR_STREAMING_REQ`, so any path that changes the status FIRST and
+        removes the request afterwards leaks the counter permanently.
+
+        Retiring a session request is exactly such a path, and the leak is fatal rather than
+        cosmetic. One leaked unit cancels one real request: with the counter stuck at 1 a
+        freshly admitted request sitting in `waiting` gives 1 + 0 - 1 = 0, the engine core
+        concludes it has no work, and its busy loop parks. Nothing then runs `schedule()`, so the
+        payloads arriving for that request are never consumed and it is never prefilled --
+        measured as 0 scheduler heartbeats for 125s while 274 payloads arrived on the 0->1 edge,
+        and the request finally freed with num_computed_tokens == 0.
+
+        Counting the parked requests directly cannot leak, so the disagreement is repaired here
+        rather than chased through every path that might cause it. The repair is logged, because
+        a silent correction would hide a real upstream defect.
+        """
+        actual = 0
+        for queue in (self.waiting, self.skipped_waiting):
+            for request in queue:
+                if getattr(request, "status", None) == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                    actual += 1
+        if actual != self.num_waiting_for_streaming_input:
+            now = time()
+            if now - self._counter_repaired_t >= self._STARVED_REPORT_EVERY_S:
+                self._counter_repaired_t = now
+                logger.error(
+                    "[OmniARScheduler] stage %s num_waiting_for_streaming_input is %d but only "
+                    "%d request(s) are actually parked for streaming input -- repairing. A high "
+                    "counter subtracts real work from get_num_unfinished_requests() and parks "
+                    "the engine loop; waiting=%d skipped_waiting=%d running=%d tracked=%d",
+                    self.vllm_config.model_config.stage_id,
+                    self.num_waiting_for_streaming_input, actual,
+                    len(self.waiting), len(self.skipped_waiting), len(self.running),
+                    len(self.requests),
+                )
+            self.num_waiting_for_streaming_input = actual
+        return super().get_num_unfinished_requests()
+
+    def _report_starved_loop(self) -> None:
+        """Say so when this scheduler tells the engine loop there is nothing to do while it is
+        still tracking requests, and name every container that could be holding one.
+
+        THE ONLY USEFUL OBSERVATION POINT for this failure. `has_work()` in the engine core is
+        `engines_running or scheduler.has_requests() or batch_queue`, so this method is the
+        decision that parks the loop -- and once parked, nothing inside `schedule()` runs, which
+        is where every other diagnostic in this class lives. A heartbeat at the top of
+        `schedule()` proved the loop parks (0 beats in 125s while 274 payloads arrived) but by
+        construction could not show WHERE the request was, because it cannot run either.
+
+        Rate-limited: this is called on every loop iteration.
+        """
+        now = time()
+        if now - self._starved_reported_t < self._STARVED_REPORT_EVERY_S:
+            return
+        self._starved_reported_t = now
+        adapter = self.chunk_transfer_adapter
+
+        def n(obj: Any) -> Any:
+            try:
+                return len(obj)
+            except TypeError:
+                return "?"
+
+        logger.error(
+            "[OmniARScheduler] stage %s is telling the engine loop THERE IS NO WORK while "
+            "tracking %d request(s) -- the loop will park. waiting=%s skipped_waiting=%s "
+            "running=%s | adapter: wait_chunk_waiting=%s wait_chunk_running=%s ready_chunks=%s "
+            "finished_load=%s held_non_active=%s active_streams=%s segment_finished=%s "
+            "origin_status=%s | streaming_parked_counter=%s | statuses=%s",
+            self.vllm_config.model_config.stage_id, len(self.requests),
+            n(self.waiting), n(self.skipped_waiting), n(self.running),
+            n(getattr(adapter, "waiting_for_chunk_waiting_requests", None)) if adapter else "-",
+            n(getattr(adapter, "waiting_for_chunk_running_requests", None)) if adapter else "-",
+            n(getattr(adapter, "requests_with_ready_chunks", None)) if adapter else "-",
+            n(getattr(adapter, "_finished_load_reqs", None)) if adapter else "-",
+            n(getattr(adapter, "_held_non_active", None)) if adapter else "-",
+            n(getattr(adapter, "_active_streams", None)) if adapter else "-",
+            n(getattr(adapter, "segment_finished_requests", None)) if adapter else "-",
+            n(getattr(adapter, "requests_origin_status", None)) if adapter else "-",
+            self.num_waiting_for_streaming_input,
+            [getattr(getattr(r, "status", None), "name", "?") for r in self.requests.values()],
+        )
 
     def has_finished_requests(self) -> bool:
         """Check if there are any finished requests (including those needing KV transfer)."""
