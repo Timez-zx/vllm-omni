@@ -464,7 +464,6 @@ class OmniStreamingVideoHandler:
                 "queue": asyncio.Queue(maxsize=4),
                 "gen_task": None,
                 "turn_done": asyncio.Event(),
-                "frames_sent": 0,   # cursor: how many buffered frames have been submitted
                 "turn_idx": 0,
                 "first_sent": False,
                 "fatal": None,
@@ -616,16 +615,31 @@ class OmniStreamingVideoHandler:
                     await self._send_error(websocket, f"Session failed: {sess['fatal']}")
                     return
 
-                new_frames = frame_buffer[sess["frames_sent"]:]
-                sess["frames_sent"] = len(frame_buffer)
+                # Consume the backlog rather than tracking a cursor into it.
+                #
+                # An integer "frames already submitted" cursor is wrong here, because the
+                # max_frames guard evicts from the FRONT of frame_buffer. Once that fires,
+                # every index shifts and the cursor silently points at the wrong frame:
+                # frames get skipped or resubmitted, with no error and nothing in the logs.
+                # In session mode the buffer's only job is to hold frames that have not been
+                # submitted yet, so it can simply be drained -- which also means it stays a
+                # handful of frames long and the eviction path never fires at all.
+                new_frames = list(frame_buffer)
                 chunk = await self._build_session_chunk(
                     config, new_frames, audio_buffer, query_text, frame_pil_cache,
                     is_first=not sess["first_sent"],
                 )
                 audio_buffer.clear()
                 if chunk is None:
+                    # Nothing to submit: keep the frames for the next turn rather than
+                    # dropping them on the floor.
                     await self._send_error(websocket, "Nothing new to submit this turn")
                     return
+                # Delete exactly the consumed prefix, not the whole buffer: frames may have
+                # arrived while the chunk was being built, and those belong to the next turn.
+                del frame_buffer[: len(new_frames)]
+                for consumed in new_frames:
+                    frame_pil_cache.pop(consumed, None)
 
                 ids = (chunk.get("prompt_token_ids") or ()) if isinstance(chunk, dict) else ()
                 ntok = len(ids)
