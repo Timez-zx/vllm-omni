@@ -176,6 +176,14 @@ _LOG_SESSION_OUTPUTS = os.environ.get("VLLM_OMNI_LOG_SESSION_OUTPUTS", "0") not 
 # that _compute_talker_prompt_ids_length relies on is broken.
 _IM_END_NEWLINE = [151645, 198]
 
+# Codec tokens carried by one audio chunk, for the talker-token estimate in session mode.
+# Recovered as 24.3 by solving  sum(placeholder) + k * sum(chunks) = 66664  at the point a
+# stage-1 worker died writing a 66,664-token array into its 65,536-token buffer, and it agrees
+# with the reference deployment's connector setting codec_chunk_frames: 25. A round 25 is used
+# rather than the fitted value: the estimate exists to say how close the session is to a wall
+# it must not hit, so erring high is the safe direction.
+_TALKER_TOKENS_PER_AUDIO_CHUNK = 25
+
 
 def _segment_finish_reason(output: Any) -> Any:
     """Per-SEGMENT finish marker, which is the only usable turn boundary in session mode.
@@ -371,6 +379,36 @@ class StreamingVideoSessionConfig(BaseModel):
             "drain-only because aborting would destroy the accumulated KV, and the "
             "session's context is bounded by max_model_len with no eviction. See the "
             "SESSION-SCOPED REQUESTS note at the top of this module."
+        ),
+    )
+    session_talker_token_budget: int | None = Field(
+        default=None,
+        description=(
+            "End the session cleanly once the TALKER's accumulated tokens are estimated to "
+            "reach this many, instead of letting it hit the stage's max_model_len. Off by "
+            "default: the running estimate is logged every turn either way, and enforcing a "
+            "guessed number would cut sessions short. Set it to slightly under the stage-1 "
+            "max_model_len of the deployment (65,536 in the reference config).\n\n"
+            "WHY THIS EXISTS -- measured, not theoretical. The talker's per-turn prompt stays "
+            "delta-sized, but the resumable request's stored token array does not: it grows "
+            "every segment by the delta PLUS the audio codes the talker generated. Crossing "
+            "max_model_len does not produce a clean error. Two things happen instead, both "
+            "observed:\n"
+            "  * the worker writes the prompt into a max_model_len-sized buffer and dies with "
+            "`ValueError: could not broadcast input array from shape (66664,) into shape "
+            "(65536,)`, taking the stage-1 engine core with it;\n"
+            "  * or the scheduler's clamp `min(num_new_tokens, max_model_len - "
+            "num_computed_tokens - num_sampled_tokens_per_step)` reaches 0 first and the "
+            "running loop does `continue` -- upstream's own comment for that branch names "
+            "'async scheduling and the request has reached max_model_len'. The request is then "
+            "skipped on every pass forever: no crash, no log line, the client simply receives "
+            "a turn's text and never its audio. Stage 1 runs the async scheduler, so this is "
+            "the reachable path.\n\n"
+            "Growth is well fitted by  sum(talker_placeholder) + 25 * sum(audio_chunks)  -- "
+            "the 25 was recovered as 24.3 from a crash and matches the connector's configured "
+            "codec_chunk_frames. So the session's LIFETIME is set by how much the model "
+            "SPEAKS, not by how many turns it takes: measured runs reached 66% of the wall "
+            "after 50 short-answer turns but 102% after 27 verbose ones."
         ),
     )
 
@@ -570,6 +608,16 @@ class OmniStreamingVideoHandler:
                                     (st["t_first_audio"] - st["t0"]) if st["t_first_audio"] else -1.0,
                                     st["audio_chunks"], len("".join(st["text_parts"])),
                                 )
+                                # The audio the talker just generated is appended to its own
+                                # accumulated token array, so it counts against the same
+                                # max_model_len as the deltas do -- and it is the larger of
+                                # the two terms on a talkative turn. Without this the estimate
+                                # would track only the deltas and stay reassuringly small
+                                # right up to the point where the stage dies.
+                                sess["talker_tokens"] = (
+                                    sess.get("talker_tokens", 0)
+                                    + _TALKER_TOKENS_PER_AUDIO_CHUNK * st["audio_chunks"]
+                                )
                                 # message_history is deliberately NOT updated: under session
                                 # mode the conversation lives in the engine request's KV, and
                                 # a second copy in the entrypoint would be dead state that
@@ -696,12 +744,42 @@ class OmniStreamingVideoHandler:
                     tlen = compute_talker_prompt_ids_length(list(ids))
                 except Exception:
                     pass
+                # Running estimate of the TALKER's accumulated tokens, which is what actually
+                # bounds the session -- see session_talker_token_budget for the measurements.
+                # Logged unconditionally because the wall is otherwise invisible: crossing it
+                # either kills the stage-1 engine core on a numpy broadcast or makes the
+                # scheduler skip the request forever with no output at all.
+                if tlen > 0:
+                    sess["talker_tokens"] = sess.get("talker_tokens", 0) + tlen
+                budget = config.session_talker_token_budget
                 logger.info(
                     "[session] turn=%d queue delta: %d new frames, %d tokens, "
-                    "cum=%d, talker_placeholder=%d, first=%s",
+                    "cum=%d, talker_placeholder=%d, talker_est=%d%s, first=%s",
                     sess["turn_idx"], len(new_frames), ntok,
-                    sess["cum_tokens"], tlen, not sess["first_sent"],
+                    sess["cum_tokens"], tlen, sess.get("talker_tokens", 0),
+                    f"/{budget}" if budget else "", not sess["first_sent"],
                 )
+                if budget and sess.get("talker_tokens", 0) >= budget:
+                    # Refuse the turn rather than submit one that may not come back. Ending
+                    # here is a real limitation, not a fix: the conversation is over. The
+                    # actual repair is to roll the session -- close this engine request and
+                    # open a fresh one seeded with the text history, paying one cold turn to
+                    # keep talking -- which is a larger change than a guard.
+                    logger.error(
+                        "[session] turn=%d REFUSED: the talker's accumulated tokens are "
+                        "estimated at %d, at or past the configured budget of %d. Submitting "
+                        "it risks max_model_len, which does not fail cleanly: it either kills "
+                        "the stage-1 engine core or makes the scheduler skip the request "
+                        "silently forever. Ending the session instead.",
+                        sess["turn_idx"], sess.get("talker_tokens", 0), budget,
+                    )
+                    sess["fatal"] = "talker token budget exhausted"
+                    await self._send_error(
+                        websocket,
+                        f"Session ended: the talker's context budget ({budget} tokens) is "
+                        f"exhausted after {sess['turn_idx']} turns. Start a new session.",
+                    )
+                    return
                 interrupt_event.clear()
                 sess["turn_done"].clear()
                 if sess["gen_task"] is None:
