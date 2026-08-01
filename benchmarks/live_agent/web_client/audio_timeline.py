@@ -37,6 +37,44 @@ def wav_seconds(raw: bytes) -> float:
         return w.getnframes() / w.getframerate()
 
 
+def wav_samples(raw: bytes) -> list[int]:
+    import struct
+    with wave.open(io.BytesIO(raw), "rb") as w:
+        data = w.readframes(w.getnframes())
+    return list(struct.unpack(f"<{len(data) // 2}h", data))
+
+
+def seam_report(chunks: list[list[int]]) -> str:
+    """Are the joins between granules discontinuous enough to click?
+
+    Smaller codec chunks mean MORE joins, and each join is where the vocoder's left
+    context has to reproduce what the previous call already emitted. A bad seam is a
+    step discontinuity in the waveform, which is audible as a click -- and it is the one
+    audio-quality question that can be answered numerically instead of by ear.
+
+    Compares the sample-to-sample jump ACROSS each join against the distribution of
+    jumps WITHIN the chunks. A seam that is indistinguishable from ordinary signal
+    movement cannot click; one far out in the tail can.
+    """
+    within = []
+    for c in chunks:
+        step = max(1, len(c) // 2000)          # sample the interior, do not walk 300k
+        within.extend(abs(c[i + 1] - c[i]) for i in range(0, len(c) - 1, step))
+    across = [abs(chunks[i + 1][0] - chunks[i][-1]) for i in range(len(chunks) - 1)
+              if chunks[i] and chunks[i + 1]]
+    if not within or not across:
+        return "  seams: not enough data"
+    within.sort()
+    q = lambda p: within[min(len(within) - 1, int(len(within) * p))]
+    worse = sum(1 for a in across if a > q(0.999))
+    return (f"  seams: {len(across)} join(s); worst jump {max(across)}, "
+            f"median {sorted(across)[len(across) // 2]}\n"
+            f"         within-chunk jumps: p50 {q(0.5)}, p99 {q(0.99)}, p99.9 {q(0.999)}, "
+            f"max {within[-1]}\n"
+            f"         {worse}/{len(across)} join(s) exceed the within-chunk p99.9 "
+            f"-> {'AUDIBLE CLICKS LIKELY' if worse else 'no seam stands out'}")
+
+
 def simulate(deltas: list[tuple[float, float]], prebuffer_s: float) -> dict:
     """Replay the client's buffering rule over measured arrivals.
 
@@ -79,7 +117,7 @@ async def run(args) -> int:
             "You are a friendly voice assistant in a live video call. "
             "Always answer with both text and speech."
         )))
-        state: dict = {"deltas": [], "text": "", "t0": None, "done": False}
+        state: dict = {"deltas": [], "pcm": [], "text": "", "t0": None, "done": False}
 
         async def reader() -> None:
             async for raw in ws:
@@ -93,6 +131,7 @@ async def run(args) -> int:
                     state["deltas"].append(
                         (time.monotonic() - state["t0"], wav_seconds(raw_wav))
                     )
+                    state["pcm"].append(wav_samples(raw_wav))
                 elif t == "response.text.delta":
                     state["text"] += msg.get("delta", "")
                 elif t == "response.audio.done":
@@ -116,13 +155,14 @@ async def run(args) -> int:
         # "smooth on the first reply only" bug pass every check here.
         turns = []
         for turn in range(args.turns):
-            state["deltas"], state["text"], state["done"] = [], "", False
+            state["deltas"], state["pcm"] = [], []
+            state["text"], state["done"] = "", False
             state["t0"] = time.monotonic()
             await ws.send(json.dumps({"type": "video.query", "text": args.query}))
             deadline = time.monotonic() + args.timeout_s
             while not state["done"] and time.monotonic() < deadline:
                 await asyncio.sleep(0.05)
-            turns.append((state["deltas"][:], state["text"]))
+            turns.append((state["deltas"][:], state["text"], state["pcm"][:]))
             # Speak again between turns, the way a live client would.
             for _ in range(3):
                 await ws.send(json.dumps({"type": "audio.chunk",
@@ -131,18 +171,19 @@ async def run(args) -> int:
         await ws.send(json.dumps({"type": "video.done"}))
         task.cancel()
 
-    if not any(d for d, _ in turns):
+    if not any(d for d, _, _ in turns):
         print("no audio at all -- this is a probe.py problem, not a continuity one")
         return 1
 
     worst = 0
-    for turn_idx, (deltas, text) in enumerate(turns):
+    for turn_idx, (deltas, text, pcm) in enumerate(turns):
         if not deltas:
             print(f"\nturn {turn_idx}: NO AUDIO")
             worst = 1
             continue
         print(f"\n--- turn {turn_idx}: {text[:70]}")
         report(deltas, args)
+        print(seam_report(pcm))
     return worst
 
 

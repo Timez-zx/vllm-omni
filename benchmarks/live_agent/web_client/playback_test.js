@@ -371,5 +371,29 @@ check('a re-arm while the previous reply is still sounding does not cut it off',
       `played ${tail.played}/${tail.frames} frames of the tail -- the deferred re-arm `
       + `waits for the queue to drain instead of truncating a word`);
 
+// ---------------------------------------------------------------------------
+// 5. the SHIPPED schedule (codec_chunk_frames: 4), where early is also smooth
+//
+// The schedule in section 3 is what codec_chunk_frames: 25 produces, and the whole
+// prebuffer trade only exists because of it. At 4 the granules are 0.32 s and arrive
+// every 0.213 s, so delivery outruns playback and there is nothing to trade.
+//
+// The first boundary is still tight and that is worth pinning: 0.217 s of playable
+// audio against 0.213 s to make the next granule is a 4 ms margin, and one measured
+// turn in nine showed exactly a 4 ms stall. Inaudible, but it is why the prebuffer
+// should not be shaved below 60 ms and why widening it belongs server-side, in
+// initial_codec_chunk_frames.
+const SHIPPED = [{ at: 350, audio: 217 }].concat(
+  Array.from({ length: 12 }, (_, i) => ({ at: 350 + 213 * (i + 1), audio: 320 })));
+
+console.log('\n5. the shipped schedule (codec_chunk_frames: 4)');
+
+const shipped = runSchedule(60, SHIPPED);
+const shippedWorst = shipped.gaps.reduce((m, g) => Math.max(m, g.durMs), 0);
+check('at codec_chunk_frames 4 the earliest start is already gap-free',
+      shipped.startedAtMs < 400 && shippedWorst < 20,
+      `starts ${shipped.startedAtMs.toFixed(0)} ms, worst gap ${shippedWorst.toFixed(0)} ms `
+      + `-- the 4 ms first-boundary margin is the only slack in it`);
+
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) failed.`);
 process.exit(failures === 0 ? 0 : 1);

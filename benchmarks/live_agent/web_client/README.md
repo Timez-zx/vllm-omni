@@ -150,62 +150,61 @@ Client-side, in `app/static/app.js`:
 | `SILENCE_RMS` | 0.012 | Raise it if a noisy room keeps triggering turns |
 | `SILENCE_HANG_MS` | 700 | How long a pause has to be before it counts as your turn ending |
 | `MIN_SPEECH_MS` | 400 | Ignores coughs and door slams |
-| `PLAYBACK_PREBUFFER_MS` | `{fast: 60, smooth: 1400}` | Selected by the on-page **Start speaking…** control; see below |
+| `PLAYBACK_PREBUFFER_MS` | `{fast: 60, smooth: 1400}` | `fast` is the default and is gap-free at `codec_chunk_frames: 4`; see below |
 | `ECHO_GUARD_MS` | 300 | Mic upload resumes this long after the assistant stops |
 
-### The prebuffer is a real trade, and it is measured
+### Codec chunk size sets the startup quantum
 
-The server sends a deliberately small first granule so speech can begin early, then
-much larger ones. Measured against the live server with `audio_timeline.py`:
+One codec frame is 1920 samples at 24 kHz = **80 ms of audio**, and the talker emits one
+per decode step at a measured **52.5 ms/frame** (36 granules, R² 0.99,
+`gap = 0.656 × audio_duration − 0.005 s`). So the talker is faster than real time per
+frame. What used to stall speech was waiting for a whole granule before the vocoder was
+called at all.
 
-| delta | arrives | audio |
-|---|---|---|
-| 0 | 0.35 s | **0.217 s** (`initial_codec_chunk_frames: 4`) |
-| 1 | 1.70 s | 2.000 s (`codec_chunk_frames: 25`) |
-| 2+ | every ~1.28 s | 2.000 s each |
+`codec_chunk_frames` is that granule: how many NEW frames to accumulate per code2wav
+call. Measured both ways:
 
-0.217 s of audio cannot cover the 1.34 s the 2 s granule takes to generate, so
-**starting on delta 0 speaks at 0.35 s and then stalls ~1.1 s, one word in — every
-turn, in the same place.** Everything after is smooth, because 2 s arriving every
-1.28 s outruns playback. It is a startup transient, not jitter.
+| chunk | granule | takes | first sound | stalls |
+|---|---|---|---|---|
+| 25 | 2.00 s | 1.31 s | 0.35 s **or** 1.70 s | one ~1.1 s stall, **or** none if you wait |
+| **4** (shipped) | 0.32 s | 0.21 s | **0.35 s** | **none** |
 
-Any threshold above 0.217 s means "wait for delta 1", so there are really only two
-settings, and the page offers both:
+At 4, delivery outruns playback from the first boundary, so there is no trade left to
+make: earliest and smoothest are the same setting.
 
-| mode | first sound | stalls |
-|---|---|---|
-| smooth (default) | ~1.70 s | none |
-| as early as possible | ~0.35 s | one, ~1.1 s |
+**What it costs.** Every call re-processes `codec_left_context_frames` (25) frames of
+history for seam continuity *without emitting them*, so work per call is `(25 + N)`
+frames to produce `N` — 2× at N=25, **7.25× at N=4**, about 3.6× more vocoder compute per
+second of speech. Measured at one user this is invisible: `gap/audio` was 0.647 at N=4
+against 0.656 at N=25, and rtf stayed 0.69–0.70 against 0.67. That is because stage 2
+pipelines behind stage 1's next-frame decode (hence the ~0 intercept in the fit). **It is
+still real GPU work on a shared card, so expect to pay it in multi-user capacity rather
+than in milliseconds — that is unmeasured.**
 
-Use **early** when measuring latency, **smooth** when listening.
+**Two things measured and worth knowing:**
 
-Two things make the smooth mode work per TURN rather than per call, and both were
-bugs first:
+* **The first boundary is tight.** 0.217 s of playable audio against 0.213 s to produce
+  the next granule is a 4 ms margin, and one turn in nine showed exactly a 4 ms stall.
+  Inaudible, but do not shave `PLAYBACK_PREBUFFER_MS.fast` below 60 ms. To widen it,
+  raise `initial_codec_chunk_frames` server-side instead.
+* **Seams do not click.** 6× more joins, so `audio_timeline.py` checks numerically:
+  sample-to-sample jump across each join against the distribution within chunks. Across
+  ~250 joins, one exceeded the within-chunk p99.9 — not systematic. Ears are still the
+  judge; this only rules out the obvious failure.
 
-* `response.audio.done` clears the threshold, so a reply shorter than the target still
-  plays instead of sitting in the buffer;
-* `response.start` re-arms it. Without that, the worklet node — which lives for the
-  whole call — kept the cleared threshold and `started` stayed true, so **the smooth
-  start applied to the first reply and no other.** The re-arm is *deferred* until the
-  queue runs dry, because the next turn can be announced while the previous reply is
-  still sounding and cutting it off mid-word would be worse.
+The page keeps the buffer choice because it cannot see the server's chunk size: at 25 the
+early start stutters, and the switch is the fix. **If speech ever stutters one word in,
+that is what it means.**
 
-Re-arming on a turn boundary is not the mistake that re-arming on underrun was: this
-one fires on an explicit event and is always released at the end of the same turn.
-`playback_test.js` section 4 covers all of it by replaying turn boundaries, which is
-what sections 1–3 and `audio_timeline.py` could not see.
-
-Raising it further buys nothing: the gap is generation time, not network jitter.
-
-To re-measure any of this after a config change:
+To re-measure after any config change:
 
 ```bash
 PYTHONPATH=/home/zx/voice-agent/vllm-omni python benchmarks/live_agent/web_client/audio_timeline.py --direct
 node benchmarks/live_agent/web_client/playback_test.js
 ```
 
-`audio_timeline.py` prices every prebuffer against the arrival schedule it just
-measured, so the trade is a table rather than an argument.
+`audio_timeline.py` prints the arrival schedule, the stalls, the seam check, and what
+every candidate prebuffer would cost — the trade is a table rather than an argument.
 
 Server-side, in `buildSessionConfig()` — `max_frame_width/height`,
 `session_roll_at_talker_tokens`, the filter gaps. These are the merged

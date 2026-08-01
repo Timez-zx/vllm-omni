@@ -62,23 +62,24 @@
   const INPUT_RATE = 16000;          // this server's audio.chunk contract
   const SEND_INTERVAL_MS = 200;      // how often queued mic PCM goes up
   const FRAME_INTERVAL_MS = 500;     // ~2 fps; frames are their own message
-  // How much audio to hold before the first sample plays. This is a REAL trade, and
-  // measured rather than guessed (benchmarks/live_agent/web_client/audio_timeline.py):
+  // How much audio to hold before the first sample plays. Measured, not guessed --
+  // benchmarks/live_agent/web_client/audio_timeline.py, and the right value depends
+  // entirely on the server's `codec_chunk_frames`.
   //
-  //   delta 0 arrives 0.35 s after the query with 0.217 s of audio
-  //            (initial_codec_chunk_frames: 4 -- a small first granule, on purpose)
-  //   delta 1 arrives 1.70 s with 2.000 s of audio (codec_chunk_frames: 25)
-  //   delta 2+ every ~1.28 s, 2.000 s each
+  // With the shipped 4 (0.32 s granules, one every ~0.213 s):
+  //   delta 0  0.35 s  0.217 s of audio      delta 1+  every 0.213 s, 0.320 s each
+  //   Delivery outruns playback from the first boundary, so 60 ms is smooth AND early.
   //
-  // Start on delta 0 and you speak at 0.35 s, then run dry for ~1.13 s because 0.217 s
-  // of audio cannot cover the 1.34 s that the 2 s granule takes to make. Everything
-  // after that is smooth -- 2 s arriving every 1.28 s outruns playback -- so the stall
-  // is a startup transient, always in the same place, and audible as a stutter one word
-  // in. Wait instead until delta 1 has landed and it never happens.
+  // With 25 (2.0 s granules, one every ~1.28 s) it is not: 0.217 s of audio cannot
+  // cover the 1.34 s the next granule takes, so an early start stalls ~1.1 s one word
+  // in and the only alternative is to wait for delta 1 at 1.70 s. That is what `smooth`
+  // is for, and why the choice is still on the page -- a page cannot see the server's
+  // chunk size, so if speech ever stutters one word in, this is the switch.
   //
-  // Both are legitimate; a latency experiment wants FAST, a person listening wants
-  // SMOOTH. Any threshold above 0.217 s means "wait for delta 1", so the two useful
-  // settings are far apart, and the target is expressed as the gap it has to cover.
+  // The first boundary is TIGHT even at 4: 0.217 s of playable audio against 0.213 s to
+  // produce the next granule is a 4 ms margin, and one turn in nine showed exactly a
+  // 4 ms stall. Inaudible, but it is the reason not to shave this further. To widen it,
+  // raise `initial_codec_chunk_frames` server-side rather than this.
   const PLAYBACK_PREBUFFER_MS = { fast: 60, smooth: 1400 };
   const ECHO_GUARD_MS = 300;         // keep uploading this long after playback
 
@@ -476,7 +477,7 @@
   }
 
   function prebufferFrames() {
-    const mode = (playbackMode && playbackMode.value) === 'fast' ? 'fast' : 'smooth';
+    const mode = (playbackMode && playbackMode.value) === 'smooth' ? 'smooth' : 'fast';
     const rate = playbackContext ? playbackContext.sampleRate : 24000;
     return Math.floor(rate * PLAYBACK_PREBUFFER_MS[mode] / 1000);
   }

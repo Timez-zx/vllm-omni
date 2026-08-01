@@ -22,10 +22,30 @@
 # its weights are 59.4 GiB, 0.62 x 94.97 = 58.9, so the stage came up with
 # "Available KV cache memory: 0.0 GiB" and died. 0.74 is a floor.
 #
-# The connector settings are copied verbatim from the measurement config, because
-# they are what makes the first audio packet arrive early:
-#   initial_codec_chunk_frames: 4   -- a SMALL first granule so speech starts fast
-#   codec_chunk_frames: 25          -- then bigger granules for throughput
+# CODEC CHUNK SIZE, which is the vocoder's call batch and therefore the startup quantum.
+#
+# One codec frame = 1920 samples @ 24 kHz = 80 ms of audio, and the talker emits one per
+# decode step at a measured 52.5 ms/frame (36 granules, R^2 0.99, gap = 0.656 x audio).
+# So the talker is faster than real time per frame; what makes speech stall is waiting
+# for a whole granule to accumulate before code2wav is called at all.
+#
+# At 25 frames a granule is 2.0 s of audio that takes 25 x 52.5 = 1.31 s to appear. The
+# 0.217 s first granule cannot cover that, so playback either starts at 0.35 s and stalls
+# ~1.1 s one word in, or waits until 1.7 s. Measured both ways with audio_timeline.py.
+#
+# At 4 frames a granule is 0.32 s of audio that takes 4 x 52.5 = 0.21 s to appear --
+# delivery outruns playback from the very first boundary, so the early start is smooth.
+#
+# What it costs: every call re-processes codec_left_context_frames (25) frames of history
+# for seam continuity WITHOUT emitting them, so the work per call is (25 + N) frames to
+# produce N. At N=25 that is 2x; at N=4 it is 7.25x -- about 3.6x more vocoder compute per
+# second of speech. That is invisible in latency, because stage 2 pipelines behind stage
+# 1's next-frame decode (hence the ~0 intercept in the fit above), but it is real GPU work
+# on a shared card, so it is paid in multi-user capacity rather than in milliseconds.
+#
+# initial_codec_chunk_frames is now redundant (same value) and kept so the ramp idea stays
+# visible: small granules only while the buffer is empty would get the smooth early start
+# without the steady-state compute. Not implemented -- the schedule is one value today.
 
 async_chunk: true
 
@@ -34,7 +54,7 @@ connectors:
     name: SharedMemoryConnector
     extra:
       initial_codec_chunk_frames: 4
-      codec_chunk_frames: 25
+      codec_chunk_frames: 4
       codec_left_context_frames: 25
 
 stages:
