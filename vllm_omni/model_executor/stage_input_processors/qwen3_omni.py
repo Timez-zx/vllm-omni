@@ -458,7 +458,10 @@ def thinker2talker_async_chunk(
     # one-token placeholder prompt, which the talker would then decode. The adapter has a
     # matching guard for this marker; both are needed, and either alone lets a click out.
     if request_is_prefill_only(request):
-        logger.debug("thinker2talker_async_chunk: prefill-only append, withholding req=%s", request_id)
+        # INFO on purpose: this line's PRESENCE is the only proof the marker survived the
+        # trip from the entrypoint. Its absence, paired with the entrypoint's own
+        # "prefill-on-arrival" line, is what tells you the marker was dropped in between.
+        logger.info("[prefill-only] thinker2talker withholding content req=%s", request_id)
         return None
 
     if not isinstance(multimodal_output, Mapping):

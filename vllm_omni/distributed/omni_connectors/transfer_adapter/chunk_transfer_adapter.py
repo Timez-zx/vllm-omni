@@ -435,8 +435,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # Skipping the put also leaves put_req_chunk untouched, which is what keeps
             # the delta-shipping branch (chunk_id > 0) selected for the real turns.
             if _request_is_prefill_only(request):
-                logger.debug(
-                    "chunk_transfer_adapter: prefill-only append, not shipping stage %s -> %s for %s",
+                logger.info(
+                    "[prefill-only] not shipping the segment marker, stage %s -> %s, req %s",
                     stage_id,
                     next_stage_id,
                     external_req_id,
