@@ -1,9 +1,19 @@
 # Where this stands
 
-## Read this first: the silence had TWO causes, both fixed and both verified
+## Read this first: THREE separate faults sat on the audio path, all fixed
 
-The reported symptom — the first reply makes some sound, later replies make none —
-had two independent causes, either of which produces roughly that.
+"The first reply makes some sound, later replies make none, and what you do hear is
+only the start of a sentence" was not one bug. It was three, in three different
+components, and each is written up below:
+
+| | where | effect on its own |
+|---|---|---|
+| Playback prebuffer + underrun re-arm | browser | deliveries fall silent in turn; what plays is the previous one |
+| Leaked streaming-parked counter | engine scheduler | text-only forever after exactly `max_num_seqs` sessions |
+| Audio delta extractor | API server | every reply capped at its first granule, 0.22 s |
+
+That is why it looked so erratic, and why each partial fix looked like it had not
+worked. **All three are fixed and verified on a running server.**
 
 **Verified after the restart: 8 consecutive sessions, every one delivered audio**
 (6 direct + 2 through the page-server proxy), first audio 319–434 ms after a
@@ -21,11 +31,11 @@ leak is still real and still happens once per session; it is now repaired every 
 instead of accumulating to `max_num_seqs`.
 
 **Cause 1, in the browser: the playback prebuffer.** `PLAYBACK_PREBUFFER_MS` was
-250 while a turn delivers ~220 ms of audio, and an underrun re-armed the threshold.
-Neither is the bug alone: an oversized threshold alone just runs a turn behind, and
-re-arming alone is harmless below one turn. Together, turns fall silent and what
-plays is the previous reply. Fixed, and `node playback_test.js` reproduces all
-three cases against the real worklet.
+250 ms while the delivery it had to start on was ~220 ms, and an underrun re-armed
+the threshold. Neither is the bug alone: an oversized threshold alone just delays the
+start by one delivery, and re-arming alone is harmless below one delivery. Together,
+each delivery has to be paid for out of the next. Fixed, and
+`node playback_test.js` reproduces all three cases against the real worklet.
 
 **Cause 2, in the engine: a leaked slot counter closes admission for good, after
 exactly `max_num_seqs` sessions.** `num_waiting_for_streaming_input` is upstream's
@@ -122,80 +132,86 @@ PYTHONPATH=$PWD python benchmarks/live_agent/web_client/probe.py --direct   # no
 bash benchmarks/live_agent/web_client/run_page_server.sh                    # then ssh -L 7870
 ```
 
-## A REAL BUG, found by the probe
+## The truncation: SOLVED
 
-**The reply's audio is truncated to about 0.22 s regardless of how long the reply
-is.** Established, not suspected:
+**Was:** the reply's audio was ~0.22 s no matter how long the reply, so only the first
+small codec granule ever reached the client. **Now:** 13.58 s delivered of 13.66 s
+produced on a 151-character reply, and audio duration tracks the reply (2.11–13.58 s
+across turns) instead of being pinned. First-audio latency unchanged, 344–402 ms.
+The 0.08 s difference is the CausalConv frame stripped from the first granule, by
+design.
 
-| text length | audio delivered |
-|---|---|
-| 34 chars — "Hello! How can I assist you today?" | 0.22 s |
-| 104 chars — "One, two, three, … fifteen." | **0.22 s** |
+### What it was
 
-0.22 s at 24 kHz is ~5,280 samples, which is exactly
-`initial_codec_chunk_frames: 4` (4 × 1920) minus the one frame the first emit
-strips as a CausalConv artifact. **Only the first small codec granule reaches the
-client.**
+The delta extractor read a bare tensor as a transient first state that would "become
+a list", emitted it once, and answered `None` to every output after it:
 
-Server-side accounting agrees that more was produced: `audio_chunks=3` per turn,
-three `type=audio stage=2` outputs with the third carrying `finish_reason=stop`.
-So stage 2 ran three times and only the first delta carried new samples.
-
-Latency itself is fine and repeatable: **first audio 340–376 ms** across five
-turns, which is the same order as the 513 ms baseline.
-
-### A/B 1: our talker change is NOT the cause — ruled out
-
-```
-TALKER_TEXT_ONLY=1 (default) :  0.22 s
-TALKER_TEXT_ONLY=0 (control) :  0.22 s     identical
+```python
+if not isinstance(audio_data, list):
+    if chunks_drained >= 1:
+        return None, chunks_drained
 ```
 
-Same probe, same query, same config otherwise. So the truncation is **upstream's
-behaviour on this path**, not something the merge introduced. Our change stays on.
+It never becomes a list. Any streaming request is coerced to
+`RequestOutputKind.DELTA` (`entrypoints/utils.py`, `maybe_coerce_to_message_type`),
+and under DELTA the output processor calls `drain_delta_payload()` after every
+snapshot, which pops the audio key outright. **Each output therefore carries only
+what stage 2 produced since the previous one** — a fresh granule every time, with
+nothing cumulative to index into.
 
-That also rules out the obvious reading of `initial_codec_chunk_frames: 4`. A small
-FIRST granule is by design; the bug is that **the granules after it never arrive**.
-Server-side, `audio_chunks=3` while only one delta carried new samples — so
-`_extract_audio_delta_b64` found `audio_data[chunks_drained:]` empty twice, meaning
-stage 2's audio tensor list did not grow across its three outputs.
-
-### A/B 2: the delta path is NOT the cause either — also ruled out
+The measured shape of one reply, per stage-2 output:
 
 ```
-VLLM_VIDEO_AUDIO_DELTA_MODE=fast (default) :  0.22 s
-VLLM_VIDEO_AUDIO_DELTA_MODE=slow           :  0.22 s     identical
+7,125 samples        <- the deliberately small first granule
+48,000  x 6          <- 25 codec frames x 1920
+32,640  finish_reason=stop
+= 13.66 s produced,  0.22 s delivered
 ```
 
-`slow` re-concatenates the whole audio buffer on every call instead of emitting
-only the new tail, so if the fast path's `chunks_drained` bookkeeping were dropping
-samples, `slow` would have recovered them. It did not.
+A cumulative payload cannot look like that — lengths would grow monotonically and
+could never drop to 32,640 — so the contract is per-step by measurement as well as by
+construction.
 
-### So the waveform really is 0.22 s, and the loss is upstream of delivery
+### Two things that made this take longer than it should have
 
-Both plausible client- and serving-side causes are eliminated by experiment. What
-remains is the **talker → code2wav** path: either the talker sends codec chunks for
-only the first granule, or code2wav stops after producing one. Everything after that
-— the delta extraction, the WAV encoding, the websocket, the page — is demonstrably
-faithful to what it is given.
+**The A/B that cleared the delivery path was worthless, and looked authoritative.**
+`fast` and `slow` both gave 0.22 s, which was read as "the delivery path is innocent".
+Both arms had the same bug: `slow` fell into `full_np[0:0]` the moment
+`chunks_drained` reached 1. **Two implementations of one wrong assumption agree with
+each other, so their agreement proves nothing.** An A/B only rules a component out if
+the arms fail independently — check that before trusting one.
 
-Where to look next, in order of how cheap it is:
+**The diagnostic actively pointed away from the bug.** The `[session-out]` log
+reported `output.audio_data`, which is not the field the extractor reads. It printed
+`audio_n=0` on every audio output, including the ones carrying the reply — asserting
+that no audio was produced while 13.66 s was being produced. Reporting a different
+field from the one that matters is worse than reporting nothing. It now summarises the
+real source, shapes only, no device-to-host copy.
 
-1. `stage_input_processors/qwen3_omni.py` — `talker2code2wav_async_chunk`. There is a
-   known-suspicious line there: `chunk_length = length % chunk_size_config` computed
-   over `code_prompt_token_ids[request_id]`, which is a modulo over the request's
-   **whole lifetime** and is only reset on `finished`. A per-turn accumulator that
-   never resets would produce exactly this shape.
-2. The `codec_left_context_frames: 25` value, which differs from MiniCPM's `3`.
-3. Whether the same truncation happens on the **older** engine with the same probe —
-   that separates "0.26.0 regression" from "always been like this and the harness
-   never noticed because it measured time-to-first-audio, not total audio".
+### Guarded against
 
-Number 3 is the one that decides whether this is new. `git checkout live-agent`,
-the `omni` env, the same probe.
+`selftest.py` replays the measured granule shape through both delta modes and asserts
+the whole reply survives. The old logic delivers 5,205 of 133,845 samples against it,
+so the check has teeth rather than merely passing.
 
-**Until this is resolved, do not judge audio quality in the browser** — you would be
-listening to a fifth of a second. Everything else about the chain is verified.
+### A number this unlocked: rtf below 1
+
+With the whole reply finally delivered, real-time factor is measurable. Per turn,
+wall time spanned by the stage-2 granules against the audio they contain:
+
+| audio | span | rtf |
+|---|---|---|
+| 9.10 s | 6 s | 0.66 |
+| 9.95 s | 6 s | 0.60 |
+| 6.91 s | 5 s | 0.72 |
+| 2.46 s | 1 s | 0.41 |
+| 2.19 s | 1 s | 0.46 |
+
+**So this pipeline generates speech faster than real time**, where MiniCPM-o measured
+**rtf 1.37** and could not. Two caveats, both real: log timestamps are
+second-resolution so this is ±1 s (trust the longer turns), and the MiniCPM number
+came from a different harness, so this is indicative rather than a matched comparison.
+A matched measurement is now worth doing — it is the project's sharpest question.
 
 ## Genuinely unknown
 
