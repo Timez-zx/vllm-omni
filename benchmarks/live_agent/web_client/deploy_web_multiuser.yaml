@@ -1,0 +1,77 @@
+# Qwen3-Omni for the MULTI-USER scaling experiment: identical to
+# deploy_web_demo.yaml except max_num_seqs 4 -> 16 on all three stages.
+#
+# That is the ONLY delta, on purpose. deploy_web_demo.yaml is the single-user
+# baseline every recent number was measured against, and deploy_pc_stage0.yaml
+# is the workflow.md baseline; neither may be retuned. This file exists so a
+# 16-session cohort can be ADMITTED at all -- at max_num_seqs 4 the fifth
+# concurrent session would queue behind the first four forever, and the
+# experiment would measure the admission cap, not the engine.
+#
+# What this delta does and does not change:
+#   * KV pool size is set by gpu_memory_utilization, which is untouched -- the
+#     16 sessions share the SAME pool the 1-user config had. Running out of it
+#     under load (preemption/recompute) is a finding, not a bug.
+#   * Per-seq scheduler buffers grow 4x; boot is verified before any cell runs.
+#
+# See deploy_web_demo.yaml for the reasoning behind every other value.
+
+async_chunk: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      initial_codec_chunk_frames: 4
+      codec_chunk_frames: 4
+      codec_left_context_frames: 25
+
+stages:
+  - stage_id: 0                      # thinker: vision + audio encoders + LLM
+    max_num_batched_tokens: 8192
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.74
+    trust_remote_code: true
+    enable_prefix_caching: true
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 2048
+
+  - stage_id: 1                      # talker: speech codec token LM
+    max_num_batched_tokens: 8192
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.10
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    enforce_eager: true
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      seed: 42
+      repetition_penalty: 1.05
+
+  - stage_id: 2                      # code2wav: waveform reconstruction
+    max_num_batched_tokens: 65536
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.08
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    enable_chunked_prefill: false
+    async_scheduling: false
+    devices: "0"
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      repetition_penalty: 1.1
