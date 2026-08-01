@@ -409,19 +409,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         next_stage_id = stage_id + 1
         external_req_id = request.external_req_id
 
-        # THE authoritative prefill-only gate: the snapshot taken at enqueue time, on the
-        # scheduler's thread. Everything about the append stops here -- no payload build,
-        # no boundary marker, and crucially no chunk_id consumption, so the next real
-        # segment's numbering is unaffected. The marker checks further down (processor and
-        # boundary) re-read the LIVE request and are kept only as logged tripwires; they
-        # lose races this snapshot cannot lose, in both directions, and both were hit.
-        if task.get("prefill_only"):
-            logger.info(
-                "[prefill-only] dropping stage %s -> %s task for %s (seg_fin=%s fin=%s)",
-                stage_id, next_stage_id, external_req_id, is_segment_finished, is_finished,
-            )
-            return
-
         chunk_id = self.put_req_chunk[external_req_id]
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
         # Process payload in save_loop thread
@@ -450,36 +437,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if payload_data is None:
             if not (is_segment_finished or is_finished):
                 return
-            # A prefill-only append must not ship even the boundary marker. The empty
-            # payload below is turned into a one-token placeholder prompt by the receive
-            # side (see "Preserve an explicit scheduler boundary"), which the next stage
-            # then decodes -- for the talker that is a fraction of a second of audio the
-            # user never asked for. The upstream processor already withheld the content;
-            # without this the marker still gets through and the click still happens.
-            #
-            # Skipping the put also leaves put_req_chunk untouched, which is what keeps
-            # the delta-shipping branch (chunk_id > 0) selected for the real turns.
-            if _request_is_prefill_only(request):
-                logger.info(
-                    "[prefill-only] not shipping the segment marker, stage %s -> %s, req %s id=%s",
-                    stage_id,
-                    next_stage_id,
-                    external_req_id,
-                    id(request),
-                )
-                return
-            # The boundary is about to ship as an empty payload. Log what this guard saw,
-            # because in the crash being investigated the processor's guard said the marker
-            # was PRESENT on this same request and this one said absent -- and the receive
-            # side turns the empty payload into a [0]-token prompt the talker then decodes,
-            # which is the chain that ends in indexSelect asserting and the engine dying.
-            _params = getattr(request, "sampling_params", None)
-            logger.info(
-                "[prefill-only?] boundary ships empty: req=%s id=%s marker=%s max_tokens=%s "
-                "seg_fin=%s fin=%s",
-                external_req_id, id(request), _request_is_prefill_only(request),
-                getattr(_params, "max_tokens", None), is_segment_finished, is_finished,
-            )
             # Segment/request finish markers must still reach downstream even when
             # the processor has no tensor payload.
             payload_data = OmniPayloadStruct()

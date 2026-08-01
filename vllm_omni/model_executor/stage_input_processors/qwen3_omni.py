@@ -449,33 +449,20 @@ def thinker2talker_async_chunk(
     request_id = request.external_req_id
     chunk_id = transfer_manager.put_req_chunk[request_id]
 
-    # LOOK BUT DO NOT SPEAK. A frames-on-arrival append exists only to get its frames
-    # prefilled into stage 0's KV while the user is still talking, so nothing about it may
-    # reach the talker -- every payload that does makes the model speak unasked.
+    # A prefill-only append is NOT withheld from the talker, and that reversal is the fix.
     #
-    # Returning None here is not enough on its own: the caller in chunk_transfer_adapter
-    # ships an EMPTY payload anyway when the segment finishes, so the boundary marker
-    # reaches the next stage. That empty payload is what the receive side turns into a
-    # one-token placeholder prompt, which the talker would then decode. The adapter has a
-    # matching guard for this marker; both are needed, and either alone lets a click out.
-    if request_is_prefill_only(request):
-        # INFO on purpose: this line's PRESENCE is the only proof the marker survived the
-        # trip from the entrypoint. Its absence, paired with the entrypoint's own
-        # "prefill-on-arrival" line, is what tells you the marker was dropped in between.
-        #
-        # id(request) and the params are in the line because the adapter's boundary guard
-        # reads THE SAME request microseconds later and has been observed to disagree --
-        # the ids tell whether it really is the same object, and via which channel the
-        # marker was seen, without a debugger attached to a background thread.
-        _params = getattr(request, "sampling_params", None)
-        logger.info(
-            "[prefill-only] thinker2talker withholding content req=%s id=%s via=%s "
-            "max_tokens=%s finished=%s",
-            request_id, id(request), prefill_only_channel(request),
-            getattr(_params, "max_tokens", None), is_finished,
-        )
-        return None
-
+    # Withholding it was the obvious design and it killed the engine: the append advances
+    # stage 0's context, the talker consumes thinker embeddings PER POSITION, and the
+    # positions it never received put the two stages' accounting out of step. The talker
+    # then indexed its ~4k-row codec table with text-vocabulary ids --
+    # `indexSelectSmallIndex: srcIndex < srcSelectDimSize` -- and the stage died. Adding
+    # more gates made it worse-behaved, not better: with all three confirmed firing it
+    # still died on turn 1, while the same pacing without appends survived 398 frames.
+    #
+    # So the append flows through normally and stage 1 stays aligned. The talker does emit
+    # a little audio for it, which is waste, but it is DROPPED at the entrypoint before
+    # reaching the client (see the arrival-append branch in _session_output_loop) rather
+    # than prevented here, because preventing it is what breaks the contract.
     if not isinstance(multimodal_output, Mapping):
         logger.debug("thinker2talker_async_chunk: skip non-dict multimodal_output for req=%s", request_id)
         return None

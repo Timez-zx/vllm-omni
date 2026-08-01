@@ -136,12 +136,34 @@ once per session (a post-mortem could not tell which features a browser tab had 
 `CUDA_LAUNCH_BLOCKING` in the launcher's environment **does not reach the stage processes** —
 their env is rebuilt at spawn, and the stage-level `runtime.env` block did not apply either.
 
-### What a real fix needs
+### What a real fix needs — narrowed twice, still open
 
-Not more gating. Either the talker must tolerate positions it never saw, or the append must
-occupy zero thinker positions (which is not what a prefill is), or stage 1 must receive a
-no-op segment that advances its accounting without producing audio — the last is the only
-shape that looks viable, and it is a change to the inter-stage contract, not to this feature.
+**Withholding the append from the talker was tried and is wrong.** Three payload gates
+(orchestrator prewarm, adapter task drop, processor withhold) all confirmed firing, and the
+engine still died on turn 1 while the control arm survived 398 frames.
+
+**Letting the append flow through the whole pipeline was then tried and is ALSO wrong.** All
+gates removed so stage 1 stays perfectly aligned, the talker's own audio dropped harmlessly at
+the entrypoint instead — same `indexSelectSmallIndex` assert, same turn.
+
+So the problem is not *where* the append is stopped. It is that **the append is a chatml turn
+at all.** Its delta is `<|im_start|>user … <|im_end|><|im_start|>assistant`, i.e. a complete
+user turn with no assistant reply, and `_compute_talker_prompt_ids_length` walks im_start
+boundaries adding `+9` only for the LAST one — so an unanswered user turn in the middle shifts
+the talker's placeholder span, and a shifted span is what puts text-vocabulary ids into the
+codec embedding lookup.
+
+**The next thing to try, and the first one that matches the model's structure:** the frames
+should EXTEND the user's in-progress utterance, not form their own turn. The append's delta
+should carry the image placeholder tokens with **no chatml headers at all**, so the eventual
+query's delta closes the same user block. Then the token sequence is byte-identical to the
+non-prefill case and only the *timing* of the prefill differs — which was the whole point.
+That needs `_build_session_chunk` to emit a headerless delta, bypassing
+`add_generation_prompt` rather than toggling it.
+
+Until then the flag stays **off**: the measured 16× frame-rate decoupling is real and worth
+returning to, but a default that kills the engine core on turn 1 is not shippable at any
+latency.
 
 ## Done and verified
 

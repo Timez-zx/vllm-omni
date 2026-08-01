@@ -746,9 +746,17 @@ class OmniStreamingVideoHandler:
                         # An append is only ever queued while no turn is in flight, so "no turn
                         # in flight" identifies its outputs positively and cannot latch: the
                         # state it reads is owned by the turn machinery, not by this branch.
-                        if (config.prefill_frames_on_arrival
-                                and not sess.get("turn_busy")
-                                and getattr(output, "stage_id", None) == 0):
+                        # EVERY stage, not just stage 0. The append now flows through the
+                        # whole pipeline on purpose -- withholding it from the talker is
+                        # what desynchronised the stages and killed the engine -- so the
+                        # talker does emit a little audio for it. That audio is waste, but
+                        # it is dropped HERE, where dropping is free, instead of being
+                        # prevented upstream, where preventing it breaks the contract.
+                        #
+                        # `turn_busy` is the discriminator: an append is only ever queued
+                        # while no turn is in flight, so anything arriving then is its own.
+                        # It cannot latch -- the flag belongs to the turn machinery.
+                        if config.prefill_frames_on_arrival and not sess.get("turn_busy"):
                             sess["arrival_skipped"] = sess.get("arrival_skipped", 0) + 1
                             continue
 

@@ -739,24 +739,6 @@ class Orchestrator:
         )
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
-            # A prefill-only append must not open a segment on the downstream stages.
-            #
-            # This is the CONTROL-plane half of look-but-do-not-speak, and it is the half
-            # whose absence killed the engine. The data-plane guards (the stage-0
-            # processor withholding content, the transfer adapter withholding the
-            # boundary) only stop the PAYLOAD -- this prewarm is what tells stage 1 "a new
-            # segment is coming". With the prewarm sent and the payload withheld, stage 1
-            # sat on a placeholder prompt whose conditioning never arrived, and the talker
-            # prefilled raw placeholder ids (text vocabulary, ~150k) straight into its
-            # codec embedding table (~4k rows): indexSelectSmallIndex asserted
-            # `srcIndex < srcSelectDimSize`, the CUDA context was poisoned, and the whole
-            # stage died. Reproduced twice, byte-identical stacks, before this line.
-            if _sampling_params_mark_prefill_only(msg.sampling_params_list):
-                logger.info(
-                    "[prefill-only] not prewarming stages 1..%d for req=%s",
-                    final_stage_id, request_id,
-                )
-                return
             await self._prewarm_async_chunk_stages(request_id, request, req_state)
 
     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
