@@ -154,6 +154,20 @@ itself, which is what the third attempt's failure pointed at, and it still died.
 talker's "one stage-0 forward per talker segment" assumption is load-bearing in **more than one
 place**; a single sentinel or a single function is not the unit of repair.
 
+**Where the assert actually is, which narrows the search.** `talker_mtp_input_ids` is an
+**int32 buffer** (`gpu_model_runner.py:218`), so the `copy_` at line 1790 that the traceback
+names cannot itself overflow — copying a large int into int32 is silent. The assert fires later,
+when that buffer is used as an INDEX:
+
+```
+gpu_model_runner.py:1147   self.talker_mtp(self.talker_mtp_input_ids.gpu[:n], ...)
+```
+
+So the bad value is written at 1790 and detonates at 1147. What must be bounded is the id
+returned by `self.model.preprocess(...)` as `req_input_ids` — i.e. the search is not the whole
+stage-0/stage-1 chain, it is *what produces that one id and what its legal range is*. Attempts
+1–4 all changed things upstream of that id without ever bounding the id itself.
+
 **What would actually fix it:** stage 1 needs a segment type that advances its position cursor
 without decoding, making an extra stage-0 forward a legal thing in the inter-stage contract.
 That is an independent piece of engineering on the stage-0↔stage-1 contract, not a patch to
