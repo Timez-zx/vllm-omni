@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import time
 from collections.abc import Callable
 from typing import Any
@@ -183,6 +184,47 @@ def try_recv_via_connector(
             return None, None
 
 
+# --- DEFAULT ON: the talker gets the TEXT of the user blocks, not their pixels ---------
+#
+# Upstream Qwen3-Omni feeds its talker every user block, with the multimodal positions filled
+# by `hidden_projection(thinker last-layer hidden)` -- see
+# `Qwen3OmniMoeForConditionalGeneration._get_talker_user_parts`. One 720p frame is 880 such
+# positions and they are never released, so they are the larger half of what pushes stage 1
+# into its `max_model_len` -- the wall that session rolling exists to work around. The talker
+# does not look at pixels; it reserves a row per pixel position and holds it forever.
+#
+# Set to 1 here, which INVERTS upstream's behaviour. Two things support that:
+#
+#   * MiniCPM-o 4.5, an independently designed model in the same thinker/talker family, hands
+#     its speech decoder only the GENERATED text tokens (<= 20 vectors per tick) and no visual
+#     positions at all. The architecture does not require them.
+#   * Measured here (run_talker_textonly_ab.sh, 5 turns/arm, 2026-07-31): the talker's
+#     per-turn rows fall 817 -> 33, a 24.8x cut, and EVERY turn still produced audio on both
+#     arms. Length contract held exactly -- built == requested on all six prefills, zero
+#     mismatch warnings. Earlier, a 45x cut of the same conditioning by a different mechanism
+#     (the F640 arm, 240 turns) produced 12% more audio, 24% faster, no gross loss.
+#
+# WHAT IS NOT ESTABLISHED, and why this stays a switch rather than a deletion:
+#
+#   * Prosody. n=5 turns, one session per arm, nobody listened. This detects "the talker
+#     stopped speaking", not "the talker sounds flatter". These weights were TRAINED with the
+#     visual positions present, so a subtle loss is possible and would be invisible here.
+#   * The session-lifetime win. The A/B could not measure it: the treatment arm happened to
+#     answer about twice as verbosely (a sampled style locked in on turn 0 and reinforced
+#     itself through session history), and the talker's own audio codes ate half the saving.
+#     Needs a greedy-decode rerun.
+#
+# `VLLM_OMNI_TALKER_TEXT_ONLY=0` restores upstream behaviour, which is what makes the control
+# arm reproducible. Do not delete that path.
+TALKER_TEXT_ONLY = os.environ.get("VLLM_OMNI_TALKER_TEXT_ONLY", "1") not in ("0", "false", "False", "")
+
+# Qwen3-Omni image/video/audio placeholder ids, verified against the checkpoint's
+# config.json. Hardcoded because this module is handed a flat id list and has no model
+# config to consult. A revision that renumbered these would silently stop filtering, which
+# is why `talker_preprocess_prefill` reports the built length instead of trusting this.
+QWEN3_OMNI_MM_TOKEN_IDS = frozenset({151655, 151656, 151675})
+
+
 def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:
     """Compute the length of the talker prompt ids.
 
@@ -207,7 +249,14 @@ def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:
         if role == system_token_id:
             continue
         elif role == user_token_id:
-            sum_user_len += e - s
+            if TALKER_TEXT_ONLY:
+                # Must stay in lockstep with `_get_talker_user_parts`, which drops exactly
+                # these positions from the embeddings. If the two disagree the worker's
+                # `seg_len = min(span_len, req_embeds.shape[0])` keeps a prefix of the
+                # conditioning and discards the rest -- no exception, wrong audio.
+                sum_user_len += sum(1 for t in prompt_ids[s:e] if t not in QWEN3_OMNI_MM_TOKEN_IDS)
+            else:
+                sum_user_len += e - s
         elif role == assistant_token_id and i == len(im_start_indexes) - 2:
             assistant_len += 9  # 3 + 4 + 1 + 1
         else:

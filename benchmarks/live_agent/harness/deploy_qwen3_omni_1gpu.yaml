@@ -1,0 +1,79 @@
+# Qwen3-Omni-30B-A3B on ONE RTX PRO 6000 Blackwell (96 GiB, sm_120).
+#
+# Derived from the bundled vllm_omni/deploy/qwen3_omni_moe.yaml, which assumes
+# 2x H100 (stage 0 on cuda:0, stages 1+2 on cuda:1). Here all three stages
+# share cuda:0, so the per-stage gpu_memory_utilization fractions must sum to
+# less than 1.
+#
+# Measured weight footprint (from the safetensors headers):
+#   thinker    63.44 GB   -> stage 0
+#   talker      6.65 GB   -> stage 1
+#   code2wav    0.43 GB   -> stage 2
+#   total      70.52 GB   = 0.735 of the 96 GiB card
+#
+# Budget: 0.74 + 0.12 + 0.06 = 0.92 (88.3 GB), leaving ~7 GB of slack for the
+# CUDA context of three processes, the vision/audio encoder activations, and
+# fragmentation. Stage 0 therefore gets 71.0 - 63.4 = ~7.6 GB for KV + peak
+# activations, which is why max_num_batched_tokens is cut from 32768 to 16384
+# (activation peak scales with it) and max_num_seqs from 64 to 16.
+#
+# Kept identical to the bundled config on purpose: async_chunk, the shared
+# memory connector chunking, prefix caching (off), and all sampling params --
+# so measurements remain comparable to the upstream reference topology.
+async_chunk: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      initial_codec_chunk_frames: 4
+      codec_chunk_frames: 25
+      codec_left_context_frames: 25
+
+stages:
+  - stage_id: 0                      # thinker: vision+audio encoders + LLM
+    max_num_batched_tokens: 16384
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.74
+    trust_remote_code: true
+    enable_prefix_caching: false
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 2048
+
+  - stage_id: 1                      # talker: speech codec token LM
+    max_num_batched_tokens: 16384
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.12
+    trust_remote_code: true
+    enable_prefix_caching: false
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      seed: 42
+      repetition_penalty: 1.05
+
+  - stage_id: 2                      # code2wav: waveform reconstruction
+    max_num_batched_tokens: 65536
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.06
+    enforce_eager: false
+    trust_remote_code: true
+    enable_prefix_caching: false
+    enable_chunked_prefill: false
+    async_scheduling: false
+    devices: "0"
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      repetition_penalty: 1.1

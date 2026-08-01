@@ -78,6 +78,20 @@ class FrameSimilarityFilter:
         self._retained_count += 1
         return True
 
+    def force_next_retain(self) -> None:
+        """Make the next ``should_retain`` call return True, keeping the statistics.
+
+        Narrower than :meth:`reset`, which also zeroes the retained/dropped counters and so
+        destroys the filtering statistics for the session.
+
+        A caller bounding how long the filter may go without retaining anything needs
+        exactly this. Simply calling ``should_retain`` again would not help: the decision is
+        made against the last RETAINED frame, so a stream whose every frame is similar to
+        that one reference keeps being dropped no matter how much the content has drifted
+        away from it in total.
+        """
+        self._last_retained = None
+
     def reset(self) -> None:
         """Clear internal state so the next frame is always retained."""
         self._last_retained = None

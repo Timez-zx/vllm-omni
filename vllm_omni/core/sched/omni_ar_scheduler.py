@@ -12,8 +12,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStat
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.core.sched.request_queue import create_request_queue
+from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
+from vllm.v1.core.sched.scheduler import PauseState
 from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.perf import PerfStats
@@ -88,6 +89,28 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     core scheduling logic.
     """
 
+    # How long a stage may schedule nothing, while still tracking requests, before it is
+    # reported as wedged (see _check_for_wedged_requests). Generous on purpose: a streaming
+    # session is legitimately idle between turns, and the client's own turn timeout is 240s,
+    # so this has to be well inside that to be useful but far outside normal think time.
+    _WEDGE_REPORT_AFTER_S = 45.0
+
+    # Set once a stage has tracked at least one request, so that dropping back to zero can be
+    # told apart from never having started. See _check_for_wedged_requests.
+    _had_requests = 0
+    _empty_reported_t = 0.0
+    _empty_since = None
+
+    # Heartbeat cadence for the presence check at the top of schedule().
+    _HEARTBEAT_EVERY_S = 10.0
+    _last_heartbeat_t = 0.0
+
+    # Cadence for the starved-loop report in has_requests(), which is called every loop
+    # iteration and so must be rate-limited hard.
+    _STARVED_REPORT_EVERY_S = 5.0
+    _starved_reported_t = 0.0
+    _counter_repaired_t = 0.0
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Track requests that need KV cache transfer when finished
@@ -124,6 +147,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.input_coordinator = OmniSchedulingCoordinator(
                 stage_id=getattr(model_config, "stage_id", 0),
             )
+        # When each currently-tracked request was first seen with no sampled output, and which
+        # have already been reported as producing nothing. See _check_for_wedged_requests.
+        self._req_seen_t: dict[str, float] = {}
+        self._mute_reported: set[str] = set()
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
@@ -243,21 +270,172 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return False
 
+    def add_request(self, request: Request) -> None:
+        """Log every admission, then admit.
+
+        There is no other way to tell "the request never reached this stage" from "it reached
+        it and was removed again", and those have completely different causes. The question is
+        live: rolling a session mints a new engine request, the API server logs sending it to
+        all three stages, stage 0 accepts it and streams 370 payloads at stage 1 -- and stage 1
+        behaves exactly as though it has no request at all. Upstream's `EngineCore.add_request`
+        calls straight through to here, so a line here means the message arrived; its absence
+        means it did not. Note the `abort_immediately` flag, which upstream honours by aborting
+        the request on the very next line after this call.
+        """
+        logger.info(
+            "[OmniARScheduler] stage %s ADMIT req=%s resumable=%s prompt_tokens=%s "
+            "abort_immediately=%s (tracked before this: %d)",
+            self.vllm_config.model_config.stage_id,
+            getattr(request, "request_id", "?"),
+            getattr(request, "resumable", None),
+            getattr(request, "num_prompt_tokens", "?"),
+            getattr(request, "abort_immediately", None),
+            len(self.requests),
+        )
+        super().add_request(request)
+
+    def _log_request_table(self, why: str) -> None:
+        """Dump every tracked request's scheduling state.
+
+        Upstream's ``assert num_new_tokens > 0`` carries no context and kills the whole
+        engine-core process, so a bare traceback says only that SOME request had nothing to
+        compute -- not which, not in which queue, not with what token counts. Two rounds of
+        fixing this by deduction produced a guard that never fired (first over ``waiting``,
+        then over ``waiting`` and ``skipped_waiting``), which is a sign that the request is
+        not where reading the code says it should be. This prints the state instead.
+
+        Note the queues are printed as they are AT THE MOMENT OF THE FAILURE, which is inside
+        ``super().schedule()``: the chunk transfer adapter removes requests waiting on a chunk
+        from both queues before that call and restores them after, and waiting admission may
+        have been swapped out for an empty queue, so a request can be tracked in
+        ``self.requests`` while appearing in none of the queues here. That is a finding, not a
+        gap in the dump -- it is exactly the case a queue sweep cannot see.
+        """
+        def describe(request: Any) -> str:
+            sq = getattr(request, "streaming_queue", None)
+            return (
+                f"id={getattr(request, 'request_id', '?')} "
+                f"status={getattr(getattr(request, 'status', None), 'name', '?')} "
+                f"num_tokens={getattr(request, 'num_tokens', '?')} "
+                f"computed={getattr(request, 'num_computed_tokens', '?')} "
+                f"prompt={getattr(request, 'num_prompt_tokens', '?')} "
+                f"output={len(getattr(request, 'output_token_ids', ()) or ())} "
+                f"resumable={getattr(request, 'resumable', None)} "
+                f"streaming_queue={len(sq) if sq is not None else None} "
+                f"preemptions={getattr(request, 'num_preemptions', '?')}"
+            )
+
+        logger.error("[OmniARScheduler] %s (stage %s)", why,
+                     self.vllm_config.model_config.stage_id)
+        queued: set[int] = set()
+        for name, queue in (("waiting", self.waiting),
+                            ("skipped_waiting", self.skipped_waiting),
+                            ("running", self.running)):
+            items = list(queue)
+            logger.error("[OmniARScheduler]   %s: %d", name, len(items))
+            for request in items:
+                queued.add(id(request))
+                logger.error("[OmniARScheduler]     %s", describe(request))
+        # Anything tracked but in no queue -- see the docstring; this is the interesting row.
+        orphans = [r for r in self.requests.values() if id(r) not in queued]
+        logger.error("[OmniARScheduler]   tracked but in NO queue: %d", len(orphans))
+        for request in orphans:
+            logger.error("[OmniARScheduler]     %s", describe(request))
+
+        # The chunk transfer adapter's state, because half the ways a downstream stage can
+        # stop making progress live in there rather than in the queues. In particular
+        # `requests_with_ready_chunks` is only ever cleared by `_clear_chunk_ready`, which
+        # keys off requests appearing in a scheduler_output -- so a request that is in that
+        # set and never gets scheduled is skipped by `_process_chunk_queue` on every
+        # subsequent pass (it `continue`s before load_async), and no further chunk is ever
+        # loaded for it. That is indistinguishable from "idle" without printing the set.
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        if adapter is None:
+            return
+        def ids(value: Any) -> str:
+            if value is None:
+                return "-"
+            try:
+                items = [getattr(r, "request_id", r) for r in value]
+            except TypeError:
+                return repr(value)[:120]
+            return f"{len(items)}{items[:4]}"
+
+        logger.error("[OmniARScheduler]   chunk adapter state:")
+        for name in ("requests_with_ready_chunks", "waiting_for_chunk_waiting_requests",
+                     "waiting_for_chunk_running_requests", "_finished_load_reqs",
+                     "_active_streams", "_held_non_active", "finished_requests",
+                     # `segment_finished_requests` gates `is_done_receiving_chunks`, which the
+                     # RECEIVER consults as well as the scheduler. While a request sits in it,
+                     # stage 1 neither pulls a chunk nor schedules, and only a streaming update
+                     # clears it -- so if the update lands before the previous segment's final
+                     # payload sets the flag, the wakeup is lost and the stage is silent for
+                     # good while stage 0 keeps pushing payloads onto the edge. That is the
+                     # shape of the observed wedge, and it is invisible without this row.
+                     "segment_finished_requests",
+                     "requests_origin_status"):
+            logger.error("[OmniARScheduler]     %-36s %s", name,
+                         ids(getattr(adapter, name, None)))
+        logger.error("[OmniARScheduler]     %-36s %s", "_active_window",
+                     getattr(adapter, "_active_window", "?"))
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        # Heartbeat, rate-limited. Every other diagnostic in this class lives at the END of
+        # this method, so all of them go quiet together if the engine's busy loop stops calling
+        # it -- and their silence then gets read as "nothing is wrong with the request", which
+        # is the opposite of the truth. Upstream's loop blocks while
+        # `not self.scheduler.has_requests()`, and has_requests() counts `waiting`/`running`,
+        # NOT `self.requests`; the chunk transfer adapter takes a request OUT of those queues
+        # while its payload load is pending. So a request can be tracked, unschedulable, and
+        # invisible to every check below, with the loop parked. This line is the only way to
+        # tell that state from a healthy idle stage, because it reports presence rather than
+        # absence.
+        _hb_now = time()
+        if _hb_now - self._last_heartbeat_t >= self._HEARTBEAT_EVERY_S:
+            self._last_heartbeat_t = _hb_now
+            logger.info(
+                "[OmniARScheduler] stage %s heartbeat: tracked=%d waiting=%d skipped=%d "
+                "running=%d",
+                self.vllm_config.model_config.stage_id,
+                len(self.requests), len(self.waiting), len(self.skipped_waiting),
+                len(self.running),
+            )
+
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
         # async abort (e.g. client disconnect during TTS streaming) to leave
         # requests in the waiting/running queues temporarily.
-        for queue in (self.waiting, self.running):
-            for req in list(queue):
-                if getattr(req, "status", None) == RequestStatus.FINISHED_ABORTED:
-                    queue.remove(req)
+        #
+        # `skipped_waiting` is swept too, and leaving it out is what killed a stage whenever a
+        # streaming session ended. An aborted request parked there was never dropped, and
+        # upstream's waiting loop draws from `skipped_waiting` BEFORE `waiting` under FCFS
+        # (`_select_waiting_queue_for_scheduling`), so it picked the aborted session up, found
+        # num_tokens == num_computed_tokens, and tripped `assert num_new_tokens > 0` -- which
+        # takes down the whole engine-core process. Measured, from the state dump below:
+        #   skipped_waiting: 1
+        #     status=FINISHED_ABORTED num_tokens=4592 computed=4592 resumable=True
+        #
+        # Via `remove_requests` rather than `remove`, which is also a latent fix: `remove` is
+        # available only because FCFSRequestQueue happens to subclass deque. Under the
+        # PRIORITY policy `self.waiting` is a PriorityRequestQueue, which has no `remove` at
+        # all, so the original line would have raised AttributeError on the first async abort.
+        # `remove_requests` is the RequestQueue interface and works for both.
+        for req in [r for r in self.running
+                    if getattr(r, "status", None) == RequestStatus.FINISHED_ABORTED]:
+            self.running.remove(req)
+        for queue in (self.waiting, self.skipped_waiting):
+            doomed = [r for r in queue
+                      if getattr(r, "status", None) == RequestStatus.FINISHED_ABORTED]
+            if doomed:
+                queue.remove_requests(doomed)
+        self._recover_orphaned_requests()
         self._consume_pending_connector_output(model_mode="ar")
         self._process_pending_input_timeouts()
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(
                 self.waiting, self.running, scheduler_requests=self.requests
             )
+
 
         original_waiting = None
         if self._should_defer_waiting_admission():
@@ -266,6 +444,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         try:
             scheduler_output = super().schedule(throttle_prefills)
+        except AssertionError:
+            # Upstream asserts kill the engine-core process. Dump the state before it dies,
+            # or the only evidence is a traceback with no request in it.
+            self._log_request_table("upstream schedule() raised AssertionError")
+            raise
         finally:
             if original_waiting is not None:
                 deferred_waiting = list(self.waiting)
@@ -322,10 +505,109 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             init_logger(__name__).exception("Failed to wrap scheduled_new_reqs with OmniNewRequestData")
             finished_reqs = {}
 
+        self._check_for_wedged_requests(scheduler_output)
+
         # Wrap in omni scheduler output to carry transfer metadata.
         return self._wrap_omni_scheduler_output(
             scheduler_output,
             finished_requests_needing_kv_transfer=finished_reqs,
+        )
+
+    def _check_for_wedged_requests(self, scheduler_output: SchedulerOutput) -> None:
+        """Dump state once if a stage stops making PROGRESS while requests are tracked.
+
+        A stage that CRASHES leaves a traceback. A stage that quietly stops leaves nothing at
+        all, and that is the observed failure mode of a long streaming session: the client
+        receives a turn's text and then no audio, forever, while stage 0 keeps generating.
+
+        PROGRESS, not "anything scheduled". The first version of this keyed on
+        `total_num_scheduled_tokens == 0` and did not fire on a reproduction that stalled for
+        126s -- comfortably past its 45s threshold -- which says the stalled stage was still
+        being handed work every pass and simply never produced anything from it. Silence in the
+        log is not evidence either way, because a healthy stage 1 logs nothing per step; that
+        only looked like evidence in an earlier run where transfer logging happened to be on.
+
+        So progress is defined per request as the pair (num_computed_tokens, output length),
+        and the stage is considered stuck when NO tracked request has moved either number for
+        `_WEDGE_REPORT_AFTER_S`. That covers both shapes: nothing scheduled at all, and
+        scheduled repeatedly without advancing. Being idle between turns is still fine -- with
+        no requests tracked the timer is simply held at the current time.
+        """
+        now = time()
+        if not self.requests:
+            # "No tracked requests" is normal at startup and between clients, but a stage that
+            # HAD requests and now has none while work is still arriving is its own failure --
+            # and it is invisible, because every other branch here needs a request to describe.
+            # It came up rolling a session: stage 0 shipped 133 payloads to stage 1 over the
+            # 0->1 edge and stage 1 emitted nothing, and no diagnostic could say whether the
+            # request was stuck or simply absent. Reported once per transition.
+            # REPEATS, rate-limited, rather than reporting once. A latching version of this
+            # hid the very answer it was added to find: at a session roll stage 1 went empty,
+            # reported once, and then stayed silent for two minutes while 370 payloads piled up
+            # on the 0->1 edge -- so "stage 1 emits nothing" looked like a stage with no
+            # diagnostics rather than a stage with no request. Staying empty is the finding, so
+            # it has to keep saying so.
+            if self._had_requests and now - self._empty_reported_t >= self._WEDGE_REPORT_AFTER_S:
+                self._empty_reported_t = now
+                logger.error(
+                    "[OmniARScheduler] stage %s tracks ZERO requests and has for %.0fs, "
+                    "having tracked %d before. If payloads are still arriving for this stage "
+                    "the request was DROPPED, not stalled -- look upstream of the scheduler.",
+                    self.vllm_config.model_config.stage_id,
+                    now - self._empty_since if self._empty_since else 0.0,
+                    self._had_requests,
+                )
+            if self._empty_since is None:
+                self._empty_since = now
+            self._last_progress_t = now
+            self._wedge_reported = False
+            self._progress_fingerprint = None
+            return
+        self._had_requests = len(self.requests)
+        self._empty_since = None
+
+        # A request that is being scheduled but has never SAMPLED anything is its own failure,
+        # distinct from a stalled one, and the fingerprint below cannot tell them apart: it
+        # counts num_computed_tokens, which advances during prefill, so a request that prefills
+        # over and over looks exactly like one that is decoding. That distinction is the open
+        # question after a session roll -- stage 1 holds the request, the fingerprint keeps
+        # moving, and nothing is ever put on the 1->2 edge.
+        for rid, r in self.requests.items():
+            if len(getattr(r, "output_token_ids", ()) or ()):
+                self._mute_reported.discard(rid)
+                self._req_seen_t.pop(rid, None)
+                continue
+            t0 = self._req_seen_t.setdefault(rid, now)
+            if now - t0 >= self._WEDGE_REPORT_AFTER_S and rid not in self._mute_reported:
+                self._mute_reported.add(rid)
+                self._log_request_table(
+                    f"req={rid} has been tracked for {now - t0:.0f}s and has sampled ZERO "
+                    f"output tokens -- being scheduled but producing nothing"
+                )
+
+        fingerprint = tuple(
+            sorted(
+                (rid, r.num_computed_tokens, len(getattr(r, "output_token_ids", ()) or ()))
+                for rid, r in self.requests.items()
+            )
+        )
+        if fingerprint != getattr(self, "_progress_fingerprint", None):
+            self._progress_fingerprint = fingerprint
+            self._last_progress_t = now
+            self._wedge_reported = False
+            return
+        if getattr(self, "_wedge_reported", False):
+            return
+        since = now - getattr(self, "_last_progress_t", now)
+        if since < self._WEDGE_REPORT_AFTER_S:
+            if not hasattr(self, "_last_progress_t"):
+                self._last_progress_t = now
+            return
+        self._wedge_reported = True
+        scheduled = getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0
+        self._log_request_table(
+            f"no request advanced for {since:.0f}s while {len(self.requests)} are tracked "
+            f"(this pass scheduled {scheduled} tokens) -- this stage looks WEDGED, not idle"
         )
 
     def update_from_output(
@@ -833,6 +1115,24 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         """Mark a request as finished and free its resources."""
         assert request.is_finished()
 
+        # Say WHY, once per request. A request leaving the scheduler is the moment that decides
+        # whether a stage goes quiet, and until this line existed the reason was unrecoverable
+        # after the fact: rolling a session admitted the new request on stage 1 and then dropped
+        # it within a pass or two, and the only visible trace was the stage reporting zero
+        # tracked requests for the next 126s while payloads piled up on the 0->1 edge. The
+        # status distinguishes an abort from a stop from a length cap, and those have nothing to
+        # do with each other.
+        logger.info(
+            "[OmniARScheduler] stage %s FREE req=%s status=%s prompt_tokens=%s output=%d "
+            "computed=%s",
+            self.vllm_config.model_config.stage_id,
+            request.request_id,
+            getattr(getattr(request, "status", None), "name", "?"),
+            getattr(request, "num_prompt_tokens", "?"),
+            len(getattr(request, "output_token_ids", ()) or ()),
+            getattr(request, "num_computed_tokens", "?"),
+        )
+
         self._omits_kv_transfer_cache.pop(request.request_id, None)
 
         # [Upstream compat] Discard request from in-flight prefills set added
@@ -984,12 +1284,218 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             return False
         return True
 
+    def _has_requests_awaiting_chunk(self) -> bool:
+        """True while the chunk transfer adapter is holding a request out of the queues.
+
+        This has to count as work, or the engine deadlocks. The adapter takes a request OUT of
+        both `waiting` and `running` while its payload load is in flight, and upstream's
+        `has_requests()` only looks at those two queues -- so the loop concludes it has nothing
+        to do and blocks. But noticing that the load has COMPLETED happens in
+        `process_pending_chunks`, which only runs from `schedule()`, which only runs if the loop
+        does not block. Nothing breaks the cycle, because the only thing that wakes the loop is
+        new client input.
+
+        Measured, rolling a session: after the new request was admitted, stage 1 logged not one
+        scheduler heartbeat for 125 seconds -- while 274 payloads arrived for it on the 0->1
+        edge -- and was finally freed with num_computed_tokens still 0. Ordinary turns escape
+        this only because each turn's own `add_request` happens to wake the loop; the first turn
+        of a rolled request has no such event, since the client is waiting on that very turn.
+        """
+        adapter = self.chunk_transfer_adapter
+        if adapter is None:
+            return False
+        # `_finished_load_reqs` is the load-bearing one and it is NOT interchangeable with the
+        # deques. A COMPLETED load lives there, and only `_process_chunk_queue*` -- reached from
+        # `schedule()` -- moves the request back into a queue and consumes it. If the loop parks
+        # while that set is non-empty, the payload is already in hand and nothing will ever pick
+        # it up.
+        #
+        # It is also the field that separates a deadlock from healthy idling, which matters
+        # because the two look nearly identical. Between turns a session legitimately sits with
+        # `origin_status=1` and the queues empty, and the loop SHOULD park until the client
+        # speaks again -- keying on `origin_status` would spin a core forever. Measured, stage 1,
+        # same run: at 11:45:30 (healthy, parked between turns) finished_load=0; at 11:55:29
+        # (deadlocked, turn never completed) finished_load=1 with every queue empty.
+        return bool(
+            getattr(adapter, "_finished_load_reqs", None)
+            or getattr(adapter, "waiting_for_chunk_waiting_requests", None)
+            or getattr(adapter, "waiting_for_chunk_running_requests", None)
+        )
+
     def has_requests(self) -> bool:
         """Check if there are any requests to process, including KV transfers."""
         # [Omni] Also check for pending KV transfers
         if self.requests_needing_kv_transfer or self.active_kv_transfers or self.waiting_for_transfer_free:
             return True
-        return super().has_requests()
+        # ... and for requests the chunk transfer adapter is holding. Same reasoning as the KV
+        # transfer check above: work is pending, so the loop must not be allowed to quiesce.
+        if self._has_requests_awaiting_chunk():
+            return True
+        result = super().has_requests()
+        if not result and self.requests:
+            self._report_starved_loop()
+        return result
+
+    def _recover_orphaned_requests(self) -> None:
+        """Re-enqueue a tracked, unfinished request that belongs to no queue and no holder.
+
+        A request in `self.requests` that is not finished must be in `waiting`,
+        `skipped_waiting`, `running`, or held deliberately by the chunk transfer adapter. Being
+        in none of them means nothing will ever schedule it and nothing will ever restore it: the
+        session stops mid-turn and the client waits out its timeout.
+
+        Measured, stage 1, turn 17 of a 40-turn session, with the engine loop still stepping
+        (heartbeats continued, so this is not the parked-loop failure):
+
+            tracked but in NO queue: 1
+              status=WAITING num_tokens=40670 computed=40669   (one token short)
+            adapter: _finished_load_reqs 1[...]  requests_origin_status 1[...]
+                     waiting_for_chunk_waiting_requests 0   waiting_for_chunk_running_requests 0
+
+        `restore_queues` had already returned it to `waiting` and cleared its deques -- the
+        orphaned `requests_origin_status` entry is what proves it passed through -- and something
+        then removed it from `waiting` without placing it anywhere. Which path does that is still
+        unknown, so this repairs the INVARIANT rather than the cause, and says so loudly. The
+        guard is narrow on purpose: a request the adapter is genuinely holding sits in one of its
+        deques or in `_held_non_active`, and is left alone.
+        """
+        if not self.requests:
+            return
+        queued: set[int] = set()
+        for container in (self.waiting, self.skipped_waiting, self.running):
+            for request in container:
+                queued.add(id(request))
+        adapter = self.chunk_transfer_adapter
+        if adapter is not None:
+            for name in ("waiting_for_chunk_waiting_requests",
+                         "waiting_for_chunk_running_requests", "_held_non_active"):
+                for request in getattr(adapter, name, ()) or ():
+                    queued.add(id(request))
+
+        for request in list(self.requests.values()):
+            if id(request) in queued:
+                continue
+            if getattr(request, "is_finished", None) and request.is_finished():
+                continue
+            logger.error(
+                "[OmniARScheduler] stage %s recovering ORPHANED req=%s status=%s "
+                "num_tokens=%s computed=%s -- tracked but in no queue and held by nothing, so "
+                "nothing would ever schedule it. Re-enqueueing to waiting.",
+                self.vllm_config.model_config.stage_id, request.request_id,
+                getattr(getattr(request, "status", None), "name", "?"),
+                getattr(request, "num_tokens", "?"),
+                getattr(request, "num_computed_tokens", "?"),
+            )
+            if adapter is not None:
+                # Drop the stale bookkeeping that says the adapter is holding it, or the next
+                # pass will believe the request is parked when it is not.
+                getattr(adapter, "requests_origin_status", {}).pop(request.request_id, None)
+            request.status = RequestStatus.WAITING
+            self._enqueue_waiting_request(request)
+
+    def get_num_unfinished_requests(self) -> int:
+        """Derive the streaming-parked count from the queues instead of trusting a counter.
+
+        Upstream computes
+
+            num_waiting = len(waiting) + len(skipped_waiting) - num_waiting_for_streaming_input
+
+        and `num_waiting_for_streaming_input` is a hand-maintained counter: incremented when a
+        request parks for streaming input, decremented when a parked request receives an update
+        or is finished while still parked. Every decrement is guarded by
+        `status == WAITING_FOR_STREAMING_REQ`, so any path that changes the status FIRST and
+        removes the request afterwards leaks the counter permanently.
+
+        Retiring a session request is exactly such a path, and the leak is fatal rather than
+        cosmetic. One leaked unit cancels one real request: with the counter stuck at 1 a
+        freshly admitted request sitting in `waiting` gives 1 + 0 - 1 = 0, the engine core
+        concludes it has no work, and its busy loop parks. Nothing then runs `schedule()`, so the
+        payloads arriving for that request are never consumed and it is never prefilled --
+        measured as 0 scheduler heartbeats for 125s while 274 payloads arrived on the 0->1 edge,
+        and the request finally freed with num_computed_tokens == 0.
+
+        Counting the parked requests directly cannot leak, so the disagreement is repaired here
+        rather than chased through every path that might cause it. The repair is logged, because
+        a silent correction would hide a real upstream defect.
+        """
+        if self._pause_state == PauseState.PAUSED_ALL:
+            return 0
+        if self._pause_state == PauseState.PAUSED_NEW:
+            return len(self.running)
+
+        num_waiting = 0
+        parked = 0
+        for queue in (self.waiting, self.skipped_waiting):
+            for request in queue:
+                if getattr(request, "status", None) == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                    parked += 1
+                else:
+                    num_waiting += 1
+
+        # The counter is NOT written back. An earlier version of this repaired it to the derived
+        # value, and that made things worse: while the chunk adapter is holding a parked request
+        # OUT of both queues the derived count is legitimately 0, so the repair zeroed a counter
+        # that upstream then decremented anyway, leaving it at -1. Reporting the disagreement is
+        # useful; mutating another component's bookkeeping from a read-only accessor is not.
+        if parked != self.num_waiting_for_streaming_input:
+            now = time()
+            if now - self._counter_repaired_t >= self._STARVED_REPORT_EVERY_S:
+                self._counter_repaired_t = now
+                logger.warning(
+                    "[OmniARScheduler] stage %s num_waiting_for_streaming_input is %d but %d "
+                    "request(s) in the queues are actually parked for streaming input. Using the "
+                    "derived count. waiting=%d skipped_waiting=%d running=%d tracked=%d",
+                    self.vllm_config.model_config.stage_id,
+                    self.num_waiting_for_streaming_input, parked,
+                    len(self.waiting), len(self.skipped_waiting), len(self.running),
+                    len(self.requests),
+                )
+        return num_waiting + len(self.running)
+
+    def _report_starved_loop(self) -> None:
+        """Say so when this scheduler tells the engine loop there is nothing to do while it is
+        still tracking requests, and name every container that could be holding one.
+
+        THE ONLY USEFUL OBSERVATION POINT for this failure. `has_work()` in the engine core is
+        `engines_running or scheduler.has_requests() or batch_queue`, so this method is the
+        decision that parks the loop -- and once parked, nothing inside `schedule()` runs, which
+        is where every other diagnostic in this class lives. A heartbeat at the top of
+        `schedule()` proved the loop parks (0 beats in 125s while 274 payloads arrived) but by
+        construction could not show WHERE the request was, because it cannot run either.
+
+        Rate-limited: this is called on every loop iteration.
+        """
+        now = time()
+        if now - self._starved_reported_t < self._STARVED_REPORT_EVERY_S:
+            return
+        self._starved_reported_t = now
+        adapter = self.chunk_transfer_adapter
+
+        def n(obj: Any) -> Any:
+            try:
+                return len(obj)
+            except TypeError:
+                return "?"
+
+        logger.error(
+            "[OmniARScheduler] stage %s is telling the engine loop THERE IS NO WORK while "
+            "tracking %d request(s) -- the loop will park. waiting=%s skipped_waiting=%s "
+            "running=%s | adapter: wait_chunk_waiting=%s wait_chunk_running=%s ready_chunks=%s "
+            "finished_load=%s held_non_active=%s active_streams=%s segment_finished=%s "
+            "origin_status=%s | streaming_parked_counter=%s | statuses=%s",
+            self.vllm_config.model_config.stage_id, len(self.requests),
+            n(self.waiting), n(self.skipped_waiting), n(self.running),
+            n(getattr(adapter, "waiting_for_chunk_waiting_requests", None)) if adapter else "-",
+            n(getattr(adapter, "waiting_for_chunk_running_requests", None)) if adapter else "-",
+            n(getattr(adapter, "requests_with_ready_chunks", None)) if adapter else "-",
+            n(getattr(adapter, "_finished_load_reqs", None)) if adapter else "-",
+            n(getattr(adapter, "_held_non_active", None)) if adapter else "-",
+            n(getattr(adapter, "_active_streams", None)) if adapter else "-",
+            n(getattr(adapter, "segment_finished_requests", None)) if adapter else "-",
+            n(getattr(adapter, "requests_origin_status", None)) if adapter else "-",
+            self.num_waiting_for_streaming_input,
+            [getattr(getattr(r, "status", None), "name", "?") for r in self.requests.values()],
+        )
 
     def has_finished_requests(self) -> bool:
         """Check if there are any finished requests (including those needing KV transfer)."""
@@ -1003,6 +1509,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # MUST verify waiting_for_transfer_free and active_kv_transfers
         # Otherwise engine loop might exit before transfer Ack is received.
         if self.requests_needing_kv_transfer or self.active_kv_transfers or self.waiting_for_transfer_free:
+            return True
+        # A request awaiting a chunk payload is unfinished by any reading, and the loop must keep
+        # stepping or it will never observe the payload arriving. See _has_requests_awaiting_chunk.
+        if self._has_requests_awaiting_chunk():
             return True
         return super().has_unfinished_requests()
 

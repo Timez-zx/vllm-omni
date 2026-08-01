@@ -651,12 +651,22 @@ class StagePool:
         inter_output_latency_ms = (
             sum(inter_output_latencies_ms) / float(len(inter_output_latencies_ms)) if inter_output_latencies_ms else 0.0
         )
+        # Report num_tokens_in for EVERY stage, not only stage 0.
+        #
+        # With the `if self.stage_id == 0` guard, the num_tokens_in column of
+        # StageRequestStats is a constant 0 for stages 1 and 2, so the prompt length of the
+        # talker and of code2wav is not observable anywhere in the system. That matters for
+        # the Qwen3-Omni pipeline in particular: the talker's prompt is a placeholder sized
+        # by compute_talker_prompt_ids_length() from the thinker's prompt, its length drives
+        # the talker's prefill cost, and without this there is no way to tell whether a
+        # given configuration is feeding the talker a delta or the whole conversation.
+        #
+        # Purely additive: it fills a field that was already emitted, as zero.
         num_tokens_in = 0
-        if self.stage_id == 0:
-            for ro in request_outputs:
-                ptids = getattr(ro, "prompt_token_ids", None)
-                if ptids is not None:
-                    num_tokens_in += len(ptids)
+        for ro in request_outputs:
+            ptids = getattr(ro, "prompt_token_ids", None)
+            if ptids is not None:
+                num_tokens_in += len(ptids)
 
         metrics = self._replica_metrics[replica_id]
         metrics.batch_seq += 1
