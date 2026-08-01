@@ -127,6 +127,28 @@ def main() -> int:
           "decodeWav" in app_js and "'data'" in app_js and "'fmt '" in app_js)
     check("16-bit is what the page supports", width == 2, f"server emits {width * 8}-bit")
 
+    # The whole reply has to survive, not just its first granule. Streaming requests are
+    # coerced to RequestOutputKind.DELTA, and under DELTA the output processor drains the
+    # audio payload after every snapshot -- so each output carries a bare tensor holding
+    # only the newest granule. The extractor used to read that as a transient first state
+    # and answer None to every output after the first, delivering 0.22 s of a 13.66 s reply.
+    # Both delta modes had the bug, which is why an A/B between them showed no difference.
+    import torch
+
+    granules = [7125, 48000, 48000, 32640]     # measured shape of one 151-char reply
+    for mode in ("fast", "slow"):
+        drained, emitted = 0, 0
+        for n_samples in granules:
+            b64, drained = getattr(H, f"_delta_{mode}")(torch.zeros(n_samples), drained)
+            if b64:
+                with wave.open(io.BytesIO(base64.b64decode(b64)), "rb") as w:
+                    emitted += w.getnframes()
+        # One codec frame comes off the first granule as a CausalConv artifact.
+        expected = sum(granules) - 1920
+        check(f"delta mode {mode} delivers the whole reply", emitted == expected,
+              f"{emitted}/{expected} samples ({emitted / 24000:.2f}s of "
+              f"{sum(granules) / 24000:.2f}s produced)")
+
     # ---- 4. the turn trigger must exist, because the server never fires one ----
     print("\n4. the turn trigger")
     handler_src = (pathlib.Path(__file__).resolve().parents[3]

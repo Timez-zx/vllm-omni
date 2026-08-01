@@ -187,6 +187,26 @@ _IM_END_NEWLINE = [151645, 198]
 _TALKER_TOKENS_PER_AUDIO_CHUNK = 25
 
 
+def _summarise_audio_payload(audio_data: Any) -> str:
+    """Describe the audio payload the delta extractor will actually read.
+
+    Shapes only, no device-to-host copy, so this is safe to call on every output.
+
+    The point is to make the payload's CONTRACT visible. `_extract_audio_delta_b64`
+    assumes a cumulative list that grows by one tensor per step; if the list is drained
+    after each snapshot instead, it stays length 1 and the extractor emits only the very
+    first granule. Those two cases are indistinguishable from a single output and obvious
+    from a sequence of them, so the length is logged per output.
+    """
+    if audio_data is None:
+        return "none"
+    if isinstance(audio_data, list):
+        lens = [int(getattr(t, "shape", (0,))[-1] or 0) for t in audio_data]
+        return f"list(n={len(lens)},samples={sum(lens)},each={lens[:6]})"
+    n = int(getattr(audio_data, "shape", (0,))[-1] or 0)
+    return f"tensor(samples={n})"
+
+
 def _segment_finish_reason(output: Any) -> Any:
     """Per-SEGMENT finish marker, which is the only usable turn boundary in session mode.
 
@@ -619,15 +639,19 @@ class OmniStreamingVideoHandler:
                                 co = outs[0] if outs else None
                             logger.info(
                                 "[session-out] type=%s stage=%s out.finished=%s ro.finished=%s "
-                                "finish_reason=%s ntok=%s audio_n=%s",
+                                "finish_reason=%s ntok=%s audio=%s",
                                 getattr(output, "final_output_type", "?"),
                                 getattr(output, "stage_id", "?"),
                                 getattr(output, "finished", None),
                                 getattr(ro, "finished", None) if ro is not None else None,
                                 getattr(co, "finish_reason", None) if co is not None else None,
                                 len(getattr(co, "token_ids", ()) or ()) if co is not None else None,
-                                (len(output.audio_data) if isinstance(getattr(output, "audio_data", None), list)
-                                 else ("1" if getattr(output, "audio_data", None) is not None else "0")),
+                                # `output.audio_data` used to be logged here and it read 0 on every
+                                # audio output, including the ones that carried the reply. It is
+                                # not the field the delta extractor uses. Reporting a different
+                                # field from the one that matters is worse than reporting nothing:
+                                # it says "no audio was produced" while audio is being produced.
+                                _summarise_audio_payload(self._get_audio_data(output)),
                             )
                         if interrupt_event.is_set():
                             continue
@@ -1833,13 +1857,36 @@ class OmniStreamingVideoHandler:
         chunks_drained: int,
     ) -> tuple[str | None, int]:
         """Emit only tensors appended since the last call."""
-        # Single tensor: output_processor hands us one tensor before it becomes a
-        # list (see output_processor.py:89). Treat it as chunk #0.
+        # A BARE TENSOR IS ALREADY THE NEW AUDIO, and this is where the reply used to be
+        # thrown away. The old code read the single tensor as a transient first state that
+        # would "become a list", so it emitted it once and answered None to every later
+        # output -- `if chunks_drained >= 1: return None`.
+        #
+        # It never becomes a list. Any streaming request is coerced to
+        # RequestOutputKind.DELTA (entrypoints/utils.py maybe_coerce_to_message_type), and
+        # under DELTA the output processor calls drain_delta_payload() after every snapshot
+        # (outputs/output_processor.py), which pops the audio key outright. So each output
+        # carries only what stage 2 produced since the previous one -- a fresh granule, every
+        # time, and nothing cumulative to index into.
+        #
+        # Measured on one 151-character reply, per stage-2 output:
+        #     7,125 samples, then 48,000 x 6 (25 codec frames x 1920), then 32,640 with stop
+        #     = 13.66 s produced.  0.22 s delivered.  Only the first granule survived.
+        # Cumulative payloads cannot look like that -- the lengths would grow monotonically
+        # and could never drop to 32,640 -- so the contract is per-step by measurement as
+        # well as by construction.
+        #
+        # `chunks_drained` therefore just counts granules emitted, and its only remaining job
+        # is to mark the first one, whose leading CausalConv frame has to be stripped. If a
+        # future engine ever does hand a cumulative tensor here, the symptom is audio that
+        # repeats and grows turn by turn.
         if not isinstance(audio_data, list):
-            if chunks_drained >= 1:
-                return None, chunks_drained
             tail_np = cls._tensor_to_1d_np(audio_data)
-            return cls._encode_tail(tail_np, chunks_drained, new_drained=1, is_first=True)
+            return cls._encode_tail(
+                tail_np, chunks_drained,
+                new_drained=chunks_drained + 1,
+                is_first=(chunks_drained == 0),
+            )
 
         n = len(audio_data)
         if n <= chunks_drained:
@@ -1863,8 +1910,21 @@ class OmniStreamingVideoHandler:
             audio_tensor = torch.cat(audio_data, dim=-1)
             new_drained = len(audio_data)
         else:
+            # Same correction as _delta_fast: a bare tensor is this step's new audio, not a
+            # cumulative buffer. This arm had the bug too, via `tail_np = full_np[0:0]` once
+            # chunks_drained reached 1 -- which is why the fast/slow A/B showed no difference
+            # and wrongly cleared the delivery path. Two implementations of one wrong
+            # assumption agree with each other, so agreement between them proved nothing.
             audio_tensor = audio_data
-            new_drained = 1
+            new_drained = chunks_drained + 1
+            full_np = cls._tensor_to_1d_np(audio_tensor)
+            if full_np is None:
+                return None, chunks_drained
+            return cls._encode_tail(
+                full_np, chunks_drained,
+                new_drained=new_drained,
+                is_first=(chunks_drained == 0),
+            )
 
         full_np = cls._tensor_to_1d_np(audio_tensor)
         if full_np is None:

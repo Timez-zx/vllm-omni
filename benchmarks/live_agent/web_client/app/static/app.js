@@ -56,8 +56,10 @@
   const INPUT_RATE = 16000;          // this server's audio.chunk contract
   const SEND_INTERVAL_MS = 200;      // how often queued mic PCM goes up
   const FRAME_INTERVAL_MS = 500;     // ~2 fps; frames are their own message
-  // Must be well under ONE TURN's audio, not merely "enough for jitter". At
-  // 250 ms nothing ever played, because a turn currently delivers ~220 ms.
+  // Must be well under the FIRST delta, not merely "enough for jitter". The server
+  // sends a deliberately small first granule so speech starts early -- measured at
+  // 0.217 s -- and the 2 s granules after it can be a moment behind. A 250 ms
+  // threshold sat above that first delta and playback never started on it.
   const PLAYBACK_PREBUFFER_MS = 60;
   const ECHO_GUARD_MS = 300;         // keep uploading this long after playback
 

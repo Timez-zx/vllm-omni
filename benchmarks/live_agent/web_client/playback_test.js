@@ -9,24 +9,29 @@
 // out that NEITHER IS SUFFICIENT ALONE -- each was first asserted to be, and the
 // assertions failed:
 //
-//   1. the prebuffer threshold (250 ms) was LARGER than one turn's delivered
-//      audio (~220 ms). Alone this only loses the first turn: the audio stays
-//      queued, the next turn pushes the total over the threshold, and playback
-//      simply runs one turn behind.
-//   2. an underrun re-armed the prebuffer. Alone, at a prebuffer smaller than a
-//      turn, this is harmless -- every turn clears the threshold again.
+//   1. the prebuffer threshold (250 ms) was LARGER than the delivery it had to start
+//      on. Alone this only delays the start: the audio stays queued and the next
+//      delivery pushes the total over the threshold, so playback runs one behind.
+//   2. an underrun re-armed the prebuffer. Alone, at a threshold below one delivery,
+//      this is harmless -- every delivery clears it again.
 //
-// Together they are the bug: once the threshold exceeds one turn, re-arming means
-// each turn must be paid for out of the NEXT one, so turns fall silent in turn and
-// what does play is the previous reply. Fixing one and not the other would have
+// Together they are the bug: once the threshold exceeds one delivery, re-arming means
+// each delivery must be paid for out of the NEXT one, so deliveries fall silent in
+// turn and what plays is the previous one. Fixing one and not the other would have
 // looked like a fix and left it broken, which is the reason this file exists.
+//
+// The arrival pattern here -- one small delivery, then a long gap -- is not a museum
+// piece. The server sends a deliberately small first granule so speech starts early
+// (measured 0.217 s, from `initial_codec_chunk_frames: 4`) and the 2 s granules after
+// it can be a moment behind, so the first delta of every turn still lands in exactly
+// this shape. What HAS changed since these tests were written is the rest of the turn:
+// a truncation bug capped each reply at that first granule, and now a turn delivers
+// its whole reply (measured 13.58 s of 13.66 s produced), in about 8 deltas.
 //
 // Neither is visible to selftest.py, which checks the protocol, nor to probe.py,
 // which never plays anything. A browser was the only thing that could catch it,
 // and a browser is exactly what neither of those has. So run the real worklet
-// under Node with the two AudioWorklet globals stubbed, and drive it with the
-// arrival pattern the server actually produces: a short burst, a long gap, the
-// next burst.
+// under Node with the two AudioWorklet globals stubbed.
 
 'use strict';
 
@@ -36,8 +41,8 @@ const vm = require('vm');
 
 const RATE = 24000;                     // the server's audio.delta rate
 const BLOCK = 128;                      // AudioWorklet render quantum
-const TURN_MS = 220;                    // what a turn currently delivers
-const GAP_MS = 3000;                    // thinking time between turns
+const TURN_MS = 220;                    // ~ the small first granule (0.217 s measured)
+const GAP_MS = 3000;                    // a hostile gap before the next delivery
 const TURNS = 3;
 
 // ---------------------------------------------------------------- the sandbox
@@ -161,7 +166,7 @@ check('both together reproduce what was reported',
       && later.some((p) => p === 0)
       && !later.every((p) => Math.abs(p - expected) < BLOCK),
       `frames per turn: [${reported.perTurn}] -- the long first turn clears 250 ms; the `
-      + `re-arm then demands 250 ms of every 220 ms turn, so turns fall silent and what `
+      + `re-arm then demands 250 ms of every 220 ms delivery, so deliveries fall silent and what `
       + `does play is the PREVIOUS turn's reply, two turns' worth at a time`);
 
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) failed.`);
