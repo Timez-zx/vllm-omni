@@ -85,6 +85,27 @@ is at fault; if both pass and the browser does not, it is the page or the tunnel
 
 ---
 
+## The first start is much slower than you expect, and looks hung
+
+Qwen3-Omni is 30B **MoE**, and FlashInfer JIT-compiles a CUTLASS fused-MoE CUDA
+kernel the first time it runs. After `torch.compile took Ns` the log goes silent
+for **many minutes**, GPU utilisation reads 0%, and the process sits in
+`pipe_read`. Every one of those says "hung" and all of them are wrong.
+
+The work is several forks down: Python -> ninja -> nvcc -> sh -> **ptxas**, and
+only the leaf burns CPU. To tell compiling from hung:
+
+```bash
+ps -eo pid=,pcpu=,comm= --sort=-pcpu | head -3     # want ptxas or cicc near 100%
+sudo env "PATH=$PATH" py-spy dump --pid $(pgrep -f StageEngineCore | head -1)
+```
+
+If the stack shows `run_ninja` / `get_cutlass_fused_moe_module`, it is compiling —
+wait. It is cached afterwards, so later starts skip it.
+
+MiniCPM-o never hits this: it is a dense 9B with no fused MoE. So do not use its
+startup time (~2 min) as the expectation for this one.
+
 ## Reading the page
 
 | Panel | What it tells you |
