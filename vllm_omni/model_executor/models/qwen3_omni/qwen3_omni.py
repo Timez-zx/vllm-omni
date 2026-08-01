@@ -441,29 +441,39 @@ class Qwen3OmniMoeForConditionalGeneration(
         elif self.model_stage == "code2wav":
             seq_token_counts: list[int] | None = kwargs.get("seq_token_counts")
 
-            # Extract codec codes from input
-            if input_ids.shape[0] % 16 == 0:
-                if seq_token_counts is not None:
-                    max_seq_len = max(seq_token_counts) // 16
-                    batch_size = len(seq_token_counts)
-                    split_codes = torch.split(input_ids, seq_token_counts, dim=0)
-                    codes = torch.zeros((batch_size, 16, max_seq_len), device=input_ids.device, dtype=input_ids.dtype)
-                    for idx, code in enumerate(split_codes):
-                        seq_len = code.shape[0] // 16
-                        codes[idx, :, :seq_len] = code.reshape(16, seq_len)
-                else:
-                    codes = input_ids.reshape(1, 16, -1)
+            # Extract codec codes from input. When the batch composition is
+            # known, requests are padded INDIVIDUALLY to a multiple of 16: a
+            # boundary-capped append ships a 1-token segment by design (see
+            # chunk_transfer_adapter), and routing on the TOTAL length used to
+            # send any batch containing one into the flat reshape(1, 16, -1)
+            # fallback below -- N requests collapsed into one batch row while
+            # seq_token_counts still listed N, IndexError at slice time in
+            # chunked_decode_streaming, engine down. Single-user traffic never
+            # hit it because a session is one engine request, so stage-2
+            # batches were always size 1 and the fallback happened to be right.
+            if seq_token_counts is not None:
+                batch_size = len(seq_token_counts)
+                split_codes = torch.split(input_ids, seq_token_counts, dim=0)
+                seq_lens = [(code.shape[0] + 15) // 16 for code in split_codes]
+                max_seq_len = max(seq_lens) if seq_lens else 1
+                codes = torch.zeros((batch_size, 16, max_seq_len), device=input_ids.device, dtype=input_ids.dtype)
+                for idx, code in enumerate(split_codes):
+                    if code.shape[0] % 16:
+                        # Expected for boundary-capped 1-token segments; the
+                        # consumer floors to count // 16 frames, so the padded
+                        # remainder is never decoded into audible samples.
+                        code = torch.cat(
+                            [code, code.new_zeros(16 - code.shape[0] % 16)]
+                        )
+                    seq_len = code.shape[0] // 16
+                    codes[idx, :, :seq_len] = code.reshape(16, seq_len)
+            elif input_ids.shape[0] % 16 == 0:
+                codes = input_ids.reshape(1, 16, -1)
             else:
-                if seq_token_counts is None:
-                    logger.debug(
-                        "Code2Wav warmup input length %s is not divisible by 16; padding with zeros.",
-                        input_ids.shape[0],
-                    )
-                else:
-                    logger.warning_once(
-                        "Code2Wav input length is not divisible by 16; padding with zeros. "
-                        "This is expected only during cudagraph warmup."
-                    )
+                logger.debug(
+                    "Code2Wav warmup input length %s is not divisible by 16; padding with zeros.",
+                    input_ids.shape[0],
+                )
                 input_ids_flatten = input_ids.reshape(-1)
                 input_ids_flatten = torch.cat(
                     [
@@ -478,9 +488,15 @@ class Qwen3OmniMoeForConditionalGeneration(
             left_context_size = []
             if runtime_additional_information is not None:
                 for info in runtime_additional_information:
-                    meta = info.get("meta", {})
-                    if "left_context_size" in meta:
-                        left_context_size.append(meta["left_context_size"])
+                    meta = info.get("meta", {}) or {}
+                    # Append for EVERY request, defaulting to 0. Appending only
+                    # when the field is present shortened the list whenever one
+                    # request in the batch lacked it, which misaligned the
+                    # request->context pairing and tripped the length guard in
+                    # chunked_decode_streaming -- zeroing EVERYONE's left
+                    # context, so innocent requests kept their untrimmed
+                    # context frames and repeated ~2 s of audio at each seam.
+                    left_context_size.append(meta.get("left_context_size", 0))
             else:
                 logger.debug("No additional_information provided to code2wav stage.")
             audio_tensors = self.generate_audio(codes, left_context_size, seq_token_counts)
