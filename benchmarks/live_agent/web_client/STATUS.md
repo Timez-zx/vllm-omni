@@ -72,6 +72,65 @@ Neither `selftest.py` nor `probe.py` could have caught either one: the first che
 the protocol, the second never plays a sample and, at the time, ran while the
 counter was still under 4.
 
+## Frames now prefill on arrival, and frame rate is decoupled from TTFA
+
+`prefill_frames_on_arrival` (on by default) appends each retained frame to the live session
+request as it ARRIVES, so its prefill runs while the user is still speaking. Session mode
+already submitted only new frames, so this changes the timing, not the amount.
+
+| frames/turn | OFF median | ON median | ON − OFF |
+|---|---|---|---|
+| ~1 (`frame_filter_min_gap: 8`) | 355.4 ms | 345.5 ms | −9.8 ms (−2.8%) |
+| 3 (`min_gap: 2`) | 419.2 ms | 349.9 ms | **−69.2 ms (−16.5%)** |
+
+**The trend is the result, not either row.** Tripling the frames costs OFF +63.8 ms and ON
++4.4 ms — about **16× less sensitive to frame rate**. At 1 frame per turn the spread also
+tightens 6×: OFF 344–379 ms, ON 343–349 ms, which for a project about *predictable* latency
+is worth more than the median. Reproduce with
+`python prefill_ab.py --direct --rounds 2 --turns 2 --min-gap 2`.
+
+### The engine needed a look-but-do-not-speak switch
+
+Qwen3-Omni has no duplex control plane (`enable_duplex_control` is False and the pipeline
+declares no runtime extension), so MiniCPM's `decide_output` short-circuit was unavailable.
+Two interceptions, and **both** are required — either alone lets a click out:
+
+* `thinker2talker_async_chunk` returns `None`, withholding the content;
+* `chunk_transfer_adapter` also skips the **segment-finish marker**, which it would otherwise
+  ship as an empty payload; the receive side turns that into `prompt_token_ids = [0]` and the
+  talker decodes it.
+
+### Three wrong turns, kept because each was expensive
+
+1. **The first measurement said 6× WORSE.** `probe.py` sends frames ~0.1 s before the query,
+   so there was no idle time and one prefill became two engine round-trips. A latency
+   optimisation measured without the idle time it exists to exploit will always lose.
+2. **The marker channel failed twice, silently.** `additional_information` as a plain dict,
+   then as a real `AdditionalInformationPayload` — neither arrives. That field is populated by
+   the *connector* for stage-to-stage payloads; nothing on the entrypoint's streaming-update
+   path transfers it from the prompt. `SamplingParams.extra_args` is the channel that works,
+   and it travels by construction.
+3. **A −73% "win" that was a bug.** While the marker was being dropped the append reached the
+   talker, its audio landed against the wrong turn, and first-audio looked 4× better. The tell
+   was `first_audio=5.941s` **before** `first_text=6.126s` — impossible within a turn. It was
+   refused as a result at the time, and that refusal was correct: the honest figure is −2.8%
+   to −16.5%.
+
+**The acceptance test is presence, not absence.** Absence of a log line misled this
+investigation twice, so the check is that both lines appear:
+
+```
+[prefill-only] thinker2talker withholding content req=...
+[prefill-only] not shipping the segment marker, stage 0 -> 1, req ...
+```
+
+### Still open
+
+`min_gap: 8` was conservative because frames were paid for at query time. That is no longer
+scarce — but the constraint **moves** rather than disappearing: every retained frame is
+permanent in the thinker's KV, so a higher frame rate now trades against session lifetime
+instead of latency. Unmeasured, and a better-posed question than before.
+
 ## Done and verified
 
 | | |
