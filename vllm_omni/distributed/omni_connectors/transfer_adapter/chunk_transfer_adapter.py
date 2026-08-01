@@ -115,6 +115,20 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         #   been read").
         self._held_non_active: deque[Any] = deque()
         self.requests_num_chunks_sent: dict[str, int] = defaultdict(int)
+        # Boundary-only segment cap (receive side, keyed by internal id).
+        #
+        # A prefill-only append ships NOTHING to this stage but the segment
+        # boundary, yet the parked request still resumes and free-runs decode
+        # from its 1-token placeholder until it samples its own stop -- usually
+        # a few unprompted codec frames, measured up to ~950 (50 s), with the
+        # next REAL segment serialized behind the junk. When a segment finishes
+        # having delivered zero data-bearing chunks, there is nothing legitimate
+        # to speak, so the segment is capped at one token: check_stop fires
+        # FINISHED_LENGTH_CAPPED after the first sample and the segment stop
+        # still ships, which is the contract that must not break (withholding
+        # the segment entirely desynchronised the stages and killed the engine).
+        self.segment_payload_chunks: dict[str, int] = defaultdict(int)
+        self._boundary_cap_saved_max_tokens: dict[str, int] = {}
         self._pending_streaming_prefills: dict[str, dict] = {}
 
     @staticmethod
@@ -231,6 +245,25 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         with self._save_cond:
             self._save_cond.notify()
 
+    @staticmethod
+    def _payload_has_data(payload: Any) -> bool:
+        """True if the decoded payload carries anything beyond meta.
+
+        msgspec omits default (None) fields on the wire, so a boundary-only
+        payload decodes as {"meta": {...}} with no data key present at all.
+        Values are sub-structs decoded as dicts; never bool() a raw tensor.
+        """
+        for key in ("embed", "hidden_states", "ids", "codes", "hidden", "latent"):
+            value = payload.get(key)
+            if value is None:
+                continue
+            if isinstance(value, dict):
+                if value:
+                    return True
+            else:
+                return True
+        return False
+
     def _poll_single_request(self, request: Request):
         stage_id = self.connector.stage_id
         target_stage_id = stage_id - 1
@@ -267,6 +300,38 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 if getattr(request, "resumable", False) and (chunk_id > 0 or replace_prompt):
                     # For new streaming input segment, we should update prompt from payload
                     construct_next_stage_streaming_input_prompt(payload_data, request)
+
+                # Boundary-only segment cap. Structural, not a plumbed flag: the
+                # prefill-only marker itself was lost on this path twice (see the
+                # snapshot comment in _send_single_request), but "the segment
+                # finished and no chunk of it carried data" is readable right
+                # here and identifies the same set of segments. Mutating
+                # request.max_tokens is race-free at this point: the request is
+                # parked in WAITING_FOR_CHUNK while this thread runs, and
+                # _finished_load_reqs.add below is what makes it runnable again.
+                has_data = self._payload_has_data(payload_data)
+                if has_data:
+                    self.segment_payload_chunks[req_id] += 1
+                    saved = self._boundary_cap_saved_max_tokens.pop(req_id, None)
+                    if saved is not None:
+                        request.max_tokens = saved
+                        # Presence probe for the RESTORE side: a missed restore
+                        # caps a real reply at one token, which must be visible.
+                        logger.info(
+                            "[boundary-cap] restored max_tokens=%d for req %s",
+                            saved, req_id,
+                        )
+                if payload_segment_finished:
+                    if not has_data and self.segment_payload_chunks.get(req_id, 0) == 0:
+                        if req_id not in self._boundary_cap_saved_max_tokens:
+                            self._boundary_cap_saved_max_tokens[req_id] = request.max_tokens
+                        request.max_tokens = 1
+                        logger.info(
+                            "[boundary-cap] boundary-only segment: capping req %s "
+                            "at 1 token (was %d)",
+                            req_id, self._boundary_cap_saved_max_tokens[req_id],
+                        )
+                    self.segment_payload_chunks.pop(req_id, None)
 
                 if payload_finished:
                     self.upstream_exhausted_requests.add(req_id)
@@ -553,6 +618,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.upstream_exhausted_requests.discard(request_id)
         self.segment_finished_requests.discard(request_id)
         self.get_req_chunk.pop(request_id, None)
+        self.segment_payload_chunks.pop(request_id, None)
+        self._boundary_cap_saved_max_tokens.pop(request_id, None)
         self.requests_with_ready_chunks.discard(request_id)
         self.request_ids_mapping.pop(request_id, None)
         self.requests_origin_status.pop(request_id, None)
