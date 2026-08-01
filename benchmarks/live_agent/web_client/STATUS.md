@@ -92,19 +92,42 @@ Server-side, `audio_chunks=3` while only one delta carried new samples — so
 `_extract_audio_delta_b64` found `audio_data[chunks_drained:]` empty twice, meaning
 stage 2's audio tensor list did not grow across its three outputs.
 
-### A/B 2: which delta path
+### A/B 2: the delta path is NOT the cause either — also ruled out
 
-`VLLM_VIDEO_AUDIO_DELTA_MODE` selects between `_delta_fast` (emit only the new
-tail) and `_delta_slow` (re-concatenate everything each call). If `slow` delivers
-full-length audio, the fast path's `chunks_drained` accounting is wrong on this
-branch — a precise and fixable finding.
-
-```bash
-tail -8 /data/zx/results/qwen_slow_launch.out
+```
+VLLM_VIDEO_AUDIO_DELTA_MODE=fast (default) :  0.22 s
+VLLM_VIDEO_AUDIO_DELTA_MODE=slow           :  0.22 s     identical
 ```
 
-**Until this is resolved, do not judge audio quality in the browser** — you would
-be listening to a fifth of a second. Everything else about the chain is verified.
+`slow` re-concatenates the whole audio buffer on every call instead of emitting
+only the new tail, so if the fast path's `chunks_drained` bookkeeping were dropping
+samples, `slow` would have recovered them. It did not.
+
+### So the waveform really is 0.22 s, and the loss is upstream of delivery
+
+Both plausible client- and serving-side causes are eliminated by experiment. What
+remains is the **talker → code2wav** path: either the talker sends codec chunks for
+only the first granule, or code2wav stops after producing one. Everything after that
+— the delta extraction, the WAV encoding, the websocket, the page — is demonstrably
+faithful to what it is given.
+
+Where to look next, in order of how cheap it is:
+
+1. `stage_input_processors/qwen3_omni.py` — `talker2code2wav_async_chunk`. There is a
+   known-suspicious line there: `chunk_length = length % chunk_size_config` computed
+   over `code_prompt_token_ids[request_id]`, which is a modulo over the request's
+   **whole lifetime** and is only reset on `finished`. A per-turn accumulator that
+   never resets would produce exactly this shape.
+2. The `codec_left_context_frames: 25` value, which differs from MiniCPM's `3`.
+3. Whether the same truncation happens on the **older** engine with the same probe —
+   that separates "0.26.0 regression" from "always been like this and the harness
+   never noticed because it measured time-to-first-audio, not total audio".
+
+Number 3 is the one that decides whether this is new. `git checkout live-agent`,
+the `omni` env, the same probe.
+
+**Until this is resolved, do not judge audio quality in the browser** — you would be
+listening to a fifth of a second. Everything else about the chain is verified.
 
 ## Genuinely unknown
 
