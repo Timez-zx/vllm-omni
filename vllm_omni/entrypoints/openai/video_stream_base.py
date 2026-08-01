@@ -692,6 +692,7 @@ class OmniStreamingVideoHandler:
                 # Frames prefilled on arrival, and the tokens they cost. Counted because the
                 # whole point is a latency saving that is otherwise invisible: the query-time
                 # delta simply gets smaller, and nothing says why.
+                "query_claimed": False,
                 "arrival_appends": 0,
                 "arrival_frames": 0,
                 "arrival_tokens": 0,
@@ -821,7 +822,9 @@ class OmniStreamingVideoHandler:
                         # `turn_busy` is the discriminator: an append is only ever queued
                         # while no turn is in flight, so anything arriving then is its own.
                         # It cannot latch -- the flag belongs to the turn machinery.
-                        if config.prefill_frames_on_arrival and not sess.get("turn_busy"):
+                        if (config.prefill_frames_on_arrival
+                                and not sess.get("turn_busy")
+                                and not sess.get("query_claimed")):
                             sess["arrival_skipped"] = sess.get("arrival_skipped", 0) + 1
                             continue
 
@@ -896,9 +899,16 @@ class OmniStreamingVideoHandler:
                                 sess["turn_done"].set()
                         else:
                             delta, st["prev_text"] = self._extract_text_delta(output, st["prev_text"])
+                            # Stamp on the first text OUTPUT, not the first non-empty delta.
+                            # The first stage-0 output of a turn often carries no new text (it
+                            # advances internal state only), so keying on `delta` put first_text
+                            # AFTER first_audio by ~17 ms and made an accounting health check
+                            # report a turn as misattributed when nothing was misattributed.
+                            # Measuring the wrong instant is not the same as attributing to the
+                            # wrong turn, and conflating them cost a debugging cycle tonight.
+                            if st["t_first_text"] is None:
+                                st["t_first_text"] = _time.monotonic()
                             if delta:
-                                if st["t_first_text"] is None:
-                                    st["t_first_text"] = _time.monotonic()
                                 st["text_parts"].append(delta)
                                 await websocket.send_json(
                                     {"type": "response.text.delta", "delta": delta}
@@ -944,7 +954,8 @@ class OmniStreamingVideoHandler:
                 query-time path picks it up. A latency optimisation must never be able to lose
                 a frame.
                 """
-                if not sess["first_sent"] or sess.get("turn_busy") or sess["fatal"]:
+                if (not sess["first_sent"] or sess.get("turn_busy")
+                        or sess.get("query_claimed") or sess["fatal"]):
                     return False
                 chunk = await self._build_session_chunk(
                     config, [frame_b64], bytearray(), "", frame_pil_cache,
@@ -1030,6 +1041,7 @@ class OmniStreamingVideoHandler:
                     return
                 sess["turn_busy"] = True
                 try:
+                    sess["query_claimed"] = False
                     await _run_session_turn_body(query_text=query_text)
                 finally:
                     sess["turn_busy"] = False
@@ -1343,6 +1355,20 @@ class OmniStreamingVideoHandler:
                     # drain-only barge-in behaviour session mode needs. A mid-session
                     # abort would pop the engine request and destroy the accumulated KV
                     # that is the entire point of this mode.
+                    # Claim the turn SYNCHRONOUSLY, before the task is scheduled.
+                    #
+                    # create_task only queues the coroutine: `turn_busy = True` inside
+                    # _run_session_turn does not run until the event loop gets round to it, and
+                    # the output loop can be woken in between. The arrival-append suppression
+                    # keys on "no turn in flight", so anything of THIS turn's that lands in that
+                    # window is swallowed -- measured as 2 bad turns in 16, one with chars=0 and
+                    # first_text=-1 (its text eaten) and one with first_audio BEFORE first_text
+                    # (impossible within a turn, so the audio belonged elsewhere).
+                    #
+                    # A separate flag rather than setting turn_busy here: turn_busy also gates
+                    # the overlap refusal, and pre-setting it would make the very next query
+                    # look like an overlap and be rejected.
+                    sess["query_claimed"] = True
                     query_task = asyncio.create_task(_run_session_turn(query_text=query_text))
                     return
 

@@ -306,7 +306,7 @@
       // spurious `<|im_start|>assistant` header plus its one sampled token to the thinker's
       // context, which is the leading suspect for desynchronising the talker's span
       // accounting. A latency win is not worth a dead engine.
-      prefill_frames_on_arrival: false,   // crash FIXED; turn-attribution still off (STATUS.md)
+      prefill_frames_on_arrival: false,   // crash FIXED; proxy-path attribution still broken
       session_roll_at_talker_tokens: 45000,
       session_roll_history_turns: 8,
     };
