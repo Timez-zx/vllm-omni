@@ -614,7 +614,6 @@ class OmniStreamingVideoHandler:
                 # Frames prefilled on arrival, and the tokens they cost. Counted because the
                 # whole point is a latency saving that is otherwise invisible: the query-time
                 # delta simply gets smaller, and nothing says why.
-                "arrival_pending": 0,
                 "arrival_appends": 0,
                 "arrival_frames": 0,
                 "arrival_tokens": 0,
@@ -711,26 +710,28 @@ class OmniStreamingVideoHandler:
                         if interrupt_event.is_set():
                             continue
 
-                        # A prefill-only append still samples one token, because the engine has
-                        # no zero-token append. Nothing about it belongs on the wire: emitting
-                        # response.start plus a one-token text delta would show the user a reply
-                        # to a question they never asked.
+                        # A prefill-only append still samples one token, because the engine
+                        # has no zero-token append. Nothing about it belongs on the wire:
+                        # response.start plus a one-token text delta would show the user a
+                        # reply to a question they never asked.
                         #
-                        # Counted rather than pattern-matched, and RESET on every real turn --
-                        # a hand-maintained counter with no reset is the exact shape that has
-                        # already caused three separate silences in this project. Leaking it
-                        # here would swallow a real turn's output; resetting bounds the worst
-                        # case to losing an append's discarded token.
-                        if sess.get("arrival_pending", 0) > 0 and getattr(output, "stage_id", None) == 0:
-                            _ro = getattr(output, "request_output", None)
-                            _outs = getattr(_ro, "outputs", None) if _ro is not None else None
-                            _co = _outs[0] if _outs else None
-                            if _co is not None and getattr(_co, "finish_reason", None) is not None:
-                                sess["arrival_pending"] -= 1
-                                logger.info(
-                                    "[session] prefill-on-arrival append settled (pending=%d)",
-                                    sess["arrival_pending"],
-                                )
+                        # DISCRIMINATED BY WHETHER A TURN IS IN FLIGHT, not by counting.
+                        # Counting was tried and it failed in a way worth recording: the
+                        # counter was decremented on "the next stage-0 output carrying a
+                        # finish_reason", the append's output did not carry one where it was
+                        # expected, and so the counter stayed armed into the following turn --
+                        # measured swallowing 13 of that turn's text tokens (arrival_skipped=13)
+                        # and then settling on ITS finish, which also produced a second,
+                        # spurious turn boundary. Two symptoms, one unreset counter; the same
+                        # shape as three earlier silences in this project.
+                        #
+                        # An append is only ever queued while no turn is in flight, so "no turn
+                        # in flight" identifies its outputs positively and cannot latch: the
+                        # state it reads is owned by the turn machinery, not by this branch.
+                        if (config.prefill_frames_on_arrival
+                                and not sess.get("turn_busy")
+                                and getattr(output, "stage_id", None) == 0):
+                            sess["arrival_skipped"] = sess.get("arrival_skipped", 0) + 1
                             continue
 
                         if not st["started"]:
@@ -756,12 +757,15 @@ class OmniStreamingVideoHandler:
                                 await websocket.send_json({"type": "response.audio.done"})
                                 logger.info(
                                     "[session] turn=%d done first_text=%.3fs "
-                                    "first_audio=%.3fs audio_chunks=%d chars=%d",
+                                    "first_audio=%.3fs audio_chunks=%d chars=%d "
+                                    "arrival_skipped=%d",
                                     sess["turn_idx"],
                                     (st["t_first_text"] - st["t0"]) if st["t_first_text"] else -1.0,
                                     (st["t_first_audio"] - st["t0"]) if st["t_first_audio"] else -1.0,
                                     st["audio_chunks"], len("".join(st["text_parts"])),
+                                    sess.get("arrival_skipped", 0),
                                 )
+                                sess["arrival_skipped"] = 0
                                 # The audio the talker just generated is appended to its own
                                 # accumulated token array, so it counts against the same
                                 # max_model_len as the deltas do -- and it is the larger of
@@ -871,7 +875,6 @@ class OmniStreamingVideoHandler:
                     # the receive loop, which also forwards generated audio.
                     return False
                 ntok = len(chunk.get("prompt_token_ids") or ())
-                sess["arrival_pending"] += 1
                 sess["arrival_appends"] += 1
                 sess["arrival_frames"] += 1
                 sess["arrival_tokens"] += ntok
@@ -1033,14 +1036,6 @@ class OmniStreamingVideoHandler:
                 if sess["gen_task"] is None:
                     sess["gen_task"] = asyncio.create_task(_session_output_loop())
                 sess["first_sent"] = True
-                # Any append still unaccounted for cannot be allowed to eat this turn.
-                if sess.get("arrival_pending", 0):
-                    logger.warning(
-                        "[session] %d prefill-on-arrival append(s) never settled; clearing so "
-                        "this turn's output cannot be swallowed",
-                        sess["arrival_pending"],
-                    )
-                    sess["arrival_pending"] = 0
                 await sess["queue"].put(chunk)
                 # Bounded wait. A lost segment boundary must surface as an error rather
                 # than a hang: the first bring-up attempt used an unusable boundary signal
