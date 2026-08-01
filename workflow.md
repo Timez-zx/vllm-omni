@@ -404,11 +404,13 @@ approach changed from "guess a cause and test it" to "read the whole path at onc
 code say". The lesson generalises: when several different fixes fail in **identical** ways, stop
 looking for one missing cause and start suspecting two.
 
-**One number to treat with care.** With the bookkeeping now correct, the reply starts about
-**a third sooner**. An earlier, much larger figure was measured while some replies were being
-credited to the wrong turn, so it is not trustworthy. The claim that "sending pictures more often
-is now free" was also measured before the fixes and **still needs re-measuring** — it is the real
-selling point, so it deserves a clean number rather than an encouraging one.
+**The clean number, finally (re-measured 2026-08-01 after every fix in section 13).** Tripling
+the pictures per turn costs **+41 ms with this off and +10 ms with it on** — about **4× less
+sensitive to frame rate**, and the reply time's spread tightens from 43 ms to 8 ms, which is
+the half that matters for predictability. An earlier **16×** figure was measured while some
+replies were being credited to the wrong turn; it was inflated and is withdrawn. This is what
+"measure again after the bookkeeping is fixed" exists for: the effect is real, and it is a
+quarter of the size first claimed.
 
 ---
 
