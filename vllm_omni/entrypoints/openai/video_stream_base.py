@@ -51,9 +51,23 @@ from vllm_omni.entrypoints.openai.video_frame_filter import FrameSimilarityFilte
 from vllm_omni.entrypoints.openai.video_stream_context import (
     text_only_message,
 )
+from vllm_omni.model_executor.stage_input_processors.tts_utils import (
+    PREFILL_ONLY_KEY as _TTS_PREFILL_ONLY_KEY,
+)
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+# Marker for an append that must be prefilled but never answered. Kept identical to
+# tts_utils.PREFILL_ONLY_KEY, and asserted equal at import so the two cannot drift: the
+# failure mode of a mismatch is the model speaking unasked, which is loud but points at
+# the wrong place.
+_PREFILL_ONLY_KEY = "vllm_omni_prefill_only"
+
+assert _PREFILL_ONLY_KEY == _TTS_PREFILL_ONLY_KEY, (
+    "prefill-only marker key drifted between the entrypoint and the stage processors; the "
+    "engine would stop recognising it and the talker would speak unasked"
+)
 
 _DEFAULT_IDLE_TIMEOUT = 60.0
 _DEFAULT_CONFIG_TIMEOUT = 10.0
@@ -477,6 +491,26 @@ class StreamingVideoSessionConfig(BaseModel):
             "This is what makes the session unbounded in TIME while bounded in MEMORY."
         ),
     )
+    prefill_frames_on_arrival: bool = Field(
+        default=False,
+        description=(
+            "Turn each retained frame into tokens WHEN IT ARRIVES instead of when the query "
+            "is submitted, so the vision encoder and the thinker's prefill for it run while "
+            "the user is still speaking rather than on the critical path.\n\n"
+            "Session mode already prefills incrementally -- each turn submits only its new "
+            "frames, never the history -- so what this changes is the TIMING, not the amount. "
+            "The saving is therefore modest at conservative frame rates (measured ~2.5 new "
+            "frames per turn = ~550 tokens = ~44 ms of prefill plus ~20 ms of copy). The real "
+            "reason to want it is that it DECOUPLES frame rate from time-to-first-audio: today "
+            "every extra frame per turn is paid at query time, which is why frame_filter_min_gap "
+            "is set as conservatively as it is.\n\n"
+            "Requires the prefill-only append path: such a chunk must reach stage 0 and stop "
+            "there, because anything that reaches the talker makes the model speak when nobody "
+            "asked it to. Costs one sampled token per append (the engine has no zero-token "
+            "append), which enters the context and is discarded.\n\n"
+            "Needs session_scoped_request; without a live request there is nothing to append to."
+        ),
+    )
 
 
 class OmniStreamingVideoHandler:
@@ -577,6 +611,13 @@ class OmniStreamingVideoHandler:
                 "transcript": [],
                 "pending_query": None,
                 "rolls": 0,
+                # Frames prefilled on arrival, and the tokens they cost. Counted because the
+                # whole point is a latency saving that is otherwise invisible: the query-time
+                # delta simply gets smaller, and nothing says why.
+                "arrival_pending": 0,
+                "arrival_appends": 0,
+                "arrival_frames": 0,
+                "arrival_tokens": 0,
             }
             session_request_id = f"video-sess-{uuid.uuid4().hex[:12]}"
 
@@ -592,10 +633,24 @@ class OmniStreamingVideoHandler:
                 """
                 from vllm.engine.protocol import StreamingInput
 
+                from vllm.sampling_params import SamplingParams
+
                 while True:
                     item = await sess["queue"].get()
                     if item is None:
                         return
+                    # A prefill-only append rides through as (prompt, max_tokens). Without a
+                    # per-chunk cap it would generate a whole answer to a question nobody
+                    # asked: the delta ends in the assistant header, so the model answers.
+                    # The talker never sees it, so it would be silent -- and still burn a
+                    # reply's worth of decode and leave that reply in the context.
+                    if isinstance(item, tuple):
+                        prompt, max_tokens = item
+                        yield StreamingInput(
+                            prompt=prompt,
+                            sampling_params=SamplingParams(max_tokens=max_tokens),
+                        )
+                        continue
                     yield StreamingInput(prompt=item)
 
             def _new_turn_state() -> dict[str, Any]:
@@ -655,6 +710,29 @@ class OmniStreamingVideoHandler:
                             )
                         if interrupt_event.is_set():
                             continue
+
+                        # A prefill-only append still samples one token, because the engine has
+                        # no zero-token append. Nothing about it belongs on the wire: emitting
+                        # response.start plus a one-token text delta would show the user a reply
+                        # to a question they never asked.
+                        #
+                        # Counted rather than pattern-matched, and RESET on every real turn --
+                        # a hand-maintained counter with no reset is the exact shape that has
+                        # already caused three separate silences in this project. Leaking it
+                        # here would swallow a real turn's output; resetting bounds the worst
+                        # case to losing an append's discarded token.
+                        if sess.get("arrival_pending", 0) > 0 and getattr(output, "stage_id", None) == 0:
+                            _ro = getattr(output, "request_output", None)
+                            _outs = getattr(_ro, "outputs", None) if _ro is not None else None
+                            _co = _outs[0] if _outs else None
+                            if _co is not None and getattr(_co, "finish_reason", None) is not None:
+                                sess["arrival_pending"] -= 1
+                                logger.info(
+                                    "[session] prefill-on-arrival append settled (pending=%d)",
+                                    sess["arrival_pending"],
+                                )
+                            continue
+
                         if not st["started"]:
                             await websocket.send_json({"type": "response.start"})
                             st["started"] = True
@@ -748,6 +826,63 @@ class OmniStreamingVideoHandler:
                     logger.exception("[session] output loop failed")
                     sess["fatal"] = str(e)
                     sess["turn_done"].set()   # never leave a turn waiting forever
+
+            async def _prefill_frame_on_arrival(frame_b64: str) -> None:
+                """Append one just-arrived frame to the live request so stage 0 prefills it now.
+
+                The append carries no query text, and `max_tokens=1` because the engine has no
+                zero-token append -- a streaming update is scheduled, prefills, samples, and
+                stops. That one token lands in the context and is thrown away; at 0.25 retained
+                frames per second it is noise next to the 220 tokens the frame itself costs.
+
+                Two conditions, both load-bearing:
+
+                * Not while a turn is in flight. The queue is the same one the turn's delta
+                  goes through, so slipping a frame in mid-turn would put an append between a
+                  turn's chunk and its answer, and the segment boundary the output loop waits
+                  on would belong to the wrong thing.
+                * Only after the first real chunk. The first chunk carries the system prompt
+                  and the roll seed; a frames-only append cannot go first without stealing
+                  that position.
+
+                Failure is deliberately soft: the frame stays in frame_buffer and the ordinary
+                query-time path picks it up. A latency optimisation must never be able to lose
+                a frame.
+                """
+                if not sess["first_sent"] or sess.get("turn_busy") or sess["fatal"]:
+                    return False
+                chunk = await self._build_session_chunk(
+                    config, [frame_b64], bytearray(), "", frame_pil_cache,
+                    is_first=False,
+                )
+                if chunk is None or not isinstance(chunk, dict):
+                    return False
+                # The marker the engine side reads to keep this append away from the talker.
+                info = chunk.get("additional_information")
+                info = dict(info) if isinstance(info, dict) else {}
+                info[_PREFILL_ONLY_KEY] = "1"
+                chunk["additional_information"] = info
+                try:
+                    # 1, not 0: the engine schedules, prefills, samples, stops -- there is no
+                    # zero-token append. One token is the floor, and it is discarded.
+                    sess["queue"].put_nowait((chunk, 1))
+                except asyncio.QueueFull:
+                    # The engine is behind. Leave the frame where it is rather than blocking
+                    # the receive loop, which also forwards generated audio.
+                    return False
+                ntok = len(chunk.get("prompt_token_ids") or ())
+                sess["arrival_pending"] += 1
+                sess["arrival_appends"] += 1
+                sess["arrival_frames"] += 1
+                sess["arrival_tokens"] += ntok
+                sess["cum_tokens"] = sess.get("cum_tokens", 0) + ntok
+                logger.info(
+                    "[session] prefill-on-arrival: frame -> %d tokens (appends=%d frames=%d "
+                    "tokens=%d cum=%d)",
+                    ntok, sess["arrival_appends"], sess["arrival_frames"],
+                    sess["arrival_tokens"], sess.get("cum_tokens", 0),
+                )
+                return True
 
             async def _run_session_turn(*, query_text: str) -> None:
                 """Serialise turns, and refuse to overlap two of them.
@@ -898,6 +1033,14 @@ class OmniStreamingVideoHandler:
                 if sess["gen_task"] is None:
                     sess["gen_task"] = asyncio.create_task(_session_output_loop())
                 sess["first_sent"] = True
+                # Any append still unaccounted for cannot be allowed to eat this turn.
+                if sess.get("arrival_pending", 0):
+                    logger.warning(
+                        "[session] %d prefill-on-arrival append(s) never settled; clearing so "
+                        "this turn's output cannot be swallowed",
+                        sess["arrival_pending"],
+                    )
+                    sess["arrival_pending"] = 0
                 await sess["queue"].put(chunk)
                 # Bounded wait. A lost segment boundary must surface as an error rather
                 # than a hang: the first bring-up attempt used an unusable boundary signal
@@ -1263,6 +1406,16 @@ class OmniStreamingVideoHandler:
                             }
                         )
                         self.on_frame_buffered(raw_bytes, frame_data, message_history, config)
+                        # Prefill this frame now rather than when the query arrives. Only if it
+                        # is actually consumed does it leave frame_buffer -- see the helper: a
+                        # refusal leaves the frame for the ordinary query-time path.
+                        if config.prefill_frames_on_arrival and config.session_scoped_request:
+                            if await _prefill_frame_on_arrival(frame_data):
+                                try:
+                                    frame_buffer.remove(frame_data)
+                                except ValueError:
+                                    pass
+                                frame_pil_cache.pop(frame_data, None)
                         await self._send_frame_ack(
                             websocket,
                             msg,

@@ -34,6 +34,13 @@
         </select>
         <button id="talkButton" class="secondary" type="button" disabled>Hold to talk</button>
       </div>
+      <p class="note">
+        This model has no listen/speak decision of its own &mdash; its vocabulary contains no such
+        token, and the server never starts a turn by itself. So <strong>this page</strong> decides
+        when you have finished: either a silence detector, or the button. That is a real difference
+        from a natively full-duplex model, not a shortcut, and it is stated here so the two are not
+        confused. Space bar works too.
+      </p>
       <div class="row">
         <label for="playbackMode">Start speaking&hellip;</label>
         <select id="playbackMode">

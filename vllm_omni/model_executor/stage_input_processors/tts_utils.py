@@ -73,6 +73,44 @@ def extract_speaker_from_request(request: Any) -> str | None:
     return None
 
 
+PREFILL_ONLY_KEY = "vllm_omni_prefill_only"
+
+
+def request_is_prefill_only(request: Any) -> bool:
+    """Is this append meant to be READ but not answered?
+
+    A frames-on-arrival append exists to get the frames prefilled into stage 0's KV while
+    the user is still talking. It must stop there: every payload that reaches the talker
+    makes the model speak, and nobody asked it to.
+
+    The marker rides on ``additional_information`` because that is the only channel that
+    survives the trip -- the entrypoint and the stage processes are separate processes, so
+    a flag in memory would not cross, and inferring it from the shape of the append (say,
+    max_tokens == 1) would silently mislabel any future caller that happens to want one
+    token.
+
+    Reads both the structured engine form (``entries[key].list_data``) and a plain dict,
+    because the prompt carries a dict and the engine request carries the structured form.
+    """
+    info = getattr(request, "additional_information", None)
+    if info is None:
+        return False
+    entries = getattr(info, "entries", None)
+    if not isinstance(entries, dict):
+        entries = info if isinstance(info, dict) else None
+        if entries is None:
+            return False
+    entry = entries.get(PREFILL_ONLY_KEY)
+    if entry is None:
+        return False
+    list_data = getattr(entry, "list_data", None)
+    if isinstance(list_data, list) and list_data:
+        entry = list_data[0]
+    if isinstance(entry, list) and entry:
+        entry = entry[0]
+    return str(entry).strip().lower() in ("1", "true", "yes")
+
+
 def extract_speaker_from_prompt(
     prompt: Any,
     index: int = 0,

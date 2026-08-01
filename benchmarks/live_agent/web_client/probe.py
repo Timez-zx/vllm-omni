@@ -76,6 +76,9 @@ def session_config(system_prompt: str) -> dict:
         "frame_filter_max_gap": 16,
         "use_audio_in_video": True,
         "session_scoped_request": True,
+        # Off by default: measured 0.36 s -> 2.12 s first_audio HERE, because this probe
+        # sends frames ~0.1 s before the query and so has no idle gap to exploit.
+        "prefill_frames_on_arrival": False,
         "session_roll_at_talker_tokens": 45000,
         "session_roll_history_turns": 8,
     }

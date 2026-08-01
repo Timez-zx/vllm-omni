@@ -28,6 +28,7 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_language_from_request,
     extract_speaker_from_prompt,
     extract_speaker_from_request,
+    request_is_prefill_only,
 )
 
 logger = logging.getLogger(__name__)
@@ -446,6 +447,20 @@ def thinker2talker_async_chunk(
 
     request_id = request.external_req_id
     chunk_id = transfer_manager.put_req_chunk[request_id]
+
+    # LOOK BUT DO NOT SPEAK. A frames-on-arrival append exists only to get its frames
+    # prefilled into stage 0's KV while the user is still talking, so nothing about it may
+    # reach the talker -- every payload that does makes the model speak unasked.
+    #
+    # Returning None here is not enough on its own: the caller in chunk_transfer_adapter
+    # ships an EMPTY payload anyway when the segment finishes, so the boundary marker
+    # reaches the next stage. That empty payload is what the receive side turns into a
+    # one-token placeholder prompt, which the talker would then decode. The adapter has a
+    # matching guard for this marker; both are needed, and either alone lets a click out.
+    if request_is_prefill_only(request):
+        logger.debug("thinker2talker_async_chunk: prefill-only append, withholding req=%s", request_id)
+        return None
+
     if not isinstance(multimodal_output, Mapping):
         logger.debug("thinker2talker_async_chunk: skip non-dict multimodal_output for req=%s", request_id)
         return None

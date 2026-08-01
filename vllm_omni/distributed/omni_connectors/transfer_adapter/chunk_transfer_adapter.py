@@ -27,6 +27,19 @@ logger = get_connector_logger(__name__)
 _LOG_TRANSFER = os.environ.get("VLLM_OMNI_LOG_TRANSFER", "0") not in ("0", "false", "False", "")
 
 
+
+def _request_is_prefill_only(request: Any) -> bool:
+    """Late import: tts_utils lives under model_executor and importing it at module scope
+    would tie this transport-level file to a model package."""
+    try:
+        from vllm_omni.model_executor.stage_input_processors.tts_utils import (
+            request_is_prefill_only,
+        )
+    except Exception:
+        return False
+    return request_is_prefill_only(request)
+
+
 class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     """Chunk-level transfer adapter for Omni connector pipelines.
 
@@ -411,6 +424,23 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if payload_data is None:
             if not (is_segment_finished or is_finished):
+                return
+            # A prefill-only append must not ship even the boundary marker. The empty
+            # payload below is turned into a one-token placeholder prompt by the receive
+            # side (see "Preserve an explicit scheduler boundary"), which the next stage
+            # then decodes -- for the talker that is a fraction of a second of audio the
+            # user never asked for. The upstream processor already withheld the content;
+            # without this the marker still gets through and the click still happens.
+            #
+            # Skipping the put also leaves put_req_chunk untouched, which is what keeps
+            # the delta-shipping branch (chunk_id > 0) selected for the real turns.
+            if _request_is_prefill_only(request):
+                logger.debug(
+                    "chunk_transfer_adapter: prefill-only append, not shipping stage %s -> %s for %s",
+                    stage_id,
+                    next_stage_id,
+                    external_req_id,
+                )
                 return
             # Segment/request finish markers must still reach downstream even when
             # the processor has no tensor payload.

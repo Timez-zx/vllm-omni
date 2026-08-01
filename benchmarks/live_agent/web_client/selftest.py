@@ -110,6 +110,19 @@ def main() -> int:
     check("the page handles every response./session. event the server emits",
           not unhandled, f"unhandled: {unhandled}" if unhandled else f"{len(notable)} events")
 
+    # probe.py claims to send "deliberately the same values app.js sends, so this probe and
+    # the page exercise one configuration rather than two". That claim drifted the moment a
+    # new field was added to one of them, and the symptom was a feature that simply never
+    # fired with no error anywhere. Compare the key sets rather than trusting the comment.
+    probe_src = (HERE / "probe.py").read_text(encoding="utf-8")
+    probe_keys = set(re.findall(r'^\s*"([a-z_]+)":', probe_src, re.M)) & known
+    page_only = sorted(set(sent) - probe_keys)
+    probe_only = sorted(probe_keys - set(sent))
+    check("probe.py and the page send the same session config",
+          not page_only and not probe_only,
+          f"page-only {page_only}, probe-only {probe_only}" if (page_only or probe_only)
+          else f"{len(probe_keys)} keys in both")
+
     # ---- 3. the audio contract, both directions ----
     print("\n3. audio contract")
     check("uplink is raw PCM16 at 16 kHz", "INPUT_RATE = 16000" in app_js
