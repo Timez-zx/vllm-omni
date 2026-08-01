@@ -64,7 +64,8 @@ async def one_turn(ws, state, *, speak_s: float, label: str) -> float | None:
     return state["first_audio_ms"]
 
 
-async def run_arm(url: str, *, prefill: bool, turns: int, speak_s: float) -> list[float]:
+async def run_arm(url: str, *, prefill: bool, turns: int, speak_s: float,
+                  min_gap: int | None = None) -> list[float]:
     import websockets
 
     cfg = session_config(
@@ -72,6 +73,13 @@ async def run_arm(url: str, *, prefill: bool, turns: int, speak_s: float) -> lis
         "Reply out loud in one short sentence. Always answer with both text and speech."
     )
     cfg["prefill_frames_on_arrival"] = prefill
+    if min_gap is not None:
+        # The premise of the feature is that it decouples frame rate from TTFA, so the
+        # experiment has to be able to raise the frames-per-turn. min_gap is what bounds it:
+        # at the shipped 8, only ~1 frame per turn is retained and there is almost nothing to
+        # move off the critical path.
+        cfg["frame_filter_min_gap"] = min_gap
+        cfg["frame_filter_max_gap"] = max(min_gap * 2, min_gap + 1)
 
     async with websockets.connect(url, max_size=None, ping_interval=20) as ws:
         await ws.send(json.dumps(cfg))
@@ -124,7 +132,8 @@ async def main_async(args) -> int:
         # Alternate the order too, so a warming trend cannot favour one arm.
         order = [False, True] if rnd % 2 == 0 else [True, False]
         for prefill in order:
-            got = await run_arm(url, prefill=prefill, turns=args.turns, speak_s=args.speak_s)
+            got = await run_arm(url, prefill=prefill, turns=args.turns, speak_s=args.speak_s,
+                                min_gap=args.min_gap)
             (on if prefill else off).extend(got)
 
     def show(name: str, xs: list[float]) -> None:
@@ -158,6 +167,8 @@ def main() -> int:
                    help="how long media streams before the query -- this IS the idle time")
     p.add_argument("--turns", type=int, default=2, help="measured turns per arm per round")
     p.add_argument("--rounds", type=int, default=2)
+    p.add_argument("--min-gap", type=int, default=None,
+                   help="frame_filter_min_gap; lower keeps more frames per turn")
     return asyncio.run(main_async(p.parse_args()))
 
 
