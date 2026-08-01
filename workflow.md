@@ -295,6 +295,59 @@ comparison stays reproducible rather than becoming a story about how things used
 
 ---
 
+## 11. You can now talk to it from a browser
+
+*2026-07-31 19:00 – 20:30 · `2452f4dd` bring this work onto upstream main · `ccff770e` the browser client · `5dfc170d` a deploy config that fits*
+
+**Scenario.** You want to hold an actual conversation with it — your own camera and
+microphone, its voice back — rather than driving it from a benchmark script.
+
+**What used to happen.** The only clients were measurement harnesses. They send
+frames and audio from files on disk, on a fixed schedule, and they ask their
+question as text. Useful for numbers, useless for finding out whether talking to
+the thing feels like anything.
+
+**What happens now.** A web page. It captures your camera and microphone, streams
+both continuously, and plays the reply. One command each for the server and the
+page, one forwarded port, and `localhost` counts as a secure context so the
+browser grants camera and microphone with no certificate to set up.
+
+Most of it was **not written from scratch** — upstream ships a browser client for a
+different model, and its microphone capture and stylesheet are used verbatim. What
+had to be rewritten is the part that speaks to *this* server, because the two
+protocols differ in three ways that each fail quietly:
+
+* audio **up** is raw samples; audio **down** is a complete sound *file* per chunk.
+  Gluing those files together end to end puts a 44-byte header into the audio every
+  chunk, which is a click you would blame on the model.
+* pictures are their own message here, not an attachment to the audio.
+* **something has to say "I've finished speaking"**, and on this model that
+  something has to be the page. See below.
+
+**The honest part.** This model has no way to decide when to talk. There is no such
+choice in its vocabulary, and the server never starts a reply on its own. So the
+page decides — either it notices you have gone quiet for 0.7 s, or you hold a
+button. **The page says this on screen**, because the other model in this repo
+*does* make that decision itself, and someone comparing the two deserves to know
+which one is actually driving.
+
+**Effect.** Verified without a browser first, so the result is about the server
+rather than about one laptop: five turns, every one produced text and speech, first
+sound at **340–376 ms**. That is the same order as the 513 ms measured before,
+which is reassuring but is **not** the same experiment — different engine version,
+fewer concurrent slots.
+
+**And a bug the check nearly missed.** "Does it produce audio?" passed. Then the
+same question was asked with a longer reply, and the answer did not change: a
+34-character reply and a 104-character reply both deliver **0.22 seconds** of
+sound. Only the first small piece of speech reaches the page; the rest is made and
+lost. A second run with our own newest change switched off produced the same 0.22 s,
+so **that change is not the cause** — the loss is in the path this branch inherited.
+Recorded, not worked around, and the page is not worth listening to until it is
+fixed.
+
+---
+
 ## Where things stand
 
 **Working**
@@ -305,6 +358,7 @@ comparison stays reproducible rather than becoming a story about how things used
 - Warning before the limit, and the distance to it visible every turn
 - Three kinds of silent freeze now report themselves
 - The speech stage no longer carries the pictures — **25× less to hold per turn**
+- **A browser client**: your own camera and microphone in, its voice out, one forwarded port
 
 **Verified**
 
@@ -313,6 +367,8 @@ comparison stays reproducible rather than becoming a story about how things used
 - Memory in a long conversation did not get worse (**as long as no swap happens**)
 - Speech still produced on **every** turn with the pictures withheld from the speech stage
   (5 turns each way)
+- The browser path end to end on the newer engine: **5 turns, all produced speech, first sound
+  340–376 ms** — verified without a browser, so it is a statement about the server
 
 **Explicitly not done or not measured**
 
@@ -324,6 +380,11 @@ comparison stays reproducible rather than becoming a story about how things used
 - The broken count is only **worked around** here; it has **not been fixed upstream.**
 - **Nobody has listened to the audio** since the pictures were withheld from the speech stage, and
   **how much longer a conversation now runs is not measured** (section 10).
+- **The browser's audio is truncated to 0.22 s per turn** (section 11). The chain works; the sound
+  does not yet. Ruled out as ours by an A/B, cause not yet found.
+- **The numbers on the newer engine are not the old numbers.** 513 ms and the 40-turn roll run were
+  measured on the older engine with a different config; they need re-running before anything is
+  compared across the two.
 
 ---
 
