@@ -42,6 +42,11 @@ from vllm_omni.distributed.omni_connectors.adapter import TALKER_TEXT_ONLY
 print('   optimisations present; talker text-only =', TALKER_TEXT_ONLY)
 " 2>&1 | grep -vE "NVFP4|RuntimeWarning|^This typically|^Using fallback|from .version|_version'|patch.py" || exit 1
 
+# Keep the PREVIOUS log instead of truncating it. A crash is investigated after the fact,
+# by which time the natural next move is to restart -- and truncating here destroyed the only
+# copy of a stage-1 CUDA device-side assert that had just killed the engine. One generation
+# back is enough and costs nothing.
+[ -s "$LOG" ] && mv -f "$LOG" "$LOG.prev"
 : > "$LOG"
 # TALKER_TEXT_ONLY is passed through so the A/B can be run without editing this
 # file: VLLM_OMNI_TALKER_TEXT_ONLY=0 bash run_qwen_server.sh gives the control arm.

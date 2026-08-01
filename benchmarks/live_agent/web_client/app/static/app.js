@@ -299,7 +299,14 @@
       // critical path). The SPREAD is the real result: 6x tighter, because frame prefill is
       // no longer racing the query. An earlier measurement claimed -73%; that was audio
       // landing against the wrong turn, and it went away when the marker was fixed.
-      prefill_frames_on_arrival: true,
+      // OFF: it CRASHES THE ENGINE in real browser use. A stage-1 CUDA device-side assert
+      // (torch.AcceleratorError / cudaErrorAssert) killed the engine core about 10 s into a
+      // hand-driven session. My own A/B survived because it retains ~1-3 frames per turn;
+      // the browser streams continuously, so appends accumulate -- and each append adds a
+      // spurious `<|im_start|>assistant` header plus its one sampled token to the thinker's
+      // context, which is the leading suspect for desynchronising the talker's span
+      // accounting. A latency win is not worth a dead engine.
+      prefill_frames_on_arrival: false,
       session_roll_at_talker_tokens: 45000,
       session_roll_history_turns: 8,
     };
