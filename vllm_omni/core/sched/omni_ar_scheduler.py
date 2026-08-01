@@ -110,6 +110,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     _STARVED_REPORT_EVERY_S = 5.0
     _starved_reported_t = 0.0
     _counter_repaired_t = 0.0
+    _counter_clamped_t = 0.0
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -436,6 +437,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.waiting, self.running, scheduler_requests=self.requests
             )
 
+
+        self._clamp_streaming_parked_counter()
 
         original_waiting = None
         if self._should_defer_waiting_admission():
@@ -1392,6 +1395,56 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 getattr(adapter, "requests_origin_status", {}).pop(request.request_id, None)
             request.status = RequestStatus.WAITING
             self._enqueue_waiting_request(request)
+
+    def _clamp_streaming_parked_counter(self) -> None:
+        """Stop a leaked `num_waiting_for_streaming_input` from closing admission for good.
+
+        The same leak `get_num_unfinished_requests` works around has a SECOND consumer, and
+        deriving the count there does nothing for this one. Upstream's waiting loop gates
+        admission on
+
+            num_running = len(self.running) + self.num_waiting_for_streaming_input
+            if num_running >= self.max_num_running_reqs: break
+
+        so once the leaked counter reaches `max_num_seqs` the loop breaks on its first pass
+        forever. Nothing is admitted, nothing runs, and -- unlike the parked-loop failure --
+        `schedule()` keeps being called, so the heartbeat keeps printing and the stage looks
+        alive. Measured on stage 1 with `max_num_seqs: 4`: the counter climbed 1, 2, 3, 4 across
+        four browser sessions and the FIFTH session got text from stage 0 and never one audio
+        token, ending in `has been tracked for 45s and has sampled ZERO output tokens`. The
+        engine survived exactly `max_num_seqs` sessions. Read as a client bug it is invisible:
+        the reply arrives, only the voice is missing.
+
+        The check is against `self.requests`, deliberately, not against the two queues. Clamping
+        to a queue-derived count was tried in `get_num_unfinished_requests` and made things
+        worse -- the chunk transfer adapter holds a parked request OUT of both queues, so the
+        queue-derived count is legitimately 0 there, and zeroing the counter left upstream to
+        decrement it to -1. Every tracked request is in `self.requests` whoever is holding it,
+        which makes this bound the true one.
+
+        Only ever clamps DOWN. Leaking is the failure that has been observed; a counter that is
+        too LOW would mean a park this scheduler never saw, and inventing slots to cover that
+        would hide it.
+        """
+        parked = sum(
+            1 for request in self.requests.values()
+            if getattr(request, "status", None) == RequestStatus.WAITING_FOR_STREAMING_REQ
+        )
+        if self.num_waiting_for_streaming_input <= parked:
+            return
+        leaked = self.num_waiting_for_streaming_input - parked
+        self.num_waiting_for_streaming_input = parked
+        now = time()
+        if now - self._counter_clamped_t >= self._STARVED_REPORT_EVERY_S:
+            self._counter_clamped_t = now
+            logger.warning(
+                "[OmniARScheduler] stage %s streaming-parked counter had leaked %d slot(s) "
+                "(was %d, actually parked %d of %d tracked); clamped. At max_num_seqs=%d a leak "
+                "of that size closes admission permanently.",
+                self.vllm_config.model_config.stage_id,
+                leaked, parked + leaked, parked, len(self.requests),
+                self.max_num_running_reqs,
+            )
 
     def get_num_unfinished_requests(self) -> int:
         """Derive the streaming-parked count from the queues instead of trusting a counter.

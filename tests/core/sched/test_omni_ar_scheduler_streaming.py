@@ -311,3 +311,68 @@ def test_model_intermediate_streaming_payload_replaces_computed_prompt() -> None
     assert session.additional_information is None
     assert session.model_intermediate_buffer == update.model_intermediate_buffer
     assert session.status == RequestStatus.WAITING
+
+
+def _make_clamp_scheduler(*, tracked_statuses: list[RequestStatus], counter: int, max_seqs: int = 4):
+    """Just enough scheduler for `_clamp_streaming_parked_counter`.
+
+    Tracked requests are given only a `status`, which is the only field the clamp reads --
+    deliberately, since the point of counting over `self.requests` rather than over the
+    queues is that it does not care where a request is being held.
+    """
+    sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=1))
+    sched.num_waiting_for_streaming_input = counter
+    sched.max_num_running_reqs = max_seqs
+    sched.requests = {
+        f"req-{i}": SimpleNamespace(status=status) for i, status in enumerate(tracked_statuses)
+    }
+    sched._counter_clamped_t = 0.0
+    return sched
+
+
+def test_clamp_repairs_the_leak_that_closes_admission():
+    """The measured wedge: counter at max_num_seqs, nothing actually parked.
+
+    Upstream's waiting loop breaks when `len(running) + counter >= max_num_running_reqs`, so
+    a counter stuck at max_num_seqs admits nothing, forever, while `schedule()` keeps running
+    and the stage keeps looking alive.
+    """
+    sched = _make_clamp_scheduler(tracked_statuses=[RequestStatus.WAITING], counter=4, max_seqs=4)
+    sched._clamp_streaming_parked_counter()
+    assert sched.num_waiting_for_streaming_input == 0
+
+
+def test_clamp_counts_requests_the_queues_cannot_see():
+    """Genuinely parked requests must keep their slots.
+
+    This is the case that made an earlier queue-derived repair worse: the chunk transfer
+    adapter holds a parked request out of both queues, so a queue-derived count reads 0 and
+    the repair zeroed a counter upstream then decremented to -1. Counting over
+    `self.requests` sees the request wherever it is held.
+    """
+    sched = _make_clamp_scheduler(
+        tracked_statuses=[RequestStatus.WAITING_FOR_STREAMING_REQ] * 2,
+        counter=2,
+    )
+    sched._clamp_streaming_parked_counter()
+    assert sched.num_waiting_for_streaming_input == 2
+
+
+def test_clamp_removes_only_the_excess():
+    sched = _make_clamp_scheduler(
+        tracked_statuses=[RequestStatus.WAITING_FOR_STREAMING_REQ, RequestStatus.RUNNING],
+        counter=3,
+    )
+    sched._clamp_streaming_parked_counter()
+    assert sched.num_waiting_for_streaming_input == 1
+
+
+def test_clamp_never_invents_slots():
+    """Too LOW means a park this scheduler never saw. Covering for it would hide it."""
+    sched = _make_clamp_scheduler(
+        tracked_statuses=[RequestStatus.WAITING_FOR_STREAMING_REQ] * 3,
+        counter=1,
+    )
+    sched._clamp_streaming_parked_counter()
+    assert sched.num_waiting_for_streaming_input == 1
