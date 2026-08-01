@@ -18,7 +18,7 @@ FORK=/home/zx/voice-agent/vllm-omni
 PY=/home/zx/miniconda3/envs/omni-minicpm/bin/vllm-omni
 LOG=/data/zx/results/qwen_live.log
 PORT=8091
-DEPLOY="$FORK/benchmarks/live_agent/harness/deploy_pc_stage0.yaml"
+DEPLOY="${DEPLOY_CONFIG:-$FORK/benchmarks/live_agent/web_client/deploy_web_demo.yaml}"
 
 [ -f "$DEPLOY" ] || { echo "!! deploy config missing: $DEPLOY"; exit 1; }
 

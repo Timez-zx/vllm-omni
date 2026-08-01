@@ -1,0 +1,87 @@
+# Qwen3-Omni for the browser live session: ONE user, memory-conservative.
+#
+# A separate file from harness/deploy_pc_stage0.yaml on purpose. That config is
+# what every number in workflow.md was measured with, so it must not be retuned
+# -- changing it would silently invalidate the comparison it exists to support.
+#
+# Why this exists at all: deploy_pc_stage0.yaml (0.74 / 0.12 / 0.06 = 0.92) fits
+# on vLLM 0.24.0 and does NOT fit on 0.26.0, which this branch needs. Stage 2 died
+# with `Tried to allocate 1.41 GiB ... 1.04 GiB is free` after stage 1's CUDA graph
+# capture had pushed resident memory to 85 GB. Two things changed under it:
+# FlashInfer's CUTLASS fused-MoE kernels want workspace, and the card is shared --
+# another user's MPS server holds a slice that the fractions do not know about.
+#
+# So the budgets leave real headroom rather than being tuned to the last GiB, and
+# max_num_seqs drops from 16 to 4: this serves one person in a browser, and 16
+# concurrent sequences per stage is capacity nobody is asking for while being
+# memory nobody can spare.
+#
+# The connector settings are copied verbatim from the measurement config, because
+# they are what makes the first audio packet arrive early:
+#   initial_codec_chunk_frames: 4   -- a SMALL first granule so speech starts fast
+#   codec_chunk_frames: 25          -- then bigger granules for throughput
+
+async_chunk: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      initial_codec_chunk_frames: 4
+      codec_chunk_frames: 25
+      codec_left_context_frames: 25
+
+stages:
+  - stage_id: 0                      # thinker: vision + audio encoders + LLM
+    max_num_batched_tokens: 16384
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.62
+    trust_remote_code: true
+    # Stage 0 only. Stage 2 (code2wav) asserts with prefix caching on, and the
+    # duplex sequence here is append-only, which is the case prefix caching is
+    # for.
+    enable_prefix_caching: true
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 2048
+
+  - stage_id: 1                      # talker: speech codec token LM
+    max_num_batched_tokens: 8192
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.12
+    trust_remote_code: true
+    enable_prefix_caching: false
+    # CUDA graph capture on this stage is what tipped the card over on 0.26.0.
+    # Eager costs some per-step latency and buys the headroom stage 2 needs; if a
+    # future run has the card entirely to itself, try turning this back off first.
+    enforce_eager: true
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      seed: 42
+      repetition_penalty: 1.05
+
+  - stage_id: 2                      # code2wav: waveform reconstruction
+    max_num_batched_tokens: 65536
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.10
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    enable_chunked_prefill: false
+    async_scheduling: false
+    devices: "0"
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      repetition_penalty: 1.1
