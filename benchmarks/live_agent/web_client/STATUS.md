@@ -76,19 +76,35 @@ So stage 2 ran three times and only the first delta carried new samples.
 Latency itself is fine and repeatable: **first audio 340–376 ms** across five
 turns, which is the same order as the 513 ms baseline.
 
-An A/B was running when this was written to isolate whether our `TALKER_TEXT_ONLY`
-change causes it:
+### A/B 1: our talker change is NOT the cause — ruled out
 
-```bash
-grep READY /data/zx/results/qwen_ttoff_launch.out          # the control arm
-# control arm = VLLM_OMNI_TALKER_TEXT_ONLY=0 bash run_qwen_server.sh
+```
+TALKER_TEXT_ONLY=1 (default) :  0.22 s
+TALKER_TEXT_ONLY=0 (control) :  0.22 s     identical
 ```
 
-If the control arm also gives 0.22 s, the truncation is upstream's on 0.26.0 and
-not ours. If it gives full-length audio, `TALKER_TEXT_ONLY` is the cause and the
-default should flip back until it is understood. Either way **do not judge audio
-quality in the browser until this is resolved** — you would be listening to a
-fifth of a second.
+Same probe, same query, same config otherwise. So the truncation is **upstream's
+behaviour on this path**, not something the merge introduced. Our change stays on.
+
+That also rules out the obvious reading of `initial_codec_chunk_frames: 4`. A small
+FIRST granule is by design; the bug is that **the granules after it never arrive**.
+Server-side, `audio_chunks=3` while only one delta carried new samples — so
+`_extract_audio_delta_b64` found `audio_data[chunks_drained:]` empty twice, meaning
+stage 2's audio tensor list did not grow across its three outputs.
+
+### A/B 2: which delta path
+
+`VLLM_VIDEO_AUDIO_DELTA_MODE` selects between `_delta_fast` (emit only the new
+tail) and `_delta_slow` (re-concatenate everything each call). If `slow` delivers
+full-length audio, the fast path's `chunks_drained` accounting is wrong on this
+branch — a precise and fixable finding.
+
+```bash
+tail -8 /data/zx/results/qwen_slow_launch.out
+```
+
+**Until this is resolved, do not judge audio quality in the browser** — you would
+be listening to a fifth of a second. Everything else about the chain is verified.
 
 ## Genuinely unknown
 
