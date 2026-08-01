@@ -577,6 +577,19 @@ class OmniStreamingVideoHandler:
             config = await self._receive_config(websocket)
             if config is None:
                 return
+            # Log the fields that differ from defaults, once per session. This exists
+            # because a crash investigation stalled on exactly this gap: an engine died
+            # during a hand-driven browser session, and nothing on the server recorded
+            # which features that session had enabled -- the client tab could have been
+            # days old. Post-mortems need the config that was live, not the one shipped.
+            try:
+                non_default = {
+                    k: v for k, v in config.model_dump().items()
+                    if v != type(config).model_fields[k].default and k != "system_prompt"
+                }
+                logger.info("[session] config (non-default): %s", non_default)
+            except Exception:
+                logger.debug("session config logging failed", exc_info=True)
 
             frame_buffer: list[str] = []  # base64-encoded JPEG frames
             frame_metadata: list[dict[str, Any]] = []

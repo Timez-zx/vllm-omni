@@ -1108,8 +1108,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self._replace_streaming_session(session, update)
             return
         super()._update_request_as_session(session, update)
-        if hasattr(update, "model_intermediate_buffer"):
-            session.model_intermediate_buffer = update.model_intermediate_buffer
+        # Apply the update's max_tokens. Upstream carries it on every StreamingUpdate and
+        # never applies it -- `Request.max_tokens` keeps the FIRST chunk's value for the
+        # whole session. The stop check compares per-segment output counts (upstream
+        # clears `_output_token_ids` in the update above) against that stale cap, so a
+        # per-chunk max_tokens is silently ignored. Measured consequence: a prefill-only
+        # append submitted with max_tokens=1 generated ~20 tokens -- a whole unasked reply,
+        # withheld from the talker but burned on the thinker and left in its context.
+        # For ordinary turns every chunk carries the same value, so this is a no-op there.
+        update_max_tokens = getattr(update, "max_tokens", None)
+        if isinstance(update_max_tokens, int) and update_max_tokens > 0:
+            session.max_tokens = update_max_tokens
 
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False

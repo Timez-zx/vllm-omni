@@ -72,64 +72,76 @@ Neither `selftest.py` nor `probe.py` could have caught either one: the first che
 the protocol, the second never plays a sample and, at the time, ran while the
 counter was still under 4.
 
-## Frames now prefill on arrival, and frame rate is decoupled from TTFA
+## Prefill-on-arrival: measured wins, then a diagnosed architectural limit. OFF.
 
-`prefill_frames_on_arrival` (on by default) appends each retained frame to the live session
-request as it ARRIVES, so its prefill runs while the user is still speaking. Session mode
-already submitted only new frames, so this changes the timing, not the amount.
+`prefill_frames_on_arrival` appends each retained frame to the live session request as it
+ARRIVES. It works, it is measurably better on latency, **and it kills the talker.** All three
+statements are supported; the last one decides the default.
+
+### What it buys (measured, before the crash was understood)
 
 | frames/turn | OFF median | ON median | ON − OFF |
 |---|---|---|---|
-| ~1 (`frame_filter_min_gap: 8`) | 355.4 ms | 345.5 ms | −9.8 ms (−2.8%) |
+| ~1 (`frame_filter_min_gap: 8`) | 355.4 ms | 345.5 ms | −9.8 ms |
 | 3 (`min_gap: 2`) | 419.2 ms | 349.9 ms | **−69.2 ms (−16.5%)** |
 
-**The trend is the result, not either row.** Tripling the frames costs OFF +63.8 ms and ON
-+4.4 ms — about **16× less sensitive to frame rate**. At 1 frame per turn the spread also
-tightens 6×: OFF 344–379 ms, ON 343–349 ms, which for a project about *predictable* latency
-is worth more than the median. Reproduce with
-`python prefill_ab.py --direct --rounds 2 --turns 2 --min-gap 2`.
+Tripling frames costs OFF +63.8 ms and ON +4.4 ms — **~16× less sensitive to frame rate**,
+which is the decoupling the feature exists for. Spread also tightens 6× (OFF 344–379 ms,
+ON 343–349 ms).
 
-### The engine needed a look-but-do-not-speak switch
+### Why it is off: stage-0 / stage-1 context divergence
 
-Qwen3-Omni has no duplex control plane (`enable_duplex_control` is False and the pipeline
-declares no runtime extension), so MiniCPM's `decide_output` short-circuit was unavailable.
-Two interceptions, and **both** are required — either alone lets a click out:
-
-* `thinker2talker_async_chunk` returns `None`, withholding the content;
-* `chunk_transfer_adapter` also skips the **segment-finish marker**, which it would otherwise
-  ship as an empty payload; the receive side turns that into `prompt_token_ids = [0]` and the
-  talker decodes it.
-
-### Three wrong turns, kept because each was expensive
-
-1. **The first measurement said 6× WORSE.** `probe.py` sends frames ~0.1 s before the query,
-   so there was no idle time and one prefill became two engine round-trips. A latency
-   optimisation measured without the idle time it exists to exploit will always lose.
-2. **The marker channel failed twice, silently.** `additional_information` as a plain dict,
-   then as a real `AdditionalInformationPayload` — neither arrives. That field is populated by
-   the *connector* for stage-to-stage payloads; nothing on the entrypoint's streaming-update
-   path transfers it from the prompt. `SamplingParams.extra_args` is the channel that works,
-   and it travels by construction.
-3. **A −73% "win" that was a bug.** While the marker was being dropped the append reached the
-   talker, its audio landed against the wrong turn, and first-audio looked 4× better. The tell
-   was `first_audio=5.941s` **before** `first_text=6.126s` — impossible within a turn. It was
-   refused as a result at the time, and that refusal was correct: the honest figure is −2.8%
-   to −16.5%.
-
-**The acceptance test is presence, not absence.** Absence of a log line misled this
-investigation twice, so the check is that both lines appear:
+The append advances **stage 0's** context and, by design, ships **nothing** to stage 1. But
+the talker consumes thinker embeddings *per position*: the positions the append created never
+reach it, so the two stages' token accounting diverges. The talker then indexes its ~4k-row
+codec embedding table with text-vocabulary ids and
 
 ```
-[prefill-only] thinker2talker withholding content req=...
-[prefill-only] not shipping the segment marker, stage 0 -> 1, req ...
+Indexing.cu:1515: indexSelectSmallIndex: Assertion `srcIndex < srcSelectDimSize` failed.
+gpu_model_runner.py:1790 in _preprocess
+    self.talker_mtp_input_ids.gpu[decode_slice].copy_(req_input_ids)
 ```
 
-### Still open
+poisons the CUDA context and the stage-1 process dies, taking the engine with it.
 
-`min_gap: 8` was conservative because frames were paid for at query time. That is no longer
-scarce — but the constraint **moves** rather than disappearing: every retained frame is
-permanent in the thinker's KV, so a higher frame rate now trades against session lifetime
-instead of latency. Unmeasured, and a better-posed question than before.
+**Controlled, because "it crashed" is not evidence on its own** (`crash_repro.py`, identical
+hostile pacing — continuous frames, mic pausing during replies, barge-in queries every 2.5 s):
+
+| arm | result |
+|---|---|
+| `--no-prefill` | **survived 6 turns / 398 frames** |
+| prefill on | **died on turn 1**, repeatedly |
+
+And it still dies with **all three payload gates confirmed firing** (`not prewarming`,
+`dropping stage`, `withholding content` in the log). That is what rules out the whole class of
+"a payload leaked through" explanations and points at the divergence itself. Withholding a
+segment from the talker is not a gap to be plugged; it is the design.
+
+### Three real defects found on the way, all fixed and all independent of this feature
+
+1. **Per-chunk `max_tokens` was silently ignored.** Upstream carries it on every
+   `StreamingUpdate` and never applies it, so `Request.max_tokens` keeps the FIRST chunk's
+   value for the whole session while the stop check compares per-segment output counts
+   against it. Measured: an append submitted with `max_tokens=1` generated ~20 tokens. Fixed
+   in `_update_request_as_session`; a no-op for ordinary turns, which all carry the same value.
+2. **A cross-thread read of per-segment state.** `save_async` enqueues a *reference* to the
+   request; by the time the save thread dequeues it, the next streaming update may have
+   replaced `sampling_params`. Both directions of that race were observed within an hour. The
+   decision is now snapshotted at enqueue time, on the scheduler's thread.
+3. **The launcher truncated the log**, destroying a crash's stack the moment the natural next
+   step (restart) was taken. It now keeps `$LOG.prev`.
+
+Plus two things that make the next attempt cheaper: the session's non-default config is logged
+once per session (a post-mortem could not tell which features a browser tab had enabled), and
+`CUDA_LAUNCH_BLOCKING` in the launcher's environment **does not reach the stage processes** —
+their env is rebuilt at spawn, and the stage-level `runtime.env` block did not apply either.
+
+### What a real fix needs
+
+Not more gating. Either the talker must tolerate positions it never saw, or the append must
+occupy zero thinker positions (which is not what a prefill is), or stage 1 must receive a
+no-op segment that advances its accounting without producing audio — the last is the only
+shape that looks viable, and it is a change to the inter-stage contract, not to this feature.
 
 ## Done and verified
 

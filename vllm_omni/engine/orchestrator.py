@@ -53,7 +53,25 @@ from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
+from vllm_omni.model_executor.stage_input_processors.tts_utils import (
+    PREFILL_ONLY_KEY as _PREFILL_ONLY_KEY,
+)
 from vllm_omni.outputs import OmniRequestOutput
+
+
+def _sampling_params_mark_prefill_only(sampling_params_list: Any) -> bool:
+    """Does this streaming update's stage-0 sampling params carry the prefill-only marker?
+
+    The key is imported, not re-typed: the entrypoint, the stage processors and this
+    fan-out gate must agree on one string, and two of the three drifting is the failure
+    mode that makes the model speak unasked with nothing pointing at the cause.
+    """
+    if not sampling_params_list:
+        return False
+    extra = getattr(sampling_params_list[0], "extra_args", None)
+    return isinstance(extra, dict) and str(extra.get(_PREFILL_ONLY_KEY, "")).strip().lower() in (
+        "1", "true", "yes",
+    )
 
 logger = init_logger(__name__)
 
@@ -721,6 +739,24 @@ class Orchestrator:
         )
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+            # A prefill-only append must not open a segment on the downstream stages.
+            #
+            # This is the CONTROL-plane half of look-but-do-not-speak, and it is the half
+            # whose absence killed the engine. The data-plane guards (the stage-0
+            # processor withholding content, the transfer adapter withholding the
+            # boundary) only stop the PAYLOAD -- this prewarm is what tells stage 1 "a new
+            # segment is coming". With the prewarm sent and the payload withheld, stage 1
+            # sat on a placeholder prompt whose conditioning never arrived, and the talker
+            # prefilled raw placeholder ids (text vocabulary, ~150k) straight into its
+            # codec embedding table (~4k rows): indexSelectSmallIndex asserted
+            # `srcIndex < srcSelectDimSize`, the CUDA context was poisoned, and the whole
+            # stage died. Reproduced twice, byte-identical stacks, before this line.
+            if _sampling_params_mark_prefill_only(msg.sampling_params_list):
+                logger.info(
+                    "[prefill-only] not prewarming stages 1..%d for req=%s",
+                    final_stage_id, request_id,
+                )
+                return
             await self._prewarm_async_chunk_stages(request_id, request, req_state)
 
     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:

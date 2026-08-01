@@ -28,6 +28,7 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_language_from_request,
     extract_speaker_from_prompt,
     extract_speaker_from_request,
+    prefill_only_channel,
     request_is_prefill_only,
 )
 
@@ -461,7 +462,18 @@ def thinker2talker_async_chunk(
         # INFO on purpose: this line's PRESENCE is the only proof the marker survived the
         # trip from the entrypoint. Its absence, paired with the entrypoint's own
         # "prefill-on-arrival" line, is what tells you the marker was dropped in between.
-        logger.info("[prefill-only] thinker2talker withholding content req=%s", request_id)
+        #
+        # id(request) and the params are in the line because the adapter's boundary guard
+        # reads THE SAME request microseconds later and has been observed to disagree --
+        # the ids tell whether it really is the same object, and via which channel the
+        # marker was seen, without a debugger attached to a background thread.
+        _params = getattr(request, "sampling_params", None)
+        logger.info(
+            "[prefill-only] thinker2talker withholding content req=%s id=%s via=%s "
+            "max_tokens=%s finished=%s",
+            request_id, id(request), prefill_only_channel(request),
+            getattr(_params, "max_tokens", None), is_finished,
+        )
         return None
 
     if not isinstance(multimodal_output, Mapping):

@@ -76,6 +76,33 @@ def extract_speaker_from_request(request: Any) -> str | None:
 PREFILL_ONLY_KEY = "vllm_omni_prefill_only"
 
 
+def prefill_only_channel(request: Any) -> str | None:
+    """Which channel carries the marker, or None. Split out so the interception site can
+    LOG the channel: when the marker outlives its append, the first question is where it
+    is stuck, and a boolean cannot answer that."""
+    params = getattr(request, "sampling_params", None)
+    extra = getattr(params, "extra_args", None)
+    if isinstance(extra, dict) and str(extra.get(PREFILL_ONLY_KEY, "")).strip().lower() in (
+        "1", "true", "yes"
+    ):
+        return f"extra_args(max_tokens={getattr(params, 'max_tokens', '?')})"
+    info = getattr(request, "additional_information", None)
+    if info is not None:
+        entries = getattr(info, "entries", None)
+        if not isinstance(entries, dict):
+            entries = info if isinstance(info, dict) else None
+        if entries is not None and PREFILL_ONLY_KEY in entries:
+            entry = entries[PREFILL_ONLY_KEY]
+            list_data = getattr(entry, "list_data", None)
+            if isinstance(list_data, list) and list_data:
+                entry = list_data[0]
+            if isinstance(entry, list) and entry:
+                entry = entry[0]
+            if str(entry).strip().lower() in ("1", "true", "yes"):
+                return "additional_information"
+    return None
+
+
 def request_is_prefill_only(request: Any) -> bool:
     """Is this append meant to be READ but not answered?
 
@@ -92,41 +119,7 @@ def request_is_prefill_only(request: Any) -> bool:
     Reads both the structured engine form (``entries[key].list_data``) and a plain dict,
     because the prompt carries a dict and the engine request carries the structured form.
     """
-    # The sampling-params channel first, because it is the one that actually arrives.
-    #
-    # additional_information was tried twice -- as a plain dict and as a real
-    # AdditionalInformationPayload -- and neither reached the stage processes: the field is
-    # populated by the CONNECTOR for stage-to-stage payloads, and nothing on the entrypoint's
-    # streaming-update path transfers it from the prompt. Both attempts failed silently, with
-    # the symptom (the model speaking unasked) three components away from the cause.
-    #
-    # SamplingParams.extra_args exists for exactly this, and it travels by construction:
-    # StreamingInput carries per-chunk sampling params, async_omni puts them in
-    # chunk_sampling_params_list[0], and they end up on request.sampling_params.
-    params = getattr(request, "sampling_params", None)
-    extra = getattr(params, "extra_args", None)
-    if isinstance(extra, dict) and str(extra.get(PREFILL_ONLY_KEY, "")).strip().lower() in (
-        "1", "true", "yes"
-    ):
-        return True
-
-    info = getattr(request, "additional_information", None)
-    if info is None:
-        return False
-    entries = getattr(info, "entries", None)
-    if not isinstance(entries, dict):
-        entries = info if isinstance(info, dict) else None
-        if entries is None:
-            return False
-    entry = entries.get(PREFILL_ONLY_KEY)
-    if entry is None:
-        return False
-    list_data = getattr(entry, "list_data", None)
-    if isinstance(list_data, list) and list_data:
-        entry = list_data[0]
-    if isinstance(entry, list) and entry:
-        entry = entry[0]
-    return str(entry).strip().lower() in ("1", "true", "yes")
+    return prefill_only_channel(request) is not None
 
 
 def extract_speaker_from_prompt(
