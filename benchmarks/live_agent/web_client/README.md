@@ -64,7 +64,7 @@ Press **Start call**, then speak. Turn the **Camera** on to let it see you.
 
 ---
 
-## Before you trust it: three checks that cost nothing
+## Before you trust it: four checks that cost nothing
 
 ```bash
 # 1. the client's assumptions against the real server code -- no GPU needed
@@ -73,7 +73,10 @@ PYTHONPATH=/home/zx/voice-agent/vllm-omni python benchmarks/live_agent/web_clien
 # 2. the playback worklet, driven over several turns -- no GPU, no browser
 node benchmarks/live_agent/web_client/playback_test.js
 
-# 3. the whole chain without a browser: synthetic frames + audio in, audio out
+# 3. can the speech actually PLAY without gaps -- needs the server, no browser
+PYTHONPATH=/home/zx/voice-agent/vllm-omni python benchmarks/live_agent/web_client/audio_timeline.py --direct
+
+# 4. the whole chain without a browser: synthetic frames + audio in, audio out
 PYTHONPATH=/home/zx/voice-agent/vllm-omni python benchmarks/live_agent/web_client/probe.py
 PYTHONPATH=/home/zx/voice-agent/vllm-omni python benchmarks/live_agent/web_client/probe.py --direct
 ```
@@ -87,6 +90,13 @@ it does not dispatch, a wrong audio container.
 silent was reachable by neither of the other two: `selftest.py` checks the
 protocol and `probe.py` never plays a sample, so a browser was the only thing that
 could catch it. Now it is caught in 200 ms.
+
+`audio_timeline.py` answers a question `probe.py` structurally cannot: **"did audio
+arrive" is not "can it play straight through."** It records the arrival time and
+duration of every delta, then replays the client's buffering rule over those
+timestamps to find where a player would run dry and for how long. A turn can deliver
+every sample it produced and still be unlistenable, because continuity is a property
+of the arrival schedule, not the total.
 
 `probe.py` localises everything else. Run it **through the page server** and then
 `--direct` to the engine: if `--direct` passes and the other does not, the proxy
@@ -120,7 +130,7 @@ startup time (~2 min) as the expectation for this one.
 | Panel | What it tells you |
 |---|---|
 | Model | Listening → Thinking → Speaking |
-| Playback | `Underrun xN` means audio arrived slower than it played — raise the prebuffer or expect stutter |
+| Playback | `Underrun xN` means audio arrived slower than it played. Between turns this is normal; during one, see the prebuffer trade below |
 | Events | Every protocol message, including `session rolled` |
 
 **`session rolled` is expected, not an error.** It is the mechanism that lets the
@@ -140,23 +150,49 @@ Client-side, in `app/static/app.js`:
 | `SILENCE_RMS` | 0.012 | Raise it if a noisy room keeps triggering turns |
 | `SILENCE_HANG_MS` | 700 | How long a pause has to be before it counts as your turn ending |
 | `MIN_SPEECH_MS` | 400 | Ignores coughs and door slams |
-| `PLAYBACK_PREBUFFER_MS` | 60 | Raise if playback stutters over a slow link — but see the warning below |
+| `PLAYBACK_PREBUFFER_MS` | `{fast: 60, smooth: 1400}` | Selected by the on-page **Start speaking…** control; see below |
 | `ECHO_GUARD_MS` | 300 | Mic upload resumes this long after the assistant stops |
 
-**The prebuffer has to be well under one turn's audio, not merely "enough for
-jitter".** A turn currently delivers about 220 ms. At the old 250 ms, each turn
-had to be paid for out of the next one — turns fell silent and what did play was
-the previous reply. And because running dry between turns is normal, an underrun
-must not re-arm the prebuffer.
+### The prebuffer is a real trade, and it is measured
 
-Neither of those alone is the bug, which is why fixing one would have looked like
-a fix: an oversized threshold alone just runs a turn behind, and re-arming alone
-is harmless while the threshold is under a turn. Both are fixed, and
-`playback_test.js` asserts all three cases against the real worklet:
+The server sends a deliberately small first granule so speech can begin early, then
+much larger ones. Measured against the live server with `audio_timeline.py`:
+
+| delta | arrives | audio |
+|---|---|---|
+| 0 | 0.35 s | **0.217 s** (`initial_codec_chunk_frames: 4`) |
+| 1 | 1.70 s | 2.000 s (`codec_chunk_frames: 25`) |
+| 2+ | every ~1.28 s | 2.000 s each |
+
+0.217 s of audio cannot cover the 1.34 s the 2 s granule takes to generate, so
+**starting on delta 0 speaks at 0.35 s and then stalls ~1.1 s, one word in — every
+turn, in the same place.** Everything after is smooth, because 2 s arriving every
+1.28 s outruns playback. It is a startup transient, not jitter.
+
+Any threshold above 0.217 s means "wait for delta 1", so there are really only two
+settings, and the page offers both:
+
+| mode | first sound | stalls |
+|---|---|---|
+| smooth (default) | ~1.70 s | none |
+| as early as possible | ~0.35 s | one, ~1.1 s |
+
+Use **early** when measuring latency, **smooth** when listening. `response.audio.done`
+releases the threshold, so a reply shorter than the target still plays instead of
+sitting in the buffer — `playback_test.js` asserts that the escape hatch is
+load-bearing by showing the reply never plays without it.
+
+Raising it further buys nothing: the gap is generation time, not network jitter.
+
+To re-measure any of this after a config change:
 
 ```bash
+PYTHONPATH=/home/zx/voice-agent/vllm-omni python benchmarks/live_agent/web_client/audio_timeline.py --direct
 node benchmarks/live_agent/web_client/playback_test.js
 ```
+
+`audio_timeline.py` prices every prebuffer against the arrival schedule it just
+measured, so the trade is a table rather than an argument.
 
 Server-side, in `buildSessionConfig()` — `max_frame_width/height`,
 `session_roll_at_talker_tokens`, the filter gaps. These are the merged
@@ -177,4 +213,5 @@ model rather than trusting it.
 | The first reply makes sound, later ones are silent | `node playback_test.js`. This exact shape was the prebuffer/re-arm interaction, and the test reproduces it |
 | One turn wedges the page and nothing recovers | A missing `response.audio.done`. The 45 s watchdog in `endTurn()` releases it; look for `turn ended (watchdog…)` in the log |
 | It never answers | Nothing is sending `video.query`. Switch the mode to hold-to-talk and press it |
+| Speech starts, stalls about a second, then continues | Expected in **as early as possible** mode and structural, not a fault: the first granule is 0.217 s and the second takes 1.34 s to make. Switch **Start speaking…** to smooth, or run `audio_timeline.py` to see the schedule |
 | Turn 20 much slower than turn 2 | `session_scoped_request` did not take effect — check the server log for `[session] turn=` lines |

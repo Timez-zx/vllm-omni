@@ -40,6 +40,7 @@
   const cameraPreview = el('cameraPreview');
   const talkButton = el('talkButton');
   const triggerMode = el('triggerMode');
+  const playbackMode = el('playbackMode');
   const systemPromptInput = el('systemPrompt');
   const connectionState = el('connectionState');
   const modelState = el('modelState');
@@ -56,11 +57,24 @@
   const INPUT_RATE = 16000;          // this server's audio.chunk contract
   const SEND_INTERVAL_MS = 200;      // how often queued mic PCM goes up
   const FRAME_INTERVAL_MS = 500;     // ~2 fps; frames are their own message
-  // Must be well under the FIRST delta, not merely "enough for jitter". The server
-  // sends a deliberately small first granule so speech starts early -- measured at
-  // 0.217 s -- and the 2 s granules after it can be a moment behind. A 250 ms
-  // threshold sat above that first delta and playback never started on it.
-  const PLAYBACK_PREBUFFER_MS = 60;
+  // How much audio to hold before the first sample plays. This is a REAL trade, and
+  // measured rather than guessed (benchmarks/live_agent/web_client/audio_timeline.py):
+  //
+  //   delta 0 arrives 0.35 s after the query with 0.217 s of audio
+  //            (initial_codec_chunk_frames: 4 -- a small first granule, on purpose)
+  //   delta 1 arrives 1.70 s with 2.000 s of audio (codec_chunk_frames: 25)
+  //   delta 2+ every ~1.28 s, 2.000 s each
+  //
+  // Start on delta 0 and you speak at 0.35 s, then run dry for ~1.13 s because 0.217 s
+  // of audio cannot cover the 1.34 s that the 2 s granule takes to make. Everything
+  // after that is smooth -- 2 s arriving every 1.28 s outruns playback -- so the stall
+  // is a startup transient, always in the same place, and audible as a stutter one word
+  // in. Wait instead until delta 1 has landed and it never happens.
+  //
+  // Both are legitimate; a latency experiment wants FAST, a person listening wants
+  // SMOOTH. Any threshold above 0.217 s means "wait for delta 1", so the two useful
+  // settings are far apart, and the target is expressed as the gap it has to cover.
+  const PLAYBACK_PREBUFFER_MS = { fast: 60, smooth: 1400 };
   const ECHO_GUARD_MS = 300;         // keep uploading this long after playback
 
   // Silence detection, used only when the trigger mode is 'auto'. These are
@@ -305,6 +319,10 @@
         break;
       }
       case 'response.audio.done':
+        // Release the smooth-start threshold: no more audio is coming, so whatever is
+        // queued is the whole remainder of the reply. A reply shorter than the target
+        // would otherwise sit in the buffer and never play.
+        if (playbackNode) playbackNode.port.postMessage({ type: 'start_now' });
         setPlayback('Draining');
         endTurn(null);
         log('turn done');
@@ -447,13 +465,17 @@
     await captureContext.resume();
   }
 
+  function prebufferFrames() {
+    const mode = (playbackMode && playbackMode.value) === 'fast' ? 'fast' : 'smooth';
+    const rate = playbackContext ? playbackContext.sampleRate : 24000;
+    return Math.floor(rate * PLAYBACK_PREBUFFER_MS[mode] / 1000);
+  }
+
   async function startPlayback() {
     playbackContext = new AudioContext();
     await playbackContext.audioWorklet.addModule('static/playback_worklet.js');
     playbackNode = new AudioWorkletNode(playbackContext, 'live-agent-playback', {
-      processorOptions: {
-        prebufferFrames: Math.floor(playbackContext.sampleRate * PLAYBACK_PREBUFFER_MS / 1000),
-      },
+      processorOptions: { prebufferFrames: prebufferFrames() },
     });
     playbackNode.port.onmessage = (message) => {
       const msg = message.data || {};
@@ -625,6 +647,14 @@
 
   if (clearLogButton) {
     clearLogButton.addEventListener('click', () => { eventLog.innerHTML = ''; events = 0; eventCount.textContent = '0'; });
+  }
+  if (playbackMode) {
+    playbackMode.addEventListener('change', () => {
+      // Retune the live node so the effect is audible on the next reply rather than
+      // only after hanging up.
+      if (playbackNode) playbackNode.port.postMessage({ type: 'prebuffer', frames: prebufferFrames() });
+      log(`playback start: ${playbackMode.value} (${PLAYBACK_PREBUFFER_MS[playbackMode.value]} ms buffered)`);
+    });
   }
 
   if (systemPromptInput && !systemPromptInput.value) systemPromptInput.value = DEFAULT_SYSTEM_PROMPT;

@@ -169,5 +169,99 @@ check('both together reproduce what was reported',
       + `re-arm then demands 250 ms of every 220 ms delivery, so deliveries fall silent and what `
       + `does play is the PREVIOUS turn's reply, two turns' worth at a time`);
 
+
+
+// ---------------------------------------------------------------------------
+// 3. the startup stall, replayed from the MEASURED arrival schedule
+//
+// The tests above deliver a chunk and then render; they cannot express "the next
+// chunk arrives 1.37 s from now", which is the whole of what a listener complained
+// about. This drives the worklet against wall-clock arrivals instead, taken from
+// audio_timeline.py against the live server:
+//
+//     delta 0   0.35 s   0.217 s of audio
+//     delta 1   1.70 s   2.000 s
+//     delta 2+  every ~1.28 s, 2.000 s each
+//
+// 0.217 s of audio cannot cover the 1.34 s the 2 s granule takes to make, so a
+// start on delta 0 runs dry ~1.1 s -- one word in, every single turn.
+const MEASURED = [
+  { at: 350, audio: 217 },
+  { at: 1700, audio: 2000 },
+  { at: 2980, audio: 2000 },
+  { at: 4260, audio: 2000 },
+  { at: 5540, audio: 2000 },
+];
+
+function runSchedule(prebufferMs, schedule, { startNowAtEnd = false } = {}) {
+  const file = path.join(__dirname, 'app', 'static', 'playback_worklet.js');
+  const { cls } = loadProcessor(file);
+  const node = new cls({ processorOptions: { prebufferFrames: Math.round(RATE * prebufferMs / 1000) } });
+  const outputs = [[new Float32Array(BLOCK)]];
+  const out = outputs[0];
+
+  const lastAt = schedule[schedule.length - 1].at + schedule[schedule.length - 1].audio;
+  const totalBlocks = Math.ceil(RATE * (lastAt + 2000) / 1000 / BLOCK);
+  let delivered = 0, startedAtMs = null, playing = 0;
+  const gaps = [];               // [{ atMs, durMs }] silence AFTER playback began
+
+  for (let b = 0; b < totalBlocks; b += 1) {
+    const nowMs = (b * BLOCK / RATE) * 1000;
+    while (delivered < schedule.length && schedule[delivered].at <= nowMs) {
+      const frames = Math.round(RATE * schedule[delivered].audio / 1000);
+      const pcm = new Float32Array(frames).fill(0.5);
+      node.port.onmessage({ data: { type: 'samples', pcm: pcm.buffer } });
+      delivered += 1;
+      if (startNowAtEnd && delivered === schedule.length) {
+        node.port.onmessage({ data: { type: 'start_now' } });
+      }
+    }
+    out[0].fill(0);
+    node.process([], outputs);
+    let nonZero = 0;
+    for (let i = 0; i < BLOCK; i += 1) if (out[0][i] !== 0) nonZero += 1;
+    if (nonZero > 0) {
+      if (startedAtMs === null) startedAtMs = nowMs;
+      playing += 1;
+    } else if (startedAtMs !== null && delivered < schedule.length) {
+      // Silence while more audio is still to come is a stall a listener hears.
+      // Trailing silence after the last chunk is just the end of the reply.
+      const blockMs = (BLOCK / RATE) * 1000;
+      const prev = gaps[gaps.length - 1];
+      if (prev && Math.abs(prev.atMs + prev.durMs - nowMs) < blockMs * 1.5) prev.durMs += blockMs;
+      else gaps.push({ atMs: nowMs, durMs: blockMs });
+    }
+  }
+  return { startedAtMs, gaps, playedMs: (playing * BLOCK / RATE) * 1000 };
+}
+
+console.log('\n3. the startup stall, on the measured arrival schedule');
+
+const fast = runSchedule(60, MEASURED);
+const worst = fast.gaps.reduce((m, g) => Math.max(m, g.durMs), 0);
+check('starting on delta 0 stalls about a second, one word in',
+      fast.startedAtMs < 500 && worst > 800,
+      `starts ${fast.startedAtMs.toFixed(0)} ms, worst stall ${worst.toFixed(0)} ms `
+      + `at ${(fast.gaps[0] ? fast.gaps[0].atMs : 0).toFixed(0)} ms -- this is what was reported`);
+
+const smooth = runSchedule(1400, MEASURED);
+check('waiting for delta 1 removes the stall entirely',
+      smooth.gaps.length === 0 && smooth.startedAtMs >= 1700,
+      `starts ${smooth.startedAtMs.toFixed(0)} ms, ${smooth.gaps.length} stall(s) -- `
+      + `the cost is ${(smooth.startedAtMs - fast.startedAtMs).toFixed(0)} ms of start latency`);
+
+// A reply shorter than the smooth target must still play. Without start_now it would
+// sit in the buffer forever, which would be a worse bug than the stutter.
+const shortReply = [{ at: 350, audio: 217 }, { at: 1700, audio: 400 }];
+const stuck = runSchedule(1400, shortReply);
+check('a reply shorter than the target would never play without start_now',
+      stuck.startedAtMs === null,
+      'confirms the escape hatch is load-bearing, not decorative');
+const released = runSchedule(1400, shortReply, { startNowAtEnd: true });
+check('response.audio.done releases it', released.startedAtMs !== null
+      && released.playedMs > 500,
+      `starts ${released.startedAtMs === null ? 'never' : released.startedAtMs.toFixed(0) + ' ms'}, `
+      + `plays ${released.playedMs.toFixed(0)} ms of the 617 ms delivered`);
+
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) failed.`);
 process.exit(failures === 0 ? 0 : 1);

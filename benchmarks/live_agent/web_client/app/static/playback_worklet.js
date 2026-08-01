@@ -51,6 +51,15 @@ class LiveAgentPlayback extends AudioWorkletProcessor {
         this.offset = 0;
         this.buffered = 0;
         this.started = false;
+      } else if (msg.type === 'prebuffer') {
+        // Live retune, so the start-latency/smoothness toggle takes effect on the
+        // current turn rather than the next call.
+        this.prebufferFrames = Math.max(0, msg.frames || 0);
+      } else if (msg.type === 'start_now') {
+        // The turn is over: whatever is queued is the whole rest of the reply, so
+        // waiting for a threshold it may never reach would swallow it. Short replies
+        // total less than the smooth-start target and would otherwise never play.
+        this.prebufferFrames = 0;
       } else if (msg.type === 'stats') {
         this.port.postMessage({
           type: 'stats',

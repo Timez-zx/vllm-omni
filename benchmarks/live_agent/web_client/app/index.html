@@ -34,6 +34,20 @@
         </select>
         <button id="talkButton" class="secondary" type="button" disabled>Hold to talk</button>
       </div>
+      <div class="row">
+        <label for="playbackMode">Start speaking&hellip;</label>
+        <select id="playbackMode">
+          <option value="smooth" selected>Smoothly &mdash; wait ~1.7 s, then no stutter</option>
+          <option value="fast">As early as possible &mdash; ~0.35 s, one stutter</option>
+        </select>
+      </div>
+      <p class="note">
+        Measured, not a preference dressed as a fact: the first audio chunk carries
+        <strong>0.217 s</strong> of speech and arrives at 0.35 s, but the second carries 2 s and
+        takes 1.34 s to generate. Playing the first one immediately means running dry for about
+        a second, one word in. Waiting for the second removes the gap entirely. Use
+        <strong>early</strong> when measuring latency, <strong>smooth</strong> when listening.
+      </p>
       <p class="note">
         This model has no listen/speak decision of its own &mdash; its vocabulary contains no such
         token, and the server never starts a turn by itself. So <strong>this page</strong> decides
