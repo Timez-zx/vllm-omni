@@ -76,58 +76,51 @@ body {
   gap: 18px;
 }
 
-/* ---------------------------------------------------------------- masthead */
-.masthead {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 16px;
+/* ------------------------------------------------------------------- stage
+ * One primary action and one plain-language status, large enough to read from
+ * across a desk. Everything explanatory lives in the folds below, because a page
+ * whose first screen is caveats does not get read at all.
+ */
+.stage {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 20px;
   align-items: center;
-  justify-content: space-between;
-  padding-bottom: 16px;
-  border-bottom: 1px solid var(--rule);
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 16px;
+  padding: 22px 24px;
+  box-shadow: var(--shadow);
 }
 
-h1 {
-  margin: 0;
-  font-size: 21px;
+.stage-main { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
+
+.status { display: flex; flex-direction: column; gap: 10px; min-width: 190px; }
+
+/* The only status a user needs: Listening / Thinking / Speaking. */
+.status-pill {
+  align-self: flex-start;
+  font-size: 17px;
   font-weight: 650;
   letter-spacing: -.01em;
-}
-
-.subtitle {
-  margin: 4px 0 0;
-  color: var(--ink-2);
-  font-size: 13.5px;
-}
-
-.subtitle code {
-  font-family: var(--mono);
-  font-size: 12px;
-  background: var(--surface-2);
-  border: 1px solid var(--rule);
-  border-radius: 4px;
-  padding: 1px 5px;
-}
-
-.badge {
-  display: inline-block;
-  margin-left: 6px;
-  font-size: 11.5px;
-  font-weight: 600;
-  letter-spacing: .02em;
-  color: var(--warn);
-  background: color-mix(in srgb, var(--warn) 12%, transparent);
-  border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent);
+  padding: 5px 15px;
   border-radius: 999px;
-  padding: 2px 9px;
-  white-space: nowrap;
+  background: var(--surface-2);
+  color: var(--ink-3);
+  transition: background .15s, color .15s;
 }
 
-.controls {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  flex-wrap: wrap;
+.stage-side { display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
+.stage-buttons { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+
+#cameraPreview {
+  display: none;
+  width: 132px;
+  height: 99px;
+  border-radius: 12px;
+  object-fit: cover;
+  background: #000;
+  border: 1px solid var(--rule);
 }
 
 /* ----------------------------------------------------------------- buttons */
@@ -136,7 +129,7 @@ button, select, textarea, summary { font: inherit; }
 button {
   font-weight: 550;
   padding: 9px 16px;
-  border-radius: 8px;
+  border-radius: 10px;
   border: 1px solid transparent;
   background: var(--accent);
   color: var(--accent-ink);
@@ -144,7 +137,10 @@ button {
   transition: filter .12s, background .12s;
 }
 button:hover:not(:disabled) { filter: brightness(1.08); }
-button:disabled { opacity: .45; cursor: not-allowed; }
+button:disabled { opacity: .4; cursor: not-allowed; }
+
+button.big { font-size: 17px; font-weight: 650; padding: 14px 30px; border-radius: 12px; }
+button.small { padding: 7px 13px; font-size: 13.5px; }
 
 button.secondary {
   background: var(--surface);
@@ -152,11 +148,7 @@ button.secondary {
   border-color: var(--rule);
 }
 button.secondary:hover:not(:disabled) { background: var(--surface-2); }
-button.secondary.is-active {
-  background: var(--accent);
-  color: var(--accent-ink);
-  border-color: transparent;
-}
+button.secondary.is-active { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
 button.is-active { filter: brightness(.92); }
 
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
@@ -165,76 +157,111 @@ select, textarea {
   color: var(--ink);
   background: var(--surface);
   border: 1px solid var(--rule);
-  border-radius: 8px;
-  padding: 8px 10px;
+  border-radius: 9px;
+  padding: 9px 11px;
+  width: 100%;
 }
-textarea { width: 100%; resize: vertical; line-height: 1.5; }
+textarea { resize: vertical; line-height: 1.5; }
 
 /* ------------------------------------------------------------------ panels */
 .panel {
   background: var(--surface);
   border: 1px solid var(--rule);
-  border-radius: 12px;
-  padding: 16px 18px;
+  border-radius: 16px;
+  padding: 18px 20px;
   box-shadow: var(--shadow);
 }
 
-.panel h2 {
-  margin: 0 0 10px;
-  font-size: 13px;
-  font-weight: 650;
-  text-transform: uppercase;
-  letter-spacing: .07em;
-  color: var(--ink-3);
-}
-
-.row {
-  display: flex;
-  gap: 12px;
-  align-items: center;
-  flex-wrap: wrap;
-  justify-content: space-between;
-}
-.row > label { font-size: 13.5px; color: var(--ink-2); font-weight: 550; }
-.row h2 { margin: 0; }
-
 .note {
-  margin: 10px 0 0;
+  margin: 12px 0 0;
   font-size: 12.5px;
-  line-height: 1.6;
+  line-height: 1.65;
   color: var(--ink-2);
 }
 .note strong { color: var(--ink); }
+.note code {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  background: var(--surface-2);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
 
-/* The main split: transcript large, diagnostics beside it. */
-.grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1.9fr) minmax(260px, .9fr);
-  gap: 16px;
-  align-items: start;
+/* -------------------------------------------------------------------- folds
+ * Collapsed by default. Nothing was removed from the page when it was
+ * simplified -- the honesty note about who decides when you stop talking, the
+ * wire log, the timings -- all of it is one click away instead of competing
+ * with the conversation for attention.
+ */
+.fold {
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.fold > summary {
+  cursor: pointer;
+  padding: 13px 20px;
+  font-size: 13px;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--ink-3);
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.fold > summary::-webkit-details-marker { display: none; }
+.fold > summary::before {
+  content: '';
+  width: 6px; height: 6px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform .15s;
+}
+.fold[open] > summary::before { transform: rotate(45deg); }
+.fold > summary:hover { color: var(--ink); }
+.fold-body { padding: 4px 20px 20px; border-top: 1px solid var(--rule); }
+
+.field { display: block; margin-top: 16px; }
+.field-label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink-2);
 }
 
 /* ------------------------------------------------------------- transcript */
+.transcript { padding: 14px 16px; }
+
 .conversation {
-  height: 380px;
+  height: min(52vh, 440px);
   overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 10px;
-  padding-right: 4px;
+  padding: 4px;
 }
 
 .empty {
   margin: auto;
+  text-align: center;
   color: var(--ink-3);
-  font-size: 13.5px;
+  font-size: 14px;
+  line-height: 1.8;
 }
+.empty strong { color: var(--ink-2); }
 
 .bubble {
-  max-width: 86%;
-  padding: 9px 13px;
-  border-radius: 12px;
-  font-size: 14.5px;
+  max-width: 82%;
+  padding: 10px 14px;
+  border-radius: 14px;
+  font-size: 15px;
   line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-word;
@@ -253,12 +280,7 @@ textarea { width: 100%; resize: vertical; line-height: 1.5; }
 }
 
 /* ------------------------------------------------------------------- state */
-.stats {
-  margin: 0;
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 8px;
-}
+.stats { margin: 0; display: grid; gap: 8px; }
 .stats > div {
   display: flex;
   align-items: baseline;
@@ -268,49 +290,37 @@ textarea { width: 100%; resize: vertical; line-height: 1.5; }
   border-bottom: 1px solid var(--rule);
 }
 .stats > div:last-child { border-bottom: none; padding-bottom: 0; }
-.stats dt {
-  font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: .05em;
-  color: var(--ink-3);
-}
-.stats dd {
-  margin: 0;
-  font-family: var(--mono);
-  font-size: 13px;
-  font-variant-numeric: tabular-nums;
-}
+.stats dt { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--ink-3); }
+.stats dd { margin: 0; font-family: var(--mono); font-size: 13px; font-variant-numeric: tabular-nums; }
 
-/* State as a pill, legible at a glance. app.js sets data-state. */
-dd[data-state] {
-  padding: 2px 9px;
-  border-radius: 999px;
-  font-family: var(--sans);
-  font-weight: 600;
-  font-size: 12px;
-}
-dd[data-state="idle"]     { background: var(--surface-2); color: var(--ink-3); }
-dd[data-state="ok"]       { background: color-mix(in srgb, var(--good) 15%, transparent); color: var(--good); }
-dd[data-state="busy"]     { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
-dd[data-state="speaking"] { background: var(--accent); color: var(--accent-ink); }
-dd[data-state="bad"]      { background: color-mix(in srgb, var(--bad) 15%, transparent); color: var(--bad); }
+/* Colour by state, so "Speaking" is legible without reading. app.js sets data-state. */
+[data-state] { padding: 2px 9px; border-radius: 999px; font-weight: 600; }
+.stats dd[data-state] { font-family: var(--sans); font-size: 12px; }
+[data-state="idle"]     { background: var(--surface-2); color: var(--ink-3); }
+[data-state="ok"]       { background: color-mix(in srgb, var(--good) 15%, transparent); color: var(--good); }
+[data-state="busy"]     { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
+[data-state="speaking"] { background: var(--accent); color: var(--accent-ink); }
+[data-state="bad"]      { background: color-mix(in srgb, var(--bad) 15%, transparent); color: var(--bad); }
 
 .meter {
-  margin-top: 14px;
-  height: 8px;
+  height: 7px;
   border-radius: 999px;
   background: var(--surface-2);
   border: 1px solid var(--rule);
   overflow: hidden;
 }
-.meter-fill {
-  height: 100%;
-  width: 0;
-  background: var(--accent);
-  transition: width .07s linear;
-}
+.meter-fill { height: 100%; width: 0; background: var(--accent); transition: width .07s linear; }
 
 /* --------------------------------------------------------------- event log */
+.log-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 18px;
+}
+.log-head .field-label { margin: 0; }
+
 .count {
   font-family: var(--mono);
   font-size: 11.5px;
@@ -320,12 +330,13 @@ dd[data-state="bad"]      { background: color-mix(in srgb, var(--bad) 15%, trans
   border: 1px solid var(--rule);
   border-radius: 999px;
   padding: 1px 8px;
-  margin-left: 6px;
+  text-transform: none;
+  letter-spacing: 0;
 }
 
 .log {
-  margin-top: 10px;
-  height: 150px;
+  margin-top: 8px;
+  height: 170px;
   overflow-y: auto;
   font-family: var(--mono);
   font-size: 11.5px;
@@ -333,16 +344,16 @@ dd[data-state="bad"]      { background: color-mix(in srgb, var(--bad) 15%, trans
   color: var(--ink-2);
   background: var(--surface-2);
   border: 1px solid var(--rule);
-  border-radius: 8px;
+  border-radius: 9px;
   padding: 10px 12px;
   white-space: pre-wrap;
   word-break: break-word;
 }
 
-#cameraPreview { border: 1px solid var(--rule); }
-
-@media (max-width: 860px) {
-  .grid { grid-template-columns: 1fr; }
-  .conversation { height: 300px; }
-  .masthead { flex-direction: column; align-items: stretch; }
+@media (max-width: 720px) {
+  .stage { grid-template-columns: 1fr; }
+  .stage-side { align-items: stretch; }
+  .stage-buttons { justify-content: stretch; }
+  .stage-buttons button { flex: 1; }
+  #cameraPreview { width: 100%; height: 150px; }
 }

@@ -146,16 +146,29 @@
     Draining: 'busy', Error: 'bad', Disconnected: 'bad',
   };
 
-  function setState(node, text) {
+  // The big pill is the only status most sessions need, so it says what is happening in
+  // words rather than in the internal state name. The internal names stay the keys, so
+  // every existing call site is unchanged and an unmapped one falls back to itself.
+  const STATE_WORDS = {
+    Idle: 'Not connected',
+    Connecting: 'Connecting…',
+    Connected: 'Ready',
+    Listening: 'Listening to you',
+    Thinking: 'Thinking…',
+    Speaking: 'Speaking',
+    Error: 'Something went wrong',
+  };
+
+  function setState(node, text, displayText) {
     if (!node) return;
-    node.textContent = text;
+    node.textContent = displayText || text;
     // Underrun carries a count ("Underrun x3"), so match the first word.
     const key = text.split(' ')[0];
     node.dataset.state = STATE_CLASS[key] || (key === 'Underrun' ? 'bad' : 'idle');
   }
 
   const setConnection = (t) => setState(connectionState, t);
-  const setModel = (t) => setState(modelState, t);
+  const setModel = (t) => setState(modelState, t, STATE_WORDS[t] || t);
   const setPlayback = (t) => setState(playbackState, t);
 
   function addTranscript(role, text) {

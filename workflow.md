@@ -348,6 +348,70 @@ fixed.
 
 ---
 
+## 12. Pictures are now understood while you are still talking
+
+*2026-08-01 · `a9e4e455` the feature, and the two bugs underneath it*
+
+**Scenario.** You hold up the camera and talk for a few seconds. Pictures keep arriving the
+whole time.
+
+**What used to happen.** Each picture was **set aside** until you stopped talking. Only then
+were they all turned into something the model can read — and that work sat directly in front of
+your answer. So the pictures were paid for at the worst possible moment: after the question,
+while you were waiting.
+
+**What happens now.** Each picture is turned into model-readable form **the moment it arrives**,
+while you are still speaking. By the time you stop, that work is already done and only the
+question itself remains.
+
+**Why this matters more than the milliseconds.** The old way meant every extra picture per turn
+made the reply slower, which is exactly why the camera was kept deliberately slow. Doing it on
+arrival breaks that link: sending pictures more often stops costing you waiting time.
+
+**What it took, and this is the part worth reading.** Turning this on killed the speech engine
+outright — every time, on the first reply. It took **five** attempts, and the first four all
+failed in exactly the same way, which was itself the misleading clue: it looked like one cause
+not yet found, and it was actually **two separate faults happening at once**, where the first
+one crashed the process before the second could ever be seen.
+
+> **Fault one.** When the model produces a word, the system writes a **placeholder** where the
+> real word should go, and fills the real one in on the next step from a short-lived copy. That
+> copy only reaches requests that were busy on the previous step. Our new "understand this
+> picture now" work briefly sets the speech part aside — so when it came back, the real word was
+> gone and only the placeholder was left. The speech part then looked that placeholder up in a
+> table it does not belong to, and the process died.
+>
+> **Fault two.** The picture-understanding step was handing the speech part a **bundle of the
+> wrong shape** — one meant for "here is a lot of new context", labelled as "here is one more
+> word". Nobody could see this until fault one was fixed, because the crash always arrived first.
+
+**Two habits that came out of it, both learned the hard way.**
+
+*Do not send a note; look at the thing itself.* Three times we tried to **tag** the
+picture-understanding work so the later stages would recognise it, using three different ways to
+carry the tag. All three arrived **blank**, silently — the field the tag rode on had already been
+overwritten by the next piece of work. What finally worked was asking a question about the work
+in front of us instead: *did this step take in a lot of new material and then stop?* If yes,
+there is nothing to say out loud. That fact cannot get lost in transit, because it is not being
+carried anywhere.
+
+*A missing log line is not evidence.* Twice a check was written to confirm something by the
+**absence** of a message, and twice it was wrong — the code had simply not run. Every check here
+now confirms things by **presence**: the message has to appear.
+
+**What it cost, honestly.** Four wrong attempts, each needing a full engine restart, before the
+approach changed from "guess a cause and test it" to "read the whole path at once and let the
+code say". The lesson generalises: when several different fixes fail in **identical** ways, stop
+looking for one missing cause and start suspecting two.
+
+**One number to treat with care.** With the bookkeeping now correct, the reply starts about
+**a third sooner**. An earlier, much larger figure was measured while some replies were being
+credited to the wrong turn, so it is not trustworthy. The claim that "sending pictures more often
+is now free" was also measured before the fixes and **still needs re-measuring** — it is the real
+selling point, so it deserves a clean number rather than an encouraging one.
+
+---
+
 ## Where things stand
 
 **Working**
