@@ -465,20 +465,54 @@ def thinker2talker_async_chunk(
     request_id = request.external_req_id
     chunk_id = transfer_manager.put_req_chunk[request_id]
 
-    # A prefill-only append is NOT withheld from the talker, and that reversal is the fix.
+    # A prefill-only append ships NOTHING to the talker, and this is now correct rather than
+    # a guess -- two independent defects had to be fixed before it could be, and each one hid
+    # the other:
     #
-    # Withholding it was the obvious design and it killed the engine: the append advances
-    # stage 0's context, the talker consumes thinker embeddings PER POSITION, and the
-    # positions it never received put the two stages' accounting out of step. The talker
-    # then indexed its ~4k-row codec table with text-vocabulary ids --
-    # `indexSelectSmallIndex: srcIndex < srcSelectDimSize` -- and the stage died. Adding
-    # more gates made it worse-behaved, not better: with all three confirmed firing it
-    # still died on turn 1, while the same pacing without appends survived 398 frames.
+    # 1. `-1` reaching the codec embedding. Under async scheduling `token_ids_cpu` never holds
+    #    a sampled id; vLLM writes the sentinel -1 and patches the real value onto the GPU row
+    #    from `prev_sampled_token_ids`, which only reaches requests that were in the PREVIOUS
+    #    forward's batch. An append parks the talker, so it leaves the batch and is re-admitted
+    #    on an output row -- readable only from CPU, and reads -1. codec_embedding has 3072
+    #    rows, so `indexSelectSmallIndex: srcIndex < srcSelectDimSize`, stage 1 dead. FIXED by
+    #    `async_scheduling: false` on stage 1 in deploy_web_demo.yaml, not here.
     #
-    # So the append flows through normally and stage 1 stays aligned. The talker does emit
-    # a little audio for it, which is waste, but it is DROPPED at the entrypoint before
-    # reaching the client (see the arrival-append branch in _session_output_loop) rather
-    # than prevented here, because preventing it is what breaks the contract.
+    # 2. A prefill tensor labelled as a decode payload -- what this branch prevents. An append
+    #    stops on the very forward that prefills it, and omni_ar_scheduler.py clears
+    #    `_output_token_ids` before calling save_async, so the code below takes its
+    #    decode-shaped path and ships the append's [N_rows, 1024] prefill tensor as
+    #    `embed.decode`. The runner then copies it into a ONE-ROW decode slot:
+    #    `RuntimeError: output with shape [1, 1024] doesn't match the broadcast shape
+    #    [222, 1024]` at gpu_model_runner.py:1793.
+    #
+    # Defect 2 was invisible until defect 1 was fixed -- the CUDA assert killed the process
+    # first, on the same turn, which is why four earlier attempts all "failed identically"
+    # while actually failing for two different reasons at once.
+    # STRUCTURAL, not marker-based. The marker (SamplingParams.extra_args) does reach the stage
+    # processes -- proven by log -- but it does NOT survive to here: by the time either the
+    # scheduler's save_async or this save-thread call reads it, the next streaming update has
+    # replaced sampling_params, so both the live read and an enqueue-time snapshot came back
+    # False while the crash they were meant to prevent happened. Two silent misses; stop
+    # relying on transported state.
+    #
+    # The condition below cannot be lost, because it is a property of THIS forward: a forward
+    # that both PREFILLS (more than one row of thinker embeddings) and ENDS the segment carries
+    # no talker obligation -- the segment produced no text, so there is nothing to speak. Only
+    # a frames-on-arrival append can do that, because it is submitted with max_tokens=1 and so
+    # stops on the very forward that prefills it. With the feature off, a segment's first
+    # forward never stops, so this branch is unreachable and the shipping path is untouched.
+    if is_finished and isinstance(multimodal_output, Mapping):
+        _emb = multimodal_output.get("hidden_states", {})
+        _layers = _emb.get("layers", {}) if isinstance(_emb, dict) else {}
+        _rows = _layer_tensor(_layers, _EMBED_LAYER_KEY)
+        if _rows is not None and int(_rows.shape[0]) > 1:
+            logger.info(
+                "[prefill-only] context-only forward: %d rows prefilled and the segment ended, "
+                "so nothing is shipped to the talker (req=%s chunk_id=%d)",
+                int(_rows.shape[0]), request_id, chunk_id,
+            )
+            return None
+
     if not isinstance(multimodal_output, Mapping):
         logger.debug("thinker2talker_async_chunk: skip non-dict multimodal_output for req=%s", request_id)
         return None

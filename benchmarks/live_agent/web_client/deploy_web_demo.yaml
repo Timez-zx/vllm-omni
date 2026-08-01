@@ -82,6 +82,28 @@ stages:
     gpu_memory_utilization: 0.10
     trust_remote_code: true
     enable_prefix_caching: false
+    # Async scheduling OFF, and this is the fix for the prefill-on-arrival crash.
+    #
+    # With it on, `token_ids_cpu` never holds a sampled id: vLLM writes the sentinel -1
+    # (gpu_model_runner.py:3767,3785) and patches the real value onto the GPU row from
+    # `prev_sampled_token_ids` on the next step. That patch reaches only requests that were
+    # in the PREVIOUS forward's batch. A frames-on-arrival append parks the live talker
+    # request, so it leaves the persistent batch and is re-admitted on an OUTPUT row, which
+    # can only be read from CPU -- and reads -1. That goes into talker_mtp_input_ids
+    # (int32, so silently) and detonates one launch later in codec_embedding, which has
+    # 3072 rows: `indexSelectSmallIndex: srcIndex < srcSelectDimSize`, stage 1 dead.
+    #
+    # Confirmed independently: nn.Embedding(3072,16).cuda() indexed with -1 reproduces that
+    # assert at the SAME file and line as the crash (Indexing.cu:1515). Index 2150 (the
+    # highest id the talker can sample -- codec_head is Linear(1024,3072) with rows
+    # [2048,3072) suppressed except codec_eos) is fine, which is why the shipping path never
+    # trips it.
+    #
+    # Off, the sampled id is written to token_ids_cpu directly, so a re-admitted output row
+    # reads a real codec id. Costs some per-step latency on the talker; stage 2 already runs
+    # this way. Four earlier fixes all failed because they changed things UPSTREAM of the
+    # index instead of removing the out-of-range value.
+    async_scheduling: false
     # CUDA graph capture on this stage is what tipped the card over on 0.26.0.
     # Eager costs some per-step latency and buys the headroom stage 2 needs; if a
     # future run has the card entirely to itself, try turning this back off first.

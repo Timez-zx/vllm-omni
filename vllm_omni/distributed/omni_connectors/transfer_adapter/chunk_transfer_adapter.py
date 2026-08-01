@@ -414,7 +414,25 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # Process payload in save_loop thread
         payload_data: OmniPayloadStruct | None = None
         _t_build0 = time.perf_counter()
-        if self.custom_process_next_stage_input_func:
+        # Skip the payload BUILD for a prefill-only append, using the snapshot taken at
+        # enqueue time. Reading the live request here does not work: sampling_params (which
+        # carries the marker) has already been replaced by the next streaming update by the
+        # time this thread runs, so the processor's own check silently never fires -- observed,
+        # with `shipping nothing` absent from the log while the crash it prevents happened.
+        #
+        # Only the build is skipped. The boundary marker, the chunk id and the key namespace
+        # all proceed exactly as before: withholding THOSE is what four earlier attempts did,
+        # and it left stage 1 unable to re-admit the talker cleanly. What must not be shipped
+        # is the append's PREFILL tensor mislabelled `embed.decode` -- the runner copies it
+        # into a one-row decode slot and raises
+        # `output with shape [1, 1024] doesn't match the broadcast shape [222, 1024]`.
+        _prefill_only = bool(task.get("prefill_only"))
+        if _prefill_only:
+            logger.info(
+                "[prefill-only] skipping payload build, stage %s -> %s, req %s (boundary still ships)",
+                stage_id, next_stage_id, external_req_id,
+            )
+        if self.custom_process_next_stage_input_func and not _prefill_only:
             try:
                 payload_data = self.custom_process_next_stage_input_func(
                     transfer_manager=self,
