@@ -33,6 +33,11 @@
 
   const config = window.LIVE_AGENT_CONFIG || {};
 
+  // addModule() caches aggressively and a reload does not reliably replace it, so a
+  // stale playback worklet can make a fixed audio bug look unfixed. The server stamps
+  // every asset; carry it onto the worklet URL too.
+  const versioned = (url) => (config.assetVersion ? `${url}?v=${config.assetVersion}` : url);
+
   const el = (id) => document.getElementById(id);
   const callButton = el('callButton');
   const muteButton = el('muteButton');
@@ -297,6 +302,11 @@
     switch (type) {
       case 'response.start':
         turnInFlight = true;
+        // Re-apply the prebuffer for this turn. The worklet node lives for the whole
+        // call, so without this the smooth start applies to the first reply only.
+        if (playbackNode) {
+          playbackNode.port.postMessage({ type: 'rearm', frames: prebufferFrames() });
+        }
         setModel('Thinking');
         log('turn started');
         break;
@@ -473,7 +483,7 @@
 
   async function startPlayback() {
     playbackContext = new AudioContext();
-    await playbackContext.audioWorklet.addModule('static/playback_worklet.js');
+    await playbackContext.audioWorklet.addModule(versioned('static/playback_worklet.js'));
     playbackNode = new AudioWorkletNode(playbackContext, 'live-agent-playback', {
       processorOptions: { prebufferFrames: prebufferFrames() },
     });
@@ -658,6 +668,7 @@
   }
 
   if (systemPromptInput && !systemPromptInput.value) systemPromptInput.value = DEFAULT_SYSTEM_PROMPT;
+  log(`client assets ${config.assetVersion || 'unversioned'}`);
   setConnection('Idle');
   log('ready -- press Start call');
 })();

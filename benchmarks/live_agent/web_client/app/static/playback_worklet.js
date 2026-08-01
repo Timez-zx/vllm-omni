@@ -37,6 +37,8 @@ class LiveAgentPlayback extends AudioWorkletProcessor {
     this.started = false;
     this.underruns = 0;
     this.playedFrames = 0;
+    // Set by 'rearm', applied the moment the queue runs dry. null means nothing pending.
+    this.pendingPrebuffer = null;
 
     this.port.onmessage = (event) => {
       const msg = event.data || {};
@@ -60,6 +62,27 @@ class LiveAgentPlayback extends AudioWorkletProcessor {
         // waiting for a threshold it may never reach would swallow it. Short replies
         // total less than the smooth-start target and would otherwise never play.
         this.prebufferFrames = 0;
+      } else if (msg.type === 'rearm') {
+        // A NEW TURN is starting, so the prebuffer has to apply again.
+        //
+        // Without this the smooth start worked on the first reply of a call and no
+        // other, for two compounding reasons: `start_now` had zeroed the threshold
+        // permanently (this node lives for the whole call, not one turn), and
+        // `started` stays true once playback has begun. Either alone makes every
+        // later turn start on the small first granule and stall.
+        //
+        // Re-arming HERE is not the mistake that re-arming on underrun was. That one
+        // fired on a condition the client could not see coming and had no matching
+        // release, so it latched. This fires on an explicit turn boundary and is
+        // always released by `start_now` at the end of the same turn.
+        //
+        // DEFERRED, not immediate. `response.start` for the next turn can arrive while
+        // the previous reply's tail is still queued, and applying it then would cut a
+        // word in half. Applying it only when the queue is already empty was the first
+        // attempt and it silently did nothing in exactly that case -- which is the
+        // common one. So it waits for the queue to run dry, which is the real boundary.
+        this.pendingPrebuffer = Math.max(0, msg.frames || 0);
+        if (this.buffered === 0) this.applyPendingRearm();
       } else if (msg.type === 'stats') {
         this.port.postMessage({
           type: 'stats',
@@ -71,9 +94,22 @@ class LiveAgentPlayback extends AudioWorkletProcessor {
     };
   }
 
+  applyPendingRearm() {
+    this.prebufferFrames = this.pendingPrebuffer;
+    this.pendingPrebuffer = null;
+    this.started = false;
+    this.offset = 0;
+  }
+
   process(_inputs, outputs) {
     const out = outputs[0][0];
     if (!out) return true;
+
+    if (this.pendingPrebuffer !== null && this.buffered === 0) {
+      // The previous reply has finished playing out; this is the turn boundary the
+      // re-arm was waiting for.
+      this.applyPendingRearm();
+    }
 
     if (!this.started) {
       if (this.buffered < this.prebufferFrames) {

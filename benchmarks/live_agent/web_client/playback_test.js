@@ -263,5 +263,113 @@ check('response.audio.done releases it', released.startedAtMs !== null
       `starts ${released.startedAtMs === null ? 'never' : released.startedAtMs.toFixed(0) + ' ms'}, `
       + `plays ${released.playedMs.toFixed(0)} ms of the 617 ms delivered`);
 
+
+// ---------------------------------------------------------------------------
+// 4. MULTIPLE turns in one call, which is where the smooth start actually broke
+//
+// Sections 1-3 and audio_timeline.py all drive a single turn, and every one of them
+// passed while a listener heard a stutter on every reply after the first. Two faults
+// compounded, and each alone was enough:
+//
+//   * `start_now` at the end of a turn zeroed the threshold PERMANENTLY -- the worklet
+//     node is created once per CALL, not per turn;
+//   * `started` stays true once playback has begun (correctly -- re-arming it on
+//     underrun is what latched the whole session silent earlier), so the gate is not
+//     consulted again at all.
+//
+// So the fix needs an explicit per-turn re-arm, and this section is the only thing
+// here that can tell whether it works: it replays turn boundaries, not just chunks.
+function runTurns(prebufferMs, turnCount) {
+  const file = path.join(__dirname, 'app', 'static', 'playback_worklet.js');
+  const { cls } = loadProcessor(file);
+  const node = new cls({ processorOptions: { prebufferFrames: Math.round(RATE * prebufferMs / 1000) } });
+  const outputs = [[new Float32Array(BLOCK)]];
+  const out = outputs[0];
+  const prebufFrames = Math.round(RATE * prebufferMs / 1000);
+  const blockMs = (BLOCK / RATE) * 1000;
+  const perTurn = [];
+
+  const render = () => {
+    out[0].fill(0);
+    node.process([], outputs);
+    for (let i = 0; i < BLOCK; i += 1) if (out[0][i] !== 0) return true;
+    return false;
+  };
+
+  for (let t = 0; t < turnCount; t += 1) {
+    // app.js posts this on response.start.
+    node.port.onmessage({ data: { type: 'rearm', frames: prebufFrames } });
+
+    let nowMs = 0, startedAt = null, stalls = 0, dry = 0, delivered = 0;
+    // Run until the whole reply has been delivered AND played out, so the next turn
+    // begins from silence -- which is what actually happens, since the user cannot
+    // trigger the next turn until this reply has finished.
+    while (delivered < MEASURED.length || node.buffered > 0) {
+      while (delivered < MEASURED.length && MEASURED[delivered].at <= nowMs) {
+        const frames = Math.round(RATE * MEASURED[delivered].audio / 1000);
+        node.port.onmessage({ data: { type: 'samples', pcm: new Float32Array(frames).fill(0.5).buffer } });
+        delivered += 1;
+        // ...and this on response.audio.done.
+        if (delivered === MEASURED.length) node.port.onmessage({ data: { type: 'start_now' } });
+      }
+      const sounding = render();
+      if (sounding) {
+        if (startedAt === null) startedAt = nowMs;
+        dry = 0;
+      } else if (startedAt !== null && delivered < MEASURED.length) {
+        dry += 1;
+        if (dry === 3) stalls += 1;      // 3 blocks = 16 ms, past rounding
+      }
+      nowMs += blockMs;
+      if (nowMs > 60000) break;          // never hang the test on a logic error
+    }
+    perTurn.push({ startedAt, stalls });
+  }
+  return perTurn;
+}
+
+// The other order: the next turn is announced while the previous reply is still
+// sounding. The re-arm must not cut that tail off mid-word, which is why it is
+// deferred rather than applied on arrival.
+function tailSurvivesRearm() {
+  const file = path.join(__dirname, 'app', 'static', 'playback_worklet.js');
+  const { cls } = loadProcessor(file);
+  const node = new cls({ processorOptions: { prebufferFrames: 0 } });
+  const outputs = [[new Float32Array(BLOCK)]];
+  const out = outputs[0];
+  const frames = Math.round(RATE * 1.0);            // 1 s of tail still to play
+  node.port.onmessage({ data: { type: 'samples', pcm: new Float32Array(frames).fill(0.5).buffer } });
+  let played = 0;
+  for (let b = 0; b < 40; b += 1) {                 // ~0.2 s in
+    out[0].fill(0); node.process([], outputs);
+    for (let i = 0; i < BLOCK; i += 1) if (out[0][i] !== 0) played += 1;
+  }
+  node.port.onmessage({ data: { type: 'rearm', frames: Math.round(RATE * 1.4) } });
+  for (let b = 0; b < 300; b += 1) {                // play the rest out
+    out[0].fill(0); node.process([], outputs);
+    for (let i = 0; i < BLOCK; i += 1) if (out[0][i] !== 0) played += 1;
+  }
+  return { played, frames };
+}
+
+console.log('\n4. several turns in one call');
+
+const smoothTurns = runTurns(1400, 3);
+check('the smooth start applies to EVERY turn, not just the first',
+      smoothTurns.every((t) => t.stalls === 0 && t.startedAt >= 1700),
+      smoothTurns.map((t, i) => `turn ${i}: start ${t.startedAt === null ? 'never' : t.startedAt.toFixed(0)} ms, `
+        + `${t.stalls} stall(s)`).join('; '));
+
+const fastTurns = runTurns(60, 3);
+check('the early start still stalls on every turn, as designed',
+      fastTurns.every((t) => t.stalls >= 1 && t.startedAt < 500),
+      fastTurns.map((t, i) => `turn ${i}: start ${t.startedAt.toFixed(0)} ms, ${t.stalls} stall(s)`).join('; '));
+
+const tail = tailSurvivesRearm();
+check('a re-arm while the previous reply is still sounding does not cut it off',
+      tail.played >= tail.frames * 0.99,
+      `played ${tail.played}/${tail.frames} frames of the tail -- the deferred re-arm `
+      + `waits for the queue to drain instead of truncating a word`);
+
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) failed.`);
 process.exit(failures === 0 ? 0 : 1);

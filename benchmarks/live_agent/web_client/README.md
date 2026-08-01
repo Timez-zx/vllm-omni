@@ -177,10 +177,23 @@ settings, and the page offers both:
 | smooth (default) | ~1.70 s | none |
 | as early as possible | ~0.35 s | one, ~1.1 s |
 
-Use **early** when measuring latency, **smooth** when listening. `response.audio.done`
-releases the threshold, so a reply shorter than the target still plays instead of
-sitting in the buffer — `playback_test.js` asserts that the escape hatch is
-load-bearing by showing the reply never plays without it.
+Use **early** when measuring latency, **smooth** when listening.
+
+Two things make the smooth mode work per TURN rather than per call, and both were
+bugs first:
+
+* `response.audio.done` clears the threshold, so a reply shorter than the target still
+  plays instead of sitting in the buffer;
+* `response.start` re-arms it. Without that, the worklet node — which lives for the
+  whole call — kept the cleared threshold and `started` stayed true, so **the smooth
+  start applied to the first reply and no other.** The re-arm is *deferred* until the
+  queue runs dry, because the next turn can be announced while the previous reply is
+  still sounding and cutting it off mid-word would be worse.
+
+Re-arming on a turn boundary is not the mistake that re-arming on underrun was: this
+one fires on an explicit event and is always released at the end of the same turn.
+`playback_test.js` section 4 covers all of it by replaying turn boundaries, which is
+what sections 1–3 and `audio_timeline.py` could not see.
 
 Raising it further buys nothing: the gap is generation time, not network jitter.
 
@@ -214,4 +227,5 @@ model rather than trusting it.
 | One turn wedges the page and nothing recovers | A missing `response.audio.done`. The 45 s watchdog in `endTurn()` releases it; look for `turn ended (watchdog…)` in the log |
 | It never answers | Nothing is sending `video.query`. Switch the mode to hold-to-talk and press it |
 | Speech starts, stalls about a second, then continues | Expected in **as early as possible** mode and structural, not a fault: the first granule is 0.217 s and the second takes 1.34 s to make. Switch **Start speaking…** to smooth, or run `audio_timeline.py` to see the schedule |
+| A fix seems to have no effect at all | Compare the `client assets <hash>` line in the event log with the stamp the page server prints at startup. Responses are `no-store` and every asset URL is stamped, but `addModule()` for the playback worklet is cached hardest and used to survive reloads |
 | Turn 20 much slower than turn 2 | `session_scoped_request` did not take effect — check the server log for `[session] turn=` lines |

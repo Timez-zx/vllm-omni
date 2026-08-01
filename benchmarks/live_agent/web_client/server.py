@@ -49,16 +49,51 @@ APP_DIR = pathlib.Path(__file__).resolve().parent / "app"
 UPSTREAM_PATH = "/v1/video/chat/stream"
 
 
+def asset_version() -> str:
+    """Short stamp over the client files, used to bust caches and to be checkable.
+
+    A stale cached `app.js` or -- worse -- a stale AudioWorklet module makes a fixed
+    playback bug look unfixed, and there is nothing in the UI to tell the two apart.
+    `addModule()` in particular is cached hard, and a normal reload does not always
+    replace it. So every asset URL carries this stamp, responses are `no-store`, and
+    the page prints the stamp in its event log: if a fix seems absent, compare it with
+    what the server reports at startup before looking anywhere else.
+    """
+    parts = []
+    for name in ("index.html", "static/app.js", "static/styles.css",
+                 "static/playback_worklet.js", "static/capture_worklet.js"):
+        path = APP_DIR / name
+        if path.exists():
+            stat = path.stat()
+            parts.append(f"{name}:{int(stat.st_mtime)}:{stat.st_size}")
+    import hashlib
+
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:8]
+
+
 def build_app(ws_backend: str, ws_url_override: str | None):
     app = FastAPI(title="Qwen3-Omni live session")
     app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")
+
+    version = asset_version()
+
+    @app.middleware("http")
+    async def no_store(request, call_next):
+        response = await call_next(request)
+        # This is a development tool served over an ssh tunnel; correctness beats a
+        # cache hit on a 25 KB file every time.
+        response.headers["Cache-Control"] = "no-store, must-revalidate"
+        return response
 
     index_template = (APP_DIR / "index.html").read_text(encoding="utf-8")
     # Empty wsUrl makes the page derive ws://<this origin>/ws, which is what the
     # same-origin proxy is for. An override exists for the case where a reverse
     # proxy in front of this server does not forward websocket upgrades.
-    page_config = json.dumps({"wsUrl": ws_url_override or ""})
-    index_html = index_template.replace("{{CONFIG_JSON}}", page_config)
+    page_config = json.dumps({"wsUrl": ws_url_override or "", "assetVersion": version})
+    index_html = (index_template
+                  .replace("{{CONFIG_JSON}}", page_config)
+                  .replace('href="static/styles.css"', f'href="static/styles.css?v={version}"')
+                  .replace('src="static/app.js"', f'src="static/app.js?v={version}"'))
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:

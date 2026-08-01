@@ -110,22 +110,45 @@ async def run(args) -> int:
                                       "data": base64.b64encode(synth_speechlike_pcm(0.5)).decode()}))
             await asyncio.sleep(0.1)
 
-        state["t0"] = time.monotonic()
-        await ws.send(json.dumps({"type": "video.query", "text": args.query}))
-
-        deadline = time.monotonic() + args.timeout_s
-        while not state["done"] and time.monotonic() < deadline:
-            await asyncio.sleep(0.05)
+        # Several turns, because the arrival schedule of turn 2 is not something turn 1
+        # can tell you -- and a per-turn client rule (the playback re-arm) is only as
+        # good as the schedule staying the same. Measuring one turn is what let a
+        # "smooth on the first reply only" bug pass every check here.
+        turns = []
+        for turn in range(args.turns):
+            state["deltas"], state["text"], state["done"] = [], "", False
+            state["t0"] = time.monotonic()
+            await ws.send(json.dumps({"type": "video.query", "text": args.query}))
+            deadline = time.monotonic() + args.timeout_s
+            while not state["done"] and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+            turns.append((state["deltas"][:], state["text"]))
+            # Speak again between turns, the way a live client would.
+            for _ in range(3):
+                await ws.send(json.dumps({"type": "audio.chunk",
+                                          "data": base64.b64encode(synth_speechlike_pcm(0.5)).decode()}))
+                await asyncio.sleep(0.05)
         await ws.send(json.dumps({"type": "video.done"}))
         task.cancel()
 
-    deltas = state["deltas"]
-    if not deltas:
+    if not any(d for d, _ in turns):
         print("no audio at all -- this is a probe.py problem, not a continuity one")
         return 1
 
-    print(f"\ntext: {state['text'][:100]}")
-    print(f"\n{'delta':>5} {'arrived':>9} {'audio_s':>8} {'gap_since_prev':>15}")
+    worst = 0
+    for turn_idx, (deltas, text) in enumerate(turns):
+        if not deltas:
+            print(f"\nturn {turn_idx}: NO AUDIO")
+            worst = 1
+            continue
+        print(f"\n--- turn {turn_idx}: {text[:70]}")
+        report(deltas, args)
+    return worst
+
+
+def report(deltas, args) -> None:
+
+    print(f"{'delta':>5} {'arrived':>9} {'audio_s':>8} {'gap_since_prev':>15}")
     prev = 0.0
     for i, (t, dur) in enumerate(deltas):
         print(f"{i:>5} {t:>8.3f}s {dur:>8.3f} {t - prev:>14.3f}s")
@@ -137,8 +160,8 @@ async def run(args) -> int:
     sim = simulate(deltas, args.prebuffer_ms / 1000.0)
     print(f"\nplayback simulation at prebuffer={args.prebuffer_ms:.0f}ms:")
     if sim["start"] is None:
-        print("  never starts -- prebuffer exceeds everything delivered")
-        return 1
+        print("  never starts on the threshold alone -- response.audio.done releases it")
+        return
     print(f"  starts at {sim['start']:.3f}s after the query")
     if not sim["stalls"]:
         print("  NO STALLS -- plays straight through")
@@ -152,11 +175,10 @@ async def run(args) -> int:
     for ms in (60, 250, 500, 1000, 1500, 2000):
         s = simulate(deltas, ms / 1000.0)
         if s["start"] is None:
-            print(f"  {ms:>5}ms  never starts")
+            print(f"  {ms:>5}ms  never starts on the threshold alone")
             continue
         print(f"  {ms:>5}ms  start {s['start']:.3f}s  "
               f"{len(s['stalls'])} stall(s), {s['stall_total'] * 1000:.0f}ms silent")
-    return 0
 
 
 def main() -> int:
@@ -166,6 +188,7 @@ def main() -> int:
     p.add_argument("--direct", action="store_true", help="bypass the page-server proxy")
     p.add_argument("--query", default="Please count slowly from one to fifteen.")
     p.add_argument("--prebuffer-ms", type=float, default=DEFAULT_PREBUFFER_MS)
+    p.add_argument("--turns", type=int, default=3, help="later turns are the interesting ones")
     p.add_argument("--timeout-s", type=float, default=120.0)
     return asyncio.run(run(p.parse_args()))
 
