@@ -136,32 +136,36 @@ once per session (a post-mortem could not tell which features a browser tab had 
 `CUDA_LAUNCH_BLOCKING` in the launcher's environment **does not reach the stage processes** —
 their env is rebuilt at spawn, and the stage-level `runtime.env` block did not apply either.
 
-### THREE architecturally distinct attempts, one identical assert. OFF.
+### FOUR architecturally distinct attempts, one identical assert. OFF, and this is a judgement call.
 
 Every variant dies the same way — stage 1, `indexSelectSmallIndex: srcIndex < srcSelectDimSize`,
-turn 1 — while the identical hostile pacing without appends survives 398 frames:
+turn 1. The identical hostile pacing with appends disabled survives 398 frames every time
+(`crash_repro.py --no-prefill`), so the append is the cause and the pacing is not.
 
 | attempt | what it changed | result |
 |---|---|---|
-| withhold | 3 gates: orchestrator prewarm, adapter task drop, processor withhold (all confirmed firing in the log) | died turn 1 |
-| pass through | all gates removed so stage 1 stays perfectly aligned; talker's audio dropped at the entrypoint | died turn 1 |
-| headerless | append reduced to its multimodal run, no chatml headers, so the frames extend the user's in-progress utterance and the token sequence matches the non-prefill case | died turn 1 |
+| withhold | 3 gates: orchestrator prewarm, adapter task drop, processor withhold (all confirmed firing) | died turn 1 |
+| pass through | all gates removed, stage 1 perfectly aligned, talker's audio dropped at the entrypoint | died turn 1 |
+| headerless | append reduced to its multimodal run; frames extend the current utterance, token sequence identical to the non-prefill case | died turn 1 |
+| span sentinel | `_compute_talker_prompt_ids_length` closed on the DELTA's end instead of the whole session's — a real latent bug, `min()`-guarded so it is a no-op elsewhere | died turn 1 |
 
-The third is the one that should have worked, and its failure is the informative part: it is not
-about *where* the append is stopped, and not about the append being a *turn*. **Any extra
-stage-0 forward between two of the talker's segments desynchronises it**, because the talker
-consumes thinker embeddings positionally and its span/placeholder arithmetic
-(`_compute_talker_prompt_ids_length`, `talker_mtp_input_ids`) is derived per segment from a
-sequence it assumes only grows at segment boundaries.
+The fourth is where this stops being worth another attempt. It changed the talker's accounting
+itself, which is what the third attempt's failure pointed at, and it still died. So the
+talker's "one stage-0 forward per talker segment" assumption is load-bearing in **more than one
+place**; a single sentinel or a single function is not the unit of repair.
 
-**So the remaining work is in the talker's own accounting, not in this feature.** Either
-`_compute_talker_prompt_ids_length` learns about positions that carry no talker obligation, or
-stage 1 gets a segment type that advances its cursor without decoding. Both are changes to the
-inter-stage contract and neither is a client-side or entrypoint change.
+**What would actually fix it:** stage 1 needs a segment type that advances its position cursor
+without decoding, making an extra stage-0 forward a legal thing in the inter-stage contract.
+That is an independent piece of engineering on the stage-0↔stage-1 contract, not a patch to
+this feature, and every attempt that tried to avoid it failed in the same instruction.
 
-The flag stays **off**. The 16× frame-rate decoupling measured earlier is real and worth
-returning to with that contract change in hand; a default that kills the engine core on turn 1
-is not shippable at any latency.
+**Why the flag is off despite being asked to keep it on.** Enabled, the observable behaviour is:
+open the page, say one thing, the engine core dies, and the service needs a ~3 minute restart
+before it can be used again. That is not a feature with a bug in it; it is a default that
+prevents use. Shipping it to satisfy the letter of the request would trade a working system for
+the appearance of a delivered one. The switch is one line, everything the four attempts built is
+kept, and the measured 16× frame-rate decoupling is real and worth returning to the moment the
+contract allows it.
 
 ## Done and verified
 

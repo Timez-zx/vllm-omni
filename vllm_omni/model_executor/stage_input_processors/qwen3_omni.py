@@ -71,10 +71,26 @@ def _compute_talker_prompt_ids_length(info: OmniPayload, device: torch.device | 
 
     input_ids = torch.tensor(ids["prompt"], dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
 
+    # The closing sentinel must be the end of THIS DELTA, not the end of the whole session.
+    #
+    # `ids["all"]` is the request's full accumulated sequence; `ids["prompt"]` is only the
+    # rows of this forward. They are equal whenever every stage-0 forward is a talker
+    # segment, which is why using the former was harmless -- and it is precisely wrong as
+    # soon as they are not. A frames-on-arrival append is a stage-0 forward with no talker
+    # segment, so `all` runs ahead of `prompt` and this sentinel overshoots: the final user
+    # block's length is computed as (full_length - s), the placeholder is sized far too
+    # large, and the talker reads past its codec embedding table --
+    # `indexSelectSmallIndex: srcIndex < srcSelectDimSize`, stage 1 dead, engine gone.
+    #
+    # min() keeps it a no-op for every existing path and bounds it for the new one. This is
+    # the fix three earlier attempts were working around from the outside: withholding the
+    # append, passing it through, and stripping its chatml headers all left this arithmetic
+    # untouched and all died identically on turn 1.
+    _delta_end = min(int(thinker_sequences.shape[-1]), int(input_ids.shape[-1]))
     im_start_indexes = torch.cat(
         [
             torch.nonzero(input_ids[0] == im_start_token_id).squeeze(1),
-            torch.tensor([thinker_sequences.shape[-1]], device=input_ids.device, dtype=input_ids.dtype),
+            torch.tensor([_delta_end], device=input_ids.device, dtype=input_ids.dtype),
         ],
         dim=0,
     )
