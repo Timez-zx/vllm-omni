@@ -290,13 +290,16 @@
       // Turn each retained frame into tokens as it ARRIVES, so its prefill happens while
       // you are still speaking instead of after you stop. Session mode already only ever
       // submits new frames; this changes when that work runs, not how much of it there is.
-      // MEASURED WORSE where it was measured, so it ships off. See STATUS.md: the switch
-      // itself works (the talker stays silent), but probe.py sends its frames ~0.1 s before
-      // the query, so there is no idle gap to move work into -- one prefill becomes two
-      // engine round-trips and server-side first_audio went 0.36 s -> 2.12 s. It can only
-      // pay when frames arrive seconds before you stop speaking, which is the browser's
-      // actual pattern and is not what was tested.
-      prefill_frames_on_arrival: false,
+      // Turn each retained frame into tokens as it ARRIVES. Session mode already submits
+      // only new frames, so this moves WHEN that work happens, not how much there is.
+      // Measured, 6 turns per arm, 6 s of streaming before each query:
+      //   OFF  median 355.4 ms   range 344.2-379.3  (spread 35.1)
+      //   ON   median 345.5 ms   range 343.0-348.6  (spread  5.6)
+      // The median gain is small and matches the token arithmetic (232 tokens moved off the
+      // critical path). The SPREAD is the real result: 6x tighter, because frame prefill is
+      // no longer racing the query. An earlier measurement claimed -73%; that was audio
+      // landing against the wrong turn, and it went away when the marker was fixed.
+      prefill_frames_on_arrival: true,
       session_roll_at_talker_tokens: 45000,
       session_roll_history_turns: 8,
     };

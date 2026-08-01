@@ -645,9 +645,14 @@ class OmniStreamingVideoHandler:
                     # reply's worth of decode and leave that reply in the context.
                     if isinstance(item, tuple):
                         prompt, max_tokens = item
+                        # extra_args is the marker's channel: it rides on the per-chunk
+                        # sampling params, which this path is already required to carry.
                         yield StreamingInput(
                             prompt=prompt,
-                            sampling_params=SamplingParams(max_tokens=max_tokens),
+                            sampling_params=SamplingParams(
+                                max_tokens=max_tokens,
+                                extra_args={_PREFILL_ONLY_KEY: "1"},
+                            ),
                         )
                         continue
                     yield StreamingInput(prompt=item)
@@ -862,10 +867,24 @@ class OmniStreamingVideoHandler:
                 if chunk is None or not isinstance(chunk, dict):
                     return False
                 # The marker the engine side reads to keep this append away from the talker.
-                info = chunk.get("additional_information")
-                info = dict(info) if isinstance(info, dict) else {}
-                info[_PREFILL_ONLY_KEY] = "1"
-                chunk["additional_information"] = info
+                #
+                # It has to be a real AdditionalInformationPayload, not a plain dict. A dict
+                # here is accepted silently and then does not survive: the field is a msgspec
+                # Struct, so it crosses the process boundary only in that shape, and the
+                # engine-side interceptions simply never fire. That failure is invisible --
+                # measured as the model speaking unasked, with no error anywhere and the
+                # symptom (an extra audio segment) three components away from the cause.
+                from vllm_omni.engine import (
+                    AdditionalInformationEntry,
+                    AdditionalInformationPayload,
+                )
+
+                entries = {}
+                existing = chunk.get("additional_information")
+                if isinstance(getattr(existing, "entries", None), dict):
+                    entries.update(existing.entries)
+                entries[_PREFILL_ONLY_KEY] = AdditionalInformationEntry(list_data=["1"])
+                chunk["additional_information"] = AdditionalInformationPayload(entries=entries)
                 try:
                     # 1, not 0: the engine schedules, prefills, samples, stops -- there is no
                     # zero-token append. One token is the floor, and it is discarded.

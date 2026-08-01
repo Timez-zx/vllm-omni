@@ -92,6 +92,24 @@ def request_is_prefill_only(request: Any) -> bool:
     Reads both the structured engine form (``entries[key].list_data``) and a plain dict,
     because the prompt carries a dict and the engine request carries the structured form.
     """
+    # The sampling-params channel first, because it is the one that actually arrives.
+    #
+    # additional_information was tried twice -- as a plain dict and as a real
+    # AdditionalInformationPayload -- and neither reached the stage processes: the field is
+    # populated by the CONNECTOR for stage-to-stage payloads, and nothing on the entrypoint's
+    # streaming-update path transfers it from the prompt. Both attempts failed silently, with
+    # the symptom (the model speaking unasked) three components away from the cause.
+    #
+    # SamplingParams.extra_args exists for exactly this, and it travels by construction:
+    # StreamingInput carries per-chunk sampling params, async_omni puts them in
+    # chunk_sampling_params_list[0], and they end up on request.sampling_params.
+    params = getattr(request, "sampling_params", None)
+    extra = getattr(params, "extra_args", None)
+    if isinstance(extra, dict) and str(extra.get(PREFILL_ONLY_KEY, "")).strip().lower() in (
+        "1", "true", "yes"
+    ):
+        return True
+
     info = getattr(request, "additional_information", None)
     if info is None:
         return False
