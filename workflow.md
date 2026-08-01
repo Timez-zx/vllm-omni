@@ -412,6 +412,65 @@ selling point, so it deserves a clean number rather than an encouraging one.
 
 ---
 
+## 13. The voice went muffled and kept getting cut off — one symptom, three faults
+
+*2026-08-01 · `9624cac1` `3093205d` — heard by ear, pinned by a five-way audit of the code and the logs*
+
+**Scenario.** With pictures-on-arrival switched on (section 12), you talk to it for a few
+turns. The first reply sounds fine. From the second or third, the voice goes muffled, and
+sometimes it stops mid-sentence and never finishes.
+
+**The one-line background.** Every kept picture spawns a small job: *"read this, say
+nothing."* The trouble was that only the **reading** part of the model ever received the
+"say nothing" half. The **speaking** part treated every one of those jobs as something to
+answer: it hummed a little meaningless audio, and then announced *"done speaking"* — a real
+announcement, the same kind a real answer ends with.
+
+**Fault one — the announcement claimed the wrong owner.** That "done speaking" takes about a
+second to travel from the speech engine back to the front desk. If your next question was
+asked inside that second, the front desk heard "done speaking" and concluded *your answer*
+had finished — half a sentence in. The rest of the real answer arrived moments later, was
+ruled "no turn is running", and was thrown away. One session lost **27.5 seconds** of real
+speech that way; every single broken turn in the logs sits exactly on one of these
+collisions, and no healthy turn does.
+
+The fix is not a smarter flag — flags read *at the moment something arrives* are exactly
+what lost this race. The fix is a **ledger of submissions**: work goes into the engine
+through one door and comes out finished in the same order, so the k-th "done speaking"
+belongs to the k-th job, full stop. A read-this job's humming and its announcement are now
+identified by name and discarded; only your question's own announcement can end your turn.
+
+**Fault two — the seams stopped being sewn.** The voice is built in small blocks, and each
+block must be stitched to the tail of the previous one — like matching the pattern when
+hanging wallpaper. One counter in that stitching arithmetic **never resets**, and it was
+being used to measure a list that **resets every turn**. From the second turn of every
+conversation onward, the second block of every reply was stitched with **no overlap at
+all** — that seam is the muffle. The same broken arithmetic, fed a very short piece, computed
+a negative length and threw the piece away entirely. The counter that resets at the right
+time already existed in the codebase; a sibling model's code was already using it.
+
+**Fault three — the humming had no limit.** Only visible once the first two were fixed: the
+meaningless humming was **unbounded**. One job hummed for **50 seconds**, and since the
+speaking part does one job at a time, the *voice* of the next real answer stood in line
+behind it — its text ready in 2 seconds, its sound arriving at 52. Now any job that arrived
+with nothing to say may make at most one sound before it is stopped. The stopping mechanism
+already existed too; it had simply never been wired to the speaking stage.
+
+**The habit this run adds to the list.** Sections 5 and 12 each ended with "it was two
+faults, not one". This is the third time — and the count is the lesson now. When a symptom
+survives a correct-looking fix, the next hypothesis should not be "the fix was wrong" but
+"there is another fault under it". Also worth keeping: the decisive evidence was already
+sitting in old logs — every broken turn in weeks of history had the feature on, every
+feature-off session was clean. A natural experiment nobody had to run, only to read.
+
+**Verified, not assumed.** Replayed the browser's exact rhythm against the live engine —
+static camera forcing one read-this job every 2 seconds, eight questions timed to land inside
+the collision window. All eight turns came back whole, every announcement was claimed by its
+rightful owner, the cap armed and released on every job, and the 50-second tail is gone. The
+same pressure before the fixes broke the second turn within seconds.
+
+---
+
 ## Where things stand
 
 **Working**
