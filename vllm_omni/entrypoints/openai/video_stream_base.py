@@ -277,6 +277,71 @@ def _shift_mm_placeholders(engine_prompt: Any, shift: int) -> None:
                     logger.warning("[session] could not shift a placeholder offset")
 
 
+def _mm_placeholder_span(engine_prompt: Any) -> tuple[int, int] | None:
+    """First and last token index covered by multimodal placeholders, or None."""
+    if not isinstance(engine_prompt, dict):
+        return None
+    ph = engine_prompt.get("mm_placeholders")
+    if not ph:
+        return None
+    lo, hi = None, None
+    groups = ph.values() if isinstance(ph, dict) else [ph]
+    for group in groups:
+        for item in group if isinstance(group, (list, tuple)) else [group]:
+            off = item.get("offset") if isinstance(item, dict) else getattr(item, "offset", None)
+            length = item.get("length") if isinstance(item, dict) else getattr(item, "length", None)
+            if off is None:
+                continue
+            off = int(off)
+            end = off + int(length or 1)
+            lo = off if lo is None else min(lo, off)
+            hi = end if hi is None else max(hi, end)
+    return None if lo is None else (lo, hi)
+
+
+def _strip_chatml_scaffolding(engine_prompt: Any) -> bool:
+    """Reduce a rendered delta to just its multimodal run, headers removed. In place.
+
+    THE fix for the prefill-on-arrival crash, and the only variant that matches the model's
+    own structure instead of working around it.
+
+    A frames-on-arrival append rendered as a normal chunk is a COMPLETE chatml turn --
+    `<|im_start|>user … <|im_end|><|im_start|>assistant` -- i.e. a user turn nobody answers.
+    `_compute_talker_prompt_ids_length` walks im_start boundaries and adds its +9 only for
+    the LAST one, so an unanswered turn in the middle shifts the talker's placeholder span,
+    and a shifted span feeds text-vocabulary ids into a ~4k-row codec embedding:
+    `indexSelectSmallIndex: srcIndex < srcSelectDimSize`, stage 1 dead, engine gone.
+
+    Both obvious alternatives were tried and measured to fail identically: withholding the
+    append from the talker (three gates confirmed firing) and letting it through untouched.
+    The crash is not about where the append is stopped; it is that the append is a TURN.
+
+    So the frames extend the user's in-progress utterance instead. Keeping only the
+    multimodal run means the eventual query's delta closes the same user block, and the
+    token sequence the model sees is the same one it would have seen without this feature --
+    only the timing of the prefill differs, which was the entire point.
+
+    One token of margin each side keeps Qwen's `<|vision_start|>` / `<|vision_end|>`
+    markers, which wrap the placeholder run; without them the frame is not a frame.
+    Returns False if the shape is not what was expected, and the caller then declines the
+    append rather than sending something malformed.
+    """
+    if not isinstance(engine_prompt, dict):
+        return False
+    ids = engine_prompt.get("prompt_token_ids")
+    span = _mm_placeholder_span(engine_prompt)
+    if not ids or span is None:
+        return False
+    lo, hi = span
+    lo = max(0, lo - 1)
+    hi = min(len(ids), hi + 1)
+    if hi <= lo:
+        return False
+    engine_prompt["prompt_token_ids"] = list(ids[lo:hi])
+    _shift_mm_placeholders(engine_prompt, -lo)
+    return True
+
+
 @runtime_checkable
 class VideoStreamPipelineHooks(Protocol):
     """Pipeline-specific hooks for streaming video handlers."""
@@ -886,6 +951,14 @@ class OmniStreamingVideoHandler:
                     is_first=False,
                 )
                 if chunk is None or not isinstance(chunk, dict):
+                    return False
+                # Headerless: the frames join the user's current utterance rather than
+                # opening a turn of their own. See _strip_chatml_scaffolding.
+                if not _strip_chatml_scaffolding(chunk):
+                    logger.warning(
+                        "[session] prefill-on-arrival: could not reduce the delta to its "
+                        "frame tokens; skipping the append (the frame stays buffered)"
+                    )
                     return False
                 # The marker the engine side reads to keep this append away from the talker.
                 #
