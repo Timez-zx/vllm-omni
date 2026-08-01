@@ -8,12 +8,22 @@
 //
 // Two behaviours are deliberate:
 //
-//   * A prebuffer before the first sample plays. Starting instantly turns the
-//     first network hiccup into a dropout. The buffer is drained down but never
-//     emptied on purpose while a turn is streaming.
+//   * A prebuffer before the first sample plays, and it must be well under ONE
+//     TURN's audio -- not merely enough for network jitter. A turn currently
+//     delivers ~220 ms, and at a 250 ms threshold each turn had to be paid for out
+//     of the next one.
 //   * On underrun the processor emits SILENCE and keeps running. Returning
 //     false, or throwing, permanently kills the node -- and a dead node is
 //     silent for the rest of the session with nothing in the console.
+//   * An underrun does NOT re-arm the prebuffer, because running dry between turns
+//     is normal, not a fault.
+//
+// The last two interact, and that is the whole bug: an oversized threshold alone
+// only loses the first turn (the audio waits, the next turn tops it up, playback
+// runs a turn behind), and re-arming alone is harmless while the threshold is under
+// a turn. Together, turns fall silent and what plays is the previous reply.
+// playback_test.js drives the real class under Node and asserts all three cases,
+// because neither selftest.py nor probe.py plays a sample.
 
 class LiveAgentPlayback extends AudioWorkletProcessor {
   constructor(options) {
@@ -84,9 +94,10 @@ class LiveAgentPlayback extends AudioWorkletProcessor {
       out.fill(0, written);
       if (this.started) {
         this.underruns += 1;
-        // Re-arm the prebuffer so a single hiccup does not become a stutter
-        // for the rest of the turn.
-        this.started = false;
+        // Stay started. Re-arming the prebuffer here is what made every turn
+        // after the first one silent: the threshold was larger than a turn's
+        // audio, so once re-armed it was never met again. Running dry between
+        // turns is normal and must not latch.
         this.port.postMessage({ type: 'underrun', underruns: this.underruns });
       }
     }

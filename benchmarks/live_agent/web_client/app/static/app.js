@@ -56,7 +56,9 @@
   const INPUT_RATE = 16000;          // this server's audio.chunk contract
   const SEND_INTERVAL_MS = 200;      // how often queued mic PCM goes up
   const FRAME_INTERVAL_MS = 500;     // ~2 fps; frames are their own message
-  const PLAYBACK_PREBUFFER_MS = 250; // absorbs ssh-tunnel jitter
+  // Must be well under ONE TURN's audio, not merely "enough for jitter". At
+  // 250 ms nothing ever played, because a turn currently delivers ~220 ms.
+  const PLAYBACK_PREBUFFER_MS = 60;
   const ECHO_GUARD_MS = 300;         // keep uploading this long after playback
 
   // Silence detection, used only when the trigger mode is 'auto'. These are
@@ -92,6 +94,7 @@
   let assistantSpeaking = false;
   let lastAudioAt = 0;
   let turnInFlight = false;
+  let turnWatchdog = null;
   let events = 0;
 
   // silence-detector state
@@ -106,14 +109,32 @@
     if (!eventLog) return;
     const line = document.createElement('div');
     line.textContent = `${new Date().toLocaleTimeString()}  ${message}`;
-    if (isError) line.style.color = 'var(--danger, #c0392b)';
+    if (isError) line.style.color = 'var(--bad, #c0392b)';
     eventLog.appendChild(line);
     eventLog.scrollTop = eventLog.scrollHeight;
   }
 
-  const setConnection = (t) => { if (connectionState) connectionState.textContent = t; };
-  const setModel = (t) => { if (modelState) modelState.textContent = t; };
-  const setPlayback = (t) => { if (playbackState) playbackState.textContent = t; };
+  // The stylesheet colours these three readouts as pills off `data-state`, so the
+  // one that matters -- Speaking -- is readable without reading. Deriving the
+  // state from the label keeps every call site a plain string and means a new
+  // label degrades to the neutral pill rather than breaking.
+  const STATE_CLASS = {
+    Idle: 'idle', Connecting: 'busy', Connected: 'ok', Listening: 'ok',
+    Thinking: 'busy', Speaking: 'speaking', Playing: 'speaking',
+    Draining: 'busy', Error: 'bad', Disconnected: 'bad',
+  };
+
+  function setState(node, text) {
+    if (!node) return;
+    node.textContent = text;
+    // Underrun carries a count ("Underrun x3"), so match the first word.
+    const key = text.split(' ')[0];
+    node.dataset.state = STATE_CLASS[key] || (key === 'Underrun' ? 'bad' : 'idle');
+  }
+
+  const setConnection = (t) => setState(connectionState, t);
+  const setModel = (t) => setState(modelState, t);
+  const setPlayback = (t) => setState(playbackState, t);
 
   function addTranscript(role, text) {
     if (!conversation || !text) return;
@@ -282,18 +303,15 @@
         break;
       }
       case 'response.audio.done':
-        turnInFlight = false;
-        assistantSpeaking = false;
-        setModel('Listening');
         setPlayback('Draining');
+        endTurn(null);
         log('turn done');
+        break;
+      case 'session.done':
+        endTurn('server closed the session');
         break;
       case 'session.rolled':
         log(`session rolled (#${event.rolls}, carried ${event.carried_messages} messages)`);
-        break;
-      case 'session.done':
-        log('server closed the session');
-        stop();
         break;
       case 'error':
         log(`server error: ${event.message}`, true);
@@ -330,6 +348,15 @@
   // ------------------------------------------------------------ the trigger
   //
   // Client-side by necessity, not by choice. See the header comment.
+  function endTurn(why) {
+    if (!turnInFlight) return;
+    turnInFlight = false;
+    assistantSpeaking = false;
+    if (turnWatchdog !== null) { window.clearTimeout(turnWatchdog); turnWatchdog = null; }
+    setModel('Listening');
+    if (why) log(`turn ended (${why})`);
+  }
+
   function sendQuery(reason) {
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
     if (turnInFlight) {
@@ -345,6 +372,11 @@
     silenceMs = 0;
     setModel('Thinking');
     log(`turn trigger sent (${reason})`);
+    // Without this, one missing response.audio.done wedges the client for the
+    // rest of the session: turnInFlight gates both the trigger and the mic
+    // upload, so nothing would ever recover it.
+    if (turnWatchdog !== null) window.clearTimeout(turnWatchdog);
+    turnWatchdog = window.setTimeout(() => endTurn('watchdog: no completion in 45 s'), 45000);
   }
 
   function updateSilenceDetector(rms, elapsedMs) {

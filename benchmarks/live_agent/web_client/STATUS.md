@@ -1,5 +1,62 @@
 # Where this stands
 
+## Read this first: the silence had TWO causes, and one needs a restart
+
+The reported symptom — the first reply makes some sound, later replies make none —
+had two independent causes, either of which produces roughly that. Both are fixed
+in code. **One of them only takes effect when the engine is restarted, so until you
+do that the browser will keep showing text with no voice.**
+
+```bash
+kill -TERM $(pgrep -f 'bin/vllm-omni' | head -1)          # the engine, mine only
+bash benchmarks/live_agent/web_client/run_qwen_server.sh   # ~4 min, kernels cached
+```
+
+I could not run that first line myself — the sandbox refused it, and the engine
+process is the wrong thing to work around a refusal on.
+
+**Cause 1, in the browser: the playback prebuffer.** `PLAYBACK_PREBUFFER_MS` was
+250 while a turn delivers ~220 ms of audio, and an underrun re-armed the threshold.
+Neither is the bug alone: an oversized threshold alone just runs a turn behind, and
+re-arming alone is harmless below one turn. Together, turns fall silent and what
+plays is the previous reply. Fixed, and `node playback_test.js` reproduces all
+three cases against the real worklet.
+
+**Cause 2, in the engine: a leaked slot counter closes admission for good, after
+exactly `max_num_seqs` sessions.** `num_waiting_for_streaming_input` is upstream's
+hand-maintained count of requests parked for streaming input, and every decrement
+is guarded on the status, so any path that changes the status before removing the
+request leaks one. `get_num_unfinished_requests` already derives around this leak —
+but there is a **second consumer** that derivation does nothing for. Upstream's
+waiting loop gates admission on
+
+```
+num_running = len(self.running) + self.num_waiting_for_streaming_input
+if num_running >= self.max_num_running_reqs: break
+```
+
+so once the counter reaches `max_num_seqs` the loop breaks on its first pass,
+forever. Measured on stage 1 with `max_num_seqs: 4` — the counter climbed **1, 2,
+3, 4 across four sessions**, and the fifth got text from stage 0 and never one
+audio token:
+
+```
+stage 1 num_waiting_for_streaming_input is 4 but 0 request(s) ... are actually parked
+req=video-sess-... has been tracked for 45s and has sampled ZERO output tokens
+no request advanced for 45s ... this stage looks WEDGED, not idle (stage 1)
+```
+
+**The engine survived exactly `max_num_seqs` sessions and then served text-only
+forever.** That reads as a client bug from the browser: the reply arrives, only the
+voice is missing. Fixed by `OmniARScheduler._clamp_streaming_parked_counter()`,
+which counts parked requests over `self.requests` — not over the queues, because
+the chunk transfer adapter holds parked requests out of both, and a queue-derived
+repair was tried before and left the counter at -1. Four unit tests cover it.
+
+Neither `selftest.py` nor `probe.py` could have caught either one: the first checks
+the protocol, the second never plays a sample and, at the time, ran while the
+counter was still under 4.
+
 ## Done and verified
 
 | | |
@@ -9,7 +66,13 @@
 | Browser client | written; `node --check` clean on all three JS files |
 | Page server | renders, injects its config, serves all four assets — verified with a FastAPI TestClient, no GPU |
 | `selftest.py` | **14/14 passing**, no GPU |
+| `playback_test.js` | **5/5 passing**, no GPU and no browser — runs the real worklet under Node |
 | `probe.py` | written; drives the whole chain with synthetic media, no browser |
+| The page | rewritten layout: transcript-dominant split, state as coloured pills, light **and** dark |
+
+Neither conda env has `pytest`, and adding one would mutate the env the 0.24.0
+measurements depend on. To run the scheduler tests, stub `pytest.mark` and call the
+functions directly — `/tmp/.../scratchpad/run_sched_tests.py` does this, 14/14.
 
 ## In progress when this was written
 

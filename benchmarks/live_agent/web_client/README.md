@@ -64,13 +64,16 @@ Press **Start call**, then speak. Turn the **Camera** on to let it see you.
 
 ---
 
-## Before you trust it: two checks that cost nothing
+## Before you trust it: three checks that cost nothing
 
 ```bash
 # 1. the client's assumptions against the real server code -- no GPU needed
 PYTHONPATH=/home/zx/voice-agent/vllm-omni python benchmarks/live_agent/web_client/selftest.py
 
-# 2. the whole chain without a browser: synthetic frames + audio in, audio out
+# 2. the playback worklet, driven over several turns -- no GPU, no browser
+node benchmarks/live_agent/web_client/playback_test.js
+
+# 3. the whole chain without a browser: synthetic frames + audio in, audio out
 PYTHONPATH=/home/zx/voice-agent/vllm-omni python benchmarks/live_agent/web_client/probe.py
 PYTHONPATH=/home/zx/voice-agent/vllm-omni python benchmarks/live_agent/web_client/probe.py --direct
 ```
@@ -78,6 +81,12 @@ PYTHONPATH=/home/zx/voice-agent/vllm-omni python benchmarks/live_agent/web_clien
 `selftest.py` catches the failures that are invisible at runtime: a config field
 the server does not have (the session silently runs on defaults), a message type
 it does not dispatch, a wrong audio container.
+
+`playback_test.js` runs the real worklet class under Node with the two
+`AudioWorklet` globals stubbed. It exists because the bug that made later turns
+silent was reachable by neither of the other two: `selftest.py` checks the
+protocol and `probe.py` never plays a sample, so a browser was the only thing that
+could catch it. Now it is caught in 200 ms.
 
 `probe.py` localises everything else. Run it **through the page server** and then
 `--direct` to the engine: if `--direct` passes and the other does not, the proxy
@@ -131,8 +140,23 @@ Client-side, in `app/static/app.js`:
 | `SILENCE_RMS` | 0.012 | Raise it if a noisy room keeps triggering turns |
 | `SILENCE_HANG_MS` | 700 | How long a pause has to be before it counts as your turn ending |
 | `MIN_SPEECH_MS` | 400 | Ignores coughs and door slams |
-| `PLAYBACK_PREBUFFER_MS` | 250 | Raise if playback stutters over a slow link |
+| `PLAYBACK_PREBUFFER_MS` | 60 | Raise if playback stutters over a slow link — but see the warning below |
 | `ECHO_GUARD_MS` | 300 | Mic upload resumes this long after the assistant stops |
+
+**The prebuffer has to be well under one turn's audio, not merely "enough for
+jitter".** A turn currently delivers about 220 ms. At the old 250 ms, each turn
+had to be paid for out of the next one — turns fell silent and what did play was
+the previous reply. And because running dry between turns is normal, an underrun
+must not re-arm the prebuffer.
+
+Neither of those alone is the bug, which is why fixing one would have looked like
+a fix: an oversized threshold alone just runs a turn behind, and re-arming alone
+is harmless while the threshold is under a turn. Both are fixed, and
+`playback_test.js` asserts all three cases against the real worklet:
+
+```bash
+node benchmarks/live_agent/web_client/playback_test.js
+```
 
 Server-side, in `buildSessionConfig()` — `max_frame_width/height`,
 `session_roll_at_talker_tokens`, the filter gaps. These are the merged
@@ -150,5 +174,7 @@ model rather than trusting it.
 | Connects, then an `error` event about reaching the engine | The engine is not up: `curl .../8091/health` |
 | It answers, but never about what you said | Speak longer; the meter must move. If it does, the turn may be firing early — try hold-to-talk |
 | Audio clicks every fraction of a second | WAV headers are reaching playback; `selftest.py` covers this, so re-run it |
+| The first reply makes sound, later ones are silent | `node playback_test.js`. This exact shape was the prebuffer/re-arm interaction, and the test reproduces it |
+| One turn wedges the page and nothing recovers | A missing `response.audio.done`. The 45 s watchdog in `endTurn()` releases it; look for `turn ended (watchdog…)` in the log |
 | It never answers | Nothing is sending `video.query`. Switch the mode to hold-to-talk and press it |
 | Turn 20 much slower than turn 2 | `session_scoped_request` did not take effect — check the server log for `[session] turn=` lines |
