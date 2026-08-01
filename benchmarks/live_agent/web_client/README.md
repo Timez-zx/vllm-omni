@@ -146,6 +146,7 @@ model rather than trusting it.
 | Symptom | Check |
 |---|---|
 | Page loads, nothing happens on Start call | Browser console; then `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:7870/healthz` |
+| `/ws` answers **403 with an empty body** and nothing is logged | The handler was never entered. `from __future__ import annotations` makes annotations strings, and FastAPI resolves `client: WebSocket` from **module** globals — if the fastapi imports are inside a function they are locals, the lookup fails, `client` is treated as a missing query parameter, and the socket is closed. Keep those imports at module level |
 | Connects, then an `error` event about reaching the engine | The engine is not up: `curl .../8091/health` |
 | It answers, but never about what you said | Speak longer; the meter must move. If it does, the turn may be firing early — try hold-to-talk |
 | Audio clicks every fraction of a second | WAV headers are reaching playback; `selftest.py` covers this, so re-run it |
