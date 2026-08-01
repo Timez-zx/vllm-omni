@@ -11,10 +11,16 @@
 # FlashInfer's CUTLASS fused-MoE kernels want workspace, and the card is shared --
 # another user's MPS server holds a slice that the fractions do not know about.
 #
-# So the budgets leave real headroom rather than being tuned to the last GiB, and
-# max_num_seqs drops from 16 to 4: this serves one person in a browser, and 16
-# concurrent sequences per stage is capacity nobody is asking for while being
-# memory nobody can spare.
+# The headroom comes from THREE places, none of them stage 0's fraction:
+#   * enforce_eager on stages 1 and 2 -- stage 1's CUDA graph capture is what took
+#     resident memory to 85 GB and tipped the card over;
+#   * max_num_seqs 16 -> 4, because this serves one person in a browser;
+#   * max_num_batched_tokens 16384 -> 8192 on the thinker, which lowers the
+#     activation peak.
+#
+# Stage 0's fraction was tried at 0.62 first and that was a mistake worth recording:
+# its weights are 59.4 GiB, 0.62 x 94.97 = 58.9, so the stage came up with
+# "Available KV cache memory: 0.0 GiB" and died. 0.74 is a floor.
 #
 # The connector settings are copied verbatim from the measurement config, because
 # they are what makes the first audio packet arrive early:
@@ -33,9 +39,13 @@ connectors:
 
 stages:
   - stage_id: 0                      # thinker: vision + audio encoders + LLM
-    max_num_batched_tokens: 16384
+    max_num_batched_tokens: 8192
     max_num_seqs: 4
-    gpu_memory_utilization: 0.62
+    # 0.74 is a FLOOR, not a preference: the thinker's weights are 59.4 GiB and
+    # 0.62 x 94.97 = 58.9, which produced "Available KV cache memory: 0.0 GiB" and
+    # killed the stage outright. The headroom stage 2 needs has to come from
+    # somewhere else -- see enforce_eager below.
+    gpu_memory_utilization: 0.74
     trust_remote_code: true
     # Stage 0 only. Stage 2 (code2wav) asserts with prefix caching on, and the
     # duplex sequence here is append-only, which is the case prefix caching is
@@ -49,7 +59,7 @@ stages:
   - stage_id: 1                      # talker: speech codec token LM
     max_num_batched_tokens: 8192
     max_num_seqs: 4
-    gpu_memory_utilization: 0.12
+    gpu_memory_utilization: 0.10
     trust_remote_code: true
     enable_prefix_caching: false
     # CUDA graph capture on this stage is what tipped the card over on 0.26.0.
@@ -69,7 +79,7 @@ stages:
   - stage_id: 2                      # code2wav: waveform reconstruction
     max_num_batched_tokens: 65536
     max_num_seqs: 4
-    gpu_memory_utilization: 0.10
+    gpu_memory_utilization: 0.08
     enforce_eager: true
     trust_remote_code: true
     enable_prefix_caching: false
