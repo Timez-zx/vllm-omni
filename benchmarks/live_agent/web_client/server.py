@@ -33,15 +33,23 @@ import json
 import pathlib
 import sys
 
+# MODULE level, and it has to be. With `from __future__ import annotations` above,
+# every annotation becomes a string, and FastAPI resolves `client: WebSocket` by
+# looking "WebSocket" up in this module's globals. These imports used to live inside
+# build_app, where they are locals -- so the lookup failed, FastAPI decided `client`
+# must be a query parameter, found it missing, and closed the websocket with **HTTP
+# 403 and an empty body**. The handler was never entered. Nothing was logged, the
+# page served fine, and only the websocket died: a failure that reads as a proxy or
+# a network problem and is neither.
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
+
 APP_DIR = pathlib.Path(__file__).resolve().parent / "app"
 UPSTREAM_PATH = "/v1/video/chat/stream"
 
 
 def build_app(ws_backend: str, ws_url_override: str | None):
-    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-    from fastapi.responses import HTMLResponse, PlainTextResponse
-    from fastapi.staticfiles import StaticFiles
-
     app = FastAPI(title="Qwen3-Omni live session")
     app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")
 
