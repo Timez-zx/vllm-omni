@@ -787,7 +787,20 @@ def talker2code2wav_async_chunk(
     left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
     configured_initial_chunk_size = int(cfg.get("initial_codec_chunk_frames") or 0)
 
-    chunk_id = transfer_manager.put_req_chunk[request_id]
+    # Segment-local, NOT session-global. `put_req_chunk` survives segment
+    # boundaries (the connector key needs continuity), but `code_prompt_token_ids`
+    # is popped at every segment end -- so under session mode the two diverge from
+    # the second turn onward, and this function's arithmetic runs against a list
+    # that restarted while the counter kept going. Concretely, with the session-
+    # global counter every post-first segment took the `length -=` branch below
+    # against a list that never shipped an initial chunk: the second chunk of
+    # every turn went out with left_context_size=0 (an audible seam every chunk
+    # until the ramp caught up), and a segment ending with fewer frames than
+    # initial_codec_chunk_frames drove `length` negative, sliced past the end,
+    # and dropped the segment's audio entirely (the torch.cat error upstream of
+    # here). qwen3_tts.py already uses the segment-local counter for exactly
+    # this reason.
+    chunk_id = transfer_manager.ramp_chunk_count[request_id]
     length = len(transfer_manager.code_prompt_token_ids[request_id])
     if length <= 0:
         return None
@@ -796,7 +809,19 @@ def talker2code2wav_async_chunk(
         if chunk_id == 0:
             chunk_size_config = configured_initial_chunk_size
         else:
-            length -= configured_initial_chunk_size
+            adjusted = length - configured_initial_chunk_size
+            if adjusted < 0:
+                # chunk_id >= 1 guarantees >= initial frames shipped from THIS
+                # list, so this cannot happen unless the counter and the list
+                # drift out of scope again. Ship unadjusted rather than slicing
+                # past the end and losing the audio -- and say so.
+                logger.warning(
+                    "[code2wav-chunk] chunk_id=%d but only %d frame(s) in the "
+                    "segment list -- counter/list scope drift; shipping unadjusted",
+                    chunk_id, length,
+                )
+            else:
+                length = adjusted
 
     chunk_length = length % chunk_size_config
     if chunk_length != 0 and not is_finished:

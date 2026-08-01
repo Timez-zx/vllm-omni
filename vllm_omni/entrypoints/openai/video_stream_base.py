@@ -36,6 +36,7 @@ import os
 import time as _time
 import uuid
 import wave
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
@@ -696,6 +697,13 @@ class OmniStreamingVideoHandler:
                 "arrival_appends": 0,
                 "arrival_frames": 0,
                 "arrival_tokens": 0,
+                # One owner tag ("append" | "turn") per chunk submitted to sess["queue"],
+                # pushed in submission order. The engine runs one segment per chunk and
+                # cannot start segment k+1 before segment k's stop, so the k-th audio
+                # stop the output loop sees belongs to the k-th submitted chunk. That
+                # makes submission ORDER a structural identity for the audio stream --
+                # the per-chunk field that outputs do not carry.
+                "audio_seg_fifo": deque(),
             }
             session_request_id = f"video-sess-{uuid.uuid4().hex[:12]}"
 
@@ -791,37 +799,72 @@ class OmniStreamingVideoHandler:
                                 # it says "no audio was produced" while audio is being produced.
                                 _summarise_audio_payload(self._get_audio_data(output)),
                             )
+                        # Attribute every AUDIO output to the chunk that caused it, by
+                        # submission order. An append flows through the whole pipeline on
+                        # purpose (withholding it from the talker desynchronised the stages
+                        # and killed the engine), and max_tokens=1 caps only stage 0 -- the
+                        # talker free-runs a few unprompted codec frames per append and ends
+                        # them with a REAL audio finish_reason=stop. That stop arrives a
+                        # median 1 s (max measured 36 s) after the append, so any flag read
+                        # AT ARRIVAL TIME tells you what is in flight now, not who caused
+                        # the output: measured closing a real turn at chars=2 while its
+                        # actual reply streamed into the void afterwards -- 27.5 s of real
+                        # speech swallowed in one session, every broken turn a collision of
+                        # an append's late stop with the next turn's open window.
+                        #
+                        # `audio_seg_fifo` is order-based, which is structural here: chunks
+                        # enter the engine through one queue, the engine finishes segment k
+                        # before starting k+1 (chunk polling is gated on the previous
+                        # segment's stop), and every submitted chunk yields exactly one
+                        # stage-2 stop -- held 141/141 in the log INCLUDING the error path
+                        # where the payload build fails and an empty stop still ships. So
+                        # head-of-FIFO == owner of the audio stream right now.
+                        #
+                        # This is not the counter that failed before (see git history of
+                        # this block): that one popped on the append's STAGE-0 finish, which
+                        # is not reliably delivered, so it latched and swallowed a real
+                        # turn's text. This one pops on the audio stream's OWN stop, which
+                        # the engine guarantees per chunk. And it cannot fail silently: a
+                        # stuck "append" head swallows the next turn's audio, turn_done
+                        # never sets, and the 240 s bounded wait already fatals the session
+                        # with "turn boundary lost".
+                        owner = None
+                        if getattr(output, "final_output_type", "text") == "audio":
+                            fifo = sess["audio_seg_fifo"]
+                            owner = fifo[0] if fifo else None
+                            if _segment_finish_reason(output) is not None and fifo:
+                                fifo.popleft()
+                                # Presence probe, not noise: pushes==pops at session end is
+                                # the invariant check, and absence of a warning proves
+                                # nothing (the inert-guard lesson).
+                                logger.info(
+                                    "[session] audio segment stop owner=%s fifo_left=%d",
+                                    owner, len(fifo),
+                                )
                         if interrupt_event.is_set():
                             continue
+                        if (getattr(output, "final_output_type", "text") == "audio"
+                                and owner != "turn"):
+                            # owner == "append": positively identified junk -- the talker's
+                            # unprompted frames and their stop. Dropping the stop HERE is
+                            # the actual fix: it can no longer close a real turn.
+                            # owner is None: audio nobody submitted a chunk for. Swallow,
+                            # but say so loudly -- if this ever fires the one-stop-per-chunk
+                            # invariant broke and attribution is shifted.
+                            if owner is None:
+                                logger.warning(
+                                    "[session] UNOWNED audio output (finish=%s) dropped -- "
+                                    "audio_seg_fifo is empty, attribution may be shifted",
+                                    _segment_finish_reason(output),
+                                )
+                            sess["arrival_skipped"] = sess.get("arrival_skipped", 0) + 1
+                            continue
 
-                        # A prefill-only append still samples one token, because the engine
-                        # has no zero-token append. Nothing about it belongs on the wire:
-                        # response.start plus a one-token text delta would show the user a
-                        # reply to a question they never asked.
-                        #
-                        # DISCRIMINATED BY WHETHER A TURN IS IN FLIGHT, not by counting.
-                        # Counting was tried and it failed in a way worth recording: the
-                        # counter was decremented on "the next stage-0 output carrying a
-                        # finish_reason", the append's output did not carry one where it was
-                        # expected, and so the counter stayed armed into the following turn --
-                        # measured swallowing 13 of that turn's text tokens (arrival_skipped=13)
-                        # and then settling on ITS finish, which also produced a second,
-                        # spurious turn boundary. Two symptoms, one unreset counter; the same
-                        # shape as three earlier silences in this project.
-                        #
-                        # An append is only ever queued while no turn is in flight, so "no turn
-                        # in flight" identifies its outputs positively and cannot latch: the
-                        # state it reads is owned by the turn machinery, not by this branch.
-                        # EVERY stage, not just stage 0. The append now flows through the
-                        # whole pipeline on purpose -- withholding it from the talker is
-                        # what desynchronised the stages and killed the engine -- so the
-                        # talker does emit a little audio for it. That audio is waste, but
-                        # it is dropped HERE, where dropping is free, instead of being
-                        # prevented upstream, where preventing it breaks the contract.
-                        #
-                        # `turn_busy` is the discriminator: an append is only ever queued
-                        # while no turn is in flight, so anything arriving then is its own.
-                        # It cannot latch -- the flag belongs to the turn machinery.
+                        # Outer fallback for TEXT outputs (an append's single stage-0 token,
+                        # a closed turn's late text): while no turn is in flight, nothing
+                        # textual belongs on the wire either. Sound only because append
+                        # AUDIO is already filtered positively above -- this flag check
+                        # alone lost the race for a year of debugging hours.
                         if (config.prefill_frames_on_arrival
                                 and not sess.get("turn_busy")
                                 and not sess.get("query_claimed")):
@@ -957,6 +1000,12 @@ class OmniStreamingVideoHandler:
                 if (not sess["first_sent"] or sess.get("turn_busy")
                         or sess.get("query_claimed") or sess["fatal"]):
                     return False
+                # Text-only sessions get no arrival appends at all: the append's junk
+                # audio segment is what the FIFO attributes, and without audio outputs
+                # there is nothing to pop against -- the text-only close at the text
+                # branch would keep the old race instead.
+                if "audio" not in (config.modalities or []):
+                    return False
                 # The queue must be EMPTY. Appends share it with the turn deltas, so anything
                 # still queued means a turn's chunk has not been consumed yet and an append
                 # would land between that chunk and its answer. Measured on the proxy path --
@@ -1007,6 +1056,9 @@ class OmniStreamingVideoHandler:
                     # The engine is behind. Leave the frame where it is rather than blocking
                     # the receive loop, which also forwards generated audio.
                     return False
+                # put_nowait -> append is synchronous: the event loop cannot interleave a
+                # turn submission between them, so FIFO order == queue order.
+                sess["audio_seg_fifo"].append("append")
                 ntok = len(chunk.get("prompt_token_ids") or ())
                 sess["arrival_appends"] += 1
                 sess["arrival_frames"] += 1
@@ -1170,6 +1222,11 @@ class OmniStreamingVideoHandler:
                 if sess["gen_task"] is None:
                     sess["gen_task"] = asyncio.create_task(_session_output_loop())
                 sess["first_sent"] = True
+                # Tag BEFORE the awaited put: if the put suspends on a full queue no
+                # output for this chunk can exist yet, and appends are refused while
+                # turn_busy, so nothing can interleave a push between these two lines.
+                if "audio" in (config.modalities or []):
+                    sess["audio_seg_fifo"].append("turn")
                 await sess["queue"].put(chunk)
                 # Bounded wait. A lost segment boundary must surface as an error rather
                 # than a hang: the first bring-up attempt used an unusable boundary signal
@@ -1224,6 +1281,9 @@ class OmniStreamingVideoHandler:
                 # been suspended mid-item, and reusing the queue would feed the new request a
                 # chunk built for the old one's context.
                 sess["queue"] = asyncio.Queue(maxsize=4)
+                # Race-free because the generator task was cancelled AND awaited above, so
+                # no old-request output can arrive after this point to pop a stale tag.
+                sess["audio_seg_fifo"].clear()
                 sess["gen_task"] = None
                 sess["first_sent"] = False        # next chunk carries system + seed
                 sess["cum_tokens"] = 0            # new request, new context
