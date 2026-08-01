@@ -136,50 +136,76 @@ once per session (a post-mortem could not tell which features a browser tab had 
 `CUDA_LAUNCH_BLOCKING` in the launcher's environment **does not reach the stage processes** —
 their env is rebuilt at spawn, and the stage-level `runtime.env` block did not apply either.
 
-### FOUR architecturally distinct attempts, one identical assert. OFF, and this is a judgement call.
+### The crash: root-caused, fixed, and the feature is ON
 
-Every variant dies the same way — stage 1, `indexSelectSmallIndex: srcIndex < srcSelectDimSize`,
-turn 1. The identical hostile pacing with appends disabled survives 398 frames every time
-(`crash_repro.py --no-prefill`), so the append is the cause and the pacing is not.
+`prefill_frames_on_arrival` is **enabled by default**. The engine no longer dies.
 
-| attempt | what it changed | result |
-|---|---|---|
-| withhold | 3 gates: orchestrator prewarm, adapter task drop, processor withhold (all confirmed firing) | died turn 1 |
-| pass through | all gates removed, stage 1 perfectly aligned, talker's audio dropped at the entrypoint | died turn 1 |
-| headerless | append reduced to its multimodal run; frames extend the current utterance, token sequence identical to the non-prefill case | died turn 1 |
-| span sentinel | `_compute_talker_prompt_ids_length` closed on the DELTA's end instead of the whole session's — a real latent bug, `min()`-guarded so it is a no-op elsewhere | died turn 1 |
+**The out-of-range index was `-1`, not a text-vocabulary id, and there were TWO defects, each
+hiding the other** — which is why four earlier attempts all "failed identically" while failing
+for two different reasons at once.
 
-The fourth is where this stops being worth another attempt. It changed the talker's accounting
-itself, which is what the third attempt's failure pointed at, and it still died. So the
-talker's "one stage-0 forward per talker segment" assumption is load-bearing in **more than one
-place**; a single sentinel or a single function is not the unit of repair.
+**Defect 1 — `-1` reaching `codec_embedding`.** Under async scheduling `token_ids_cpu` never
+holds a sampled id: vLLM writes the sentinel `-1` and patches the real value onto the GPU row
+from `prev_sampled_token_ids`, which reaches only requests present in the **previous forward's
+batch**. An append parks the talker, so it leaves the persistent batch and is re-admitted on an
+**output** row — readable only from CPU, and reads `-1`. `codec_embedding` is
+`nn.Embedding(3072, hidden)`, so `indexSelectSmallIndex: srcIndex < srcSelectDimSize`.
+Independently confirmed: `nn.Embedding(3072,16).cuda()` indexed with `-1` reproduces that assert
+at the **same file and line**; index 2150 (the largest id the talker can sample) is fine, which
+is why the shipping path never tripped it. **Fixed by `async_scheduling: false` on stage 1.**
 
-**Where the assert actually is, which narrows the search.** `talker_mtp_input_ids` is an
-**int32 buffer** (`gpu_model_runner.py:218`), so the `copy_` at line 1790 that the traceback
-names cannot itself overflow — copying a large int into int32 is silent. The assert fires later,
-when that buffer is used as an INDEX:
+**Defect 2 — a prefill tensor labelled as a decode payload.** An append stops on the very
+forward that prefills it, and the scheduler clears `_output_token_ids` before `save_async`, so
+`thinker2talker_async_chunk` took its decode-shaped path and shipped the append's `[222,1024]`
+prefill tensor as `embed.decode`; the runner copies that into a **one-row** decode slot:
+`output with shape [1,1024] doesn't match the broadcast shape [222,1024]`. Invisible until
+defect 1 was fixed, because the CUDA assert killed the process first, on the same turn.
 
-```
-gpu_model_runner.py:1147   self.talker_mtp(self.talker_mtp_input_ids.gpu[:n], ...)
-```
+**The discriminator is STRUCTURAL, not a transported marker.** Three marker channels were tried
+and all three silently read False at the point of use (`additional_information` as a dict and as
+a real payload, `SamplingParams.extra_args`, and an enqueue-time snapshot): `sampling_params` has
+already been replaced by the next streaming update by the time either the scheduler or the save
+thread looks. What cannot be lost is a property of the forward itself — **more than one row of
+thinker embeddings AND the segment ending** means the segment produced no text, so there is no
+talker obligation. With the feature off, a segment's first forward never stops, so the branch is
+unreachable — verified by windowed log count (0 hits), not by argument.
 
-So the bad value is written at 1790 and detonates at 1147. What must be bounded is the id
-returned by `self.model.preprocess(...)` as `req_input_ids` — i.e. the search is not the whole
-stage-0/stage-1 chain, it is *what produces that one id and what its legal range is*. Attempts
-1–4 all changed things upstream of that id without ever bounding the id itself.
+**Three further real fixes, all independent of this feature:**
 
-**What would actually fix it:** stage 1 needs a segment type that advances its position cursor
-without decoding, making an extra stage-0 forward a legal thing in the inter-stage contract.
-That is an independent piece of engineering on the stage-0↔stage-1 contract, not a patch to
-this feature, and every attempt that tried to avoid it failed in the same instruction.
+1. Per-chunk `max_tokens` was silently ignored — upstream carries it on every `StreamingUpdate`
+   and never applies it, so `Request.max_tokens` kept the first chunk's value for the whole
+   session. Measured: an append submitted with `max_tokens=1` generated ~20 tokens.
+2. The turn was claimed only *inside* the task `create_task` schedules, so this turn's outputs
+   arriving in that window were swallowed by the append suppression (2 bad turns in 16). Claimed
+   synchronously now, with a separate flag so the overlap refusal is unaffected.
+3. `t_first_text` was stamped on the first non-empty **delta**, not the first text output. The
+   first stage-0 output often carries no new text, so `first_text` landed ~17 ms *after*
+   `first_audio` and a health check called a clean turn misattributed. Measuring the wrong
+   instant is not attributing to the wrong turn.
 
-**Why the flag is off despite being asked to keep it on.** Enabled, the observable behaviour is:
-open the page, say one thing, the engine core dies, and the service needs a ~3 minute restart
-before it can be used again. That is not a feature with a bug in it; it is a default that
-prevents use. Shipping it to satisfy the letter of the request would trade a working system for
-the appearance of a delivered one. The switch is one line, everything the four attempts built is
-kept, and the measured 16× frame-rate decoupling is real and worth returning to the moment the
-contract allows it.
+**Appends require an empty queue.** They share the session queue with turn deltas, so anything
+still queued means a turn's chunk has not been consumed and an append would land between that
+chunk and its answer — measured on the proxy path as `Overlapping turn` plus a turn reporting
+`first_text=-1.000s chars=0 audio_chunks=1`. `turn_busy` alone does not cover it: the flag clears
+when the turn's body returns, while its chunk may still be queued.
+
+### Verified
+
+| check | result |
+|---|---|
+| proxy path (what the browser uses), 6 turns | **6/6 clean**, 0 anomalies, no overlap, first audio 340–348 ms |
+| hostile pacing, 8 turns / 90 frames | engine alive |
+| hostile pacing, 398 frames | engine alive |
+| feature OFF control | clean, and the new branch unreachable (windowed count 0) |
+| `selftest.py` / `playback_test.js` / scheduler units | 17/17, 13/13, 14/14 |
+| A/B, direct path | ON 83–256 ms vs OFF 378 ms |
+
+**Known residual, disclosed rather than hidden.** Under the A/B's deliberately hostile pacing
+(query every 2.5 s, media never pausing), 3 turns in 16 show `first_audio` before `first_text`
+by **9–59 ms**: a trailing audio output from the previous turn landing on the new turn's state
+after the segment boundary rotated it. It is a tail of tens of milliseconds, not a misattributed
+reply, and it inflates the A/B's ON figure — so treat −78% as an upper bound and the −32%
+measured with clean accounting as the honest one. The proxy path shows none of it.
 
 ## Done and verified
 

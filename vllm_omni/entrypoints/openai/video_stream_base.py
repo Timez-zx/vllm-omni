@@ -957,6 +957,15 @@ class OmniStreamingVideoHandler:
                 if (not sess["first_sent"] or sess.get("turn_busy")
                         or sess.get("query_claimed") or sess["fatal"]):
                     return False
+                # The queue must be EMPTY. Appends share it with the turn deltas, so anything
+                # still queued means a turn's chunk has not been consumed yet and an append
+                # would land between that chunk and its answer. Measured on the proxy path --
+                # the one the browser uses -- as `Overlapping turn` plus a turn reporting
+                # `first_text=-1.000s chars=0 audio_chunks=1`, i.e. a fraction of a second of
+                # the wrong turn's reply. turn_busy alone does not cover it: the flag clears
+                # when the turn's body returns, while its chunk may still be in the queue.
+                if sess["queue"].qsize() > 0:
+                    return False
                 chunk = await self._build_session_chunk(
                     config, [frame_b64], bytearray(), "", frame_pil_cache,
                     is_first=False,

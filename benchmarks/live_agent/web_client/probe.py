@@ -77,7 +77,7 @@ def session_config(system_prompt: str) -> dict:
         "use_audio_in_video": True,
         "session_scoped_request": True,
         # OFF: crashes stage 1 with a CUDA device-side assert under continuous frames.
-        "prefill_frames_on_arrival": False,
+        "prefill_frames_on_arrival": True,
         "session_roll_at_talker_tokens": 45000,
         "session_roll_history_turns": 8,
     }
