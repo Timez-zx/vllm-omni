@@ -16,7 +16,7 @@ set -uo pipefail
 
 FORK=/home/zx/voice-agent/vllm-omni
 PY=/home/zx/miniconda3/envs/omni-minicpm/bin/vllm-omni
-LOG=/data/zx/results/qwen_live.log
+LOG="${QWEN_LOG:-/data/zx/results/qwen_live.log}"
 PORT=8091
 DEPLOY="${DEPLOY_CONFIG:-$FORK/benchmarks/live_agent/web_client/deploy_web_demo.yaml}"
 
@@ -43,7 +43,10 @@ print('   optimisations present; talker text-only =', TALKER_TEXT_ONLY)
 " 2>&1 | grep -vE "NVFP4|RuntimeWarning|^This typically|^Using fallback|from .version|_version'|patch.py" || exit 1
 
 : > "$LOG"
+# TALKER_TEXT_ONLY is passed through so the A/B can be run without editing this
+# file: VLLM_OMNI_TALKER_TEXT_ONLY=0 bash run_qwen_server.sh gives the control arm.
 HF_HOME=/data/zx/hf CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$FORK" \
+VLLM_OMNI_TALKER_TEXT_ONLY="${VLLM_OMNI_TALKER_TEXT_ONLY:-1}" \
 VLLM_OMNI_LOG_SESSION_OUTPUTS=1 \
 setsid "$PY" serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
   --omni --deploy-config "$DEPLOY" \

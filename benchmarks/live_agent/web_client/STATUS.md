@@ -21,15 +21,23 @@ both of them consequences of moving from vLLM 0.24.0 to 0.26.0:
    0%, log silent, process in `pipe_read` — and `ptxas` at 100% five forks down.
    Cached after the first build. See the README for the one command that tells
    compiling from hung.
-2. **Stage 2 OOM.** The measurement config (`harness/deploy_pc_stage0.yaml`,
-   0.74/0.12/0.06 = 0.92) fits on 0.24.0 and does not on 0.26.0 —
-   `Tried to allocate 1.41 GiB ... 1.04 GiB is free`, after stage 1's CUDA graph
-   capture had taken resident memory to 85 GB. FlashInfer's kernels want workspace
-   the fractions did not budget, and another user's MPS server holds a slice they
-   cannot see. Fixed with a **new** config, `deploy_web_demo.yaml`
-   (0.62/0.12/0.10 = 0.84, `max_num_seqs` 4, stage 1 eager) rather than by
-   retuning the measurement config, which must stay byte-identical or every number
-   in `workflow.md` loses its baseline.
+2. **Stage 2 OOM, then my own overcorrection.** The measurement config
+   (`harness/deploy_pc_stage0.yaml`, 0.74/0.12/0.06) fits on 0.24.0 and does not on
+   0.26.0 — `Tried to allocate 1.41 GiB ... 1.04 GiB is free`, after stage 1's CUDA
+   graph capture had taken resident memory to 85 GB. FlashInfer's kernels want
+   workspace the fractions did not budget, and another user's MPS server holds a
+   slice they cannot see.
+
+   Cutting stage 0 to 0.62 to make room **killed stage 0 instead**: its weights are
+   59.4 GiB and 0.62 × 94.97 = 58.9, so it reported
+   `Available KV cache memory: 0.0 GiB` and died. **Stage 0's fraction is a floor,
+   not a preference.**
+
+   The working shape is `deploy_web_demo.yaml`: stage 0 back at **0.74**, and the
+   headroom taken from three other places — `enforce_eager` on stages 1 and 2,
+   `max_num_seqs` 16→4, and `max_num_batched_tokens` 16384→8192 on the thinker.
+   A **new** file rather than a retune of the measurement config, which must stay
+   byte-identical or every number in `workflow.md` loses its baseline.
 
 Check where it got to:
 
@@ -45,6 +53,42 @@ cd /home/zx/voice-agent/vllm-omni
 PYTHONPATH=$PWD python benchmarks/live_agent/web_client/probe.py --direct   # no browser
 bash benchmarks/live_agent/web_client/run_page_server.sh                    # then ssh -L 7870
 ```
+
+## A REAL BUG, found by the probe
+
+**The reply's audio is truncated to about 0.22 s regardless of how long the reply
+is.** Established, not suspected:
+
+| text length | audio delivered |
+|---|---|
+| 34 chars — "Hello! How can I assist you today?" | 0.22 s |
+| 104 chars — "One, two, three, … fifteen." | **0.22 s** |
+
+0.22 s at 24 kHz is ~5,280 samples, which is exactly
+`initial_codec_chunk_frames: 4` (4 × 1920) minus the one frame the first emit
+strips as a CausalConv artifact. **Only the first small codec granule reaches the
+client.**
+
+Server-side accounting agrees that more was produced: `audio_chunks=3` per turn,
+three `type=audio stage=2` outputs with the third carrying `finish_reason=stop`.
+So stage 2 ran three times and only the first delta carried new samples.
+
+Latency itself is fine and repeatable: **first audio 340–376 ms** across five
+turns, which is the same order as the 513 ms baseline.
+
+An A/B was running when this was written to isolate whether our `TALKER_TEXT_ONLY`
+change causes it:
+
+```bash
+grep READY /data/zx/results/qwen_ttoff_launch.out          # the control arm
+# control arm = VLLM_OMNI_TALKER_TEXT_ONLY=0 bash run_qwen_server.sh
+```
+
+If the control arm also gives 0.22 s, the truncation is upstream's on 0.26.0 and
+not ours. If it gives full-length audio, `TALKER_TEXT_ONLY` is the cause and the
+default should flip back until it is understood. Either way **do not judge audio
+quality in the browser until this is resolved** — you would be listening to a
+fifth of a second.
 
 ## Genuinely unknown
 
