@@ -1,0 +1,132 @@
+# Browser live session for Qwen3-Omni
+
+Talk to the Qwen3-Omni pipeline — with the session-scoped request, the automatic
+session roll, the frame downscale and filter bounds, and the text-only speech
+stage — from a browser, using your own camera and microphone.
+
+Runs on branch `live-agent-web`: upstream `main` (which has the browser-client
+machinery and the newer engine) merged with the optimisations that were developed
+against v0.24.0.
+
+---
+
+## What this is, and what it is not
+
+**It is** continuous streaming: frames and audio go up as independent messages
+and never stop, including while the model is talking — anything you say then is
+kept for the next turn.
+
+**It is not** a natively full-duplex model. Qwen3-Omni has no listen/speak token
+in its vocabulary, and this server's `should_trigger_turn()` returns `False`
+unconditionally, so **nothing on the server side will ever decide you have
+finished speaking.** This page therefore decides, with either a silence detector
+or a hold-to-talk button, and it says so on screen. That is a genuine difference
+from `examples/online_serving/minicpmo/realtime_web`, where the model itself
+owns the decision — do not confuse the two when comparing them.
+
+---
+
+## Run it
+
+### 1. Server (about 2–3 minutes)
+
+```bash
+bash benchmarks/live_agent/web_client/run_qwen_server.sh
+```
+
+It refuses to start if the GPU is not free — the card is shared, so check rather
+than assume, and never kill someone else's job. It also asserts that the
+importable `vllm_omni` is this checkout and that the merged config fields exist,
+because a server on `site-packages` would come up healthy with none of the
+optimisations and nothing would say so.
+
+### 2. Page server
+
+```bash
+PYTHONPATH=/home/zx/voice-agent/vllm-omni \
+  /home/zx/miniconda3/envs/omni-minicpm/bin/python \
+  benchmarks/live_agent/web_client/server.py --port 7870 --ws-backend ws://127.0.0.1:8091
+```
+
+It serves the page **and** same-origin-proxies the websocket to
+`/v1/video/chat/stream`, so only one port has to reach your Mac.
+
+### 3. Your Mac
+
+```bash
+ssh -N -L 7870:127.0.0.1:7870 <server>
+```
+
+Open **`http://localhost:7870/`**. `localhost` is a secure context, so the
+browser grants camera and microphone without any certificate.
+
+Press **Start call**, then speak. Turn the **Camera** on to let it see you.
+
+---
+
+## Before you trust it: two checks that cost nothing
+
+```bash
+# 1. the client's assumptions against the real server code -- no GPU needed
+PYTHONPATH=/home/zx/voice-agent/vllm-omni python benchmarks/live_agent/web_client/selftest.py
+
+# 2. the whole chain without a browser: synthetic frames + audio in, audio out
+PYTHONPATH=/home/zx/voice-agent/vllm-omni python benchmarks/live_agent/web_client/probe.py
+PYTHONPATH=/home/zx/voice-agent/vllm-omni python benchmarks/live_agent/web_client/probe.py --direct
+```
+
+`selftest.py` catches the failures that are invisible at runtime: a config field
+the server does not have (the session silently runs on defaults), a message type
+it does not dispatch, a wrong audio container.
+
+`probe.py` localises everything else. Run it **through the page server** and then
+`--direct` to the engine: if `--direct` passes and the other does not, the proxy
+is at fault; if both pass and the browser does not, it is the page or the tunnel.
+
+---
+
+## Reading the page
+
+| Panel | What it tells you |
+|---|---|
+| Model | Listening → Thinking → Speaking |
+| Playback | `Underrun xN` means audio arrived slower than it played — raise the prebuffer or expect stutter |
+| Events | Every protocol message, including `session rolled` |
+
+**`session rolled` is expected, not an error.** It is the mechanism that lets the
+conversation outlive the speech stage's length limit: the engine request is
+retired while healthy and reopened seeded with the last 8 turns of text. That one
+turn is slower, and older *visual* detail does not cross.
+
+---
+
+## Knobs
+
+Client-side, in `app/static/app.js`:
+
+| Constant | Default | When to change it |
+|---|---|---|
+| `FRAME_INTERVAL_MS` | 500 | ~2 fps. Raise for less video cost, lower for a fresher view |
+| `SILENCE_RMS` | 0.012 | Raise it if a noisy room keeps triggering turns |
+| `SILENCE_HANG_MS` | 700 | How long a pause has to be before it counts as your turn ending |
+| `MIN_SPEECH_MS` | 400 | Ignores coughs and door slams |
+| `PLAYBACK_PREBUFFER_MS` | 250 | Raise if playback stutters over a slow link |
+| `ECHO_GUARD_MS` | 300 | Mic upload resumes this long after the assistant stops |
+
+Server-side, in `buildSessionConfig()` — `max_frame_width/height`,
+`session_roll_at_talker_tokens`, the filter gaps. These are the merged
+optimisations, and `selftest.py` verifies each name against the real Pydantic
+model rather than trusting it.
+
+---
+
+## If something is wrong
+
+| Symptom | Check |
+|---|---|
+| Page loads, nothing happens on Start call | Browser console; then `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:7870/healthz` |
+| Connects, then an `error` event about reaching the engine | The engine is not up: `curl .../8091/health` |
+| It answers, but never about what you said | Speak longer; the meter must move. If it does, the turn may be firing early — try hold-to-talk |
+| Audio clicks every fraction of a second | WAV headers are reaching playback; `selftest.py` covers this, so re-run it |
+| It never answers | Nothing is sending `video.query`. Switch the mode to hold-to-talk and press it |
+| Turn 20 much slower than turn 2 | `session_scoped_request` did not take effect — check the server log for `[session] turn=` lines |

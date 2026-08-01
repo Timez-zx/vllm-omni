@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Bring up Qwen3-Omni for the browser live session, with the merged optimisations.
+#
+# A script rather than an inline command on purpose: backgrounding a long
+# `cd X && ENV=1 setsid ... &` chain has repeatedly lost either the working
+# directory or the redirect in this project, and the symptom (an empty log, or a
+# stale one) looks like the server failing rather than the launcher failing.
+#
+#   bash run_qwen_server.sh            # start, wait for health, report
+#
+# Nothing may be inserted between the env assignments and the command: a comment
+# after a backslash continuation comments out the rest of the line, PYTHONPATH
+# silently stops being exported, and the server comes up on site-packages with
+# none of our changes.
+set -uo pipefail
+
+FORK=/home/zx/voice-agent/vllm-omni
+PY=/home/zx/miniconda3/envs/omni-minicpm/bin/vllm-omni
+LOG=/data/zx/results/qwen_live.log
+PORT=8091
+DEPLOY="$FORK/benchmarks/live_agent/harness/deploy_pc_stage0.yaml"
+
+[ -f "$DEPLOY" ] || { echo "!! deploy config missing: $DEPLOY"; exit 1; }
+
+free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits)
+if [ "$free" -lt 80000 ]; then
+  echo "!! only ${free} MiB free -- Qwen3-Omni needs ~80 GB. Someone else may be on the card."
+  nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader
+  exit 1
+fi
+
+echo "== which vllm_omni will load =="
+PYTHONPATH="$FORK" $(dirname "$PY")/python -c "
+import vllm_omni, os
+p = os.path.dirname(vllm_omni.__file__)
+print('  ', p)
+assert '/voice-agent/vllm-omni/' in p, 'NOT the fork -- aborting'
+from vllm_omni.entrypoints.openai.video_stream_base import StreamingVideoSessionConfig as C
+need = {'session_scoped_request','session_roll_at_talker_tokens','max_frame_width','frame_filter_min_gap'}
+assert need <= set(C.model_fields), 'merged optimisations missing from the config model'
+from vllm_omni.distributed.omni_connectors.adapter import TALKER_TEXT_ONLY
+print('   optimisations present; talker text-only =', TALKER_TEXT_ONLY)
+" 2>&1 | grep -vE "NVFP4|RuntimeWarning|^This typically|^Using fallback|from .version|_version'|patch.py" || exit 1
+
+: > "$LOG"
+HF_HOME=/data/zx/hf CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$FORK" \
+VLLM_OMNI_LOG_SESSION_OUTPUTS=1 \
+setsid "$PY" serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --omni --deploy-config "$DEPLOY" \
+  --trust-remote-code --host 127.0.0.1 --port "$PORT" \
+  --init-timeout 3000 --stage-init-timeout 1500 >> "$LOG" 2>&1 &
+
+echo "== waiting for health (about 2-3 minutes) =="
+for i in $(seq 1 200); do
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:${PORT}/health" 2>/dev/null)
+  if [ "$code" = "200" ]; then
+    echo "READY after ~$((i*5))s"
+    nvidia-smi --query-gpu=memory.used --format=csv,noheader
+    exit 0
+  fi
+  # Report the deepest exception rather than the first line that contains the
+  # word "error", which is usually a benign warning.
+  if grep -qE "Engine core initialization failed|not enough GPU memory|ModuleNotFoundError|FileNotFoundError" "$LOG" 2>/dev/null; then
+    echo "!! STARTUP FAILED"
+    sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -E "^\S*\s*(\w+Error|\w+Exception):" | tail -4 | cut -c1-200
+    exit 1
+  fi
+  sleep 5
+done
+echo "!! TIMEOUT after 1000s"
+sed 's/\x1b\[[0-9;]*m//g' "$LOG" | tail -6 | cut -c1-170
+exit 2

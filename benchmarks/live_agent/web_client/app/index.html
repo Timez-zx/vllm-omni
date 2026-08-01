@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Qwen3-Omni live session</title>
+  <link rel="stylesheet" href="static/styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="masthead">
+      <div>
+        <h1>Qwen3-Omni &mdash; live session</h1>
+        <p class="subtitle">
+          Camera and microphone in, speech out, over <code>/v1/video/chat/stream</code>.
+          <span class="badge">Turn-taking runs in this browser</span>
+        </p>
+      </div>
+      <div class="controls">
+        <button id="callButton" type="button">Start call</button>
+        <button id="muteButton" class="secondary" type="button">Mute</button>
+        <button id="cameraButton" class="secondary" type="button" disabled>Camera</button>
+        <video id="cameraPreview" muted playsinline
+               style="display:none;width:96px;height:72px;border-radius:8px;object-fit:cover;background:#000"></video>
+      </div>
+    </header>
+
+    <section class="panel">
+      <div class="row">
+        <label for="triggerMode">When does it answer?</label>
+        <select id="triggerMode">
+          <option value="auto" selected>Automatically, when you stop speaking</option>
+          <option value="manual">Only when I press to talk</option>
+        </select>
+        <button id="talkButton" class="secondary" type="button" disabled>Hold to talk</button>
+      </div>
+      <p class="note">
+        This model has no listen/speak decision of its own &mdash; its vocabulary contains no such
+        token, and the server never starts a turn by itself. So <strong>this page</strong> decides
+        when you have finished: either a silence detector, or the button. That is a real difference
+        from a natively full-duplex model, not a shortcut, and it is stated here so the two are not
+        confused. Space bar works too.
+      </p>
+    </section>
+
+    <section class="panel">
+      <label for="systemPrompt">System prompt</label>
+      <textarea id="systemPrompt" rows="3"></textarea>
+      <p class="note">
+        Short replies are load-bearing: every audio chunk the speech stage generates is appended to
+        its own accumulated array, so a verbose turn both shortens the session and lengthens the wait
+        before you can speak again.
+      </p>
+    </section>
+
+    <section class="grid">
+      <div class="panel">
+        <h2>Conversation</h2>
+        <div id="conversation" class="conversation">
+          <p id="emptyConversation" class="empty">Nothing yet.</p>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>State</h2>
+        <dl class="stats">
+          <div><dt>Connection</dt><dd id="connectionState">Idle</dd></div>
+          <div><dt>Model</dt><dd id="modelState">Idle</dd></div>
+          <div><dt>Playback</dt><dd id="playbackState">Idle</dd></div>
+          <div><dt>Elapsed</dt><dd id="sessionTimer">00:00</dd></div>
+        </dl>
+        <div class="meter"><div id="meterFill" class="meter-fill"></div></div>
+        <p id="runtimeDetail" class="note"></p>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="row">
+        <h2>Events <span id="eventCount" class="count">0</span></h2>
+        <button id="clearLogButton" class="secondary" type="button">Clear</button>
+      </div>
+      <div id="eventLog" class="log"></div>
+    </section>
+  </main>
+
+  <script>window.LIVE_AGENT_CONFIG = {{CONFIG_JSON}};</script>
+  <script src="static/app.js"></script>
+</body>
+</html>
