@@ -1,19 +1,24 @@
 # Where this stands
 
-## Read this first: the silence had TWO causes, and one needs a restart
+## Read this first: the silence had TWO causes, both fixed and both verified
 
 The reported symptom — the first reply makes some sound, later replies make none —
-had two independent causes, either of which produces roughly that. Both are fixed
-in code. **One of them only takes effect when the engine is restarted, so until you
-do that the browser will keep showing text with no voice.**
+had two independent causes, either of which produces roughly that.
 
-```bash
-kill -TERM $(pgrep -f 'bin/vllm-omni' | head -1)          # the engine, mine only
-bash benchmarks/live_agent/web_client/run_qwen_server.sh   # ~4 min, kernels cached
+**Verified after the restart: 8 consecutive sessions, every one delivered audio**
+(6 direct + 2 through the page-server proxy), first audio 319–434 ms after a
+1,324 ms first-request warm-up. Before the fix the fifth session would have been
+text-only. And the fix is doing work rather than the leak having gone away — the
+engine log shows the clamp firing, three times, each repairing a leak of exactly
+one slot on stage 1:
+
+```
+stage 1 streaming-parked counter had leaked 1 slot(s) (was 1, actually parked 0 of 0 tracked); clamped.
 ```
 
-I could not run that first line myself — the sandbox refused it, and the engine
-process is the wrong thing to work around a refusal on.
+with zero occurrences of `has sampled ZERO output tokens` or `looks WEDGED`. So the
+leak is still real and still happens once per session; it is now repaired every pass
+instead of accumulating to `max_num_seqs`.
 
 **Cause 1, in the browser: the playback prebuffer.** `PLAYBACK_PREBUFFER_MS` was
 250 while a turn delivers ~220 ms of audio, and an underrun re-armed the threshold.
