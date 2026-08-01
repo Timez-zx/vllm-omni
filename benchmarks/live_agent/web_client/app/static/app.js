@@ -290,12 +290,18 @@
       max_frame_width: 640,
       max_frame_height: 352,
       frame_jpeg_quality: 90,
-      // Without the filter a moving camera fills the prompt in seconds; the two
-      // gaps bound it from both sides so a still scene still yields a frame.
+      // FRESHNESS FLOOR: after 3 consecutive similarity-drops the 4th frame is
+      // force-retained (and, with arrival prefill on, turned into tokens right
+      // then), so the model's picture of the scene is never older than 4 sends
+      // = 2 s at this page's 2 fps. min_gap stays 0 ON PURPOSE: it is checked
+      // before max_gap and short-circuits, so any nonzero value here would
+      // delay the forced retain behind an unconditional drop window. The flood
+      // bound min_gap existed for is already provided by FRAME_INTERVAL_MS --
+      // worst case is 2 retained frames/s (~440 tokens/s at 640x352).
       enable_frame_filter: true,
       frame_filter_threshold: 0.95,
-      frame_filter_min_gap: 8,
-      frame_filter_max_gap: 16,
+      frame_filter_min_gap: 0,
+      frame_filter_max_gap: 4,
       use_audio_in_video: true,
       // One engine request per conversation, so turn 20 does not re-read turns
       // 1..19, and an automatic roll before the speech stage's limit so the
