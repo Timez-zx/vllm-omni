@@ -23,7 +23,10 @@
         </div>
       </div>
       <div class="stage-side">
-        <video id="cameraPreview" muted playsinline></video>
+        <div class="cam">
+          <video id="cameraPreview" muted playsinline></video>
+          <span id="cameraBadge" class="cam-badge" data-state="idle">Camera off</span>
+        </div>
         <div class="stage-buttons">
           <button id="muteButton" class="secondary small" type="button">Mute</button>
           <button id="cameraButton" class="secondary small" type="button" disabled>Camera</button>

@@ -113,15 +113,56 @@ body {
 .stage-side { display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
 .stage-buttons { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 
-#cameraPreview {
-  display: none;
-  width: 132px;
-  height: 99px;
+/* The preview frame is ALWAYS there, even with the camera off. An element that appears
+ * from nowhere gives you no way to tell "camera failed" from "camera not started" -- and
+ * the first version of this layout did exactly that, because `display:none` moved from the
+ * inline style into here while app.js still cleared the inline one. Reserved space plus a
+ * label that says which state it is in. */
+.cam {
+  position: relative;
+  width: 148px;
+  height: 111px;
   border-radius: 12px;
+  overflow: hidden;
+  background: var(--surface-2);
+  border: 1px solid var(--rule);
+  display: grid;
+  place-items: center;
+}
+.cam::after {
+  content: '';
+  position: absolute;
+  width: 26px; height: 20px;
+  border: 2px solid var(--ink-3);
+  border-radius: 4px;
+  opacity: .35;
+}
+#cameraPreview {
+  display: none;          /* app.js sets 'block' explicitly, never '' */
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
   object-fit: cover;
   background: #000;
-  border: 1px solid var(--rule);
 }
+.cam-badge {
+  position: absolute;
+  z-index: 2;
+  bottom: 5px;
+  left: 5px;
+  right: 5px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  text-align: center;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--surface) 78%, transparent);
+  backdrop-filter: blur(6px);
+  color: var(--ink-3);
+}
+.cam-badge[data-state="ok"] { color: var(--good); }
 
 /* ----------------------------------------------------------------- buttons */
 button, select, textarea, summary { font: inherit; }

@@ -43,6 +43,7 @@
   const muteButton = el('muteButton');
   const cameraButton = el('cameraButton');
   const cameraPreview = el('cameraPreview');
+  const cameraBadge = el('cameraBadge');
   const talkButton = el('talkButton');
   const triggerMode = el('triggerMode');
   const playbackMode = el('playbackMode');
@@ -533,13 +534,28 @@
     await playbackContext.resume();
   }
 
+  let framesSent = 0;
+
   function startCamera() {
     if (cameraStream) return;
     navigator.mediaDevices.getUserMedia({ video: true, audio: false }).then(async (stream) => {
       cameraStream = stream;
       cameraPreview.srcObject = stream;
-      cameraPreview.style.display = '';
+      // `= 'block'`, not `= ''`. Clearing the inline style used to reveal it because
+      // `display:none` lived in the inline style; it now lives in the stylesheet, so
+      // clearing falls straight back to hidden -- camera running, preview invisible, and
+      // no way to tell the two apart from the page. Set the value explicitly.
+      cameraPreview.style.display = 'block';
       await cameraPreview.play().catch(() => {});
+      // Say so in words as well as in pixels. A black rectangle looks the same whether the
+      // camera failed, the lens is covered, or the first frame has not arrived yet.
+      cameraPreview.addEventListener('loadedmetadata', () => {
+        log(`camera on: ${cameraPreview.videoWidth}x${cameraPreview.videoHeight}`);
+        if (cameraBadge) {
+          cameraBadge.textContent = `${cameraPreview.videoWidth}x${cameraPreview.videoHeight}`;
+          cameraBadge.dataset.state = 'ok';
+        }
+      }, { once: true });
       cameraTimer = window.setInterval(() => {
         if (!cameraStream || cameraPreview.videoWidth === 0) return;
         cameraCanvas.width = cameraPreview.videoWidth;
@@ -551,6 +567,14 @@
         if (socket && socket.readyState === WebSocket.OPEN && cameraPendingFrame) {
           socket.send(JSON.stringify({ type: 'video.frame', data: cameraPendingFrame }));
           cameraPendingFrame = null;
+          // A live count, because a frozen preview and a working one look identical in a
+          // still screenshot -- and because the server filters most frames away, so "sent"
+          // is the last number the page can honestly report.
+          framesSent += 1;
+          if (cameraBadge && cameraBadge.dataset.state === 'ok') {
+            cameraBadge.textContent =
+              `${cameraPreview.videoWidth}x${cameraPreview.videoHeight} · ${framesSent} sent`;
+          }
         }
       }, FRAME_INTERVAL_MS);
       cameraButton.textContent = 'Camera off';
@@ -569,6 +593,7 @@
     cameraPendingFrame = null;
     cameraPreview.srcObject = null;
     cameraPreview.style.display = 'none';
+    if (cameraBadge) { cameraBadge.textContent = 'Camera off'; cameraBadge.dataset.state = 'idle'; }
     cameraButton.textContent = 'Camera';
     cameraButton.classList.remove('is-active');
   }
