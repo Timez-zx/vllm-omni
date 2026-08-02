@@ -462,6 +462,19 @@ class Qwen3OmniMoeForConditionalGeneration(
                         # Expected for boundary-capped 1-token segments; the
                         # consumer floors to count // 16 frames, so the padded
                         # remainder is never decoded into audible samples.
+                        if code.shape[0] > 16:
+                            # A request LARGER than one frame that is not
+                            # 16-aligned cannot come from the current producer
+                            # (frames ship as [F, 16] transposed flat). Flat-end
+                            # padding would row-shift the quantizer layout and
+                            # decode SCRAMBLED-but-valid audio -- make that a
+                            # loud event instead of silent garble.
+                            logger.warning(
+                                "Code2Wav: request shipped %d codec tokens, not frame-aligned; "
+                                "its decoded frames will be scrambled. Upstream must ship "
+                                "16-aligned frames or a single boundary token.",
+                                code.shape[0],
+                            )
                         code = torch.cat(
                             [code, code.new_zeros(16 - code.shape[0] % 16)]
                         )
