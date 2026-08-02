@@ -473,6 +473,79 @@ same pressure before the fixes broke the second turn within seconds.
 
 ---
 
+## 14. Sixteen people at once — the waiting holds up, the lifetime doesn't
+
+*2026-08-01 · `e91735b3` `cd399ae0` `ba64c261` — a 15-cell matrix: 1/2/4/8/16 users × three kinds of picture*
+
+**Scenario.** Everything so far was one person. This run asks the cloud question: put
+N people on the same card at once — does the waiting get worse, and how fast? Each
+simulated person is a real connection through the same door the browser uses, pumping
+2 real video frames a second and holding a 30-turn conversation (ask, listen to the
+whole answer, think a few seconds, ask again). Three kinds of picture from the July
+study: a still screen, a talking head, a walking handheld shot. Every cell starts on a
+freshly booted engine, and reply length was pinned by the prompt (27–29 characters in
+all 15 cells), so a difference in waiting can only come from the crowd.
+
+**The waiting, measured** (median / 95th-percentile milliseconds to first sound,
+counting only turns before a cell hit its wall — see below):
+
+| users | still screen | talking head | handheld walk |
+|---|---|---|---|
+| 1 | 384 / 451 | 377 / 437 | 435 / 544 |
+| 2 | 399 / 688 | 412 / 705 | 514 / 815 |
+| 4 | 585 / 757 | 597 / 762 | 728 / 961 |
+| 8 | 732 / 1,001 | 714 / 937 | 844 / 1,326 |
+| 16 | 845 / 1,491 | 875 / 1,306 | 1,252 / 2,202 |
+
+Three things worth saying out loud:
+
+- **Sixteen times the people costs 2.2× the waiting.** No explosion anywhere. In July,
+  on the old rebuild-everything architecture, the handheld shot took **5.4 seconds at
+  just 4 users and 8.3 at 8**. Same card, same pictures: sections 8 and 12 turned a
+  7–10× multi-user latency problem into a 15–45% one, because pictures are paid for
+  while you are still talking and history is never recomputed.
+- **What the camera sees stopped mattering** — at 8 users all three contents sit
+  within 130 ms of each other. The old architecture's worst case was 11× its best.
+- **The early warning is not the waiting.** The margin by which sound is delivered
+  faster than it plays thins from 1.75× to 1.31×, and the worst mid-sentence stall
+  creeps from 0 to ~350 ms, *before* the waiting looks bad. If this ever gets an SLO,
+  it should watch the delivery margin.
+
+**The wall.** Every conversation's context only ever grows, and the thinking stage's
+memory pool is a fixed size regardless of how many people share it. So the pool runs
+out at a **predictable turn number**: pool ÷ (people × growth per turn). One number —
+how many pictures per second the filter keeps — sets the growth, and it predicted every
+death in the matrix, including one written down before the cell ran (16 users ×
+handheld: predicted around turn 4, died turns 3–5). Light content keeps 25% of frames
+and 8 people die near turn 18; the handheld shot keeps 56%, so **4 people die near turn
+18 too** — "four users is safe" is a statement about the camera, not the card.
+
+**Why each crash happened.**
+
+1. **Eight users deadlock together — a design problem: a parked session's lost signal
+   is never redelivered.** When the pool fills, the scheduler parks a session request
+   to make room — normal operation. But the "done speaking" signal is delivered
+   exactly once; miss it while parked and it is gone forever. The turn can then never
+   close, and every later question is refused with "a turn is still running". The
+   health check tests HTTP, not audio, so the deadlock reads as "fine" throughout.
+   **The latency problem became a lifetime problem.**
+2. **Sixteen users crash the engine — an implementation problem: the memory fraction
+   does not govern runtime peaks.** `gpu_memory_utilization` only sizes the memory
+   pool; nothing bounds the instantaneous activation memory of sixteen concurrent
+   picture prefills. The moment that peak exceeds the card's remaining VRAM, stage 0
+   hits CUDA OOM and the process dies.
+3. **Two users in one batch crash — an implementation problem: the multi-request
+   batching code had never run** (fixed, `e91735b3`). Stage 2 picks its processing
+   path by whether the batch's TOTAL length divides by 16; one 1-token stub in the
+   batch breaks that, the code flattens N requests into one row and then slices it as
+   N — index out of bounds, engine down. Fix: pad each request individually. Two
+   collateral bugs in the same code: a request missing the "seam" field zeroed
+   **everyone's** seam parameters (fixed, same commit); different-sized chunks in one
+   batch still mis-place a seam by ~23 ms (open; audio output frozen during the
+   benchmark).
+
+---
+
 ## Where things stand
 
 **Working**
@@ -500,7 +573,10 @@ same pressure before the fixes broke the second turn within seconds.
 - **Memory across a swap was never tested.** In principle text carries over and pictures do not, so
   the **expectation** is "remembers what was said, forgets what was seen earlier" — but an
   expectation is not a result, and this has not been measured.
-- **Single user only.** Several people using it at once is completely untouched.
+- **Multi-user is measured (section 14) but not survivable.** The waiting scales fine; the
+  session **dies** at a predictable turn when the shared memory pool fills. The two fixes that
+  would change that — surviving being parked, and admitting people by context growth instead of
+  head-count — are designed on paper and not built.
 - There is a self-heal that recovers a stuck job, but **why it gets stuck that way is still unknown.**
 - The broken count is only **worked around** here; it has **not been fixed upstream.**
 - **Nobody has listened to the audio** since the pictures were withheld from the speech stage, and
