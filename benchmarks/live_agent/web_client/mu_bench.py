@@ -307,6 +307,9 @@ def summarize(records: list[dict], users: list[User], meta: dict, log_slice: str
         "session_rolls": sum(u.rolls for u in users),
         "stray_audio_deltas": sum(u.stray_audio for u in users),
         "client_errors": sum(len(u.errors) for u in users),
+        # First few error strings per user: the 8-user wedge postmortem had to
+        # be reconstructed from the engine log because these never hit disk.
+        "per_user_errors": {u.name: u.errors[:5] for u in users if u.errors},
         "engine_probes": probes,
     }
 

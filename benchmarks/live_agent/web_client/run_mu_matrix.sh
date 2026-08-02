@@ -5,10 +5,15 @@
 #   bash run_mu_matrix.sh                    # full matrix, ~3-5 h
 #   ONLY_CONTENT=talkinghead ONLY_USERS=2 bash run_mu_matrix.sh   # one cell
 #
-# The engine is restarted at each content boundary so every content starts
-# from a clean engine (no cross-contamination from a previous cell's KV pool
-# or any slow leak), and restored to the single-user default config at the
-# end. Restarts go through run_qwen_server.sh, which keeps the previous log.
+# The engine is restarted before EVERY cell. Per-content restarts were the
+# original design; the 8-user screencast cell then demonstrated why that is
+# not enough: at ~13.8k tokens x 8 sessions the aggregate crosses the stage-0
+# KV pool and the engine does not degrade -- sessions WEDGE (the in-flight
+# segment's stop signal is lost, every later query is refused as an overlap),
+# and the NEXT cell inherits a poisoned engine. A cell must start clean to be
+# interpretable. SKIP_DONE=1 (default) skips cells that already have a
+# summary.json, so an interrupted matrix resumes where it left off.
+# Restarts go through run_qwen_server.sh, which keeps the previous log.
 set -uo pipefail
 
 FORK=/home/zx/voice-agent/vllm-omni
@@ -21,6 +26,7 @@ PORT=8091
 CONTENTS=${ONLY_CONTENT:-"screencast talkinghead handheld_walk_talk"}
 USERS=${ONLY_USERS:-"1 2 4 8 16"}
 TURNS=${TURNS:-30}
+SKIP_DONE=${SKIP_DONE:-1}
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 
@@ -28,20 +34,22 @@ log() { echo "[$(date +%H:%M:%S)] $*"; }
 # is shared -- pid matching must never widen beyond our own user and our own
 # command line (jkim38's MPS server lives on this card permanently).
 stop_engine() {
-  local main
-  main=$(pgrep -u "$USER" -f "vllm-omni.*serve.*Qwen3-Omni" | head -1 || true)
-  if [ -z "$main" ]; then log "no engine running"; return 0; fi
-  local pgid
-  pgid=$(ps -o pgid= -p "$main" | tr -d ' ')
-  log "stopping engine pid=$main pgid=$pgid"
-  kill -TERM -- "-$pgid" 2>/dev/null
+  local pids pgids pgid
+  pids=$(pgrep -u "$USER" -f "vllm-omni.*serve.*Qwen3-Omni" || true)
+  if [ -z "$pids" ]; then log "no engine running"; return 0; fi
+  # A wedged cell can leave more than one process group behind; sweep them all.
+  pgids=$(ps -o pgid= -p $pids 2>/dev/null | tr -d ' ' | sort -u)
+  for pgid in $pgids; do
+    log "stopping engine pgid=$pgid"
+    kill -TERM -- "-$pgid" 2>/dev/null
+  done
   for _ in $(seq 1 24); do
-    pgrep -g "$pgid" >/dev/null 2>&1 || break
+    pgrep -u "$USER" -f "vllm-omni.*serve.*Qwen3-Omni" >/dev/null || break
     sleep 5
   done
-  if pgrep -g "$pgid" >/dev/null 2>&1; then
+  if pgrep -u "$USER" -f "vllm-omni.*serve.*Qwen3-Omni" >/dev/null; then
     log "engine still up after 120s; SIGKILL"
-    kill -KILL -- "-$pgid" 2>/dev/null
+    for pgid in $pgids; do kill -KILL -- "-$pgid" 2>/dev/null; done
     sleep 5
   fi
   # run_qwen_server.sh refuses to start below 80 GB free; wait for the freeing
@@ -79,18 +87,23 @@ run_cell() {  # $1 content, $2 users
   local rc=${PIPESTATUS[0]}
   kill "$sampler" 2>/dev/null
   log "cell done rc=$rc"
+  # No mid-loop repair: the next cell boots a fresh engine regardless. Just
+  # record whether this cell left the engine dead, for the analysis step.
   if ! healthy; then
-    log "!! engine unhealthy after cell $content/u$u -- restarting before next cell"
+    log "NOTE: engine unhealthy after cell $content/u$u (next cell boots fresh anyway)"
     echo "engine_died_after=true" >> "$out/summary_note.txt"
-    stop_engine && start_engine "$MU_DEPLOY" || return 1
   fi
 }
 
-log "matrix start: contents=[$CONTENTS] users=[$USERS] turns=$TURNS"
+log "matrix start: contents=[$CONTENTS] users=[$USERS] turns=$TURNS skip_done=$SKIP_DONE"
 for content in $CONTENTS; do
-  stop_engine || exit 1
-  start_engine "$MU_DEPLOY" || { log "!! engine failed to boot for $content"; exit 1; }
   for u in $USERS; do
+    if [ "$SKIP_DONE" = "1" ] && [ -f "$RES/mu_${content}_u${u}/summary.json" ]; then
+      log "skip $content x $u -- summary.json already present"
+      continue
+    fi
+    stop_engine || exit 1
+    start_engine "$MU_DEPLOY" || { log "!! engine failed to boot for $content/u$u"; exit 1; }
     run_cell "$content" "$u" || exit 1
   done
 done
