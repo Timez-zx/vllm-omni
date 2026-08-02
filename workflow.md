@@ -500,40 +500,57 @@ worst few turns seen", not a strict percentile):
 | 8 | 693 / 965 / 1,074 | 700 / 932 / 985 | 839 / 1,317 / 1,406 |
 | 16 | 783 / 1,250 / 1,416 | 798 / 1,069 / 1,121 | **1,405 / 4,673 / 5,368** |
 
-Three things worth saying out loud:
+**Where sixteen users actually get slow.** The table's one ugly cell (handheld × 16)
+is not jitter — it is steady decay: 0.9 s at turn 2, 3.3 s at turn 30, and the
+slowest 5% of turns all land after turn 22. Split each turn in two and look at
+ABSOLUTE milliseconds (16 users, early → late, P50/P95):
 
-- **Sixteen times the people costs about 2× the waiting** (light content: 380 → 783).
-  With sixteen people on the card, half the answers still start speaking within
-  0.8 s, and the worst few turns stay under 1.5 s. Against July's old architecture
-  (5.4 s at just 4 users on the handheld shot) and against yesterday's bf16 (8 users
-  deadlocked at turns 18–23, 16 users dead within minutes) — every cell now runs to
-  completion.
-- **On light content, what the camera sees does not matter**: at 16 users, still
-  screen and talking head are 15 ms apart. The one exception is the next point.
-- **High motion × 16 no longer dies — it queues.** Handheld × 16 is the table's one
-  ugly cell: it climbs steadily from 0.9 s at turn 2 to 3.3 s at turn 30. No
-  deadlock, no crash, no preemption — but every user's conversation history fattens
-  fast (high motion stores ~1,600 tokens per turn, 2.2× the light-content rate),
-  sixteen histories fatten together, and **every new token has to read back through
-  an ever-thicker pile**, so each turn is slower than the last. This is a second
-  disease, entirely different from yesterday's sudden death: slow, predictable, and
-  it leaves a scheduler time to act.
+| segment | early (turns 2–8) | late (turns 18–25) |
+|---|---|---|
+| thinking (question → first text char) | 202 / 541 | **1,151 / 2,404** |
+| speaking (first char → first sound) | 686 / 954 | 1,297 / 2,216 |
 
-**Where the extra waiting goes at 16 users.** Stopwatch on "question → first sound",
-split in two (light content, 16 users vs 1):
+Then pull out the per-second hardware samples for exactly the seconds when the
+slowest 5% of turns were running: **the SM (compute units) sit at 93% while memory
+bandwidth sits at 18%**; split by process, the thinker owns 64% of the compute
+during slow turns (50% on median turns) while the talker FALLS from 30% to 21% — it
+did not get slower, it **cannot get the card**. Both segments slow down for one
+root cause: the thinker eats the compute.
 
-| segment | 1 user | 16 users | delta |
-|---|---|---|---|
-| waiting for the brain (question → first text char) | ~102 ms | ~125–175 ms | +30–70 ms |
-| **waiting for the mouth (first char → first sound)** | ~281 ms | **~594 ms** | **+313 ms** |
-| of which: the mouth's actual working rhythm | 207 ms/chunk | 225 ms/chunk | only +9% |
+**Why many pictures make COMPUTE the wall, not memory bandwidth.** The engine only
+does two kinds of work:
 
-One-sentence conclusion: **about 80% of the extra waiting is "the answer is ready but
-it is not your turn to speak"** — your first speech chunk stands in line behind the
-chunks of up to fifteen other people mid-sentence, while the speech engine's own
-production rate barely changes (it batches well). To push 16-user latency further
-down, the thing to change is the queueing rule for a turn's FIRST chunk (let a user
-who is about to start speaking jump the line), not the speech engine's speed.
+- **prefill (digesting input)**: one frame becomes 220 tokens entering as ONE
+  batch — the whole history is fetched from memory ONCE, and all 220 tokens each
+  run their multiplications against that one fetch. Fetch ×1, compute ×220.
+- **decode (producing the answer)**: one character at a time — the same full
+  history is fetched, but only ONE token's worth of compute uses it. Fetch ×1,
+  compute ×1.
+
+This card's constitution: per byte fetched, the compute units can afford ~110
+multiplications. Decode uses 1–2 per byte (bandwidth clogs first — the origin of
+the old saying "LLM inference is bandwidth-bound"); prefill uses ~350 per byte
+(compute clogs first). A concrete ledger at 45k tokens of history: one frame's
+prefill takes **3 ms of fetching and 40 ms of computing** — compute is 13× the
+fetch, so the fetch pipeline idles. And our load is lopsided: ~30 decode tokens per
+turn versus ~1,500 frame tokens — **96% of the work is prefill-shaped**, so the
+whole card behaves like prefill: SM pinned, bandwidth idle. Total demand in one
+product: **users × frames-per-second × history thickness per frame**. The first two
+factors are fixed; the third climbs every turn — handheld × 16 crosses the card's
+capacity around turn 13, and everything after that is queueing.
+
+**The counter-example proves the rule: a duplex WITHOUT pictures hits the bandwidth
+wall first.** We have measured Moshi (speech-only full-duplex) under multi-user
+load: it has no batch-shaped input at all — audio enters step by step, one time
+slice every 80 ms, so its load is 100% decode-shaped at 1–2 multiplications per
+byte, on a dense model that re-fetches full weights every step — and under
+multi-user load **memory bandwidth broke first**, the exact mirror of this table.
+Two systems, two opposite walls, one criterion (multiplications per fetched byte)
+explaining both. In one sentence: **the moment a live agent grows eyes, its
+bottleneck migrates from memory bandwidth to compute** — and the medicine changes
+with it: the bandwidth wall wants fewer bytes moved (quantize, batch wider), the
+compute wall wants fewer multiplications done (cap the history, admit by the
+product) — the two prescriptions do not transfer.
 
 **The wall (bf16 history — no longer reached in the FP8 re-measure).** Every conversation's context only ever grows, and the thinking stage's
 memory pool is a fixed size regardless of how many people share it. So the pool runs
