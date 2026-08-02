@@ -520,6 +520,19 @@ handheld: predicted around turn 4, died turns 3–5). Light content keeps 25% of
 and 8 people die near turn 18; the handheld shot keeps 56%, so **4 people die near turn
 18 too** — "four users is safe" is a statement about the camera, not the card.
 
+**Coda (the next morning): FP8 tore the wall down.** Quantizing the thinker's
+weights and KV cache to FP8 (vLLM converts the OFFICIAL weights at load time;
+talker and vocoder stay bf16) grows the memory pool from 107k to **731,904
+tokens**. Re-run: 8 users complete 240/240 and 16 users **480/480** with
+latency unchanged (16-user median 780 ms) and text **verbatim identical** to
+bf16. Two lessons from the road: a community pre-quantized checkpoint loaded
+fine and spoke gibberish (discarded — converting official weights at load is
+the clean path); and the 0.74 memory fraction was tuned for bf16 — fp8
+kernels' workspace ate the headroom and OOM'd at 8 users, so 0.70 trades 83k
+pool tokens for 4 GB of scratch space, which is the real concurrency
+constraint. **Still owed: a human ear** (the talker consumes hidden states
+produced by the FP8 thinker; prosody is unconfirmed by listening).
+
 **Why each crash happened.**
 
 1. **Eight users deadlock together — a design problem: a parked session's lost signal
