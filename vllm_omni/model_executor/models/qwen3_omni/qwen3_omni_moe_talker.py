@@ -286,6 +286,57 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         """Embed codec input IDs."""
         return self.language_model.embed_input_ids(input_ids)
 
+    # Modules built as plain nn.Linear / custom MLPs, OUTSIDE vLLM's
+    # quantized-linear machinery. A block-FP8 checkpoint (e.g.
+    # marksverdhei/Qwen3-Omni-30B-A3B-FP8) quantizes them anyway; their fp8
+    # weights must be expanded back to bf16 at load time, or the loader dies
+    # on the orphan `weight_scale_inv` parameter. HF (pre-mapper) names.
+    _PLAIN_FP8_PREFIXES = (
+        "talker.codec_head.",
+        "talker.text_projection.",
+        "talker.hidden_projection.",
+        "talker.code_predictor.",
+    )
+
+    def _expand_plain_fp8(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Dequantize block-FP8 (weight, weight_scale_inv) pairs headed for
+        plain modules; everything else passes through untouched. The two
+        halves of a pair may arrive in either order, so stash one side until
+        the other shows up. Block size 128x128, w = w_fp8 * scale_inv."""
+        pending_w: dict[str, torch.Tensor] = {}
+        pending_s: dict[str, torch.Tensor] = {}
+
+        def expand(w: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+            out_dim, in_dim = w.shape
+            se = s.to(torch.float32)
+            se = se.repeat_interleave(128, 0)[:out_dim]
+            se = se.repeat_interleave(128, 1)[:, :in_dim]
+            return (w.to(torch.float32) * se).to(torch.bfloat16)
+
+        for name, tensor in weights:
+            if name.startswith(self._PLAIN_FP8_PREFIXES):
+                if name.endswith("weight_scale_inv"):
+                    base = name[: -len("_scale_inv")]
+                    if base in pending_w:
+                        yield base, expand(pending_w.pop(base), tensor)
+                    else:
+                        pending_s[base] = tensor
+                    continue
+                if name.endswith("weight") and tensor.dtype == torch.float8_e4m3fn:
+                    if name in pending_s:
+                        yield name, expand(tensor, pending_s.pop(name))
+                    else:
+                        pending_w[name] = tensor
+                    continue
+            yield name, tensor
+        if pending_w or pending_s:
+            raise ValueError(
+                "unpaired FP8 tensors for plain talker modules: "
+                f"{list(pending_w) + list(pending_s)}"
+            )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights for the talker model.
 
@@ -299,7 +350,9 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
             # "code_predictor."],
         )
         # Don't apply mapper again since we already did it
-        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(
+            self._expand_plain_fp8(weights), mapper=self.hf_to_vllm_mapper
+        )
 
         # Log load summary
         try:

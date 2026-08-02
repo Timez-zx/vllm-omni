@@ -19,6 +19,11 @@ PY=/home/zx/miniconda3/envs/omni-minicpm/bin/vllm-omni
 LOG="${QWEN_LOG:-/data/zx/results/qwen_live.log}"
 PORT=8091
 DEPLOY="${DEPLOY_CONFIG:-$FORK/benchmarks/live_agent/web_client/deploy_web_demo.yaml}"
+# QWEN_MODEL swaps the checkpoint without touching this file -- used for the
+# FP8 experiment: marksverdhei/Qwen3-Omni-30B-A3B-FP8 is a block-FP8 E4M3
+# quant of the SAME Instruct base (thinker+talker FP8; encoders, code2wav,
+# embeddings, norms, MoE gates kept bf16).
+MODEL="${QWEN_MODEL:-Qwen/Qwen3-Omni-30B-A3B-Instruct}"
 
 [ -f "$DEPLOY" ] || { echo "!! deploy config missing: $DEPLOY"; exit 1; }
 
@@ -53,7 +58,7 @@ print('   optimisations present; talker text-only =', TALKER_TEXT_ONLY)
 HF_HOME=/data/zx/hf CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$FORK" \
 VLLM_OMNI_TALKER_TEXT_ONLY="${VLLM_OMNI_TALKER_TEXT_ONLY:-1}" \
 VLLM_OMNI_LOG_SESSION_OUTPUTS=1 \
-setsid "$PY" serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
+setsid "$PY" serve "$MODEL" \
   --omni --deploy-config "$DEPLOY" \
   --trust-remote-code --host 127.0.0.1 --port "$PORT" \
   --init-timeout 3000 --stage-init-timeout 1500 >> "$LOG" 2>&1 &
