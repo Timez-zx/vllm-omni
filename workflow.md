@@ -475,7 +475,7 @@ same pressure before the fixes broke the second turn within seconds.
 
 ## 14. Sixteen people at once — the waiting holds up, the lifetime doesn't
 
-*2026-08-01 · `e91735b3` `cd399ae0` `ba64c261` — a 15-cell matrix: 1/2/4/8/16 users × three kinds of picture*
+*2026-08-01 first pass (bf16) · 2026-08-02 fully re-measured on the FP8 engine · `e91735b3` `cd399ae0` `ba64c261` `73131a2b` — a 15-cell matrix: 1/2/4/8/16 users × three kinds of picture*
 
 **Scenario.** Everything so far was one person. This run asks the cloud question: put
 N people on the same card at once — does the waiting get worse, and how fast? Each
@@ -486,32 +486,56 @@ study: a still screen, a talking head, a walking handheld shot. Every cell start
 freshly booted engine, and reply length was pinned by the prompt (27–29 characters in
 all 15 cells), so a difference in waiting can only come from the crowd.
 
-**The waiting, measured** (median / 95th-percentile milliseconds to first sound,
-counting only turns before a cell hit its wall — see below):
+**The waiting, measured** (FP8 engine; all 15 cells completed in full, zero deaths.
+The three numbers are P50 / P95 / P99 in milliseconds. P99 excludes each cell's
+first-turn cold start — the FP8 engine's very first turn after boot costs 2–4.5 s,
+paid once per boot; and with 60–480 samples per cell, P99 should be read as "the
+worst few turns seen", not a strict percentile):
 
 | users | still screen | talking head | handheld walk |
 |---|---|---|---|
-| 1 | 384 / 451 | 377 / 437 | 435 / 544 |
-| 2 | 399 / 688 | 412 / 705 | 514 / 815 |
-| 4 | 585 / 757 | 597 / 762 | 728 / 961 |
-| 8 | 732 / 1,001 | 714 / 937 | 844 / 1,326 |
-| 16 | 845 / 1,491 | 875 / 1,306 | 1,252 / 2,202 |
+| 1 | 380 / 454 / 499 | 385 / 473 / 496 | 399 / 517 / 551 |
+| 2 | 439 / 695 / 695 | 421 / 743 / 743 | 453 / 902 / 902 |
+| 4 | 575 / 794 / 813 | 614 / 797 / 832 | 673 / 977 / 1,048 |
+| 8 | 693 / 965 / 1,074 | 700 / 932 / 985 | 839 / 1,317 / 1,406 |
+| 16 | 783 / 1,250 / 1,416 | 798 / 1,069 / 1,121 | **1,405 / 4,673 / 5,368** |
 
 Three things worth saying out loud:
 
-- **Sixteen times the people costs 2.2× the waiting.** No explosion anywhere. In July,
-  on the old rebuild-everything architecture, the handheld shot took **5.4 seconds at
-  just 4 users and 8.3 at 8**. Same card, same pictures: sections 8 and 12 turned a
-  7–10× multi-user latency problem into a 15–45% one, because pictures are paid for
-  while you are still talking and history is never recomputed.
-- **What the camera sees stopped mattering** — at 8 users all three contents sit
-  within 130 ms of each other. The old architecture's worst case was 11× its best.
-- **The early warning is not the waiting.** The margin by which sound is delivered
-  faster than it plays thins from 1.75× to 1.31×, and the worst mid-sentence stall
-  creeps from 0 to ~350 ms, *before* the waiting looks bad. If this ever gets an SLO,
-  it should watch the delivery margin.
+- **Sixteen times the people costs about 2× the waiting** (light content: 380 → 783).
+  With sixteen people on the card, half the answers still start speaking within
+  0.8 s, and the worst few turns stay under 1.5 s. Against July's old architecture
+  (5.4 s at just 4 users on the handheld shot) and against yesterday's bf16 (8 users
+  deadlocked at turns 18–23, 16 users dead within minutes) — every cell now runs to
+  completion.
+- **On light content, what the camera sees does not matter**: at 16 users, still
+  screen and talking head are 15 ms apart. The one exception is the next point.
+- **High motion × 16 no longer dies — it queues.** Handheld × 16 is the table's one
+  ugly cell: it climbs steadily from 0.9 s at turn 2 to 3.3 s at turn 30. No
+  deadlock, no crash, no preemption — but every user's conversation history fattens
+  fast (high motion stores ~1,600 tokens per turn, 2.2× the light-content rate),
+  sixteen histories fatten together, and **every new token has to read back through
+  an ever-thicker pile**, so each turn is slower than the last. This is a second
+  disease, entirely different from yesterday's sudden death: slow, predictable, and
+  it leaves a scheduler time to act.
 
-**The wall.** Every conversation's context only ever grows, and the thinking stage's
+**Where the extra waiting goes at 16 users.** Stopwatch on "question → first sound",
+split in two (light content, 16 users vs 1):
+
+| segment | 1 user | 16 users | delta |
+|---|---|---|---|
+| waiting for the brain (question → first text char) | ~102 ms | ~125–175 ms | +30–70 ms |
+| **waiting for the mouth (first char → first sound)** | ~281 ms | **~594 ms** | **+313 ms** |
+| of which: the mouth's actual working rhythm | 207 ms/chunk | 225 ms/chunk | only +9% |
+
+One-sentence conclusion: **about 80% of the extra waiting is "the answer is ready but
+it is not your turn to speak"** — your first speech chunk stands in line behind the
+chunks of up to fifteen other people mid-sentence, while the speech engine's own
+production rate barely changes (it batches well). To push 16-user latency further
+down, the thing to change is the queueing rule for a turn's FIRST chunk (let a user
+who is about to start speaking jump the line), not the speech engine's speed.
+
+**The wall (bf16 history — no longer reached in the FP8 re-measure).** Every conversation's context only ever grows, and the thinking stage's
 memory pool is a fixed size regardless of how many people share it. So the pool runs
 out at a **predictable turn number**: pool ÷ (people × growth per turn). One number —
 how many pictures per second the filter keeps — sets the growth, and it predicted every
@@ -520,18 +544,20 @@ handheld: predicted around turn 4, died turns 3–5). Light content keeps 25% of
 and 8 people die near turn 18; the handheld shot keeps 56%, so **4 people die near turn
 18 too** — "four users is safe" is a statement about the camera, not the card.
 
-**Coda (the next morning): FP8 tore the wall down.** Quantizing the thinker's
-weights and KV cache to FP8 (vLLM converts the OFFICIAL weights at load time;
-talker and vocoder stay bf16) grows the memory pool from 107k to **731,904
-tokens**. Re-run: 8 users complete 240/240 and 16 users **480/480** with
-latency unchanged (16-user median 780 ms) and text **verbatim identical** to
-bf16. Two lessons from the road: a community pre-quantized checkpoint loaded
-fine and spoke gibberish (discarded — converting official weights at load is
-the clean path); and the 0.74 memory fraction was tuned for bf16 — fp8
-kernels' workspace ate the headroom and OOM'd at 8 users, so 0.70 trades 83k
-pool tokens for 4 GB of scratch space, which is the real concurrency
-constraint. **Still owed: a human ear** (the talker consumes hidden states
-produced by the FP8 thinker; prosody is unconfirmed by listening).
+**How FP8 tore that wall down.** Quantizing the thinker's weights and KV cache
+to FP8 (vLLM converts the OFFICIAL weights at load time; talker and vocoder
+stay bf16) grows the memory pool from 107k to **731,904 tokens**; the table
+above IS the full re-measure on that engine — 15 cells, zero deaths, text
+verbatim identical to bf16, latency flat. Three lessons from the road: a
+community pre-quantized checkpoint loaded fine and spoke gibberish
+(discarded); the 0.74 memory fraction was tuned for bf16 — fp8 kernels'
+workspace ate the headroom and OOM'd at 8 users, so 0.70 trades 83k pool
+tokens for 4 GB of transient working memory, the real concurrency constraint;
+and the human-ear gate passed (normal Mandarin conversation confirmed) with
+ONE session-level oddity on record — a session that spoke Cantonese from its
+first reply onward, gone on reconnect, mechanism pointing at a borderline
+language call on the first spoken utterance then locked in by session
+history. If it recurs, keep the session and read its first line.
 
 **Why each crash happened.**
 
