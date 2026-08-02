@@ -20,7 +20,10 @@ FORK=/home/zx/voice-agent/vllm-omni
 WC=$FORK/benchmarks/live_agent/web_client
 PYBIN=/home/zx/miniconda3/envs/omni-minicpm/bin/python
 RES=/data/zx/results
-MU_DEPLOY=$WC/deploy_web_multiuser.yaml
+# MU_DEPLOY picks the engine config; RESULT_PREFIX keeps result sets apart
+# (mu_* = the bf16 baseline matrix, mufp8_* = the FP8 re-measure).
+MU_DEPLOY="${MU_DEPLOY:-$WC/deploy_web_multiuser.yaml}"
+RESULT_PREFIX="${RESULT_PREFIX:-mu}"
 PORT=8091
 
 CONTENTS=${ONLY_CONTENT:-"screencast talkinghead handheld_walk_talk"}
@@ -75,7 +78,7 @@ healthy() {
 run_cell() {  # $1 content, $2 users
   local content=$1 u=$2 reps=1
   [ "$u" = "1" ] && reps=2   # two sequential sessions: turn indices match other cells
-  local out=$RES/mu_${content}_u${u}
+  local out=$RES/${RESULT_PREFIX}_${content}_u${u}
   mkdir -p "$out"
   log "=== cell $content x ${u} users (reps=$reps) -> $out"
   nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used \
@@ -98,7 +101,7 @@ run_cell() {  # $1 content, $2 users
 log "matrix start: contents=[$CONTENTS] users=[$USERS] turns=$TURNS skip_done=$SKIP_DONE"
 for content in $CONTENTS; do
   for u in $USERS; do
-    if [ "$SKIP_DONE" = "1" ] && [ -f "$RES/mu_${content}_u${u}/summary.json" ]; then
+    if [ "$SKIP_DONE" = "1" ] && [ -f "$RES/${RESULT_PREFIX}_${content}_u${u}/summary.json" ]; then
       log "skip $content x $u -- summary.json already present"
       continue
     fi
@@ -108,7 +111,8 @@ for content in $CONTENTS; do
   done
 done
 
-log "matrix done; restoring the single-user default config"
+log "matrix done; restoring the single-user config"
+RESTORE_DEPLOY="${RESTORE_DEPLOY:-$WC/deploy_web_demo.yaml}"
 stop_engine || exit 1
-start_engine "$WC/deploy_web_demo.yaml" || exit 1
+start_engine "$RESTORE_DEPLOY" || exit 1
 log "all done"
