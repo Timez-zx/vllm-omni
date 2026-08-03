@@ -602,6 +602,82 @@ history. If it recurs, keep the session and read its first line.
 
 ---
 
+## 15. Context compression — the notebook swap users can no longer feel
+
+*2026-08-02, commit `0b37129c`.*
+
+One sentence: the turn-over-turn climb that section 14 measured for sixteen users on
+high-motion content is now held flat by session-level compression — 40 turns straight
+with per-turn p50 never above 1.2 s — and the turn a compression lands on is
+**indistinguishable** from an ordinary one.
+
+**What was built.** The old roll was "swap notebooks the moment the page runs out": at
+the instant a user asked a question, the old request was deleted and the seed
+re-prefilled, and that turn paid 3.70×. It is now a **shadow swap**, in four steps:
+
+1. **Two fuel gauges**: the thinker's context total (a NEW trigger — nothing watched
+   this wall before) and the talker-side estimate (the original trigger, backstop
+   semantics unchanged);
+2. **Background warm-up**: once a gauge crosses its line, a fresh request is quietly
+   opened during a silence gap and pre-prefilled with the system prompt + the recent
+   transcript trimmed to budget, then parked warm;
+3. **Pointer swap**: at the start of the next turn the session flips to the new
+   request — that turn pays **no cold prefill at all**;
+4. **Deferred retirement**: the old request is destroyed only after the swap turn has
+   closed — ordering replaces the cross-process race that the old roll's 1-second
+   settle sleep papered over.
+
+Behaviorally this matches Gemini Live's context window compression: `trigger_tokens`
+fires it, `target_tokens` decides how much text survives, the user feels nothing, the
+session talks forever.
+
+**Numbers.** Single user (tiny trigger forcing two compressions): compressed-turn TTFA
+409/420 ms against an ordinary-turn median of 391 ms — indistinguishable; recall across
+the compression boundary 3/3 (name and color both survived). Sixteen users × handheld ×
+40 turns (trigger 16k):
+
+| Metric | No compression (section 14 baseline, 30 turns) | Compression (40 turns) |
+|---|---|---|
+| Per-turn p50 trajectory | 993 → 4,363 ms, climbs and never returns | **865–1,177 ms, flat through turn 40** |
+| Overall p50 / p95 | 1,378 / 4,477 | **930 / 1,578** |
+| Turns over 2 s | 38.4% | **3.0%** |
+| Completion | — | 640/640, zero timeouts |
+| Compressions | — | 56, all invisible, 0 fallbacks to the blocking roll |
+
+The remaining tail (1.3% of turns at 5–13 s) is the ordinary sixteen-user thinker
+contention tail, present in the baseline too, unrelated to compression — that is the
+disease first-chunk priority scheduling is meant to treat, a separate knife.
+
+**Three traps only building it could reveal.**
+
+1. **The seed must not be "prefill without speaking".** A segment that stops in one
+   step ships the talker an EMPTY first page; when the next real page arrives, its
+   numbering assumes the full prompt while its data covers only the delta, and stage 1
+   dies on the spot (`tensor a (6) vs b (9)`). Fix: the seed is a REAL micro-segment
+   with `max_tokens=2`, so the talker's first page is shaped exactly like every
+   session's first page, and the swap turn rides the everyday delta branch.
+2. **"Ready" must mean the junk audio has drained.** The talker free-runs a short
+   burst of junk speech for the seed (median ~1 s, 36 s observed), and segments within
+   one request are strictly serial — swap too early and the first real turn's speech
+   queues behind the junk. Measured: 8/640 turns with text at ~0.1 s but audio at
+   6–26 s, all on swap clusters. Fix: readiness is the junk audio's own stop signal;
+   zero recurrences after — the waiting all happens in the background while the live
+   request keeps serving.
+3. **Concurrency slots are not free.** Parked requests (shadows included) hold a full
+   `max_num_seqs` slot on every stage, so the quota needs headroom (sessions + shadow
+   margin); but the headroom itself costs VRAM — raising 18 to 34 pushed the waveform
+   stage into a boot-time OOM (third confirmation that the memory fraction budgets the
+   KV plan, not runtime buffers). 20 is right for sixteen users: a slot-starved shadow
+   just swaps one turn later; it is never an error.
+
+**Knobs** (all in `session.config`): `context_compression_trigger_tokens` (default off;
+16000 for sixteen users on high motion) · `context_compression_target_tokens` (default
+4096, the text seed budget) · `context_compression_warmup_timeout_s` (default 30 s;
+timeout falls back to the blocking roll). One hard deployment rule:
+`max_num_seqs ≥ sessions + shadow margin`.
+
+---
+
 ## Where things stand
 
 **Working**
@@ -659,4 +735,6 @@ The rest all live in `session.config`, with these defaults:
 `max_frame_width` / `max_frame_height` = no shrinking · `frame_jpeg_quality` = 90 ·
 `frame_filter_min_gap` / `max_gap` = unbounded · `session_scoped_request` = off ·
 `session_talker_token_budget` = none · `session_roll_at_talker_tokens` = off ·
-`session_roll_history_turns` = 8 turns · `session_roll_settle_s` = 1 second
+`session_roll_history_turns` = 8 turns · `session_roll_settle_s` = 1 second ·
+`context_compression_trigger_tokens` = off · `context_compression_target_tokens` = 4096 ·
+`context_compression_warmup_timeout_s` = 30 seconds
