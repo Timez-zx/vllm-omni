@@ -1214,6 +1214,43 @@ higher, options by cost: give stage 1 a larger memory share (0.10 → 0.15,
 the trigger formula), or FP8 KV for the talker (quality-sensitive — ears
 before speed).
 
+### More memory, plus a guard — what each fix bought
+
+Both fixes, as decided: the memory split moved toward the speech stage
+(stage-1 0.10 → 0.15, pool 116,384 → 365,344, ×3.1; the thinker gave up 8%),
+and the speech stage got a guard from the same family as the compression
+trigger — each turn the roll threshold is lowered to 0.75 × pool ÷ active
+sessions, and a new session whose share would fall below the roll floor
+(2,048) is refused at the door (`stage1_kv_pool_tokens`, off by default).
+The session counter lives in exactly one wrapper function — section 13's
+leaked-counter lesson.
+
+64 users × 48 turns, three cells:
+
+| | A memory only | B memory + guard (real pool) | C guard on, pool lied down to 116k |
+|---|---|---|---|
+| completed | **3,072/3,072** | **3,072/3,072** | 2,016 (= 42 users, clean) + 22 refused at the door |
+| p50 / p95 / p99 | 614 / 804 / 966 | 614 / 921 / 1,951 | 452 / 1,449 / 1,607 |
+| rolls | 0 | 104 | 140 |
+| preempt / wedge / timeout | 0 / 0 / 0 | 0 / 0 / 0 | **0 / 0 / 0** |
+
+Three sentences:
+
+1. **Memory alone rescued 64 users within the 48-turn horizon** — and refuted
+   the pre-run arithmetic: total demand ~512k exceeds 365k if every session's
+   array stays resident, yet nothing burst, so the speech stage's residency is
+   much looser than full-array. A wrong account, recorded: **the pool's true
+   residency model is unmeasured, so the guard's 0.75 factor is conservative.**
+2. **The guard buys expensive insurance when the pool is not actually tight**
+   (B's p99 doubles): under its pessimistic model it starts rolling at ~turn
+   26. For bounded horizons, admission-only is enough; the full guard earns
+   its keep on unbounded sessions.
+3. **Under real scarcity the guard wins outright** (C versus yesterday's death
+   under identical conditions): 64 users against a 116k pool used to mean
+   every session preempted, p99 57 s, 56 users kicked; with the guard it means
+   42 users served cleanly (p99 1,607, over-2 s 0%), 22 refused at the door,
+   zero preemptions, zero wedges. **The crash became a capacity boundary.**
+
 ---
 
 ## Where things stand

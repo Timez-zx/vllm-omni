@@ -205,6 +205,14 @@ _TALKER_TOKENS_PER_AUDIO_CHUNK = 25
 # tokens/frame at 640x352 (boot_shadow20c.log: 9-frame chunks = 2,03x tokens); 250 errs
 # high so the first trim guess lands under budget and the rebuild loop rarely runs.
 _SEED_TOKENS_PER_FRAME = 250
+
+# Floor for the pool-guarded talker roll threshold. Below this, rolling every
+# few turns would cost more than it saves (a roll turn pays ~3.7x TTFA), so a
+# session that cannot be granted even this much of the stage-1 KV pool is
+# refused at admission instead of being admitted into a preemption storm:
+# at 64 sessions on a 116,384-token pool, every talker request was preempted
+# exactly once and the recompute storm pushed p99 to 57 s.
+_TALKER_ROLL_FLOOR = 2048
 # Transcript retention when compression carries frames. The blocking-roll default
 # (2 * session_roll_history_turns = 16 entries) binds far below a 32k rolling window
 # (~25 turns of frames+text), so compression raises the floor to 48 turns of entries...
@@ -562,6 +570,21 @@ class StreamingVideoSessionConfig(BaseModel):
             "held at 8/8; fine visual detail did not survive)."
         ),
     )
+    stage1_kv_pool_tokens: int | None = Field(
+        default=None,
+        description=(
+            "Size of the SPEECH stage's shared KV pool in tokens (read it off the boot "
+            "log's stage-1 'GPU KV cache size' line). When set, the talker roll threshold "
+            "is lowered per turn to 0.75 * pool / active_sessions, so sessions roll before "
+            "the shared pool fills -- the per-session threshold alone cannot see the pool: "
+            "at 64 sessions on a 116,384-token pool every talker request was preempted and "
+            "recompute storms pushed p99 to 57 s while bandwidth and compute sat idle. "
+            "Same family as the pool-aware compression trigger: the wall is shared, the "
+            "guard must divide by the number of tenants. A session whose share would fall "
+            "below the roll floor is refused at admission (graceful 'at capacity' instead "
+            "of a preemption storm). None = guard off."
+        ),
+    )
     session_roll_settle_s: float = Field(
         default=1.0,
         ge=0.0,
@@ -748,8 +771,21 @@ class OmniStreamingVideoHandler:
         # brake on simultaneous seed prefills. Sized by pool arithmetic, not by GPU
         # compute: see _MAX_CONCURRENT_SHADOW_WARMUPS.
         self._shadow_warmup_sem = asyncio.Semaphore(_MAX_CONCURRENT_SHADOW_WARMUPS)
+        # Live session count for the stage-1 pool guard. Maintained in exactly
+        # ONE place (the handle_session wrapper below) so it cannot leak: a
+        # hand-maintained counter with scattered updates once parked the whole
+        # engine loop (workflow section 13).
+        self._active_sessions = 0
 
     async def handle_session(self, websocket: WebSocket) -> None:
+        """Count the session in, run it, count it out -- whatever happens."""
+        self._active_sessions += 1
+        try:
+            await self._handle_session_inner(websocket)
+        finally:
+            self._active_sessions -= 1
+
+    async def _handle_session_inner(self, websocket: WebSocket) -> None:
         """Main session loop for a single WebSocket connection."""
         await websocket.accept()
 
@@ -770,6 +806,25 @@ class OmniStreamingVideoHandler:
                 logger.info("[session] config (non-default): %s", non_default)
             except Exception:
                 logger.debug("session config logging failed", exc_info=True)
+
+            # Stage-1 pool guard, admission half: a session whose share of the
+            # speech stage's KV pool would be below the roll floor cannot be
+            # served without risking a preemption storm for EVERYONE, so it is
+            # refused here, gracefully, instead. self._active_sessions already
+            # counts this session.
+            if config.stage1_kv_pool_tokens and config.session_scoped_request:
+                _share = int(0.75 * config.stage1_kv_pool_tokens
+                             / max(1, self._active_sessions))
+                if _share < _TALKER_ROLL_FLOOR:
+                    logger.warning(
+                        "[session] REFUSED at admission: stage-1 pool share %d < floor %d "
+                        "(pool=%d, active=%d)", _share, _TALKER_ROLL_FLOOR,
+                        config.stage1_kv_pool_tokens, self._active_sessions)
+                    await self._send_error(
+                        websocket,
+                        "at capacity: the speech stage's KV pool cannot hold another "
+                        "session without preempting existing ones")
+                    return
 
             # Resolve the compression trigger once per session. None anchors to the
             # MODEL: 75% of stage-0 max_model_len -- the single-user default only guards
@@ -1583,12 +1638,28 @@ class OmniStreamingVideoHandler:
                 if _warmup_due() and _shadow_allowed():
                     _launch_shadow_warmup("turn end")
 
+            def _talker_roll_at() -> int | None:
+                """Effective talker roll threshold: the per-session configured value,
+                LOWERED to this session's share of the stage-1 KV pool when that pool
+                is declared. The configured threshold guards a per-session wall
+                (stage-1 max_model_len); the pool is shared by every session in the
+                process, so at N sessions the honest budget is pool/N -- measured at
+                64 sessions, the per-session threshold slept 30x above the shared
+                wall while every talker request got preempted."""
+                roll_at = config.session_roll_at_talker_tokens
+                pool = config.stage1_kv_pool_tokens
+                if not pool:
+                    return roll_at
+                share = max(_TALKER_ROLL_FLOOR,
+                            int(0.75 * pool / max(1, self._active_sessions)))
+                return min(roll_at, share) if roll_at else share
+
             def _warmup_due() -> bool:
                 """Should a shadow start warming? Thresholds sit BELOW the walls so the
                 shadow is normally ready before any wall forces a blocking roll."""
                 if compression_trigger and sess.get("cum_tokens", 0) >= compression_trigger:
                     return True
-                roll_at = config.session_roll_at_talker_tokens
+                roll_at = _talker_roll_at()
                 return bool(roll_at and sess.get("talker_tokens", 0) >= 0.85 * roll_at)
 
             def _must_roll_now() -> bool:
@@ -1596,8 +1667,17 @@ class OmniStreamingVideoHandler:
                 original blocking semantics -- its wall does not fail cleanly -- and the
                 context side gets a hard fallback (1.5x trigger, capped below
                 max_model_len) in case shadows keep failing."""
-                roll_at = config.session_roll_at_talker_tokens
+                roll_at = _talker_roll_at()
                 if roll_at and sess.get("talker_tokens", 0) >= roll_at:
+                    if roll_at != config.session_roll_at_talker_tokens:
+                        # Rare (once per roll), so a log line is affordable -- and it is
+                        # the only visible trace that the POOL, not the per-session
+                        # wall, forced this roll.
+                        logger.warning(
+                            "[session] talker-pool guard rolls at %d (configured %s, "
+                            "pool=%d, active=%d)", roll_at,
+                            config.session_roll_at_talker_tokens,
+                            config.stage1_kv_pool_tokens or 0, self._active_sessions)
                     return True
                 return bool(compression_hard
                             and sess.get("cum_tokens", 0) >= compression_hard)
