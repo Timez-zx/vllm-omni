@@ -1181,6 +1181,39 @@ text gates cannot see speech-side defects.
    (priority scheduling). The median improvement (−36%) is entirely the speech
    half.
 
+### The new wall shows itself: 48 users clean, 64 hit the speech stage's KV pool
+
+With the wall pushed, slots went to 64 (`deploy_mu_fp8_s64_graph.yaml`, three
+`max_num_seqs` lines changed and nothing else) and the audio ladder continued:
+
+| audio-only (graph, 64 slots) | 48 users | 64 users |
+|---|---|---|
+| completed | **2,304 / 2,304** | 2,585, +15 timeouts, 472 given up, 112 connection errors |
+| p50 / p95 | 484 / 644 | 596 / 830, **p99 = 57,028** |
+| rtf margin p10 | 1.97 | 1.46 |
+| zero-output wedges | 0 | 125 lines |
+| nonzero preemption counters | 0 | **exactly 64, all on stage 1, one per session** |
+| DRAMA / SMACT / power | 0.31 / 0.45 / 241 W | 0.31 / 0.44 / 236 W |
+
+(The 26 over-1 s turns at 48 users are all turn 1 after the restart — cold
+start again.)
+
+The cause reads off in one line: at 64 users **bandwidth and compute are more
+idle than at 48**, yet each of the 64 talker sessions got preempted exactly
+once — the speech stage's own KV pool (116,384 tokens, one sixth of the
+thinker's) ran out, preempted requests recompute their whole array, every step
+lags the next, and the server finally kicked 56 users on "Idle timeout".
+**A capacity wall again, and from the same family as section 17's**: the
+thinker's pool has the compression trigger standing guard (the fix is a
+pool-aware trigger), the speech pool had nobody guarding it until today.
+
+So the audio-only capacity conclusion is revised: **this card, this config,
+~48 users clean; between 48 and 64 the speech-side KV pool bites.** To go
+higher, options by cost: give stage 1 a larger memory share (0.10 → 0.15,
+~5.5 GB is free on the card), pool-aware admission control (same family as
+the trigger formula), or FP8 KV for the talker (quality-sensitive — ears
+before speed).
+
 ---
 
 ## Where things stand
