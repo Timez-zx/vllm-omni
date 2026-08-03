@@ -749,10 +749,115 @@ mechanism's envelope.)*
 
 **Knobs** (all in `session.config`): `context_compression_trigger_tokens` = the
 preparation line, default auto at 75% of the model limit, 0 disables ·
-`context_compression_target_tokens` = how much text rides across a swap, default 4096 ·
-`context_compression_warmup_timeout_s` = how long preparation may take, default 30 s;
-on timeout the old blocking swap is the fallback. Two hard deployment rules:
-`max_num_seqs ≥ sessions + shadow margin`, and concurrent sessions ≤ KV pool ÷ trigger line.
+`context_compression_target_tokens` = how much content rides across a swap, default
+16,384 (see the next section; it used to be 4,096 of pure text) ·
+`context_compression_carry_frames` = whether frames ride along, default true, false
+restores the text-only carry · `context_compression_warmup_timeout_s` = how long
+preparation may take, default 30 s; on timeout the old blocking swap is the fallback.
+Two hard deployment rules: `max_num_seqs ≥ sessions + shadow margin`, and concurrent
+sessions ≤ KV pool ÷ trigger line.
+
+---
+
+## 16. Carrying the picture across a swap — and what it costs under load
+
+*2026-08-03, commits `4680cd57` / `14a34076`.*
+
+**The problem.** The swap in the previous section carries only TEXT. Text answers
+"what is my name", but every visual detail — the colour of someone's top, the object
+on the shelf — is gone. Section 9 measured exactly that: with a text notebook, spoken
+recall held 8/8 while fine visual detail scored 0/8. So each swap made the model
+forget, in the eyes rather than the ears.
+
+**What it does now: the carry becomes a rolling window of the real thing.** The newest
+turns cross verbatim, frames included (budgeted at 250 tokens per frame); older turns
+degrade to text-only as a floor; older still are dropped. The window fills to
+`context_compression_target_tokens` (16,384). This is the shape Gemini Live's own docs
+describe — discard the oldest, let the result begin at a complete user turn, always
+keep the system instructions — with "what is kept" upgraded from text to the original.
+
+**What it measures like.**
+
+The cleanest evidence is a 10-turn single-user A/B in which the camera CHANGES SOURCE
+mid-session: turns 1-4 look at a room (a person in a dark blue top, a trophy on a
+shelf), from turn 5 the feed becomes a screencast, and the visual questions are asked
+AFTER a swap. None of those details is ever mentioned in the text transcript:
+
+| Asked after a swap | Frames carried (now) | Text-only (old behaviour) |
+|---|---|---|
+| Colour of the top | "dark blue shirt" ✓ | "black and white patterned top" ✗ (invented) |
+| Object on the shelf | "trophy on the shelf" ✓ | "silver award" (half-lucky) |
+| My name (text control) | ✓ | ✓ |
+| Swap-turn TTFA | 451 ms | normal median 396 ms |
+
+Frames also survived two consecutive swaps.
+
+**One user, 48 turns: free.** p50 415 ms, flat end to end (first half 414, second half
+416), the swap turn itself 371 ms, 119 frames riding in the seed. Visual memory costs
+a single user nothing.
+
+**13 users, 48 turns: not free.** 624/624 with zero timeouts, 23 invisible swaps, zero
+fallbacks — but the whole latency distribution moves up a step:
+
+| | Text-only (4,096) | Frames carried (16,384) |
+|---|---|---|
+| Completed | 624/624 | 624/624 |
+| p50 | 980 ms | **1,355 ms** |
+| p95 | 3,008 | **5,080** |
+| p99 | 3,696 | **7,190** |
+| max | 5,953 | **11,088** |
+| turns over 2 s | 15.2% | **32.1%** |
+| sawtooth peak (per-turn p50) | 3,110 (turn 25) | **4,745** (turn 27) |
+| post-swap plateau | 910 | **2,059** |
+
+**Why, in one line:** after a swap each user's context now restarts at ~14k instead of
+~4k, and per-frame prefill is charged by how thick the history already is (the unit
+price table in section 13) — so even the post-swap plateau doubles. This is not a
+defect; it is the price tag on visual memory under load, and flattening the peak
+remains the scheduling lane's job.
+
+**Three parameters, each set from measurement.**
+
+1. **Window 16,384, not 32,768.** A 32k seed took a median 9.5 s to warm, while 13
+   users crossing together leaves only 5.8 s per warm-up inside the 11,141-token runway
+   between the preparation line and the hard line — sessions queued behind it grew to
+   58,680 (hard line 60,293), nearly consuming the runway. Halving the window closes
+   the deficit. The price, stated plainly: the window reaches ~62 frames back instead
+   of ~125.
+2. **At most 2 warm-ups in flight.** The pool cannot fund a third: 13 sessions at the
+   trigger already hold 87% of it, two 16k seeds fit in the remaining 92,928 tokens and
+   three do not (the run peaked near 110% of the pool with two in flight).
+3. **A warm-up that cannot get a permit QUEUES; it must not skip.** Skip-and-retry
+   relied on frame arrivals and turn boundaries, and congestion had slowed exactly those
+   to ~1/s — measured as 1-2 permits idle for ~10 s with 9 sessions waiting. With one
+   waiter per session, first over the line first served, all 16 queued warm-ups got a
+   permit and nothing fell back.
+
+**Two engine defects fixed, one still open.**
+
+1. **One marker was fatal.** A chunk carrying a single `<|im_start|>` made
+   `torch.nonzero(...).squeeze()` collapse a [1,1] result to 0-d, and `torch.cat`
+   refuses it — stage 1 died. Now `squeeze(-1)` (exact for every count), and the site
+   logs the marker count plus head/tail ids: that shape was previously unknowable.
+2. **A split segment shipped only its tail.** Under load the engine splits one
+   segment's prefill across steps, and the payload builder overwrote its pending entry
+   each step, shipping the LAST step's rows and sizing the talker's ids from that count
+   — dropping the leading `<|im_end|>\n<|im_start|>user`. The steps now accumulate.
+3. **Still open: 0.8% of turns still ship a fragment.** 5 of 624 turns in the final run,
+   with the split counter at zero — so another path can make computed rows fall short of
+   the segment. The crash is guarded, so this is now a LOGGED known defect rather than a
+   silent one. The real repair is one payload per SEGMENT instead of per step, upstream.
+
+**Two dead ends, recorded so they are not walked again.**
+
+- **A "prompt tokens shipped to the talker" watermark cannot measure a segment.**
+  Prefill-only appends (frames prefilled on arrival) ship nothing by design, so their
+  tokens count against the next segment forever — the reported shortfall was exactly 1,
+  2 and 4 frames' worth.
+- **A partial payload cannot be withheld until the segment completes.** The stages are
+  coupled step by step, so the next step's decode-only payload is then read as this
+  segment's prefill — `KeyError: 'prefill'`, engine dead. A partial segment is therefore
+  REPORTED, not repaired.
 
 ---
 
