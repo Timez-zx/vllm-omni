@@ -38,7 +38,11 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from probe import session_config  # noqa: E402
 
-LOG = pathlib.Path("/data/zx/results/qwen_live.log")
+# The engine's CURRENT log file. Boots write wherever the launch redirected
+# them, so the default here can silently go stale (probes then count an empty
+# slice -- every engine_probes field reads 0). Point MU_ENGINE_LOG at the live
+# boot log; verify with: ls -la /proc/<engine pid>/fd | grep log
+LOG = pathlib.Path(os.environ.get("MU_ENGINE_LOG", "/data/zx/results/qwen_live.log"))
 URL = "ws://127.0.0.1:8091/v1/video/chat/stream"
 FRAMES_ROOT = pathlib.Path("/data/zx/stimuli/frames640")
 
@@ -97,14 +101,22 @@ LOG_PROBES_BAD = {
 }
 LOG_PROBES_INFO = {
     "segment_stops": r"\[session\] audio segment stop",
-    "prefill_only": r"\[prefill-only\]",
-    "boundary_cap": r"\[boundary-cap\]",
+    "arrival_prefill": r"prefill-on-arrival",
+    "compress_warm": r"COMPRESS: warming shadow",
+    "compress_swap": r"COMPRESS #\d+ at turn",
+    "warmup_queued": r"warm-up queued",
+    "blocking_roll": r"(?i)blocking roll",
     "preempt": r"(?i)preempt",
     "recompute": r"(?i)recomput",
 }
 
 
 def load_frames(content: str) -> list[str]:
+    if content == "none":
+        # Audio-only scenario: no camera at all. The user side is a text query
+        # (standing in for ASR'd speech); the model still answers with speech,
+        # so the whole output pipeline is loaded -- only the visual input is gone.
+        return []
     d = FRAMES_ROOT / content
     files = sorted(d.glob("*.jpg"))
     assert files, f"no frames under {d}"
@@ -128,7 +140,7 @@ class User:
         self.frames = frames
         self.turns = turns
         self.rng = random.Random(seed * 10_000 + rep * 100 + uid)
-        self.frame_pos = self.rng.randrange(len(frames))
+        self.frame_pos = self.rng.randrange(len(frames)) if frames else 0
         self.q_offset = (uid * 7 + rep * 3) % len(QUESTIONS)
         self.records: list[dict] = []
         self.acks_accepted = 0
@@ -168,6 +180,8 @@ class User:
             self._mark_skipped(reason="connection_lost")
 
     async def _frame_pump(self, ws) -> None:
+        if not self.frames:
+            return
         seq = 0
         while True:
             await ws.send(json.dumps({
@@ -324,7 +338,7 @@ async def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--users", type=int, required=True)
     ap.add_argument("--content", required=True,
-                    choices=["screencast", "talkinghead", "handheld_walk_talk"])
+                    choices=["none", "screencast", "talkinghead", "handheld_walk_talk"])
     ap.add_argument("--turns", type=int, default=30)
     ap.add_argument("--repeat-sessions", type=int, default=1)
     ap.add_argument("--seed", type=int, default=7)
