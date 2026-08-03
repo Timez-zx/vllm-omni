@@ -283,8 +283,13 @@
       system_prompt: instructions,
       modalities: ['text', 'audio'],
       // Frames the server samples per turn, and how many it keeps buffered.
+      // max_frames is a LATENCY cap, not a memory one: the buffer holds frames
+      // whose on-arrival prefill was refused (a turn in flight, or a compression
+      // shadow warming), and the next turn submits the whole buffer at once --
+      // 348 ms + 59 ms per frame, measured. 8 bounds that sweep; the oldest frame
+      // is the one evicted, which is the right one to lose on a live feed.
       num_frames: 16,
-      max_frames: 256,
+      max_frames: 8,
       // Shrink on arrival: one 1280x720 frame is 880 tokens against 220 at
       // 640x352, and that cost lands on every turn's latency.
       max_frame_width: 640,

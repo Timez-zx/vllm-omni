@@ -66,7 +66,14 @@ def session_config(system_prompt: str) -> dict:
         "system_prompt": system_prompt,
         "modalities": ["text", "audio"],
         "num_frames": 16,
-        "max_frames": 256,
+        # 8, not 256: the buffer holds frames whose on-arrival prefill was refused
+        # (a turn is in flight, or a compression shadow is warming), and a turn
+        # submits the WHOLE buffer at once. Measured single-user cost of a turn is
+        # 348 ms + 59 ms per frame, so an unbounded buffer turns a stalled moment
+        # into a 13-19 frame sweep (876 ms single-user, ~4.7 s at 13 users). The
+        # cap evicts the OLDEST frame, which is the right one to lose on a live
+        # feed. See workflow section 16.
+        "max_frames": 8,
         "max_frame_width": 640,
         "max_frame_height": 352,
         "frame_jpeg_quality": 90,

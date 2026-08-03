@@ -420,7 +420,20 @@ class StreamingVideoSessionConfig(BaseModel):
         default=50,
         ge=1,
         le=256,
-        description="Max frames to keep in the buffer.",
+        description=(
+            "Max frames to keep in the buffer; the oldest is evicted when it is full.\n\n"
+            "In session mode this is a LATENCY cap rather than a memory one, and the "
+            "live-agent configs set it to 8. The buffer only holds frames whose "
+            "on-arrival prefill was REFUSED -- a turn is in flight (the frame would "
+            "land between a turn's chunk and its answer), or a compression shadow is "
+            "warming (the frame would land in KV that is about to be discarded) -- and "
+            "the next turn submits the WHOLE buffer as one chunk. Measured cost of a "
+            "turn is 348 ms + 59 ms per frame single-user, so an unbounded buffer turns "
+            "a stalled moment into a 13-19 frame sweep: 876 ms single-user and ~4.7 s "
+            "at 13 users, which is where the 13-user swap-window peak came from. "
+            "Evicting the OLDEST is the right policy on a live feed: the newest frames "
+            "are the ones the answer is about."
+        ),
     )
     system_prompt: str | None = Field(
         default=None,
@@ -1125,14 +1138,16 @@ class OmniStreamingVideoHandler:
                                 logger.info(
                                     "[session] turn=%d done first_text=%.3fs "
                                     "first_audio=%.3fs audio_chunks=%d chars=%d "
-                                    "arrival_skipped=%d",
+                                    "arrival_skipped=%d frames_dropped=%d",
                                     sess["turn_idx"],
                                     (st["t_first_text"] - st["t0"]) if st["t_first_text"] else -1.0,
                                     (st["t_first_audio"] - st["t0"]) if st["t_first_audio"] else -1.0,
                                     st["audio_chunks"], len("".join(st["text_parts"])),
                                     sess.get("arrival_skipped", 0),
+                                    sess.get("frames_dropped", 0),
                                 )
                                 sess["arrival_skipped"] = 0
+                                sess["frames_dropped"] = 0
                                 # The audio the talker just generated is appended to its own
                                 # accumulated token array, so it counts against the same
                                 # max_model_len as the deltas do -- and it is the larger of
@@ -2296,6 +2311,12 @@ class OmniStreamingVideoHandler:
                             dropped_metadata = frame_metadata.pop(0)
                             dropped_frame_id = dropped_metadata.get("frame_id")
                             frame_pil_cache.pop(dropped, None)
+                            # Counted per turn because this is a LATENCY control, and a
+                            # latency control that silently discards input is one nobody
+                            # can audit: the buffer only fills when arrival prefill is
+                            # refused, so this number is the size of the sweep that did
+                            # NOT land on the next turn.
+                            sess["frames_dropped"] = sess.get("frames_dropped", 0) + 1
                         frame_buffer.append(frame_data)
                         frame_metadata.append(
                             {

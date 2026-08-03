@@ -859,6 +859,78 @@ remains the scheduling lane's job.
   segment's prefill — `KeyError: 'prefill'`, engine dead. A partial segment is therefore
   REPORTED, not repaired.
 
+### At most 8 frames buffered per user — the largest win one parameter bought
+
+*Xiao's call. `max_frames` goes 256 → 8 in both client configs.*
+
+**Why frames pile up at all.** An arriving frame is supposed to be prefilled immediately
+(section 12), but that path is shut for the WHOLE duration of a turn — the test is "has
+this turn finished", not "is the engine busy", because frames share a queue with the
+turn's own content and slipping one in makes the answer's segment boundary belong to the
+wrong thing. It is shut during a compression warm-up too (the prefill would land in KV
+about to be discarded). A refused frame is never retried; it simply waits for the next
+turn to submit the whole buffer at once. Measured in the 13-user run: **2,727 frames were
+prefilled on arrival and 4,903 were refused — 64% of frames never got the optimisation**,
+and it fails exactly when congestion makes it most valuable.
+
+**Why the cap is 8.** A 47-turn single-user regression gives the price of a turn:
+
+```
+TTFA ≈ 348 ms + 59 ms × frames in this turn
+```
+
+(measured medians: 1 frame 392, 2 → 426, 3 → 462, 4 → 521, 7 → 567, 13 → 876 ms). The
+348 ms floor is everything that does not depend on frames; 59 ms is the marginal price of
+one. At 13 users the floor rises to ~1,000 ms and a frame costs roughly 150-180 ms under
+contention — which reproduces the 19-frame peak: 1,000 + 19×180 ≈ 4,400 against 4,745
+measured. So the cap is not a guess, it is **the latency budget for frames ÷ the price of
+a frame**: 8 frames = at most 472 ms single-user, ~1,400 ms at 13 users. Beyond the cap
+the OLDEST frame is evicted — on a live feed the newest frames are the ones the answer is
+about.
+
+**What it bought (three scales, all with frames carried and the cap on).**
+
+| | 1 user | 3 users | 13 users |
+|---|---|---|---|
+| completed | 48/48 | 144/144 | 624/624 |
+| p50 | 409 ms | 573 | 1,168 |
+| p95 | 544 | 828 | 3,535 |
+| turns over 2 s | 0% | 1.4% (turn 1 only) | 18.1% |
+| worst/best user p50 | — | 1.09× | 1.60× |
+| is a swap visible | no | **no** | yes |
+| frames dropped, whole run | 2 | 15 | 149 |
+
+**Before and after the cap:**
+
+| | 1 user: none → 8 | 13 users: none → 8 |
+|---|---|---|
+| p50 | 415 → 409 | 1,355 → **1,168** |
+| p95 | 876 → **544** | 5,080 → **3,535** |
+| max | 4,465 → **601** | 11,088 → 9,524 |
+| turns over 2 s | — | 32.1% → **18.1%** |
+| swap-window peak | 876 (13 frames) → **no bump at all** | 4,745 → 4,041 |
+| post-swap plateau | — | 2,059 → **1,165** |
+| worst/best user p50 | — | 2.06 → **1.60×** |
+| playback starvation p95 | — | 834 → **558 ms** |
+
+**Two things to read out of that.** First, the single-user spikes — the swap turn's 876 ms
+AND the first turn's 4,465 ms — simply vanish, at a cost of 2 dropped frames in a whole
+run; both were "accumulate a batch, then pay for it in one turn". Second, at 13 users the
+TAIL and the PLATEAU are where the win is (p95 −30%, plateau −43%, fairness 2.06→1.60)
+while the 4 s peak only drops 15%: that peak is not frame accumulation, it is thirteen
+seed warm-ups and thirteen turns contending for one card — **which separates the two
+problems cleanly: accumulation is a quota problem, the peak is a scheduling problem.**
+
+**So carrying the picture across a swap is FREE up to 3 users** (573 ms, no visible swap,
+fairness 1.09) and starts costing at 13, where the cost is mostly in the tail — and one
+parameter already removed a third of it.
+
+**Two notes.** The cap is PER USER: the buffer is a per-session local (each stores its
+own) while the frames all land in one engine competing for one per-step token budget
+(everyone shares the compute) — so this cap is also a crude per-user quota. And dropped
+frames are counted into each turn's closing log line (`frames_dropped=`): a latency
+control that discards input silently is one nobody can audit.
+
 ---
 
 ## Where things stand
