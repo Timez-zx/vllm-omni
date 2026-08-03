@@ -106,7 +106,10 @@ LOG_PROBES_INFO = {
     "compress_swap": r"COMPRESS #\d+ at turn",
     "warmup_queued": r"warm-up queued",
     "blocking_roll": r"(?i)blocking roll",
-    "preempt": r"(?i)preempt",
+    # Count nonzero per-request preemption COUNTERS, not the word: our own
+    # scheduler dumps print "preemptions=0" on every row, and a bare /preempt/i
+    # counted 840 of those in a run whose real preemption count was zero.
+    "preempted_reqs": r"preemptions=[1-9]",
     "recompute": r"(?i)recomput",
 }
 

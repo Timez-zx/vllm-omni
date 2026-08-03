@@ -933,6 +933,152 @@ control that discards input silently is one nobody can audit.
 
 ---
 
+## 17. How many people fit, in three scenarios — the camera sets the ceiling
+
+*2026-08-03, commit `1210772d`.*
+
+One-sentence conclusion first: **the same engine seats 32 audio-only users with no
+knee in sight, about 24 users of near-still video, and 13 users of high-motion
+video already visibly slowing down. The three ceilings have three different causes, and
+none of them is "the model is too slow".**
+
+**How it was measured.** The three scenarios differ in exactly one variable: the
+camera. Questions are text in all three (standing in for transcribed speech) and
+answers are always spoken, so the output side carries the same load everywhere;
+only the input side changes — no frames at all (`--content none`, added for this
+study), a near-still feed (talkinghead, which the similar-frame filter cuts down
+to the forced-through 25%), or a high-motion feed (handheld, where 57% of frames
+count as "new"). 48 turns per user per cell, same protocol as section 16.
+
+### Scenario 1: audio only — no knee at 32 users; the ceiling is configuration
+
+| users | p50 (ms) | p95 | over 1 s | thinker p50 | speech p50 | rtf p10 |
+|---|---|---|---|---|---|---|
+| 1 | 317 | 319 | 0% | 33 | 284 | 1.65 |
+| 4 | 504 | 616 | 0% | 36 | 464 | 1.45 |
+| 8 | 607 | 645 | 0% | 39 | 569 | 1.38 |
+| 13 | 633 | 677 | 0% | 40 | 593 | 1.34 |
+| 16 | 639 | 698 | 0% | 42 | 596 | 1.32 |
+| 20 | 663 | 731 | 0% | 43 | 620 | 1.29 |
+| 24 | 668 | 746 | 1.0%* | 45 | 622 | 1.29 |
+| 28 | 690 | 762 | 0% | 47 | 641 | 1.25 |
+| 32 | 702 | 798 | 0% | 48 | 652 | 1.23 |
+
+\* All of the 1% at 24 users is turn 1 right after an engine restart (a cold
+start, with kernels still being compiled on the spot), not a concurrency effect.
+
+Three things worth reading off this table:
+
+1. **The latency is almost entirely the speech side's fixed startup.** The thinker
+   (first token of text) takes 33–48 ms throughout; everything else is the
+   text-to-sound pipeline getting going, and it barely moves with user count.
+2. **The only step is between 1 and 8 users, and it is two discrete prices, not a
+   slope.** Solo 315 ms, ensemble 585: at 4 users the two kinds of turns split
+   44% / 56% with only ~13% landing between the two — the step is "is someone
+   else generating speech at this same moment". From 8 users on, nearly every
+   turn pays the ensemble price, which then rises only ~15% more all the way
+   to 32 (607 → 702).
+3. **What is actually thinning is the rtf margin** (how much faster speech is
+   generated than played; at 1 the audio starts to stall): 1.65 → 1.23. After
+   filling the 20-slot boot we restarted with a 32-slot config
+   (`deploy_mu_fp8_s32.yaml`) and the curve stayed flat — so audio-only hits the
+   **slot count (configuration)** first, and only later the speech-side rtf wall.
+   Extrapolating the 13→32 slope: the margin falls through 1.1 at roughly 50
+   users and reaches 1.0 (where audio starts to stall) at roughly 70;
+   **both are extrapolations, not measurements**.
+
+### Scenario 2: near-still video — usable to ~24 users; but long sessions once locked up all 20
+
+The 48-turn slope first (24 and 28 users ran with a lowered compression trigger —
+the reason follows):
+
+| users | trigger | p50 | p95 | over 1 s | over 2 s | thinker p50 | rtf p10 |
+|---|---|---|---|---|---|---|---|
+| 13 | default | 758 | 988 | 4.0% | 0% | 154 | 1.30 |
+| 16 | default | 802 | 1,071 | 12.2% | 0% | 177 | 1.27 |
+| 20 | default | 873 | 1,219 | 25.3% | 0% | 210 | 1.22 |
+| 24 | 20,480 | 991 | 1,755 | 48.7% | 2.4% | 265 | 1.14 |
+| 28 | 16,384 | 1,141 | 2,252 | 68.8% | 9.6% | 312 | 1.06 |
+
+The source of the climb is plain: even a still picture gets a quarter of its
+frames forced through the filter, so history still thickens by ~850 tokens per
+turn, and the price of a frame is proportional to how thick the history is
+(section 16). The thinker share grows 154 → 312; the speech side gets squeezed
+too (frame chewing and speech generation share one card). By the standard of
+"keep p50 under a second and don't let the rtf margin fall through 1.1", **the
+practical ceiling for this scenario sits around 24 users**.
+
+**The long-session collective lock-up, and the one-parameter rescue.** 72 turns
+× 20 users, all defaults: **all twenty** users time out (first timeouts fall in
+turns 46–62, 17 of them in 46–55), and all 20 sessions get flagged "sampled zero output tokens" (once per stage, thinker and
+talker, 40 log lines). The engine log states the cause plainly:
+
+    waiting=0 skipped_waiting=20 running=0
+
+Every session holds its own KV cache (the intermediate results the model keeps
+for everything it has read, resident in GPU memory) while waiting for the next block of memory;
+the pool (731,904 tokens on that 20-slot boot) is already full at 20 × ~37k,
+nobody can yield, nobody can proceed. **Not a crash — a livelock**: the
+preemption counter stays 0 throughout (every per-request dump line reads
+preemptions=0), the engine loop parks over and over, and
+only when users time out and disconnect does memory free up and the survivors
+move again.
+
+The key point: **compression never fired at all.** All 20
+sessions had compression armed, but the trigger is **per session** — 49,152
+tokens — while pool ÷ 20 users = 36,595. **The pool fills 25% before the trigger
+is reached.** The trigger watches one user at a time; the pool belongs to everyone.
+
+The rescue is exactly Xiao's "just reduce the context": drop the trigger below
+pool ÷ users (trigger 24,576, window 8,192), same 72 turns × 20 users:
+
+| | default trigger | trigger at 24,576 |
+|---|---|---|
+| completed | 1,007 (60 timeouts, 373 given up) | **1,440 / 1,440** |
+| zero-output wedge log lines | 40 | **0** |
+| invisible swaps | 0 | 40 (~2 per user) |
+| p50 | 904 (completed turns) | 927 |
+
+The cost is 23 ms of p50 (35 ms if compared only against the dead run's
+pre-lock-up turns, whose p50 is 892). The curve shows the swap knocking the thickness back
+down: turns 37–40 climb to 1,150, then fall back to ~900 and never run away
+again.
+
+The obvious next step (**not built**): make the trigger
+min(0.75 × context limit, 0.75 × pool ÷ active sessions) — one line of formula,
+and the table above is its evidence.
+
+### Scenario 3: high-motion video — 13 users, bottlenecked on frame prefill, the step that reads new frames into the model (measured in section 16)
+
+### The three scenarios side by side (13 users, same protocol)
+
+| 13 users | audio only | near-still video | high-motion video |
+|---|---|---|---|
+| p50 | 633 | 758 | 1,168 |
+| p95 | 677 | 988 | 3,535 |
+| over 1 s | 0% | 4.0% | 63.6% |
+| thinker p50 | 40 | 154 | 416 |
+| speech p50 | 593 | 608 | 724 |
+
+How to read it: audio-only and near-still video pay almost the same speech share
+(593 / 608); high motion squeezes the speech side up a fifth as well (724).
+**But the main difference across the columns is still the thinker share
+(40 / 154 / 416)** — what the camera points at decides how many
+frames the thinker chews per turn, and whether this engine is lightly or heavily
+loaded.
+
+### Fixed along the way
+
+- mu_bench's engine-log path pointed at a file that stopped growing on 08-02, so
+  every cell's engine-side probes since then were counting an empty slice (client
+  metrics were unaffected). `MU_ENGINE_LOG` now points them at the live boot log,
+  and the probe vocabulary matches what the code actually prints.
+- The `counter_leak_clamped` guard fires occasionally under swap pressure (up to
+  29 times in one cell), always clamped, zero consequences — but the source of
+  the leak is still upstream, unfixed.
+
+---
+
 ## Where things stand
 
 **Working**
