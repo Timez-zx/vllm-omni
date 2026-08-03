@@ -688,6 +688,17 @@ never came, turn signals lost, each user written off after three timeouts; zero 
 all run — nobody lived to 49,152. The self-checks from section 7 dumped the whole
 anatomy in real time. This death is the measured proof of the capacity rule above.
 
+**Latency summary for every scenario in this section (TTFA, ms; all on the uniform
+75% line except the last row).**
+
+| Scenario | p50 | p95 | **p99** | max | over 2 s | shape |
+|---|---|---|---|---|---|---|
+| 1 user × 48 turns | 371 | 409 | **437** | 437 | 0% | flat |
+| 13 users × 48 turns | 968 | 2,915 | **3,537** | 3,885 | 14.6% | sawtooth (peak at turns 22–29) |
+| 16 users × 48 turns (over capacity) | 1,161 | 3,765 | **5,347** | 5,915 | 26.0% | surviving turns before the deaths; turn signals start vanishing at turn 24 |
+| Reference: 16 users, no compression (section 14 baseline) | 1,378 | 4,477 | **5,368** | 10,194 | 38.4% | a climb that never comes back |
+| Side note: 16 users @ hand-tuned 16,000 | 871 | 1,320 | **1,860** | 6,498 | 1.0% | low sawtooth (not current policy) |
+
 *(Side note: the mechanism itself CAN moonlight as a latency knob — sixteen users with
 the line hand-tuned to 16,000 once measured p95 1,320 ms, flat across 40 turns, zero
 deaths. Current policy does not use it that way; recorded here only to mark the
