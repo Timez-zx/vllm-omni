@@ -201,6 +201,26 @@ _IM_END_NEWLINE = [151645, 198]
 # it must not hit, so erring high is the safe direction.
 _TALKER_TOKENS_PER_AUDIO_CHUNK = 25
 
+# Seed-budget cost of one retained frame, for the rolling-window trim. Measured 226
+# tokens/frame at 640x352 (boot_shadow20c.log: 9-frame chunks = 2,03x tokens); 250 errs
+# high so the first trim guess lands under budget and the rebuild loop rarely runs.
+_SEED_TOKENS_PER_FRAME = 250
+# Transcript retention when compression carries frames. The blocking-roll default
+# (2 * session_roll_history_turns = 16 entries) binds far below a 32k rolling window
+# (~25 turns of frames+text), so compression raises the floor to 48 turns of entries...
+_COMPRESSION_TRANSCRIPT_KEEP = 96
+# ...but strips the FRAMES off entries older than the newest 40 user turns: only the
+# window (plus margin) can ever render them, and 40 turns x ~5 frames x ~40 KB of JPEG
+# is a few MB per session where unbounded retention would grow forever.
+_FRAME_KEEP_TURNS = 40
+# Process-wide cap on concurrent shadow warm-ups. A warming seed holds up to
+# target_tokens of KV on top of the live requests, and the pool slack at full
+# capacity is thin: 731,904-token pool - 13 users x 49,152 trigger = 92,928, which
+# fits TWO 32k seeds and not three. The permit covers warm-up only (seed submit ->
+# ready); a hook that finds the limit busy skips silently and re-fires at the next
+# hook, because cum_tokens keeps growing until a swap resets it.
+_MAX_CONCURRENT_SHADOW_WARMUPS = 2
+
 
 def _summarise_audio_payload(audio_data: Any) -> str:
     """Describe the audio payload the delta extractor will actually read.
@@ -585,13 +605,32 @@ class StreamingVideoSessionConfig(BaseModel):
         ),
     )
     context_compression_target_tokens: int = Field(
-        default=4096,
+        default=32768,
         ge=256,
         description=(
-            "Token budget for the text carried across a compression (Gemini Live's "
-            "target_tokens). The transcript is trimmed newest-first to fit. The budget is "
-            "what keeps the seed from growing roll over roll until it approaches the wall "
-            "the compression exists to avoid."
+            "Token budget for the ROLLING WINDOW carried across a compression (Gemini "
+            "Live's target_tokens; its docs describe the same sliding-window shape: drop "
+            "the oldest turns, keep the result starting at a user turn, system "
+            "instructions always retained). Trimmed newest-first: recent turns keep their "
+            "FRAMES verbatim (~226 tokens each, budgeted at 250) as long as the budget "
+            "lasts, then older turns degrade to text-only, then drop entirely. So what "
+            "the model keeps after a swap is a window of full multimodal recent history "
+            "with a text floor under it -- the fine visual detail that text-only carry "
+            "measurably loses (frame recall 0/8 vs 8/8 elsewhere in this study) now "
+            "survives as far back as the window reaches. The budget is what keeps the "
+            "seed from growing roll over roll until it approaches the wall the "
+            "compression exists to avoid; it is also the KV a warming shadow holds ON TOP "
+            "of the live requests, which is why concurrent warm-ups are capped "
+            "process-wide (see context_compression_carry_frames for the kill-switch)."
+        ),
+    )
+    context_compression_carry_frames: bool = Field(
+        default=True,
+        description=(
+            "Carry recent frames inside the compression seed (the rolling window above). "
+            "False restores the old text-only carry: seeds shrink from ~32k to a few "
+            "hundred tokens, warm-ups get cheaper, and every swap forgets everything the "
+            "camera ever showed. The A/B knob for measuring what visual carry costs."
         ),
     )
     context_compression_warmup_timeout_s: float = Field(
@@ -682,6 +721,11 @@ class OmniStreamingVideoHandler:
         self._idle_timeout = idle_timeout
         self._config_timeout = config_timeout
         self._engine_client = engine_client
+        # One handler instance serves every WebSocket session in this process (see
+        # api_server: app.state.openai_streaming_video), so this is the process-wide
+        # brake on simultaneous seed prefills. Sized by pool arithmetic, not by GPU
+        # compute: see _MAX_CONCURRENT_SHADOW_WARMUPS.
+        self._shadow_warmup_sem = asyncio.Semaphore(_MAX_CONCURRENT_SHADOW_WARMUPS)
 
     async def handle_session(self, websocket: WebSocket) -> None:
         """Main session loop for a single WebSocket connection."""
@@ -800,6 +844,12 @@ class OmniStreamingVideoHandler:
                 # when the turn closes. See session_roll_at_talker_tokens.
                 "transcript": [],
                 "pending_query": None,
+                # Frame b64s the model has seen since the last transcript append -- the
+                # turn body's post-filter list plus any arrival appends -- so the output
+                # loop can attach them to the user entry when the turn closes. Popped on
+                # attach; attribution of frames that land mid-answer skews one turn early,
+                # which recency-ordered memory does not care about.
+                "pending_frames": [],
                 "rolls": 0,
                 # Frames prefilled on arrival, and the tokens they cost. Counted because the
                 # whole point is a latency saving that is otherwise invisible: the query-time
@@ -1095,18 +1145,43 @@ class OmniStreamingVideoHandler:
                                 # new one -- the visual KV cannot. Kept only when rolling is
                                 # enabled, and trimmed to the configured window, so it cannot
                                 # quietly become an unbounded second history.
-                                if config.session_roll_at_talker_tokens:
+                                # Compression alone must also populate it: the gate used
+                                # to be the talker-roll knob only, and a compression-only
+                                # config silently rolled with an EMPTY seed every time.
+                                if config.session_roll_at_talker_tokens or compression_trigger:
                                     text = "".join(st["text_parts"]).strip()
                                     q = sess.get("pending_query") or ""
-                                    if q:
-                                        sess["transcript"].append({"role": "user", "content": q})
+                                    frames = sess.get("pending_frames") or []
+                                    sess["pending_frames"] = []
+                                    carry_frames = bool(
+                                        compression_trigger
+                                        and config.context_compression_carry_frames
+                                    )
+                                    if q or (frames and carry_frames):
+                                        entry: dict[str, Any] = {"role": "user", "content": q}
+                                        if frames and carry_frames:
+                                            # Sibling key, not content: every text-only
+                                            # consumer keeps reading a plain string, and
+                                            # only the seed renderer opts into the frames.
+                                            entry["frames"] = frames
+                                        sess["transcript"].append(entry)
                                     if text:
                                         sess["transcript"].append(
                                             {"role": "assistant", "content": text}
                                         )
                                     keep = 2 * max(0, config.session_roll_history_turns)
+                                    if carry_frames:
+                                        # The roll default (16 entries) binds far below a
+                                        # 32k window; the window renders nothing the
+                                        # transcript no longer holds.
+                                        keep = max(keep, _COMPRESSION_TRANSCRIPT_KEEP)
                                     if keep and len(sess["transcript"]) > keep:
                                         del sess["transcript"][:-keep]
+                                    holders = [m for m in sess["transcript"] if "frames" in m]
+                                    for m in holders[:-_FRAME_KEEP_TURNS]:
+                                        # JPEG bytes beyond any window's reach: keep the
+                                        # text, drop the images, bound the session's RSS.
+                                        m.pop("frames", None)
                                 st = _new_turn_state()
                                 sess["turn_done"].set()
                         else:
@@ -1252,6 +1327,11 @@ class OmniStreamingVideoHandler:
                 sess["arrival_frames"] += 1
                 sess["arrival_tokens"] += ntok
                 sess["cum_tokens"] = sess.get("cum_tokens", 0) + ntok
+                # Arrival-consumed frames never reach the turn body's new_frames list,
+                # so the transcript would lose exactly the frames this optimisation
+                # touches. Same pending list the turn body feeds, same turn-close drain.
+                if compression_trigger and config.context_compression_carry_frames:
+                    sess.setdefault("pending_frames", []).append(frame_b64)
                 logger.info(
                     "[session] prefill-on-arrival: frame -> %d tokens (appends=%d frames=%d "
                     "tokens=%d cum=%d)",
@@ -1347,7 +1427,14 @@ class OmniStreamingVideoHandler:
                     _launch_shadow_warmup("turn start")
 
                 new_frames = list(frame_buffer)
-                seed = list(sess["transcript"]) if not sess["first_sent"] else None
+                # The blocking roll's seed is deliberately TEXT-ONLY even when frames are
+                # retained: it prefills in the foreground of a turn the user is waiting
+                # on, and recovery speed beats fidelity on the emergency path. The shadow
+                # seed is where frames ride (they prefill in silence).
+                seed = (
+                    _transcript_chat_msgs(sess["transcript"], with_frames=False)
+                    if not sess["first_sent"] else None
+                )
                 chunk = await self._build_session_chunk(
                     config, new_frames, audio_buffer, query_text, frame_pil_cache,
                     is_first=not sess["first_sent"],
@@ -1362,6 +1449,16 @@ class OmniStreamingVideoHandler:
                 # Delete exactly the consumed prefix, not the whole buffer: frames may have
                 # arrived while the chunk was being built, and those belong to the next turn.
                 del frame_buffer[: len(new_frames)]
+                if compression_trigger and config.context_compression_carry_frames:
+                    # Post-filter list: a frame the chunk dropped as undecodable must not
+                    # come back to poison a seed later. Captured before the cache pops
+                    # below erase the _BAD_FRAME verdicts.
+                    kept = [
+                        f for f in new_frames
+                        if frame_pil_cache.get(f) is not _BAD_FRAME
+                    ]
+                    if kept:
+                        sess.setdefault("pending_frames", []).extend(kept)
                 for consumed in new_frames:
                     frame_pil_cache.pop(consumed, None)
 
@@ -1493,30 +1590,108 @@ class OmniStreamingVideoHandler:
                 prewarm_tasks.add(t)
                 t.add_done_callback(prewarm_tasks.discard)
 
+            def _transcript_chat_msgs(
+                msgs: list[dict[str, Any]], *, with_frames: bool
+            ) -> list[dict[str, Any]]:
+                """Project transcript entries into chat messages the request schema knows.
+
+                Transcript entries keep frames under a SIBLING key so every text-only
+                consumer stays untouched; this is the one place that key is honoured.
+                with_frames=False is the text view (blocking roll, swap carry); True
+                renders a user entry's frames as image parts ahead of its text -- the
+                exact per-turn shape _build_session_chunk already emits for live frames.
+                """
+                out: list[dict[str, Any]] = []
+                for m in msgs:
+                    frames = m.get("frames") if with_frames else None
+                    if frames:
+                        content: list[dict[str, Any]] = [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{b}"},
+                            }
+                            for b in frames
+                        ]
+                        text = str(m.get("content") or "")
+                        if text:
+                            content.append({"type": "text", "text": text})
+                        out.append({"role": m["role"], "content": content})
+                    else:
+                        out.append(
+                            {"role": m["role"], "content": m.get("content") or ""}
+                        )
+                return out
+
             def _trim_transcript_for_seed() -> list[dict[str, Any]]:
                 """Newest turns that fit context_compression_target_tokens (Gemini's
-                target_tokens). Chars/3 is only the first guess; the built chunk's real
-                token count is checked afterwards and the seed rebuilt smaller if the
-                guess was badly off."""
+                target_tokens), as a ROLLING WINDOW: an entry's frames are kept while
+                the budget lasts (newest first, 250 tokens per frame, erring high of
+                the measured 226), and the first entry whose frames do not fit drops
+                them for itself AND everything older -- a latch, so a small old entry
+                cannot out-keep a big recent one. Text keeps accumulating under the
+                same budget until it too runs out; chars/3 is only the first guess,
+                the built chunk's real token count is checked afterwards and the seed
+                rebuilt smaller if the guess was badly off."""
                 budget = config.context_compression_target_tokens
+                frames_allowed = bool(config.context_compression_carry_frames)
                 out: list[dict[str, Any]] = []
                 total = 0
                 for m in reversed(sess["transcript"]):
-                    cost = max(1, len(str(m.get("content", ""))) // 3)
+                    text_cost = max(1, len(str(m.get("content", ""))) // 3)
+                    frames = m.get("frames") if frames_allowed else None
+                    cost = text_cost + _SEED_TOKENS_PER_FRAME * len(frames or ())
+                    if frames and out and total + cost > budget:
+                        frames = None
+                        frames_allowed = False
+                        cost = text_cost
                     if out and total + cost > budget:
                         break
-                    out.append(m)
+                    entry: dict[str, Any] = {"role": m["role"], "content": m.get("content", "")}
+                    if frames:
+                        entry["frames"] = list(frames)
+                    out.append(entry)
                     total += cost
                 out.reverse()
                 return out
 
             async def _start_shadow_warmup(where: str) -> None:
+                """Admission shell around the warm-up: the process-wide permit.
+
+                A warming seed holds up to target_tokens of KV on top of every live
+                request, and the pool slack at full capacity fits two such seeds, not
+                thirteen -- so warm-ups queue at the door instead of stampeding when a
+                whole cohort crosses the trigger together. Busy means SKIP, silently:
+                the hook that skipped re-fires (cum_tokens only grows until a swap),
+                and the skip must not stamp shadow_failed_at -- a busy period is not a
+                broken shadow path, and the 60s cooldown would convert it into forced
+                blocking rolls at the hard wall.
+                """
+                sem = self._shadow_warmup_sem
+                if sess.get("shadow") is not None or sess["fatal"]:
+                    return
+                if sem.locked():
+                    logger.info(
+                        "[session] COMPRESS: warm-up deferred (%s): %d already in "
+                        "flight; the next hook retries",
+                        where, _MAX_CONCURRENT_SHADOW_WARMUPS,
+                    )
+                    return
+                # No await between the locked() check and this acquire's fast path, so
+                # the pair is atomic on the event loop.
+                await sem.acquire()
+                try:
+                    await _start_shadow_warmup_inner(where)
+                finally:
+                    sem.release()
+
+            async def _start_shadow_warmup_inner(where: str) -> None:
                 """Pre-warm the replacement request while the live one keeps serving.
 
                 This is what turns the roll from a user-visible pause into a background
-                action: the seed (system prompt + trimmed transcript) is prefilled into a
-                brand-new resumable request marked prefill-only, which then parks with its
-                KV warm. The swap at the next turn boundary is a pointer flip.
+                action: the seed (system prompt + the rolling window of the transcript,
+                recent frames included) is prefilled into a brand-new resumable request,
+                which then parks with its KV warm. The swap at the next turn boundary is
+                a pointer flip.
 
                 Two engine-side facts this leans on, both verified in-tree:
                   * the FIRST chunk of a resumable request honors per-chunk sampling
@@ -1539,7 +1714,9 @@ class OmniStreamingVideoHandler:
                 try:
                     chunk = await self._build_session_chunk(
                         config, [], bytearray(), "", frame_pil_cache,
-                        is_first=True, seed_history=seed_msgs, seed_only=True,
+                        is_first=True,
+                        seed_history=_transcript_chat_msgs(seed_msgs, with_frames=True),
+                        seed_only=True,
                     )
                     if not isinstance(chunk, dict):
                         raise RuntimeError("seed chunk did not build")
@@ -1549,7 +1726,11 @@ class OmniStreamingVideoHandler:
                         seed_msgs = seed_msgs[2:]
                         chunk = await self._build_session_chunk(
                             config, [], bytearray(), "", frame_pil_cache,
-                            is_first=True, seed_history=seed_msgs, seed_only=True,
+                            is_first=True,
+                            seed_history=_transcript_chat_msgs(
+                                seed_msgs, with_frames=True
+                            ),
+                            seed_only=True,
                         )
                         if not isinstance(chunk, dict):
                             raise RuntimeError("seed chunk did not build")
@@ -1580,7 +1761,17 @@ class OmniStreamingVideoHandler:
                             ),
                         )
                     except Exception:
-                        seed_tlen = ntok  # err high: the estimate guards a wall
+                        # Err high -- the estimate guards a wall -- but from the TEXT,
+                        # not from ntok: the talker drops image rows (TALKER_TEXT_ONLY),
+                        # so a mostly-image seed's ntok (~32k) would start the newborn
+                        # talker a step from its roll line and re-roll every turn.
+                        seed_tlen = max(
+                            64,
+                            sum(
+                                (len(str(m.get("content", ""))) // 3) * 2
+                                for m in seed_msgs
+                            ),
+                        )
                     sess["shadow"]["seed_tlen"] = seed_tlen
                     ctx["task"] = asyncio.create_task(_session_output_loop(ctx))
                     # The seed's junk audio needs an owner tag, exactly like an arrival
@@ -1592,10 +1783,11 @@ class OmniStreamingVideoHandler:
                     if "audio" in (config.modalities or []):
                         ctx["fifo"].append("append")
                     await ctx["queue"].put((chunk, 2, "seed"))
+                    seed_frames = sum(len(m.get("frames") or ()) for m in seed_msgs)
                     logger.info(
                         "[session] COMPRESS: warming shadow %s at %s (seed=%d msgs, "
-                        "%d tokens; cum=%d, talker_est=%d)",
-                        ctx["rid"], where, len(seed_msgs), ntok,
+                        "%d frames, %d tokens; cum=%d, talker_est=%d)",
+                        ctx["rid"], where, len(seed_msgs), seed_frames, ntok,
                         sess.get("cum_tokens", 0), sess.get("talker_tokens", 0),
                     )
                     try:
@@ -1638,7 +1830,12 @@ class OmniStreamingVideoHandler:
                 old_ctx = sess["active_ctx"]
                 old_task = old_ctx.get("task")
                 old_rid = old_ctx["rid"]
-                carry = [dict(m) for m in sess["transcript"][shadow["watermark"]:]]
+                # Text view on purpose: the carry prefills on the swap turn's critical
+                # path. Its turns' frames stay in the transcript, inside the NEXT seed's
+                # window -- temporarily invisible to the model, never lost.
+                carry = _transcript_chat_msgs(
+                    sess["transcript"][shadow["watermark"]:], with_frames=False
+                )
                 if ctx["fifo"]:
                     # The seed's "append" tag is still pending: its audio stop has not
                     # arrived yet. KEEP it -- the live loop's append handling swallows the
