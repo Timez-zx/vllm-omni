@@ -656,6 +656,30 @@ uniform policy carries one hard capacity rule: **concurrent sessions ≤ KV pool
 trigger line** (this card: 732k ÷ 49,152 ≈ 14; take 13 for margin) — beyond it the
 pool runs dry BEFORE the trigger, see the measured sixteen-user death below.
 
+**The setup these numbers hold for.** One 96 GB card (RTX PRO 6000 Blackwell), all
+three model stages sharing it: the thinker runs FP8 weights + FP8 memory (KV); the
+talker and the waveform stage stay bf16. The memory split: the thinker gets 70%
+(31.4 GB weights + a 33.5 GB memory pool), the talker 10%, the waveform stage 8%, the
+rest is runtime headroom. **The memory pool holds 731,904 tokens, shared by every
+session, fixed at boot.** 20 concurrency slots; every frame shrunk to 640×352 (220
+tokens); the content is the most expensive one (handheld, high motion); one frame
+every 0.5 s, 4–5 surviving the filter per turn; short questions, one-or-two-sentence
+answers.
+
+**Why this card tops out at 13 users.** Under the uniform 75% policy every session's
+memory grows to at most 49,152 tokens before it swaps — so each user effectively
+claims a plot of up to 49,152 in the shared pool:
+
+| Concurrency | peak share of the pool | outcome |
+|---|---|---|
+| 13 users | 639k = **87%** | measured pass (the remaining 13% covers the brief old+new coexistence at a swap, plus working churn) |
+| 14–15 users | 94–101% | theoretical edge, not measured |
+| 16 users | 786k = **107%** | measured death — the pool ran dry at ~45k/user (98% aggregate), before anyone reached the swap line |
+
+Three ways to hold more people: a card with a bigger pool, a lower trigger line (which
+is the latency-knob usage, not current policy), or true fine-grained deletion that
+actually frees memory (the second knife, still on the shelf).
+
 **What it measures like (three scales, one 75% line).**
 
 **One user × 48 turns:** p50 371 / p95 409 ms, a straight line throughout. At turn 34
