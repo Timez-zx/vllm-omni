@@ -520,6 +520,20 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if payload_data is None:
             if not (is_segment_finished or is_finished):
                 return
+            if _prefill_only and chunk_id == 0:
+                # A prefill-only FIRST chunk: a compression shadow's seed. For mid-session
+                # appends the boundary must still ship -- withholding it desyncs a talker
+                # that already runs this request (the four earlier attempts documented
+                # above) -- but at chunk 0 the talker has never seen the request, and a
+                # tensor-less boundary would BE its bring-up payload: an untested shape.
+                # Suppressing the ship (put_req_chunk only increments on a successful put,
+                # below) means stage 1 first hears of this request from the first REAL
+                # turn, as a normal full chunk 0.
+                logger.info(
+                    "[prefill-only] chunk-0 boundary suppressed, stage %s -> %s, req %s",
+                    stage_id, next_stage_id, external_req_id,
+                )
+                return
             # Segment/request finish markers must still reach downstream even when
             # the processor has no tensor payload.
             payload_data = OmniPayloadStruct()

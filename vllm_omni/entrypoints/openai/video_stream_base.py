@@ -557,6 +557,45 @@ class StreamingVideoSessionConfig(BaseModel):
             "This is what makes the session unbounded in TIME while bounded in MEMORY."
         ),
     )
+    context_compression_trigger_tokens: int | None = Field(
+        default=None,
+        description=(
+            "Compress the session when the THINKER's accumulated context (the running sum "
+            "of every delta's tokens, frames included) reaches this. Same knob Gemini Live "
+            "calls trigger_tokens. The wall it guards is context growth itself: per-frame "
+            "prefill cost grows linearly with accumulated context, and stage-0 "
+            "max_model_len is a hard ceiling behind it -- neither of which the talker-side "
+            "trigger above ever looks at.\n\n"
+            "Compression is a SHADOW roll: a second engine request is pre-warmed in the "
+            "background (system prompt + trimmed transcript, prefill-only) while the live "
+            "request keeps serving; the swap at the next turn boundary is a pointer flip, "
+            "so no turn pays the cold prefill. A shadow needs a max_num_seqs slot on every "
+            "stage while the old request still holds its own, so deployments must leave "
+            "headroom (max_num_seqs >= sessions + 1) or warm-ups starve silently and every "
+            "compression falls back to the blocking roll."
+        ),
+    )
+    context_compression_target_tokens: int = Field(
+        default=4096,
+        ge=256,
+        description=(
+            "Token budget for the text carried across a compression (Gemini Live's "
+            "target_tokens). The transcript is trimmed newest-first to fit. The budget is "
+            "what keeps the seed from growing roll over roll until it approaches the wall "
+            "the compression exists to avoid."
+        ),
+    )
+    context_compression_warmup_timeout_s: float = Field(
+        default=30.0,
+        gt=0.0,
+        description=(
+            "How long a shadow request may take to become ready before it is abandoned. "
+            "Readiness is presence-based -- the seed segment's own stage-0 finish_reason "
+            "-- but that signal is not contractually guaranteed in every configuration, "
+            "so a bound turns a wedged warm-up into a fallback to the blocking roll "
+            "instead of a hang."
+        ),
+    )
     prefill_frames_on_arrival: bool = Field(
         default=False,
         description=(
@@ -678,8 +717,44 @@ class OmniStreamingVideoHandler:
 
             msg_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=_MAX_MSG_QUEUE)
             # ---------------------------------------------------------------- PA_SESSION
+
+            def _new_request_ctx() -> dict[str, Any]:
+                """Per-ENGINE-REQUEST state. A session normally owns exactly one, but a
+                compression shadow briefly makes it two: the live request keeps serving
+                while the replacement pre-warms, and the swap is a pointer flip of
+                sess["active_ctx"]. Everything whose identity is the REQUEST (its input
+                queue, its audio-attribution FIFO, its drain task) lives here; everything
+                whose identity is the SESSION (transcript, turn flags, counters) stays in
+                `sess`."""
+                return {
+                    "rid": f"video-sess-{uuid.uuid4().hex[:12]}",
+                    "queue": asyncio.Queue(maxsize=4),
+                    # One owner tag ("append" | "turn") per chunk submitted to this
+                    # request, pushed in submission order. The engine runs one segment per
+                    # chunk and cannot start segment k+1 before segment k's stop, so the
+                    # k-th audio stop the output loop sees belongs to the k-th submitted
+                    # chunk. That makes submission ORDER a structural identity for the
+                    # audio stream -- the per-chunk field that outputs do not carry. It is
+                    # per-request state: order across two requests means nothing.
+                    "fifo": deque(),
+                    "task": None,
+                    # Shadow warm-up bookkeeping; inert on the live request.
+                    "ready": False,
+                    "ready_evt": asyncio.Event(),
+                    "failed": None,
+                    "junk_chunks": 0,
+                }
+
+            main_ctx = _new_request_ctx()
             sess: dict[str, Any] = {
-                "queue": asyncio.Queue(maxsize=4),
+                # Aliases of the ACTIVE ctx's objects, so every producer site (turn body,
+                # arrival appends) keeps addressing sess["queue"] / sess["audio_seg_fifo"]
+                # and a swap only has to repoint these two references.
+                "queue": main_ctx["queue"],
+                "audio_seg_fifo": main_ctx["fifo"],
+                "active_ctx": main_ctx,
+                "shadow": None,
+                "shadow_failed_at": 0.0,
                 "gen_task": None,
                 "turn_done": asyncio.Event(),
                 "turn_idx": 0,
@@ -697,18 +772,11 @@ class OmniStreamingVideoHandler:
                 "arrival_appends": 0,
                 "arrival_frames": 0,
                 "arrival_tokens": 0,
-                # One owner tag ("append" | "turn") per chunk submitted to sess["queue"],
-                # pushed in submission order. The engine runs one segment per chunk and
-                # cannot start segment k+1 before segment k's stop, so the k-th audio
-                # stop the output loop sees belongs to the k-th submitted chunk. That
-                # makes submission ORDER a structural identity for the audio stream --
-                # the per-chunk field that outputs do not carry.
-                "audio_seg_fifo": deque(),
             }
-            session_request_id = f"video-sess-{uuid.uuid4().hex[:12]}"
+            session_request_id = main_ctx["rid"]
 
-            async def _chunk_stream():
-                """Native async generator of per-turn deltas.
+            async def _chunk_stream(ctx: dict[str, Any]):
+                """Native async generator of per-turn deltas for ONE engine request.
 
                 MUST be a real `async def ... yield` generator. async_omni.py:398 branches
                 on `isinstance(prompt, collections.abc.AsyncGenerator)`, whose
@@ -719,10 +787,10 @@ class OmniStreamingVideoHandler:
                 """
                 from vllm.engine.protocol import StreamingInput
 
-                from vllm.sampling_params import SamplingParams
+                from vllm.sampling_params import RequestOutputKind, SamplingParams
 
                 while True:
-                    item = await sess["queue"].get()
+                    item = await ctx["queue"].get()
                     if item is None:
                         return
                     # A prefill-only append rides through as (prompt, max_tokens). Without a
@@ -731,7 +799,33 @@ class OmniStreamingVideoHandler:
                     # The talker never sees it, so it would be silent -- and still burn a
                     # reply's worth of decode and leave that reply in the context.
                     if isinstance(item, tuple):
-                        prompt, max_tokens = item
+                        prompt, max_tokens = item[0], item[1]
+                        is_seed = len(item) > 2 and item[2] == "seed"
+                        if is_seed:
+                            # A compression shadow's seed is a REAL micro-segment, NOT a
+                            # prefill-only append, for two measured reasons:
+                            #   * max_tokens=2, not 1: a segment whose ENDING forward
+                            #     prefilled >1 row ships nothing to the talker (the
+                            #     structural skip in qwen3_omni.py), and a tensor-less
+                            #     chunk 0 kills stage 1 -- the swap turn's chunk-0 payload
+                            #     then pairs full-prompt ids with delta-only embeds
+                            #     (RuntimeError: tensor a (6) vs b (9)). With 2, the
+                            #     ending forward is the one-row decode step, so chunk 0
+                            #     ships the same full-prompt payload every session's
+                            #     first chunk ships: the talker is born the tested way.
+                            #   * no prefill-only marker, same reason: the marker's whole
+                            #     effect is to suppress that payload.
+                            # output_kind is explicit because a first chunk's params
+                            # become the REQUEST's params, and the bare default is the
+                            # non-streaming kind.
+                            yield StreamingInput(
+                                prompt=prompt,
+                                sampling_params=SamplingParams(
+                                    max_tokens=max_tokens,
+                                    output_kind=RequestOutputKind.DELTA,
+                                ),
+                            )
+                            continue
                         # extra_args is the marker's channel: it rides on the per-chunk
                         # sampling params, which this path is already required to carry.
                         yield StreamingInput(
@@ -751,8 +845,8 @@ class OmniStreamingVideoHandler:
                     "t0": _time.monotonic(), "t_first_text": None, "t_first_audio": None,
                 }
 
-            async def _session_output_loop() -> None:
-                """ONE generate() for the whole session, demultiplexed back into turns.
+            async def _session_output_loop(ctx: dict[str, Any]) -> None:
+                """ONE generate() per engine request, demultiplexed back into turns.
 
                 In per-turn mode the wire events response.audio.done / response.text.done
                 are emitted AFTER the `async for` loop exits. Here the loop only exits at
@@ -770,8 +864,8 @@ class OmniStreamingVideoHandler:
                 st = _new_turn_state()
                 try:
                     result_gen = self._engine_client.generate(
-                        prompt=_chunk_stream(),
-                        request_id=session_request_id,
+                        prompt=_chunk_stream(ctx),
+                        request_id=ctx["rid"],
                         output_modalities=config.modalities,
                     )
                     async for output in result_gen:
@@ -799,6 +893,45 @@ class OmniStreamingVideoHandler:
                                 # it says "no audio was produced" while audio is being produced.
                                 _summarise_audio_payload(self._get_audio_data(output)),
                             )
+                        # SHADOW / RETIRED PATH. While this loop's request is not the live
+                        # one -- a compression shadow warming up before its swap, or the
+                        # old request draining after it -- nothing here may touch the
+                        # websocket or the shared turn state. The one useful signal is the
+                        # seed segment's own finish_reason: its PRESENCE is what marks the
+                        # shadow ready (presence-based on purpose -- the inert-guard
+                        # lesson; an absence-based gate here would hang silently).
+                        if sess.get("active_ctx") is not ctx:
+                            if getattr(output, "final_output_type", "text") == "audio":
+                                # The transfer adapter suppresses the seed's tensor-less
+                                # first boundary, so normally no audio arrives at all.
+                                # Count whatever does: it sizes the shadow talker's array
+                                # at swap time.
+                                ctx["junk_chunks"] += 1
+                                if _segment_finish_reason(output) is not None and ctx["fifo"]:
+                                    ctx["fifo"].popleft()
+                            if _segment_finish_reason(output) is not None and not ctx["ready"]:
+                                # Ready means the seed's AUDIO stop arrived, not merely
+                                # the stage-0 text finish. The talker free-runs junk for
+                                # a seed segment (median ~1 s, measured up to 36 s), and
+                                # segments within one request are strictly serial -- a
+                                # swap before that stop parks the first real turn's
+                                # speech behind the junk. Measured as 8/640 turns with
+                                # ttft ~100-200 ms but ttfa 6.5-26.5 s, all on swap
+                                # clusters. Waiting costs nothing: the live request keeps
+                                # serving while the junk drains in the background.
+                                seed_drained = (
+                                    "audio" not in (config.modalities or [])
+                                    or getattr(output, "final_output_type", "text") == "audio"
+                                )
+                                if seed_drained:
+                                    ctx["ready"] = True
+                                    ctx["ready_evt"].set()
+                                    logger.info(
+                                        "[session] COMPRESS: shadow %s is ready "
+                                        "(seed fully drained)",
+                                        ctx["rid"],
+                                    )
+                            continue
                         # Attribute every AUDIO output to the chunk that caused it, by
                         # submission order. An append flows through the whole pipeline on
                         # purpose (withholding it from the talker desynchronised the stages
@@ -830,7 +963,7 @@ class OmniStreamingVideoHandler:
                         # with "turn boundary lost".
                         owner = None
                         if getattr(output, "final_output_type", "text") == "audio":
-                            fifo = sess["audio_seg_fifo"]
+                            fifo = ctx["fifo"]
                             owner = fifo[0] if fifo else None
                             if _segment_finish_reason(output) is not None and fifo:
                                 fifo.popleft()
@@ -971,9 +1104,21 @@ class OmniStreamingVideoHandler:
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:  # noqa: BLE001
-                    logger.exception("[session] output loop failed")
-                    sess["fatal"] = str(e)
-                    sess["turn_done"].set()   # never leave a turn waiting forever
+                    if sess.get("active_ctx") is ctx:
+                        logger.exception("[session] output loop failed")
+                        sess["fatal"] = str(e)
+                        sess["turn_done"].set()   # never leave a turn waiting forever
+                    else:
+                        # A non-live request's failure abandons that request, never the
+                        # live session: reusing the fatal path here would let a shadow
+                        # warm-up hiccup (or a retired request's teardown noise) kill a
+                        # perfectly healthy conversation.
+                        logger.warning(
+                            "[session] COMPRESS: non-live request %s loop ended: %s",
+                            ctx["rid"], e,
+                        )
+                        ctx["failed"] = str(e)
+                        ctx["ready_evt"].set()
 
             async def _prefill_frame_on_arrival(frame_b64: str) -> None:
                 """Append one just-arrived frame to the live request so stage 0 prefills it now.
@@ -999,6 +1144,13 @@ class OmniStreamingVideoHandler:
                 """
                 if (not sess["first_sent"] or sess.get("turn_busy")
                         or sess.get("query_claimed") or sess["fatal"]):
+                    return False
+                # While a compression shadow warms up, frames are HELD, not appended: an
+                # append lands in the OLD request's KV, which dies at the swap, and the
+                # arrival path would also remove the frame from frame_buffer -- the swap
+                # turn would then be blind to the whole warm-up window. Refusal keeps the
+                # frame buffered for the swap turn's ordinary query-time sweep.
+                if sess.get("shadow") is not None:
                     return False
                 # Text-only sessions get no arrival appends at all: the append's junk
                 # audio segment is what the FIFO attributes, and without audio outputs
@@ -1070,6 +1222,11 @@ class OmniStreamingVideoHandler:
                     ntok, sess["arrival_appends"], sess["arrival_frames"],
                     sess["arrival_tokens"], sess.get("cum_tokens", 0),
                 )
+                # Frames alone can carry the context across the compression trigger during
+                # a long silence; without this hook the warm-up would only start at the
+                # next turn and the swap would slip one turn further.
+                if _warmup_due() and _shadow_allowed():
+                    _launch_shadow_warmup("arrival")
                 return True
 
             async def _run_session_turn(*, query_text: str) -> None:
@@ -1127,23 +1284,38 @@ class OmniStreamingVideoHandler:
                 # In session mode the buffer's only job is to hold frames that have not been
                 # submitted yet, so it can simply be drained -- which also means it stays a
                 # handful of frames long and the eviction path never fires at all.
-                # Roll BEFORE building the chunk, so this turn is the rolled request's first
-                # one and carries the seed. Rolling after would waste a turn.
-                roll_at = config.session_roll_at_talker_tokens
-                if roll_at and sess.get("talker_tokens", 0) >= roll_at:
+                # Compress/roll BEFORE building the chunk, so this turn is the new
+                # request's first one and carries the seed (or the carry); after would
+                # waste a turn. The ladder, in order:
+                #   1. a READY shadow wins -- the swap is a pointer flip and upgrades
+                #      BOTH triggers to the invisible path;
+                #   2. a wall that cannot wait pays the blocking roll, exactly the old
+                #      guarantee (the talker wall does not fail cleanly, so a shadow
+                #      that is not ready yet must not be waited for);
+                #   3. otherwise a due warm-up is started in the background and this
+                #      turn is served on the live request, which still has margin --
+                #      the warm-up thresholds sit below the walls on purpose.
+                carry: list[dict[str, Any]] | None = None
+                shadow = sess.get("shadow")
+                if (shadow is not None and shadow["ctx"].get("ready")
+                        and not shadow["ctx"].get("failed")):
+                    carry = await _swap_to_shadow()
+                elif _must_roll_now():
                     await _roll_session()
                     if sess["fatal"]:
                         await self._send_error(
                             websocket, f"Session failed: {sess['fatal']}"
                         )
                         return
+                elif _warmup_due() and _shadow_allowed():
+                    _launch_shadow_warmup("turn start")
 
                 new_frames = list(frame_buffer)
                 seed = list(sess["transcript"]) if not sess["first_sent"] else None
                 chunk = await self._build_session_chunk(
                     config, new_frames, audio_buffer, query_text, frame_pil_cache,
                     is_first=not sess["first_sent"],
-                    seed_history=seed,
+                    seed_history=seed if seed is not None else carry,
                 )
                 audio_buffer.clear()
                 if chunk is None:
@@ -1220,7 +1392,9 @@ class OmniStreamingVideoHandler:
                 # transcript, which is the seed a roll carries into the next request.
                 sess["pending_query"] = query_text
                 if sess["gen_task"] is None:
-                    sess["gen_task"] = asyncio.create_task(_session_output_loop())
+                    ctx0 = sess["active_ctx"]
+                    ctx0["task"] = asyncio.create_task(_session_output_loop(ctx0))
+                    sess["gen_task"] = ctx0["task"]
                 sess["first_sent"] = True
                 # Tag BEFORE the awaited put: if the put suspends on a full queue no
                 # output for this chunk can exist yet, and appends are refused while
@@ -1245,6 +1419,251 @@ class OmniStreamingVideoHandler:
                     await self._send_error(websocket, "Turn boundary lost")
                     return
                 sess["turn_idx"] += 1
+                # Start a due warm-up in the silence AFTER the turn, not during one: the
+                # seed prefill competes for the GPU with whatever is decoding.
+                if _warmup_due() and _shadow_allowed():
+                    _launch_shadow_warmup("turn end")
+
+            def _warmup_due() -> bool:
+                """Should a shadow start warming? Thresholds sit BELOW the walls so the
+                shadow is normally ready before any wall forces a blocking roll."""
+                trig = config.context_compression_trigger_tokens
+                if trig and sess.get("cum_tokens", 0) >= trig:
+                    return True
+                roll_at = config.session_roll_at_talker_tokens
+                return bool(roll_at and sess.get("talker_tokens", 0) >= 0.85 * roll_at)
+
+            def _must_roll_now() -> bool:
+                """A wall that cannot wait for a shadow. The talker trigger keeps its
+                original blocking semantics -- its wall does not fail cleanly -- and the
+                context trigger gets a hard fallback at 1.5x in case shadows keep
+                failing."""
+                roll_at = config.session_roll_at_talker_tokens
+                if roll_at and sess.get("talker_tokens", 0) >= roll_at:
+                    return True
+                trig = config.context_compression_trigger_tokens
+                return bool(trig and sess.get("cum_tokens", 0) >= 1.5 * trig)
+
+            def _shadow_allowed() -> bool:
+                if sess.get("shadow") is not None or sess["fatal"]:
+                    return False
+                if not config.session_scoped_request:
+                    return False
+                # Cooldown after a failed warm-up, so a broken shadow path degrades to
+                # the blocking roll instead of spinning warm-up attempts.
+                return (_time.monotonic() - sess.get("shadow_failed_at", 0.0)) > 60.0
+
+            def _launch_shadow_warmup(where: str) -> None:
+                t = asyncio.create_task(_start_shadow_warmup(where))
+                prewarm_tasks.add(t)
+                t.add_done_callback(prewarm_tasks.discard)
+
+            def _trim_transcript_for_seed() -> list[dict[str, Any]]:
+                """Newest turns that fit context_compression_target_tokens (Gemini's
+                target_tokens). Chars/3 is only the first guess; the built chunk's real
+                token count is checked afterwards and the seed rebuilt smaller if the
+                guess was badly off."""
+                budget = config.context_compression_target_tokens
+                out: list[dict[str, Any]] = []
+                total = 0
+                for m in reversed(sess["transcript"]):
+                    cost = max(1, len(str(m.get("content", ""))) // 3)
+                    if out and total + cost > budget:
+                        break
+                    out.append(m)
+                    total += cost
+                out.reverse()
+                return out
+
+            async def _start_shadow_warmup(where: str) -> None:
+                """Pre-warm the replacement request while the live one keeps serving.
+
+                This is what turns the roll from a user-visible pause into a background
+                action: the seed (system prompt + trimmed transcript) is prefilled into a
+                brand-new resumable request marked prefill-only, which then parks with its
+                KV warm. The swap at the next turn boundary is a pointer flip.
+
+                Two engine-side facts this leans on, both verified in-tree:
+                  * the FIRST chunk of a resumable request honors per-chunk sampling
+                    params, so max_tokens=1 caps the seed at one discarded token and the
+                    request parks in WAITING_FOR_STREAMING_REQ with KV retained;
+                  * the transfer adapter suppresses a prefill-only chunk-0 boundary, so
+                    stage 1 first hears of this request from the first REAL turn, as a
+                    normal full chunk 0 -- no tensor-less bring-up payload.
+                """
+                if sess.get("shadow") is not None or sess["fatal"]:
+                    return
+                watermark = len(sess["transcript"])
+                seed_msgs = _trim_transcript_for_seed()
+                if not seed_msgs and not config.system_prompt:
+                    # Nothing to seed with. The blocking roll handles this case fine: its
+                    # seed rides the first real turn, which is never empty.
+                    return
+                ctx = _new_request_ctx()
+                sess["shadow"] = {"ctx": ctx, "watermark": watermark, "seed_ntok": 0}
+                try:
+                    chunk = await self._build_session_chunk(
+                        config, [], bytearray(), "", frame_pil_cache,
+                        is_first=True, seed_history=seed_msgs, seed_only=True,
+                    )
+                    if not isinstance(chunk, dict):
+                        raise RuntimeError("seed chunk did not build")
+                    ntok = len(chunk.get("prompt_token_ids") or ())
+                    while (ntok > config.context_compression_target_tokens * 1.3
+                           and len(seed_msgs) > 2):
+                        seed_msgs = seed_msgs[2:]
+                        chunk = await self._build_session_chunk(
+                            config, [], bytearray(), "", frame_pil_cache,
+                            is_first=True, seed_history=seed_msgs, seed_only=True,
+                        )
+                        if not isinstance(chunk, dict):
+                            raise RuntimeError("seed chunk did not build")
+                        ntok = len(chunk.get("prompt_token_ids") or ())
+                    # Deliberately NOT marked prefill-only. The seed must ship a normal
+                    # full chunk-0 payload so stage 1 brings the talker up the same way
+                    # every session's first chunk does -- suppressing it was measured to
+                    # kill stage 1 when the swap turn's chunk-0 payload paired full-prompt
+                    # ids with delta-only embeds. The cost is a micro-segment: one stray
+                    # text token in the seed context and a moment of junk audio that the
+                    # warm-up drain discards.
+                    sess["shadow"]["seed_ntok"] = ntok
+                    # The talker never sees the seed chunk (its boundary is suppressed),
+                    # but the first REAL turn ships as chunk 0, i.e. the FULL prompt --
+                    # seed included -- so the shadow talker's array starts at the seed's
+                    # placeholder length, not zero. The turn-time accounting only sees the
+                    # delta, so this must be captured here or the wall guard undercounts
+                    # from birth (in the unsafe direction).
+                    seed_tlen = 0
+                    try:
+                        from vllm_omni.distributed.omni_connectors.adapter import (
+                            compute_talker_prompt_ids_length,
+                        )
+                        seed_tlen = max(
+                            0,
+                            compute_talker_prompt_ids_length(
+                                list(chunk.get("prompt_token_ids") or ())
+                            ),
+                        )
+                    except Exception:
+                        seed_tlen = ntok  # err high: the estimate guards a wall
+                    sess["shadow"]["seed_tlen"] = seed_tlen
+                    ctx["task"] = asyncio.create_task(_session_output_loop(ctx))
+                    # The seed's junk audio needs an owner tag, exactly like an arrival
+                    # append: its stage-2 stop can arrive AFTER the swap, on the by-then
+                    # live loop, and an unowned stop would close the first real turn
+                    # early. Tagged "append", it is positively identified junk on either
+                    # side of the swap. No producer races this push: the shadow queue has
+                    # exactly one writer until the swap.
+                    if "audio" in (config.modalities or []):
+                        ctx["fifo"].append("append")
+                    await ctx["queue"].put((chunk, 2, "seed"))
+                    logger.info(
+                        "[session] COMPRESS: warming shadow %s at %s (seed=%d msgs, "
+                        "%d tokens; cum=%d, talker_est=%d)",
+                        ctx["rid"], where, len(seed_msgs), ntok,
+                        sess.get("cum_tokens", 0), sess.get("talker_tokens", 0),
+                    )
+                    try:
+                        await asyncio.wait_for(
+                            ctx["ready_evt"].wait(),
+                            timeout=config.context_compression_warmup_timeout_s,
+                        )
+                    except asyncio.TimeoutError:
+                        ctx["failed"] = "warm-up timeout"
+                    if ctx.get("failed"):
+                        raise RuntimeError(ctx["failed"])
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "[session] COMPRESS: shadow warm-up abandoned (%s); the blocking "
+                        "roll remains the fallback",
+                        e,
+                    )
+                    task = ctx.get("task")
+                    if task is not None and not task.done():
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                    if sess.get("shadow") and sess["shadow"]["ctx"] is ctx:
+                        sess["shadow"] = None
+                    sess["shadow_failed_at"] = _time.monotonic()
+
+            async def _swap_to_shadow() -> list[dict[str, Any]]:
+                """Point the session at the pre-warmed request; returns the carry.
+
+                Runs at turn start with turn_busy held and the queue empty, which is what
+                makes the flip race-free. The carry is the transcript delta since the seed
+                was built (turns that closed while the shadow warmed); it rides THIS
+                turn's chunk so the model never loses the newest exchange -- skipping it
+                would be silent amnesia, invisible until a recall probe.
+                """
+                nonlocal session_request_id
+                shadow = sess.pop("shadow")
+                ctx = shadow["ctx"]
+                old_ctx = sess["active_ctx"]
+                old_task = old_ctx.get("task")
+                old_rid = old_ctx["rid"]
+                carry = [dict(m) for m in sess["transcript"][shadow["watermark"]:]]
+                if ctx["fifo"]:
+                    # The seed's "append" tag is still pending: its audio stop has not
+                    # arrived yet. KEEP it -- the live loop's append handling swallows the
+                    # late stop by ownership, and this turn's "turn" tag queues behind it.
+                    # Clearing it here would hand the seed's stop to the first real turn.
+                    logger.info(
+                        "[session] COMPRESS: seed audio stop still pending at swap "
+                        "(fifo=%d) -- the append tag rides across",
+                        len(ctx["fifo"]),
+                    )
+                sess["active_ctx"] = ctx
+                sess["queue"] = ctx["queue"]
+                sess["audio_seg_fifo"] = ctx["fifo"]
+                sess["gen_task"] = ctx["task"]
+                session_request_id = ctx["rid"]
+                # True, not False: the shadow already consumed its is_first chunk (the
+                # seed). Building the next chunk as first would inject a second system
+                # block mid-request and skip the <|im_end|> shim.
+                sess["first_sent"] = True
+                sess["cum_tokens"] = shadow["seed_ntok"]
+                sess["talker_tokens"] = (
+                    shadow.get("seed_tlen", 0)
+                    + _TALKER_TOKENS_PER_AUDIO_CHUNK * ctx.get("junk_chunks", 0)
+                )
+                sess["rolls"] = sess.get("rolls", 0) + 1
+                this_turn = sess["turn_idx"]
+
+                async def _retire_old() -> None:
+                    # The old request stays parked until the swap turn has closed, so its
+                    # abort's cross-process cleanup cannot race this turn's update -- the
+                    # same overlap the blocking roll's settle sleep papers over, closed
+                    # here by ordering instead of sleeping.
+                    for _ in range(600):
+                        if sess["turn_idx"] > this_turn or sess["fatal"]:
+                            break
+                        await asyncio.sleep(0.5)
+                    if old_task is not None and not old_task.done():
+                        old_task.cancel()
+                        await asyncio.gather(old_task, return_exceptions=True)
+                    logger.info("[session] COMPRESS: old request %s retired", old_rid)
+
+                retire_task = asyncio.create_task(_retire_old())
+                prewarm_tasks.add(retire_task)
+                retire_task.add_done_callback(prewarm_tasks.discard)
+                logger.info(
+                    "[session] COMPRESS #%d at turn=%d: %s -> %s, seed=%d tokens, "
+                    "carry=%d message(s); the swap is a pointer flip, this turn pays no "
+                    "cold prefill.",
+                    sess["rolls"], sess["turn_idx"], old_rid, ctx["rid"],
+                    shadow["seed_ntok"], len(carry),
+                )
+                try:
+                    await websocket.send_json(
+                        {"type": "session.compressed", "turn": sess["turn_idx"],
+                         "rolls": sess["rolls"], "carried_messages": len(carry)}
+                    )
+                except Exception:
+                    # The client not understanding this event must not end the session.
+                    logger.debug("[session] could not send session.compressed", exc_info=True)
+                return carry
 
             async def _roll_session() -> None:
                 """Replace the engine request, carrying the recent text across.
@@ -1272,24 +1691,37 @@ class OmniStreamingVideoHandler:
                 prev_id = session_request_id
                 prev_tokens = sess.get("talker_tokens", 0)
 
+                # A live shadow is torn down first: the blocking roll replaces the request
+                # NOW, and a half-warm shadow seeded from the pre-roll transcript would
+                # otherwise swap in a context that no longer matches the conversation.
+                stale_shadow = sess.pop("shadow", None)
+                if stale_shadow is not None:
+                    stask = stale_shadow["ctx"].get("task")
+                    if stask is not None and not stask.done():
+                        stask.cancel()
+                        await asyncio.gather(stask, return_exceptions=True)
+
                 task = sess["gen_task"]
                 if task is not None and not task.done():
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
 
-                # A fresh queue, not the old one drained: the cancelled generator may have
-                # been suspended mid-item, and reusing the queue would feed the new request a
-                # chunk built for the old one's context.
-                sess["queue"] = asyncio.Queue(maxsize=4)
-                # Race-free because the generator task was cancelled AND awaited above, so
-                # no old-request output can arrive after this point to pop a stale tag.
-                sess["audio_seg_fifo"].clear()
+                # A fresh ctx (queue, fifo, request id), not the old one drained: the
+                # cancelled generator may have been suspended mid-item, and reusing the
+                # queue would feed the new request a chunk built for the old one's
+                # context. Race-free because the generator task was cancelled AND awaited
+                # above, so no old-request output can arrive after this point to pop a
+                # stale tag.
+                ctx = _new_request_ctx()
+                sess["active_ctx"] = ctx
+                sess["queue"] = ctx["queue"]
+                sess["audio_seg_fifo"] = ctx["fifo"]
                 sess["gen_task"] = None
                 sess["first_sent"] = False        # next chunk carries system + seed
                 sess["cum_tokens"] = 0            # new request, new context
                 sess["talker_tokens"] = 0
                 sess["rolls"] = sess.get("rolls", 0) + 1
-                session_request_id = f"video-sess-{uuid.uuid4().hex[:12]}"
+                session_request_id = ctx["rid"]
 
                 # Let the stages finish retiring the old request before the new one arrives.
                 # See session_roll_settle_s: the ordering is right on this side, but the stages
@@ -1333,6 +1765,14 @@ class OmniStreamingVideoHandler:
                 sentinel. Abort at session end is safe -- unlike a mid-session abort, which
                 would destroy the accumulated KV this whole mode exists to preserve.
                 """
+                # A warming shadow holds its own engine request; leaving it behind would
+                # leak a parked request (and its max_num_seqs slot) past the session.
+                shadow = sess.pop("shadow", None)
+                if shadow is not None:
+                    stask = shadow["ctx"].get("task")
+                    if stask is not None and not stask.done():
+                        stask.cancel()
+                        await asyncio.gather(stask, return_exceptions=True)
                 task = sess["gen_task"]
                 if task is None:
                     return
@@ -1827,6 +2267,7 @@ class OmniStreamingVideoHandler:
         *,
         is_first: bool,
         seed_history: list[dict[str, Any]] | None = None,
+        seed_only: bool = False,
     ) -> Any:
         """Render one per-turn delta into an engine prompt, or None if it would be empty.
 
@@ -1886,7 +2327,10 @@ class OmniStreamingVideoHandler:
         if query_text:
             user_content.append({"type": "text", "text": query_text})
 
-        if not user_content:
+        if not user_content and not (seed_only and (seed_history or config.system_prompt)):
+            # Only a compression shadow's seed may build without user content: it has
+            # hundreds of transcript tokens, so the waiting-scheduler's
+            # num_new_tokens > 0 assert stays safe.
             return None
 
         messages: list[dict[str, Any]] = []
@@ -1896,14 +2340,17 @@ class OmniStreamingVideoHandler:
         # block interleaved with the conversation.
         if is_first and config.system_prompt:
             messages.append({"role": "system", "content": config.system_prompt})
-        # Carried text from before a roll. It goes between the system block and this turn, so
-        # the new request reads as one conversation rather than a fresh one. Only ever set on
-        # the first chunk of a rolled request -- appearing mid-session would put completed
-        # turns after the current one and make the model answer the wrong question.
+        # Carried text. On the FIRST chunk this is the roll/compression seed, placed
+        # between the system block and this turn so the new request reads as one
+        # conversation. On a LATER chunk it is the compression carry -- turns that closed
+        # while a shadow warmed -- and the <|im_end|> shim below closes the previous
+        # assistant turn before these render, so the chatml structure stays valid. In
+        # both cases the messages are COMPLETED turns and precede the current user block,
+        # which is what keeps the model answering the current question.
         if seed_history:
-            assert is_first, "seed_history belongs to the first chunk of a request only"
             messages.extend(seed_history)
-        messages.append({"role": "user", "content": user_content})
+        if user_content:
+            messages.append({"role": "user", "content": user_content})
 
         request_kwargs: dict[str, Any] = {
             "model": config.model or "default",

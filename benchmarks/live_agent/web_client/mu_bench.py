@@ -26,6 +26,7 @@ the multi-user cells and turn index cannot be read as concurrency.
 """
 import argparse
 import asyncio
+import os
 import base64
 import json
 import pathlib
@@ -145,6 +146,11 @@ class User:
         cfg["frame_filter_min_gap"] = 0
         cfg["frame_filter_max_gap"] = 4
         cfg["prefill_frames_on_arrival"] = True
+        # Session-config overrides injected by the harness (e.g. context compression
+        # knobs) without forking the bench: MU_SESSION_CFG_JSON='{"key": value}'.
+        _extra = os.environ.get("MU_SESSION_CFG_JSON")
+        if _extra:
+            cfg.update(json.loads(_extra))
 
         try:
             async with websockets.connect(URL, max_size=None) as ws:
