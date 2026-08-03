@@ -987,6 +987,50 @@ Three things worth reading off this table:
    users and reaches 1.0 (where audio starts to stall) at roughly 70;
    **both are extrapolations, not measurements**.
 
+### Follow-up: is audio-only bottlenecked on GPU memory bandwidth? — Measured: no, not close
+
+Decode classically eats memory bandwidth (every generated token re-reads the
+weights from GPU memory), so the suspicion is natural. Verification: re-run
+audio-only at 8 / 16 / 32 users while sampling, once per second — DRAMA (the
+fraction of time the memory interface is actually moving data), sm% (the
+fraction of time any compute kernel is running), and the per-process split
+(pmon). No clock-locking experiments: the card is shared.
+
+| audio-only | idle | 8 users | 16 users | 32 users |
+|---|---|---|---|---|
+| DRAMA median / p90 | 0 | 0.07 / 0.10 | 0.10 / 0.15 | **0.17 / 0.22** |
+| sm% median / p90 | 0 | 27 / 63 | 34 / 82 | **58 / 90** |
+| power (W, 600 cap) | 81 | 119 | 138 | 184 |
+
+Three judgements:
+
+1. **Bandwidth is nowhere near saturation.** 32 users (2.5× the video capacity)
+   use 17%, and it grows roughly linearly with users (0.07→0.10→0.17); at that
+   slope even 100 users would sit near half — while the rtf-margin wall
+   extrapolates to 50–70 users, which arrives first. **Memory bandwidth will
+   not be this engine's bottleneck at any reachable user count.**
+2. **The shape is "many small kernels", not "starved for data".** sm% p90 is
+   already 90 (some kernel is almost always running), but true SM occupancy
+   (SMACT) is only 0.23 — the kernels that run use a small slice of the compute
+   units. That is a scheduling / small-batch profile, and it corroborates the
+   discrete ensemble-price step: the cost is queueing and co-batching, not a
+   resource running dry.
+3. **Split per process, the speech side is the biggest consumer — but the
+   thinker is catching up.** At 32 users, median sm%/mem%: talker 29 / 6,
+   thinker 15 / 4, code2wav 4 / 0. The thinker does produce output every turn,
+   but only a dozen-odd text tokens finished in a few hundred ms, then back to
+   waiting; the talker has to follow the whole delivery window at 87 codec
+   tokens per second of audio (25 per chunk, one chunk per 288 ms). Note the
+   thinker's share grew from 6% (16 users) to 15% (32) — it keeps growing with
+   user count.
+
+One honest correction: the back-of-envelope made beforehand ("the talker
+re-reads its 6.26 GiB of weights every step") predicted DRAMA 0.4–0.6 at 32
+users; the measurement says 0.17 — the talker process only has kernels running
+29% of the time, meaning speech is generated in bursts on the chunk cadence,
+not decoded wall-to-wall at delivery speed. The estimate was 3× high; the
+measurement stands.
+
 ### Scenario 2: near-still video — usable to ~24 users; but long sessions once locked up all 20
 
 The 48-turn slope first (24 and 28 users ran with a lowered compression trigger —
