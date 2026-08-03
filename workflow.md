@@ -1123,6 +1123,66 @@ loaded.
 
 ---
 
+## 18. The first wall, pushed — CUDA graphs for the speech stage
+
+*2026-08-03, config experiment following commit `1210772d`; a one-line change.*
+
+Section 17's diagnosis said the first wall for audio-only is scheduling — the
+talker launches hundreds of small kernels one by one per step
+(`enforce_eager`), and has kernels running only 29% of the time. A diagnosis
+this specific can be tested: turn eager off for stage 1 so vLLM records the
+talker's step as one pre-built graph, launched once per step
+(`deploy_mu_fp8_s32_graph.yaml`, differing from the 32-slot config by that one
+line). code2wav was **deliberately left alone**: one variable at a time.
+
+**Correctness before speed.** Text, audio durations, chunk cadence, all probes
+normal; the stage-1 KV pool did not lose a single token (123,040); graphs cost
+~200 MiB; boot takes 55 s longer (recording is a one-time cost). Four speech
+samples (counting, a tongue twister, …) are saved under
+`/data/zx/results/graph_ab/` — **the final verdict belongs to human ears**;
+text gates cannot see speech-side defects.
+
+**Results (same protocol as the eager cells):**
+
+| audio-only | eager | CUDA graph |
+|---|---|---|
+| solo price (1 user p50) | 317 ms | **145** |
+| ensemble price (32 users p50) | 702 | **367** |
+| 32-user p95 | 798 | **497** |
+| speech share p50 (32 users) | 652 | **303** |
+| rtf p50 / p10 (32 users) | 1.42 / 1.23 | **3.62 / 2.65** |
+| playback starvation p95 (32 users) | 268 ms | **19** |
+
+| video, 13 users | eager | CUDA graph |
+|---|---|---|
+| near-still: p50 / over 1 s | 758 / 4.0% | **367 / 0.2%** |
+| high-motion: p50 / over 1 s / over 2 s | 1,168 / 63.6% / 18.1% | **749 / 31.1% / 11.9%** |
+| high-motion: p95 | 3,535 | 3,986 (not improved) |
+
+**Four readings.**
+
+1. **Both prices halved.** Thirty-two people in ensemble (367) now cost 50 ms
+   more than one person solo used to (317); the speech side's fixed startup
+   fell from ~600 ms to ~300.
+2. **The 50–70-user scheduling wall extrapolated in section 17 has been pushed
+   out of measurable range**: the rtf margin at 32 users rose from 1.23 to
+   2.65. Finding the new wall requires more slots first — next time's work.
+3. **The load intensifies itself — a property of closed loops.** Halve the
+   latency and each turn cycle shortens, so the same 32 users produce 26% more
+   turns per second; utilization therefore rose across the board (sm 58→93,
+   DRAMA 0.17→0.27, power 184→226 W): the card is doing more work, not working
+   harder per unit. One mechanism worth recording: faster steps → fewer streams
+   speaking at once → thinner co-batches → more weight-read bytes per token —
+   **trading bandwidth for latency**, an excellent trade on a card using a
+   third of its bandwidth.
+4. **The high-motion tail did not move** (p95 3,986), because it never lived on
+   the speech side: it is the thinker's frame prefill and swap windows fighting
+   for the card — the territory of the next wall section 17 queued up
+   (priority scheduling). The median improvement (−36%) is entirely the speech
+   half.
+
+---
+
 ## Where things stand
 
 **Working**
