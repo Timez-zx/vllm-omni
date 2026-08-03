@@ -605,7 +605,7 @@ class StreamingVideoSessionConfig(BaseModel):
         ),
     )
     context_compression_target_tokens: int = Field(
-        default=32768,
+        default=16384,
         ge=256,
         description=(
             "Token budget for the ROLLING WINDOW carried across a compression (Gemini "
@@ -621,7 +621,16 @@ class StreamingVideoSessionConfig(BaseModel):
             "seed from growing roll over roll until it approaches the wall the "
             "compression exists to avoid; it is also the KV a warming shadow holds ON TOP "
             "of the live requests, which is why concurrent warm-ups are capped "
-            "process-wide (see context_compression_carry_frames for the kill-switch)."
+            "process-wide (see context_compression_carry_frames for the kill-switch).\n\n"
+            "16,384 rather than a full half-context, from a MEASURED queueing argument: "
+            "at 13 users the sessions cross the uniform trigger within a couple of "
+            "minutes of each other, and a 28.6k seed took a median 9.5 s to warm while "
+            "the 11,141-token runway to the hard roll allows ~5.8 s per warm-up at two "
+            "permits. Halving the window halves the seed and closes that deficit; the "
+            "pool cannot fund a third permit (the 13-user run already peaked near 110% "
+            "of the KV pool with two in flight). The price is the window's REACH: ~62 "
+            "frames instead of ~125, so visual recall falls back to the text floor "
+            "sooner."
         ),
     )
     context_compression_carry_frames: bool = Field(
@@ -850,6 +859,8 @@ class OmniStreamingVideoHandler:
                 # attach; attribution of frames that land mid-answer skews one turn early,
                 # which recency-ordered memory does not care about.
                 "pending_frames": [],
+                # One shadow warm-up waiter per session at a time (the permit queue).
+                "warmup_waiting": False,
                 "rolls": 0,
                 # Frames prefilled on arrival, and the tokens they cost. Counted because the
                 # whole point is a latency saving that is otherwise invisible: the query-time
@@ -1669,19 +1680,35 @@ class OmniStreamingVideoHandler:
                 sem = self._shadow_warmup_sem
                 if sess.get("shadow") is not None or sess["fatal"]:
                     return
-                if sem.locked():
+                # QUEUE, one waiter per session, rather than skip-and-retry-at-the-next
+                # hook. Skipping was measured to strand permits: the hooks that would
+                # retry are frame arrivals and turn boundaries, and the congestion that
+                # makes the queue deep is exactly what slows those to ~1/s, so 1-2
+                # permits sat idle for ~10 s with 9 sessions waiting. asyncio.Semaphore
+                # is FIFO, so waiting also makes the order fair -- first over the line,
+                # first served. Waiting is safe HERE and would not be one frame later:
+                # sess["shadow"] is still unset, so prefill-on-arrival keeps running.
+                if sess.get("warmup_waiting"):
+                    return
+                sess["warmup_waiting"] = True
+                queued = sem.locked()
+                if queued:
                     logger.info(
-                        "[session] COMPRESS: warm-up deferred (%s): %d already in "
-                        "flight; the next hook retries",
+                        "[session] COMPRESS: warm-up queued (%s): %d permits in use",
                         where, _MAX_CONCURRENT_SHADOW_WARMUPS,
                     )
-                    return
-                # No await between the locked() check and this acquire's fast path, so
-                # the pair is atomic on the event loop.
-                await sem.acquire()
                 try:
-                    await _start_shadow_warmup_inner(where)
+                    await sem.acquire()
+                except asyncio.CancelledError:
+                    sess["warmup_waiting"] = False
+                    raise
+                try:
+                    # Re-check after the wait: the session may have rolled, failed, or
+                    # been served by an earlier hook's warm-up while queued.
+                    if sess.get("shadow") is None and not sess["fatal"] and _warmup_due():
+                        await _start_shadow_warmup_inner(where)
                 finally:
+                    sess["warmup_waiting"] = False
                     sem.release()
 
             async def _start_shadow_warmup_inner(where: str) -> None:

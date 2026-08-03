@@ -304,25 +304,97 @@ def _construct_thinker2talker_streaming_input_async_chunk(
     emb_cpu = thinker_emb.detach().cpu()
     hid_cpu = thinker_hid.detach().cpu()
 
+    # Has the engine finished prefilling every prompt token it has been given?
+    # This is the ENGINE's own bookkeeping, and it is the only trustworthy answer:
+    # a watermark of "prompt tokens shipped to the talker" cannot work, because
+    # prefill-only appends (frames prefilled on arrival) deliberately ship nothing,
+    # so their tokens would be counted against the next segment forever -- measured
+    # as segments reported short by exactly 1, 2 or 4 frames' worth of tokens.
+    # Placeholders subtracted for the same reason the chunk adapter's
+    # _confirmed_num_computed_tokens does it: async scheduling advances
+    # num_computed_tokens for output tokens that are not committed yet, so the raw
+    # counter would call a segment prefilled while rows are still missing.
+    prompt_len = len(request.prompt_token_ids)
+    computed = max(
+        0,
+        int(getattr(request, "num_computed_tokens", 0) or 0)
+        - int(getattr(request, "num_output_placeholders", 0) or 0),
+    )
+    fully_prefilled = computed >= prompt_len
+
     if output_token_ids:
         if thinker_emb.shape[0] > 1:
             # if thinker_emb.shape[0] > 1, new streaming input segment is added
             # and will transfer prefill embeddings and hidden states to talker.
-            new_prompt_len = thinker_emb.shape[0]
+            #
+            # ACCUMULATE across steps, and size the ids from the SEGMENT, not from
+            # this step. One segment's prefill can span several engine steps --
+            # chunked prefill splits it whenever the batch token budget runs out,
+            # which a long chunk (many frames, or a compression seed) does routinely
+            # under load -- and every step arrives here. Sizing the ids by the last
+            # step's row count shipped the segment's TAIL: the delta reached the
+            # talker without its leading `<|im_end|>\n<|im_start|>user` and with only
+            # the trailing `<|im_start|>assistant`. Measured consequence: stage 1 died
+            # in _thinker_to_talker_prefill (a lone im_start collapses torch.nonzero's
+            # [n,1] to a 0-d tensor that torch.cat refuses), and with that crash
+            # guarded the failure goes SILENT instead -- the talker conditioned on an
+            # assistant header alone, because compute_talker_prompt_ids_length reads
+            # the same truncated ids and returns 9.
+            prev = transfer_manager._pending_streaming_prefills.get(request_id)
+            prompt_rows = int(thinker_emb.shape[0])
+            if prev is not None:
+                prev_emb = prev.get("embed", {}).get("prefill")
+                prev_hid = prev.get("hidden_states", {}).get("output")
+                if isinstance(prev_emb, torch.Tensor) and isinstance(prev_hid, torch.Tensor):
+                    emb_cpu = torch.cat((prev_emb, emb_cpu), dim=0)
+                    hid_cpu = torch.cat((prev_hid, hid_cpu), dim=0)
+                    prompt_rows = int(prev.get("_prompt_rows", prev_emb.shape[0])) + int(
+                        thinker_emb.shape[0]
+                    )
+            # A split segment is otherwise invisible, and it is the shape that broke
+            # stage 1 -- so report its presence, at WARNING because this module's
+            # logger is not part of vLLM's configured tree and its INFO lines never
+            # reach the log at all.
+            if prompt_rows != thinker_emb.shape[0]:
+                logger.warning(
+                    "[stage0->1] req %s: streaming segment split across prefill steps "
+                    "(%d rows accumulated; computed=%d prompt_len=%d)",
+                    request_id, prompt_rows, computed, prompt_len,
+                )
+            ids_len = prompt_rows
             payload = OmniPayloadStruct(
                 meta=MetaStruct(finished=finished),
                 embed=EmbeddingsStruct(prefill=emb_cpu),
                 hidden_states=HiddenStatesStruct(output=hid_cpu),
                 ids=IdsStruct(
-                    all=_ensure_list(request.all_token_ids[-new_prompt_len - 1 :]),
-                    prompt=_ensure_list(request.prompt_token_ids[-new_prompt_len:]),
+                    all=_ensure_list(request.all_token_ids[-ids_len - 1 :]),
+                    prompt=_ensure_list(request.prompt_token_ids[-ids_len:]),
                 ),
                 speaker=speaker,
                 language=language,
             )
-            transfer_manager._pending_streaming_prefills[request_id] = to_dict(payload)
+            pending = to_dict(payload)
+            pending["_prompt_rows"] = prompt_rows
+            transfer_manager._pending_streaming_prefills[request_id] = pending
             return None
         else:
+            if (
+                not fully_prefilled
+                and transfer_manager._pending_streaming_prefills.get(request_id) is not None
+            ):
+                # Prompt tokens are still unprefilled, so the payload about to ship
+                # covers only PART of the segment: the talker will be conditioned on a
+                # fragment. Reported, not repaired -- and deliberately so. Withholding
+                # the payload until the rest arrives was measured to kill stage 1 with
+                # `KeyError: 'prefill'`: the stages are coupled step-by-step, so the
+                # next step's decode-only payload is then read as this segment's
+                # prefill. A real repair belongs in the payload framing (one payload
+                # per SEGMENT rather than per step), which is an upstream change.
+                logger.warning(
+                    "[stage0->1] req %s: shipping a PARTIAL segment -- %d of %d prompt "
+                    "tokens prefilled; the talker sees a fragment of this turn",
+                    request_id, computed, prompt_len,
+                )
             save_payload = transfer_manager._pending_streaming_prefills.pop(request_id, None)
             if save_payload is not None:
                 saved_prefill = save_payload.get("embed", {}).get("prefill")

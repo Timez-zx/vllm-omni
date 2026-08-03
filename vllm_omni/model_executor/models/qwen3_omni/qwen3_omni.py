@@ -1016,9 +1016,25 @@ class Qwen3OmniMoeForConditionalGeneration(
             (input_ids, input_embeds) for talker
         """
         target_len = thinker_result_ids.shape[-1]
+        # squeeze(-1), not squeeze(): nonzero returns [n_starts, 1], and a bare squeeze
+        # also collapses the ROW dim when n_starts == 1, yielding a 0-d tensor that
+        # torch.cat refuses ("zero-dimensional tensor (at position 0) cannot be
+        # concatenated") -- it killed stage 1 on a chunk carrying a single im_start.
+        # squeeze(-1) is exact for every n_starts, 0 and 1 included.
+        im_start_pos = torch.nonzero(input_ids[0] == self.config.im_start_token_id).squeeze(-1)
+        if im_start_pos.numel() <= 1:
+            # The shapes that reach here are the interesting ones and nothing else
+            # reports them: log the ids so the producing chunk is identifiable rather
+            # than inferred. Cheap -- one line per rare chunk.
+            logger.warning(
+                "[talker-prefill] chunk carries %d im_start token(s); prompt len=%d "
+                "head=%s tail=%s",
+                int(im_start_pos.numel()), int(input_ids.shape[-1]),
+                input_ids[0][:12].tolist(), input_ids[0][-12:].tolist(),
+            )
         im_start_indexes = torch.cat(
             (
-                torch.nonzero(input_ids[0] == self.config.im_start_token_id).squeeze(),
+                im_start_pos,
                 torch.tensor([target_len], device=input_ids.device, dtype=input_ids.dtype),
             ),
             dim=-1,
