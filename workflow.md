@@ -670,11 +670,18 @@ disease first-chunk priority scheduling is meant to treat, a separate knife.
    KV plan, not runtime buffers). 20 is right for sixteen users: a slot-starved shadow
    just swaps one turn later; it is never an error.
 
-**Knobs** (all in `session.config`): `context_compression_trigger_tokens` (default off;
-16000 for sixteen users on high motion) · `context_compression_target_tokens` (default
-4096, the text seed budget) · `context_compression_warmup_timeout_s` (default 30 s;
-timeout falls back to the blocking roll). One hard deployment rule:
-`max_num_seqs ≥ sessions + shadow margin`.
+**Knobs** (all in `session.config`): `context_compression_trigger_tokens` — default
+**auto**: 75% of the model's context limit (65,536 × 0.75 = 49,152 in the reference
+deployment). The reasoning: a single user's default only needs to stay clear of the
+lifetime wall (measured: one user at 45k context shows no latency growth at all), so
+the trigger anchors to the MODEL's limit, not to a latency budget; multi-user operators
+tune it DOWN to their budget (16,000 holds p95 near 1.5 s for sixteen users on high
+motion); `0` disables compression. A paired backstop: the forced blocking roll is
+capped at 92% of the model limit (60,293) — 1.5 × a 75% trigger would sit PAST the
+wall and never fire without the cap. The other two:
+`context_compression_target_tokens` (default 4096, the text seed budget) ·
+`context_compression_warmup_timeout_s` (default 30 s; timeout falls back to the
+blocking roll). One hard deployment rule: `max_num_seqs ≥ sessions + shadow margin`.
 
 ---
 
@@ -736,5 +743,5 @@ The rest all live in `session.config`, with these defaults:
 `frame_filter_min_gap` / `max_gap` = unbounded · `session_scoped_request` = off ·
 `session_talker_token_budget` = none · `session_roll_at_talker_tokens` = off ·
 `session_roll_history_turns` = 8 turns · `session_roll_settle_s` = 1 second ·
-`context_compression_trigger_tokens` = off · `context_compression_target_tokens` = 4096 ·
-`context_compression_warmup_timeout_s` = 30 seconds
+`context_compression_trigger_tokens` = auto (75% of the model limit; 0 = off) ·
+`context_compression_target_tokens` = 4096 · `context_compression_warmup_timeout_s` = 30 seconds

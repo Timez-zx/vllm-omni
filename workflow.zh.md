@@ -384,8 +384,13 @@
    ("配额只管记忆池、不管运行时缓冲"这一课第三次应验)。16 人用 20 正好:抢不到员额的
    影子只是晚一轮换轨,不是错误。
 
-**开关**(都在 `session.config`):`context_compression_trigger_tokens`(默认关;
-16 人高动态用 16000)· `context_compression_target_tokens`(默认 4096,种子文字预算)·
+**开关**(都在 `session.config`):`context_compression_trigger_tokens` —— 默认**自动**:
+模型 context 上限的 75%(参考部署 65,536 × 0.75 = 49,152)。这么定的道理:单用户的默认
+只需要防寿命墙(实测单人 4.5 万 context 时延迟纹丝不动),所以扳机锚在模型上限、不锚在
+延迟预算;多用户运营时按延迟预算**往低调**(16 人高动态用 16,000,p95 压在 1.5 秒);
+传 `0` 彻底关闭。配套一道保底:贴墙强制换本的线封在模型上限的 92%(60,293)——
+1.5 × 75% 已经在墙外,不封顶这道保底就永远不会触发。
+其余两个:`context_compression_target_tokens`(默认 4096,种子文字预算)·
 `context_compression_warmup_timeout_s`(默认 30 秒,超时退回老滚动)。
 部署一条硬规矩:`max_num_seqs ≥ 会话数 + 影子余量`。
 
@@ -438,5 +443,5 @@
 `frame_filter_min_gap` / `max_gap` = 不限制 · `session_scoped_request` = 关 ·
 `session_talker_token_budget` = 无 · `session_roll_at_talker_tokens` = 关 ·
 `session_roll_history_turns` = 8 轮 · `session_roll_settle_s` = 1 秒 ·
-`context_compression_trigger_tokens` = 关 · `context_compression_target_tokens` = 4096 ·
-`context_compression_warmup_timeout_s` = 30 秒
+`context_compression_trigger_tokens` = 自动(模型上限的 75%;0 = 关)·
+`context_compression_target_tokens` = 4096 · `context_compression_warmup_timeout_s` = 30 秒

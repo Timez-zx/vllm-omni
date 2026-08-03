@@ -566,6 +566,12 @@ class StreamingVideoSessionConfig(BaseModel):
             "prefill cost grows linearly with accumulated context, and stage-0 "
             "max_model_len is a hard ceiling behind it -- neither of which the talker-side "
             "trigger above ever looks at.\n\n"
+            "Default (None) resolves to 75% of stage-0 max_model_len at session start: "
+            "the single-user default only needs to stay clear of the lifetime wall "
+            "(measured: one user at 45k context shows no latency growth at all), so the "
+            "trigger anchors to the MODEL's context, not to a latency budget. Multi-user "
+            "operators tune it DOWN to their latency budget instead (16 users on high "
+            "motion: 16000 holds p95 near 1.5 s). 0 disables compression entirely.\n\n"
             "Compression is a SHADOW roll: a second engine request is pre-warmed in the "
             "background (system prompt + trimmed transcript, prefill-only) while the live "
             "request keeps serving; the swap at the next turn boundary is a pointer flip, "
@@ -695,6 +701,33 @@ class OmniStreamingVideoHandler:
                 logger.info("[session] config (non-default): %s", non_default)
             except Exception:
                 logger.debug("session config logging failed", exc_info=True)
+
+            # Resolve the compression trigger once per session. None anchors to the
+            # MODEL: 75% of stage-0 max_model_len -- the single-user default only guards
+            # the lifetime wall. The blocking-roll backstop must sit BELOW that wall:
+            # 1.5x a 75% trigger would be PAST max_model_len and never fire, so it is
+            # capped at 92% of the model's context.
+            _mml = 0
+            try:
+                _mc = getattr(self._engine_client, "model_config", None)
+                _mml = int(getattr(_mc, "max_model_len", 0) or 0)
+            except Exception:
+                _mml = 0
+            if config.context_compression_trigger_tokens is None:
+                compression_trigger = int(0.75 * _mml) if _mml else 0
+            else:
+                compression_trigger = max(0, config.context_compression_trigger_tokens)
+            compression_hard = 0
+            if compression_trigger:
+                compression_hard = int(1.5 * compression_trigger)
+                if _mml:
+                    compression_hard = min(compression_hard, int(0.92 * _mml))
+                logger.info(
+                    "[session] context compression armed: trigger=%d hard_roll=%d "
+                    "(max_model_len=%d, explicit=%s)",
+                    compression_trigger, compression_hard, _mml,
+                    config.context_compression_trigger_tokens is not None,
+                )
 
             frame_buffer: list[str] = []  # base64-encoded JPEG frames
             frame_metadata: list[dict[str, Any]] = []
@@ -1427,8 +1460,7 @@ class OmniStreamingVideoHandler:
             def _warmup_due() -> bool:
                 """Should a shadow start warming? Thresholds sit BELOW the walls so the
                 shadow is normally ready before any wall forces a blocking roll."""
-                trig = config.context_compression_trigger_tokens
-                if trig and sess.get("cum_tokens", 0) >= trig:
+                if compression_trigger and sess.get("cum_tokens", 0) >= compression_trigger:
                     return True
                 roll_at = config.session_roll_at_talker_tokens
                 return bool(roll_at and sess.get("talker_tokens", 0) >= 0.85 * roll_at)
@@ -1436,13 +1468,13 @@ class OmniStreamingVideoHandler:
             def _must_roll_now() -> bool:
                 """A wall that cannot wait for a shadow. The talker trigger keeps its
                 original blocking semantics -- its wall does not fail cleanly -- and the
-                context trigger gets a hard fallback at 1.5x in case shadows keep
-                failing."""
+                context side gets a hard fallback (1.5x trigger, capped below
+                max_model_len) in case shadows keep failing."""
                 roll_at = config.session_roll_at_talker_tokens
                 if roll_at and sess.get("talker_tokens", 0) >= roll_at:
                     return True
-                trig = config.context_compression_trigger_tokens
-                return bool(trig and sess.get("cum_tokens", 0) >= 1.5 * trig)
+                return bool(compression_hard
+                            and sess.get("cum_tokens", 0) >= compression_hard)
 
             def _shadow_allowed() -> bool:
                 if sess.get("shadow") is not None or sess["fatal"]:
