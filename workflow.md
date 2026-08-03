@@ -648,27 +648,50 @@ frames becomes unanswerable.
 | Thinker's (mostly pictures) | 49,152 (= 75% of the 65,536 model limit) | 60,293 (= 92% of the limit, so 65,536 is never reached) |
 | Talker's (mostly speech) | 38,250 (= 85% of 45,000) | 45,000 (hitting this wall kills the engine — no gambling, swap immediately) |
 
-The default is set for "one user must not hit the ceiling" — measured, a single user
-at 45k context shows no latency growth at all (~400 ms flat across 30 turns), so a
-single user only needs ceiling protection. With many users the thinker's preparation
-line should be tuned DOWN: sixteen users ran with 16,000, because under load a thicker
-history makes every turn slower, and the line's height is the latency ceiling.
+The line is **the same for one user and for many — 75% of the model limit, uniformly**
+(Xiao's call): compression has exactly one job, lifetime — the conversation must never
+hit 65,536. The latency that a thick history causes under load is a different problem
+that belongs to scheduling; compression does not moonlight as a latency knob. The
+uniform policy carries one hard capacity rule: **concurrent sessions ≤ KV pool ÷
+trigger line** (this card: 732k ÷ 49,152 ≈ 14; take 13 for margin) — beyond it the
+pool runs dry BEFORE the trigger, see the measured sixteen-user death below.
 
-**What it measures like.** Single user (line forced very low, two swaps in ten turns):
-the swap turns took 407/416 ms against an ordinary-turn median of 386 ms —
-indistinguishable. Sixteen users × high motion × 40 turns (line = 16,000):
+**What it measures like (three scales, one 75% line).**
 
-| Metric | No compression (section 14 baseline, 30 turns) | Compression (40 turns) |
-|---|---|---|
-| Per-turn median over time | 993 → 4,363 ms, climbs and never returns | **949 → 719 ms, flat through turn 40** |
-| Overall p50 / p95 / p99 | 1,378 / 4,477 / 5,368 | **871 / 1,320 / 1,860** |
-| Turns over 2 s | 38.4% | **1.0%** |
-| Completion | — | 640/640, zero timeouts |
-| Swaps | — | 56; swap turns 862/1,282 (p50/p95) vs ordinary 879/1,350 — **lost in the crowd** |
+**One user × 48 turns:** p50 371 / p95 409 ms, a straight line throughout. At turn 34
+the context reached 49,217 and triggered automatically; turn 35 swapped invisibly
+(409 ms against neighbors at 373/365). **From turn 44 on, the session lived past its
+old grave** — without compression the accumulated input would have hit 65,536 around
+turn 43; this is the first session ever to outlive that point. Memory across the swap
+was probed separately (a smoke run with the line forced to 2,500 and two swaps):
+recall questions like "what is my name" went 3/3.
 
-The remaining two >5 s outliers are slow in text AND speech together — the ordinary
-sixteen-user contention tail, present in the baseline too, unrelated to compression.
-That is the disease the next knife (priority scheduling for urgent work) treats.
+**Thirteen users × 48 turns (inside the capacity boundary, 13 × 49,152 = 87% of the
+pool):** 624/624, zero timeouts, 13 swaps all invisible, 0 fallbacks. The curve is a
+textbook sawtooth:
+
+| Turn | per-turn p50 (ms) |
+|---|---|
+| 10 | 821 |
+| 26 (sawtooth peak) | 2,689 |
+| 30 (after the swaps) | **815** |
+| 38–48 | 900–970, flat |
+
+The 2.7 s peak is the price of the 75% policy at thirteen users — compression manages
+lifetime, not this; flattening that peak is the scheduler's knife (priority for urgent
+work), a separate one.
+
+**Sixteen users × 48 turns (outside the boundary, 16 × 49,152 = 107% of the pool):**
+**everyone died, one step short of the trigger.** At ~45k per user (98% of the pool in
+aggregate) the KV pool ran dry; every session stuck in a wait for memory blocks that
+never came, turn signals lost, each user written off after three timeouts; zero swaps
+all run — nobody lived to 49,152. The self-checks from section 7 dumped the whole
+anatomy in real time. This death is the measured proof of the capacity rule above.
+
+*(Side note: the mechanism itself CAN moonlight as a latency knob — sixteen users with
+the line hand-tuned to 16,000 once measured p95 1,320 ms, flat across 40 turns, zero
+deaths. Current policy does not use it that way; recorded here only to mark the
+mechanism's envelope.)*
 
 **Three traps.**
 
@@ -693,8 +716,8 @@ That is the disease the next knife (priority scheduling for urgent work) treats.
 preparation line, default auto at 75% of the model limit, 0 disables ·
 `context_compression_target_tokens` = how much text rides across a swap, default 4096 ·
 `context_compression_warmup_timeout_s` = how long preparation may take, default 30 s;
-on timeout the old blocking swap is the fallback. One hard deployment rule:
-`max_num_seqs ≥ sessions + shadow margin`.
+on timeout the old blocking swap is the fallback. Two hard deployment rules:
+`max_num_seqs ≥ sessions + shadow margin`, and concurrent sessions ≤ KV pool ÷ trigger line.
 
 ---
 
