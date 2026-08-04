@@ -131,6 +131,25 @@ class StageReplicaResources:
     coordinator: Any | None = None
     addresses: EngineZmqAddresses | None = None
     lock_fds: list[int] = field(default_factory=list)
+    # When this replica HOSTS a colocated sibling stage (speech-pair merge:
+    # stage 2 rides inside stage 1's process so their kernels share one CUDA
+    # context), the sibling's ZMQ addresses land here. The sibling's client
+    # attaches to these; there is no separate process to manage.
+    sibling_addresses: EngineZmqAddresses | None = None
+
+
+@dataclass(frozen=True)
+class SiblingStageLaunch:
+    """Everything needed to build a second engine core inside a host stage's
+    process. Mirrors the spawn kwargs a stage process would normally receive;
+    assembled by the host stage's launch and carried through the process
+    manager into ``run_stage_core``."""
+
+    vllm_config: VllmConfig
+    executor_class: type[Executor]
+    stage_id: int
+    replica_id: int
+    log_stats: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -1067,6 +1086,7 @@ def launch_stage_replica(
     omni_coordinator_address: str | None = None,
     stage_visible_devices: str | None = None,
     spawn_device_lock: threading.Lock | None = None,
+    sibling: SiblingStageLaunch | None = None,
 ) -> Iterator[StageReplicaResources]:
     """Launch a local LLM stage replica.
 
@@ -1075,7 +1095,17 @@ def launch_stage_replica(
     registration/address ownership stays centralized in ``OmniMasterServer``.
     Colocated launches use an IPC handshake without master registration but
     keep the same returned resource bundle.
+
+    ``sibling`` (colocated mode only): a second stage whose engine core is
+    built INSIDE this replica's process instead of its own, so the two stages
+    share one CUDA context and their kernels can overlap. This function then
+    allocates the sibling's ZMQ addresses, binds its handshake ROUTER before
+    the spawn (the sibling's HELLO arrives only after the host's model has
+    loaded -- the ROUTER queues it), and performs BOTH startup handshakes
+    sequentially on context exit.
     """
+    if sibling is not None and omni_master_server is not None:
+        raise ValueError("sibling colocation is only supported in colocated (non-master) mode")
     if omni_master_server is not None:
         with _launch_omni_core_engines(
             vllm_config=vllm_config,
@@ -1104,6 +1134,26 @@ def launch_stage_replica(
     addresses = get_engine_zmq_addresses(vllm_config)
     handshake_address = get_open_zmq_ipc_path()
     engines_to_handshake = [CoreEngine(index=0, local=True)]
+
+    sibling_addresses: EngineZmqAddresses | None = None
+    sibling_handshake_address: str | None = None
+    sibling_kwargs: dict[str, Any] | None = None
+    if sibling is not None:
+        sibling_addresses = get_engine_zmq_addresses(sibling.vllm_config)
+        sibling_handshake_address = get_open_zmq_ipc_path()
+        # Mirrors the spawn kwargs of a standalone stage process; consumed by
+        # run_stage_core to build the second engine core after the host's.
+        sibling_kwargs = {
+            "vllm_config": sibling.vllm_config,
+            "local_client": True,
+            "handshake_address": sibling_handshake_address,
+            "executor_class": sibling.executor_class,
+            "log_stats": sibling.log_stats,
+            "omni_stage_id": int(sibling.stage_id),
+            "omni_replica_id": int(sibling.replica_id),
+            "dp_rank": 0,
+        }
+
     with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock):
         engine_manager = StageEngineCoreProcManager(
             local_engine_count=1,
@@ -1117,12 +1167,22 @@ def launch_stage_replica(
             omni_stage_id=stage_id,
             omni_coordinator_address=omni_coordinator_address,
             omni_replica_base_id=replica_id,
+            sibling_kwargs=sibling_kwargs,
         )
 
-    with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
+    with contextlib.ExitStack() as stack:
+        handshake_socket = stack.enter_context(zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True))
+        sibling_socket = None
+        if sibling_handshake_address is not None:
+            # Bind BEFORE yielding: the sibling's HELLO arrives minutes later
+            # (after the host model loads) and the ROUTER queues it meanwhile.
+            sibling_socket = stack.enter_context(
+                zmq_socket_ctx(sibling_handshake_address, zmq.ROUTER, bind=True)
+            )
         yield StageReplicaResources(
             manager=engine_manager,
             addresses=addresses,
+            sibling_addresses=sibling_addresses,
         )
         wait_for_engine_startup(
             handshake_socket,
@@ -1134,6 +1194,24 @@ def launch_stage_replica(
             engine_manager,
             None,  # coordinator_proc
         )
+        if sibling is not None:
+            assert sibling_socket is not None and sibling_addresses is not None
+            logger.info(
+                "[colocate] host stage %s ready; waiting for sibling stage %s handshake",
+                stage_id, sibling.stage_id,
+            )
+            wait_for_engine_startup(
+                sibling_socket,
+                sibling_addresses,
+                [CoreEngine(index=0, local=True)],
+                sibling.vllm_config.parallel_config,
+                False,  # coordinated_dp
+                sibling.vllm_config.cache_config,
+                engine_manager,
+                None,  # coordinator_proc
+            )
+            logger.info("[colocate] sibling stage %s ready in host stage %s process",
+                        sibling.stage_id, stage_id)
 
 
 def launch_headless_llm_replica(

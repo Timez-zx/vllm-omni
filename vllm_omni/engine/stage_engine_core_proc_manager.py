@@ -75,6 +75,7 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
         omni_replica_base_id: int = 0,
         client_handshake_address: str | None = None,
         tensor_queue: Queue | None = None,
+        sibling_kwargs: dict[str, object] | None = None,
     ) -> None:
         # NOTE: we intentionally do not call ``super().__init__`` — the
         # parent's body hardcodes the wrong target. We re-implement it here
@@ -96,6 +97,16 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
 
         if client_handshake_address:
             common_kwargs["client_handshake_address"] = client_handshake_address
+
+        if sibling_kwargs is not None:
+            # Colocated sibling stage: its engine core is built inside this
+            # (single) process after the primary's. Only meaningful for a
+            # one-process replica -- a DP mesh hosting a sibling is undefined.
+            if local_engine_count != 1:
+                raise ValueError(
+                    f"sibling_kwargs requires local_engine_count == 1, got {local_engine_count}"
+                )
+            common_kwargs["sibling_stage_kwargs"] = sibling_kwargs
 
         # Intra-replica vLLM DP mesh (i.e. ``data_parallel_size`` ranks sharing
         # one engine, one DPCoordinator, one set of weights). Distinct from

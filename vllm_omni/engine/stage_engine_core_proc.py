@@ -89,6 +89,13 @@ class StageEngineCoreProc(EngineCoreProc):
         signal_callback: SignalCallback | None = None
         maybe_register_config_serialize_by_value()
 
+        # Colocated sibling stage (speech-pair merge): a second engine core
+        # built in THIS process after the primary's, so both stages share one
+        # CUDA context and their kernels can overlap instead of time-slicing.
+        # Popped before the primary's construction -- it is not an
+        # EngineCoreProc argument.
+        sibling_stage_kwargs: dict[str, Any] | None = kwargs.pop("sibling_stage_kwargs", None)
+
         # Register vllm-omni reasoning parsers (e.g. step_audio) in this
         # subprocess so they are available when the engine core resolves
         # ``--reasoning-parser``.  The main process already registered them
@@ -167,6 +174,59 @@ class StageEngineCoreProc(EngineCoreProc):
                     queue_length_getter=scheduler.get_num_unfinished_requests,
                 )
 
+            sibling_core: StageEngineCoreProc | None = None
+            sibling_thread = None
+            if sibling_stage_kwargs is not None:
+                import threading as _threading
+
+                sib = dict(sibling_stage_kwargs)
+                sib_stage_id = sib.pop("omni_stage_id", None)
+                sib_replica_id = sib.pop("omni_replica_id", 0)
+                sib_dp_rank = sib.pop("dp_rank", 0)
+                # Sequential construction on THIS thread, after the primary:
+                # vllm's env cache froze at the primary's init, and the two
+                # engines' CUDA graph captures must not interleave.
+                maybe_apply_audex_cfg_patches(sib.get("vllm_config"))
+                logger.info(
+                    "[colocate] building sibling stage %s core inside stage %s process",
+                    sib_stage_id, omni_stage_id,
+                )
+                sibling_core = StageEngineCoreProc(
+                    engine_index=sib_dp_rank,
+                    **sib,
+                )
+                logger.info(
+                    "[colocate] sibling stage %s core built (replica %s); starting its busy loop thread",
+                    sib_stage_id, sib_replica_id,
+                )
+
+                def _sibling_loop() -> None:
+                    # Presence-over-absence: this function's EXIT is the death
+                    # signal. A silent return would leave the client waiting
+                    # forever, so both paths log at ERROR/WARNING and notify.
+                    try:
+                        sibling_core.run_busy_loop()
+                        logger.warning(
+                            "[colocate] sibling stage %s busy loop RETURNED (clean shutdown)",
+                            sib_stage_id,
+                        )
+                    except SystemExit:
+                        logger.warning("[colocate] sibling stage %s busy loop exited via SystemExit", sib_stage_id)
+                    except Exception:
+                        logger.exception(
+                            "[colocate] sibling stage %s busy loop DIED; notifying its client",
+                            sib_stage_id,
+                        )
+                        with contextlib.suppress(Exception):
+                            sibling_core._send_engine_dead()
+
+                sibling_thread = _threading.Thread(
+                    target=_sibling_loop,
+                    name=f"StageEngineCore_colocated_stage{sib_stage_id}",
+                    daemon=True,
+                )
+                sibling_thread.start()
+
             def wakeup_engine() -> None:
                 engine_core.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
 
@@ -174,6 +234,10 @@ class StageEngineCoreProc(EngineCoreProc):
 
             def signal_handler(signum: int, frame: Any) -> None:
                 engine_core.shutdown_state = EngineShutdownState.REQUESTED
+                if sibling_core is not None:
+                    sibling_core.shutdown_state = EngineShutdownState.REQUESTED
+                    with contextlib.suppress(Exception):
+                        sibling_core.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
                 signal_callback.trigger()
                 raise SystemExit(_signal_exit_code(signum))
 

@@ -36,6 +36,7 @@ from vllm_omni.engine.stage_client import StageClient, StagePoolClient
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
 from vllm_omni.engine.stage_engine_startup import (
     OmniMasterServer,
+    SiblingStageLaunch,
     StageReplicaResources,
     connect_remote_diffusion_proc,
     connect_remote_engine_cores,
@@ -443,6 +444,11 @@ class StageRuntime:
         initialized_clients_by_stage: dict[int, list[StagePoolClient | None]] = {
             plan.stage_idx: [None] * len(plan.replicas) for plan in stage_plans
         }
+        # Colocation (speech-pair merge) needs the GUEST stage's plan while the
+        # HOST stage is launching, and a place to park the guest's addresses
+        # until the guest's own init turn attaches to them.
+        self._plans_by_stage_id = {plan.stage_id: plan for plan in stage_plans}
+        self._colocated_guest_stash: dict[int, StageReplicaResources] = {}
         primary_exc: Exception | None = None
         init_state_lock = threading.Lock()
         self._init_visible_devices_baseline = os.environ.get(current_omni_platform.device_control_env_var)
@@ -535,12 +541,30 @@ class StageRuntime:
         """Initialize a remote replica. Only distributed runtime implements this."""
         raise NotImplementedError("Remote replicas require DistStageRuntime")
 
+    @staticmethod
+    def _colocation_map() -> dict[int, int]:
+        """Parse VLLM_OMNI_COLOCATE_STAGES ("guest:host[,guest:host]") into
+        {guest_stage_id: host_stage_id}. Empty/absent = feature off (default
+        behavior byte-identical to before). Chosen as an env var so old deploy
+        yamls stay valid everywhere."""
+        raw = os.environ.get("VLLM_OMNI_COLOCATE_STAGES", "").strip()
+        if not raw:
+            return {}
+        out: dict[int, int] = {}
+        for pair in raw.split(","):
+            guest_s, _, host_s = pair.partition(":")
+            out[int(guest_s)] = int(host_s)
+        return out
+
     def _initialize_local_llm_replica(
         self,
         plan: ReplicaInitPlan,
         stage_init_timeout: int,
     ) -> StageEngineCoreClientBase:
         """Initialize one local LLM replica using vLLM's launch/attach pattern."""
+        coloc = self._colocation_map()
+        if plan.metadata.stage_id in coloc:
+            return self._attach_colocated_guest(plan)
         resources: StageReplicaResources | None = None
         stage_client = None
         lock_fds: list[int] = []
@@ -569,6 +593,35 @@ class StageRuntime:
                     plan.engine_args_dict,
                     stage_init_timeout,
                 )
+            # Colocated sibling (speech-pair merge): if a guest stage rides in
+            # this stage's process, hand its launch bundle to our spawn. The
+            # guest's own init turn (later in the same sequential group) then
+            # attaches to the stashed addresses instead of spawning.
+            sibling = None
+            guest_ids = [g for g, h in self._colocation_map().items() if h == plan.metadata.stage_id]
+            if guest_ids and plan.replica_id == 0:
+                if len(guest_ids) > 1:
+                    raise ValueError(f"stage {plan.metadata.stage_id} hosts more than one guest: {guest_ids}")
+                guest_plan_group = self._plans_by_stage_id.get(guest_ids[0])
+                if guest_plan_group is None:
+                    raise ValueError(f"colocated guest stage {guest_ids[0]} not found in deploy config")
+                if len(guest_plan_group.replicas) != 1:
+                    raise ValueError("colocated guest stages support exactly one replica")
+                guest_replica = guest_plan_group.replicas[0]
+                if guest_replica.stage_vllm_config is None or guest_replica.executor_class is None:
+                    raise ValueError(f"colocated guest stage {guest_ids[0]} is not a local LLM stage")
+                sibling = SiblingStageLaunch(
+                    vllm_config=guest_replica.stage_vllm_config,
+                    executor_class=guest_replica.executor_class,
+                    stage_id=guest_ids[0],
+                    replica_id=guest_replica.replica_id,
+                    log_stats=False,
+                )
+                logger.info(
+                    "[colocate] stage %s will host stage %s in its process",
+                    plan.metadata.stage_id, guest_ids[0],
+                )
+
             # Serialize engine-core spawning across all LLM replicas to avoid
             # ZMQ port-allocation races and simultaneous CUDA context init.
             with self._replica_launch_lock:
@@ -583,8 +636,15 @@ class StageRuntime:
                     omni_coordinator_address=self._get_coordinator_address(),
                     stage_visible_devices=physical_devices,
                     spawn_device_lock=self._spawn_device_lock,
+                    sibling=sibling,
                 ) as resources:
                     pass
+
+            if sibling is not None and resources is not None:
+                self._colocated_guest_stash[sibling.stage_id] = StageReplicaResources(
+                    manager=resources.manager,
+                    addresses=resources.sibling_addresses,
+                )
 
             logger.info("[StageRuntime] Stage %s engine startup completed", plan.metadata.stage_id)
             if resources is None:
@@ -621,6 +681,36 @@ class StageRuntime:
         finally:
             if lock_fds:
                 release_device_locks(lock_fds)
+
+    def _attach_colocated_guest(self, plan: ReplicaInitPlan) -> StageEngineCoreClientBase:
+        """Attach a client to a guest stage whose engine core lives inside its
+        host stage's process. The host's launch (earlier in the same sequential
+        init group) already completed the guest's handshake and stashed its
+        addresses; there is no process to spawn and no device lock to take."""
+        stash = getattr(self, "_colocated_guest_stash", {}).get(plan.metadata.stage_id)
+        if stash is None or stash.addresses is None:
+            raise RuntimeError(
+                f"colocated guest stage {plan.metadata.stage_id} has no stashed resources -- "
+                "its host stage must appear EARLIER in the deploy config and must have "
+                "launched successfully"
+            )
+        if plan.stage_vllm_config is None or plan.executor_class is None:
+            raise RuntimeError(f"colocated guest stage {plan.metadata.stage_id} is missing vllm_config")
+        stage_client = StageEngineCoreClientBase.make_async_mp_client(
+            vllm_config=plan.stage_vllm_config,
+            executor_class=plan.executor_class,
+            metadata=plan.metadata,
+            client_addresses=self._client_addresses_from_zmq(stash.addresses),
+            # The host's manager owns the (shared) process; a hung guest THREAD
+            # is invisible at this granularity -- the in-process death log in
+            # run_stage_core's _sibling_loop is the guest's liveness probe.
+            engine_manager=stash.manager,
+            coordinator=None,
+        )
+        logger.info(
+            "[StageRuntime] Stage %s attached as colocated guest", plan.metadata.stage_id
+        )
+        return stage_client
 
     def _get_coordinator_address(self) -> str | None:
         """Return coordinator router address. Overridden by DistStageRuntime."""
