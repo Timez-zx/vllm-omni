@@ -67,6 +67,16 @@ connectors:
       initial_codec_chunk_frames: 4
       codec_chunk_frames: 4
       codec_left_context_frames: 25
+  # Speech pair (stages 1+2 colocated in one process): the s1->s2 edge is a
+  # process-global take-once dict passing tensor REFERENCES -- no msgpack, no
+  # /dev/shm, no GIL-held copy work. Cross-process edges (s0->s1) delegate to
+  # SharedMemoryConnector inside the same connector, routed per edge.
+  connector_coloc_speech:
+    name: ColocInProcConnector
+    extra:
+      initial_codec_chunk_frames: 4
+      codec_chunk_frames: 4
+      codec_left_context_frames: 25
 
 stages:
   - stage_id: 0                      # thinker: vision + audio encoders + LLM
@@ -92,7 +102,7 @@ stages:
     enforce_eager: false           # EXPERIMENT: CUDA graphs for the talker
     devices: "0"
     input_connectors:
-      from_stage_0: connector_of_shared_memory
+      from_stage_0: connector_coloc_speech
     default_sampling_params:
       temperature: 0.9
       top_k: 50
@@ -115,7 +125,7 @@ stages:
     async_scheduling: false
     devices: "0"
     input_connectors:
-      from_stage_1: connector_of_shared_memory
+      from_stage_1: connector_coloc_speech
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0

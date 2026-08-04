@@ -152,11 +152,25 @@ class StageEngineCoreProc(EngineCoreProc):
                 # thread-local BEFORE either core runs a forward.
                 make_forward_context_thread_local()
 
-            engine_core = StageEngineCoreProc(
-                *args,
-                engine_index=dp_rank,
-                **kwargs,
-            )
+            # With a colocated sibling, the HOST must leave the legacy default
+            # stream too: the default stream synchronizes with every other
+            # stream, so host kernels left on it would serialize against the
+            # sibling's private stream and no overlap could ever happen.
+            host_stream = None
+            if sibling_stage_kwargs is not None:
+                import torch as _torch_host
+
+                host_stream = _torch_host.cuda.Stream()
+                _host_stream_ctx: Any = _torch_host.cuda.stream(host_stream)
+            else:
+                _host_stream_ctx = contextlib.nullcontext()
+
+            with _host_stream_ctx:
+                engine_core = StageEngineCoreProc(
+                    *args,
+                    engine_index=dp_rank,
+                    **kwargs,
+                )
 
             # Each subprocess corresponds to exactly one omni replica with
             # its own OmniMasterServer allocation, so the heartbeat client
@@ -183,8 +197,11 @@ class StageEngineCoreProc(EngineCoreProc):
 
             sibling_core: StageEngineCoreProc | None = None
             sibling_thread = None
+            sibling_stream = None
             if sibling_stage_kwargs is not None:
                 import threading as _threading
+
+                import torch as _torch
 
                 sib = dict(sibling_stage_kwargs)
                 sib_stage_id = sib.pop("omni_stage_id", None)
@@ -198,10 +215,16 @@ class StageEngineCoreProc(EngineCoreProc):
                     "[colocate] building sibling stage %s core inside stage %s process",
                     sib_stage_id, omni_stage_id,
                 )
-                sibling_core = StageEngineCoreProc(
-                    engine_index=sib_dp_rank,
-                    **sib,
-                )
+                # The sibling lives on its OWN CUDA stream so its kernels can
+                # overlap the host's instead of queueing behind them on the
+                # default stream. Construction happens inside the stream scope
+                # too: its graph captures then replay on the same stream.
+                sibling_stream = _torch.cuda.Stream()
+                with _torch.cuda.stream(sibling_stream):
+                    sibling_core = StageEngineCoreProc(
+                        engine_index=sib_dp_rank,
+                        **sib,
+                    )
                 logger.info(
                     "[colocate] sibling stage %s core built (replica %s); starting its busy loop thread",
                     sib_stage_id, sib_replica_id,
@@ -212,7 +235,8 @@ class StageEngineCoreProc(EngineCoreProc):
                     # signal. A silent return would leave the client waiting
                     # forever, so both paths log at ERROR/WARNING and notify.
                     try:
-                        sibling_core.run_busy_loop()
+                        with _torch.cuda.stream(sibling_stream):
+                            sibling_core.run_busy_loop()
                         logger.warning(
                             "[colocate] sibling stage %s busy loop RETURNED (clean shutdown)",
                             sib_stage_id,
@@ -251,7 +275,13 @@ class StageEngineCoreProc(EngineCoreProc):
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
 
-            engine_core.run_busy_loop()
+            if host_stream is not None:
+                import torch as _torch_host_loop
+
+                with _torch_host_loop.cuda.stream(host_stream):
+                    engine_core.run_busy_loop()
+            else:
+                engine_core.run_busy_loop()
 
         except SystemExit:
             logger.debug("StageEngineCoreProc exiting.")

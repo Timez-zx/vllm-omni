@@ -129,6 +129,15 @@ def _create_mori_transfer_engine_connector(config: dict[str, Any]) -> OmniConnec
 OmniConnectorFactory.register_connector("MooncakeStoreConnector", _create_mooncake_store_connector)
 OmniConnectorFactory.register_connector("MooncakeTransferEngineConnector", _create_mooncake_transfer_engine_connector)
 OmniConnectorFactory.register_connector("SharedMemoryConnector", _create_shm_connector)
+
+
+def _create_coloc_inproc_connector(config: dict[str, Any]) -> OmniConnectorBase:
+    from .connectors.coloc_inproc_connector import ColocInProcConnector
+
+    return ColocInProcConnector(config)
+
+
+OmniConnectorFactory.register_connector("ColocInProcConnector", _create_coloc_inproc_connector)
 OmniConnectorFactory.register_connector("YuanrongConnector", _create_yuanrong_connector)
 OmniConnectorFactory.register_connector("YuanrongTransferEngineConnector", _create_yuanrong_transfer_engine_connector)
 OmniConnectorFactory.register_connector("MoriTransferEngineConnector", _create_mori_transfer_engine_connector)
