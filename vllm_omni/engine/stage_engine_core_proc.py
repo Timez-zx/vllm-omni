@@ -31,6 +31,7 @@ from vllm.v1.engine.utils import (
 from vllm_omni.distributed.omni_coordinator import create_stage_coord_client
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.stage_init_utils import (
+    make_forward_context_thread_local,
     maybe_apply_audex_cfg_patches,
     set_death_signal,
 )
@@ -144,6 +145,12 @@ class StageEngineCoreProc(EngineCoreProc):
             # Audex CFG scheduler patches must land before EngineCore builds
             # its Scheduler; gated on the stage's logits_processors config.
             maybe_apply_audex_cfg_patches(kwargs.get("vllm_config"))
+
+            if sibling_stage_kwargs is not None:
+                # Two engine cores will step concurrently from two threads;
+                # vllm's module-global forward context must become
+                # thread-local BEFORE either core runs a forward.
+                make_forward_context_thread_local()
 
             engine_core = StageEngineCoreProc(
                 *args,

@@ -1241,6 +1241,72 @@ def initialize_diffusion_stage(
     return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
 
 
+def make_forward_context_thread_local() -> None:
+    """Route vllm's active ForwardContext through a threading.local.
+
+    Colocated stages (speech-pair merge) step TWO engine cores from two
+    threads in one process, but vllm stores the in-flight forward context in
+    a module GLOBAL. The two engines' concurrent forwards overwrite each
+    other's context mid-step -- measured on the first 32-user cell: the
+    talker's MoE layer looked itself up in code2wav's ``no_compile_layers``
+    and died with ``KeyError: 'talker...experts'``, and the secondary
+    cleanup then killed the sibling thread on destroyed parallel groups.
+
+    The accessor FUNCTIONS are imported by value all over vllm, so
+    rebinding module attributes would miss every existing reference.
+    Instead the fix transplants ``__code__`` onto the existing function
+    objects (same objects everywhere), switching their storage to a
+    threading.local injected into the module's dict. Semantics for a
+    single-threaded process are unchanged, and the patch is only applied
+    in colocated mode.
+
+    Known non-covered writer: ``vllm/v1/worker/ubatching.py`` pokes the raw
+    global directly, but micro-batch overlap is inactive in this deployment
+    (single GPU, DP=1); if ubatching is ever enabled together with
+    colocation, that path needs the same treatment.
+    """
+    import threading
+
+    import vllm.forward_context as fc
+
+    if getattr(fc, "_omni_forward_context_tls", None) is not None:
+        return
+    fc._omni_forward_context_tls = threading.local()
+
+    def get_forward_context():  # noqa: ANN202
+        ctx = getattr(_omni_forward_context_tls, "ctx", None)  # noqa: F821
+        assert ctx is not None, (
+            "Forward context is not set. "
+            "Please use `set_forward_context` to set the forward context."
+        )
+        return ctx
+
+    def is_forward_context_available():  # noqa: ANN202
+        return getattr(_omni_forward_context_tls, "ctx", None) is not None  # noqa: F821
+
+    def override_forward_context(forward_context):  # noqa: ANN001, ANN202
+        prev_context = getattr(_omni_forward_context_tls, "ctx", None)  # noqa: F821
+        _omni_forward_context_tls.ctx = forward_context  # noqa: F821
+        try:
+            yield
+        finally:
+            _omni_forward_context_tls.ctx = prev_context  # noqa: F821
+
+    fc.get_forward_context.__code__ = get_forward_context.__code__
+    fc.is_forward_context_available.__code__ = is_forward_context_available.__code__
+    wrapped = getattr(fc.override_forward_context, "__wrapped__", None)
+    if wrapped is None:
+        raise RuntimeError(
+            "override_forward_context has no __wrapped__ generator; "
+            "vllm's forward_context layout changed -- re-audit before colocating"
+        )
+    wrapped.__code__ = override_forward_context.__code__
+    logger.warning(
+        "[colocate] vllm forward context storage switched to threading.local "
+        "(two engine cores will step concurrently in this process)"
+    )
+
+
 def maybe_apply_audex_cfg_patches(vllm_config: Any) -> None:
     """Install the Audex CFG scheduler patches for CFG-configured engines.
 
