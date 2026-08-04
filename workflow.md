@@ -1251,6 +1251,41 @@ Three sentences:
    42 users served cleanly (p99 1,607, over-2 s 0%), 22 refused at the door,
    zero preemptions, zero wedges. **The crash became a capacity boundary.**
 
+### Pushing to 128: the wall is at ~90 users, and it is still the timeline
+
+Guard off, 128 slots, audio-only ladder 80 → 96 → 112 → 128 (48 turns each):
+
+| users | p50 | rtf margin p50 / p10 | starvation p95 | timeouts/preempts/wedges |
+|---|---|---|---|---|
+| 80 | 756 | 1.45 / 1.16 | 353 | 1 / 0 / 1 |
+| 96 | 909 | 1.17 / **0.88** | 747 | 0 / 0 / 0 |
+| 112 | 1,130 | **0.91** / 0.76 | 1,175 | 0 / 0 / 0 |
+| 128 | 1,342 | 0.75 / 0.63 | **1,805 (max 8.6 s)** | 0 / 0 / 0 |
+
+Resource fingerprint at the break (96–128 users): sm% pinned at 95–98, SMACT
+only 0.54–0.59, DRAMA 0.39–0.43, power 276–294 of 600 W.
+
+Three conclusions:
+
+1. **It breaks by running out of breath mid-sentence, not by answering late.**
+   TTFA's p99 is still 1.7 s at 128 users; what blows up is rtf — at ~90 users
+   generation falls below playback speed and utterances stall for 1–2 s in the
+   middle. The prebuffer protects the first sound, not the rest of it.
+2. **What pins it is still the timeline, not the silicon.** With the time axis
+   95% occupied, compute sits 40% idle, bandwidth 60% idle, power at half —
+   the same disease as before the CUDA graphs, with the wall moved from
+   ~50–70 users to ~90. The remaining organisation overheads, by name:
+   code2wav still eager (the talker's old ailment), stage-1 async_scheduling
+   still off, three stages handing the card back and forth.
+3. **Both memory pools spectated** (zero preemptions, wedges, timeouts; the
+   thinker pool at 128 × ~5k ≈ its ceiling never bit) — 128 users degrade
+   smoothly into breathlessness rather than crashing, which is exactly the
+   failure shape one wants.
+
+The final audio-only account (this card, this config): **~48 users with
+headroom, ~80 usable, ~90 starts gasping, 128 everyone gasps — and not one
+crash on the way.**
+
 ---
 
 ## Where things stand
