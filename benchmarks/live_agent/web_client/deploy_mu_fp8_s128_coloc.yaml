@@ -114,11 +114,13 @@ stages:
     max_num_batched_tokens: 65536
     max_num_seqs: 128
     gpu_memory_utilization: 0.08
-    enforce_eager: false          # colocated mode: the vocoder's own CUDA-graph
-                                  # wrapper collapses hundreds of GIL-held eager
-                                  # launches per chunk into one -- the launches were
-                                  # fighting the talker loop for the GIL once both
-                                  # engines shared a process (rtf 0.75 -> 0.54 at 128u)
+    enforce_eager: true           # vocoder CUDA graphs REVERTED: the graph wrapper
+                                  # mishandles heterogeneous VIDEO co-batches
+                                  # (split_with_sizes [1,1,16] != 24 rows: 1-frame
+                                  # boundary chunks co-batched with full ones) and
+                                  # crashes WITH OR WITHOUT colocation. Audio chunks
+                                  # are uniform and ran clean for hours; re-enable only
+                                  # for audio-only deployments until the wrapper is fixed
     trust_remote_code: true
     enable_prefix_caching: false
     enable_chunked_prefill: false
