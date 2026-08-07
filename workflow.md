@@ -1288,6 +1288,119 @@ crash on the way.**
 
 ---
 
+## 19. The second stack learned to talk — full-duplex serving on the same engine
+
+*2026-08-07, overnight run. Commit 205c94be (the fix) plus the load generator and
+analyzer under `benchmarks/live_agent/duplex/`.*
+
+Everything before this section serves a turn-based contract: the user speaks, a
+turn ends, the model answers. The industry's consumer frontier flipped this year
+to the other contract — full duplex, where audio (and camera frames) stream in
+continuously, and the **model** decides each second whether to talk. This
+repository ships an experimental implementation of that contract for
+MiniCPM-o 4.5 (upstream PR #3907, merged 2026-07-23, validated on H20 + vLLM
+0.25). Tonight it was stood up on our card for the first time, and the goal was
+the five-phase ladder: bring it up, validate video, scale sessions, characterize
+capacity, and bound the KV.
+
+### It would not speak, and the reason was worth the night
+
+The stack booted cleanly and then listened. Forever. Every input — including the
+upstream fixture literally named `response_required` — produced LISTEN decisions
+and nothing else.
+
+Three suspects were eliminated in order. The model's hearing: the same server's
+turn-based chat endpoint transcribed the same audio perfectly, so the ears work.
+The decision sampling: the stock config decides greedily (temperature 0, fixed
+seed), and flipping to the official demo's sampled decisions (0.7 / top-k 20)
+changed nothing — three runs, zero speaks. That refuted the tempting theory that
+greedy argmax sits on a numerical knife edge between our card and H20.
+
+Instrumentation found the real fault two layers down. Each 1-second unit of
+audio rides into the engine inside a per-append metadata buffer on a resumable
+request. **vLLM 0.26's extend-path session update grows the request's prompt but
+never carries the new append's buffer onto it.** The engine replayed the FIRST
+append's audio for every unit — seq stayed 1 forever, the prompt grew with pad
+embeddings, and the model listened at silence because silence is what it heard.
+Upstream validated on 0.25, where the buffer still arrived; 0.26 broke the
+contract silently. The fix is one block in `omni_ar_scheduler.py`: copy the
+update's buffer onto the session after the extend.
+
+Two self-inflicted detours are recorded so they are not repeated. `--first-turn-
+ms 0` does not mean "send the whole file"; it means a zero-length first turn,
+and the model was once asked to judge 16 samples — one millisecond — of speech.
+And both attribution schemes we trust on the turn-based stack lose here:
+windowed attribution mislabels late answers, and order-matching assumes
+responses are 1:1 with commits, which full duplex explicitly is not (the model
+may stay silent, or speak twice, or speak before the commit — a negative
+latency in our table was the model interrupting us). **The metric that works is
+server-side: the per-session unit-service cadence.**
+
+After the fix, three sessions out of three: the input asks the model to repeat a
+sentence, and the model repeats it verbatim, first audio 322–372 ms after
+commit. The engine-side TTFT is 81 ms.
+
+### The video path's first witness
+
+Upstream merged camera-frame admission but explicitly declined to claim it
+("video input: not claimed"). With one JPEG per second attached: every unit
+admits at exactly **79 tokens = 13 (audio unit) + 66 (one frame)** — the
+official model contract to the token — and the model speaks while watching.
+As far as we know this is the first end-to-end validation of that path.
+
+### Capacity: the ceiling is not where the config says, and not where compute says
+
+The stock profile allows 2 sessions. We raised it to 8 and ran the ladder with
+the new load generator (N users × question/silence cycles at true realtime
+pacing, one frame per second in the video arm):
+
+| arm | sessions | unit cadence p50/p95 | GPU util | admission |
+|---|---|---|---|---|
+| audio | 1→8 | 1.0 s / 1.0 s | 9.1% avg, 100 W | all admitted |
+| audio | 9 | — | — | **exactly 8 admitted, 9th refused** |
+| video (1 fps) | 1→8 | 1.0 s / 1.0 s | 12.7% avg, 111 W | all admitted |
+
+The engine never fell behind the 1 Hz clock — 2–3.6% of intervals exceeded
+1.5 s across the whole night, none catastrophically. Eight full-duplex video
+sessions cost an eighth of the GPU. The duty-cycle account we derived on the
+Qwen stack is here in the flesh: a duplex user costs roughly **1% of this GPU
+for audio, 1.5% with 1-fps video** at this profile, so the compute ceiling
+extrapolates to dozens of users — but nobody reaches it, because two other
+walls come first: the admission config, and the context.
+
+### The context wall, and the roll carried over
+
+Stage 0 caps at 40,960 tokens (the model's trained limit; the config asked for
+more and was refused). At 13 tokens/s an audio session dies in ~52 minutes; at
+79 tokens/s a video session dies in **~8.6 minutes**. This is the same wall
+sections 9–12 fought on the turn-based stack, and the same answer ports: retire
+the request, reseed with recent text, start fresh.
+
+Tonight's version is session-level: after N cycles the load generator closes
+the session and reopens it with the transcript tail as the system-prompt seed.
+Measured: **the roll gap is 1.36 s**, the reopened session's first admit is 119
+tokens (70 base + ~49 of seed — the old context is gone, the memory rides in),
+and all post-roll turns answer normally. The engine-level version — rebirth of
+the resumable request inside a live session, invisible to the client — is the
+refinement; the machinery to build it on (incarnation fences, per-incarnation
+stage state) is identified but not yet written.
+
+### What is still open
+
+- Per-response latency under load needs server-side turn IDs surfaced to the
+  client; both client-side attribution schemes are structurally wrong for
+  duplex.
+- The barge-in knob exists in the load generator and is untested.
+- Greedy vs sampled decisions on a healthy audio path: never A/B'd (the yaml
+  variant with sampled decisions is what ran tonight).
+- The official OpenBMB demo (one session per GPU, PyTorch) is deployed on this
+  machine and stopped; the same-card duplex-vs-duplex comparison is one restore
+  script away.
+- The 29 s outlier in the cadence table appeared once, between runs, and is
+  unexplained.
+
+---
+
 ## Where things stand
 
 **Working**
