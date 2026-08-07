@@ -1,0 +1,47 @@
+# MiniCPM-o 4.5 native duplex with SAMPLED listen/speak decisions.
+#
+# The stock duplex overlay inherits stage-0 greedy sampling (temperature 0.0,
+# seed 42) from minicpmo_4_5.yaml. The listen/speak decision is ordinary
+# next-token prediction at each unit boundary, and greedy argmax sits on a
+# numerical knife edge: validated SPEAK on H20 comes out LISTEN-forever on
+# sm_120. This overlay matches the official OpenBMB demo's duplex decision
+# sampling (temperature 0.7, top_k 20, top_p 0.8, no fixed seed).
+base_config: minicpmo_4_5.yaml
+pipeline: minicpmo_4_5
+session_mode: duplex
+active_stream_window: 1
+duplex_session:
+  idle_ttl_s: 300
+  disconnect_grace_s: 30
+  reaper_interval_s: 5
+  resume_replay_ttl_s: 60
+  resume_replay_max_bytes_per_session: 8388608
+  max_pending_input_bytes_per_session: 16777216
+  max_pending_turns_per_session: 4
+  max_sessions: 2
+  completed_append_cache_size: 256
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 2
+    async_scheduling: false
+    default_sampling_params:
+      temperature: 0.7
+      top_p: 0.8
+      top_k: 20
+      max_tokens: 2048
+      seed: null
+      detokenize: true
+      repetition_penalty: 1.05
+
+  - stage_id: 1
+    max_num_seqs: 2
+    async_scheduling: false
+    default_sampling_params:
+      max_tokens: 2048
+      min_tokens: 0
+      stop_token_ids: [1]
+
+  - stage_id: 2
+    max_num_seqs: 2
+    async_scheduling: false

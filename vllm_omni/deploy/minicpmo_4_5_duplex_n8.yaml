@@ -1,0 +1,46 @@
+# MiniCPM-o 4.5 native duplex scaled to 8 concurrent sessions.
+#
+# P2 capacity overlay: same sampled listen/speak decisions as
+# minicpmo_4_5_duplex_sampled.yaml, with max_sessions and per-stage
+# max_num_seqs raised 2 -> 8. Stage memory fractions stay at the base
+# 0.55/0.15/0.15; KV per duplex session is small (~90 tok/s of context),
+# so admission, not pool, is the first expected wall.
+base_config: minicpmo_4_5.yaml
+pipeline: minicpmo_4_5
+session_mode: duplex
+active_stream_window: 1
+duplex_session:
+  idle_ttl_s: 300
+  disconnect_grace_s: 30
+  reaper_interval_s: 5
+  resume_replay_ttl_s: 60
+  resume_replay_max_bytes_per_session: 8388608
+  max_pending_input_bytes_per_session: 16777216
+  max_pending_turns_per_session: 4
+  max_sessions: 8
+  completed_append_cache_size: 256
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 8
+    async_scheduling: false
+    default_sampling_params:
+      temperature: 0.7
+      top_p: 0.8
+      top_k: 20
+      max_tokens: 2048
+      seed: null
+      detokenize: true
+      repetition_penalty: 1.05
+
+  - stage_id: 1
+    max_num_seqs: 8
+    async_scheduling: false
+    default_sampling_params:
+      max_tokens: 2048
+      min_tokens: 0
+      stop_token_ids: [1]
+
+  - stage_id: 2
+    max_num_seqs: 8
+    async_scheduling: false

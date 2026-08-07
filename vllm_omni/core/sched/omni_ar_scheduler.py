@@ -1108,6 +1108,18 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self._replace_streaming_session(session, update)
             return
         super()._update_request_as_session(session, update)
+        # vLLM 0.26's extend-path _update_request_as_session grows the prompt but
+        # never carries the update's model_intermediate_buffer/additional_information
+        # onto the session. Stage-0 duplex appends ship each second's audio inside
+        # that buffer, so without this copy the runner replays the FIRST append's
+        # payload for every unit (seq stays 1, later audio never reaches the model,
+        # and the listen/speak head correctly listens forever at pad tokens).
+        update_buffer = getattr(update, "model_intermediate_buffer", None)
+        if isinstance(update_buffer, dict) and update_buffer:
+            session.model_intermediate_buffer = update_buffer
+        update_additional = getattr(update, "additional_information", None)
+        if update_additional is not None:
+            session.additional_information = update_additional
         # Apply the update's max_tokens. Upstream carries it on every StreamingUpdate and
         # never applies it -- `Request.max_tokens` keeps the FIRST chunk's value for the
         # whole session. The stop check compares per-segment output counts (upstream
