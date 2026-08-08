@@ -18,7 +18,19 @@ FORK=/home/zx/voice-agent/vllm-omni
 PY=/home/zx/miniconda3/envs/omni-minicpm/bin/vllm-omni
 LOG="${QWEN_LOG:-/data/zx/results/qwen_live.log}"
 PORT=8091
-DEPLOY="${DEPLOY_CONFIG:-$FORK/benchmarks/live_agent/web_client/deploy_web_demo.yaml}"
+# DEFAULT MODE (2026-08-08): two processes -- the speech pair (talker +
+# code2wav) colocated in one process, the thinker in its own. This is the
+# split the evidence picked: the pair's fine-grained per-chunk handoff wants
+# one process (in-proc references, kernel overlap where speech starved), the
+# thinker's heavy Python bookkeeping wants its own GIL. It also set the
+# extreme-load record (128-user rtf 1.13). Override with
+#   VLLM_OMNI_COLOCATE_STAGES=""        # three separate processes
+#   VLLM_OMNI_COLOCATE_STAGES="2:1,0:1" # tri-colocation (research platform)
+# The async deploy config routes both edges through ColocInProcConnector,
+# which delegates to SharedMemory automatically for cross-process edges, so
+# ONE yaml serves every mode.
+export VLLM_OMNI_COLOCATE_STAGES="${VLLM_OMNI_COLOCATE_STAGES-2:1}"
+DEPLOY="${DEPLOY_CONFIG:-$FORK/benchmarks/live_agent/web_client/deploy_mu_fp8_s128_async.yaml}"
 # QWEN_MODEL swaps the checkpoint without touching this file -- used for the
 # FP8 experiment: marksverdhei/Qwen3-Omni-30B-A3B-FP8 is a block-FP8 E4M3
 # quant of the SAME Instruct base (thinker+talker FP8; encoders, code2wav,
