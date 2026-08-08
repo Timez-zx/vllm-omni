@@ -1288,6 +1288,68 @@ crash on the way.**
 
 ---
 
+## 19. Three locked doors, one key each — the video path gets its optimisations back
+
+*2026-08-08, commits `d8ccfd48`, `baf0e711`, `9a6a0908` (plus `eea63d41` from the
+colocation project). Section 18 halved the speech prices with CUDA graphs, and a
+later experiment (async scheduling) bought another +51% — but only audio could
+collect. Three defects kept every one of those wins away from video. Tonight all
+three fell.*
+
+**Door 1: vocoder CUDA graphs crashed on video.** The crash
+(`split_with_sizes expects sum 88, got 81`) looked like the vocoder's batch
+composition mishandling mixed chunk sizes. The real culprit was an accounting
+mismatch two layers up: with graphs on, the runner pads the flat token stream to
+the capture bucket (81 → 88, always to a multiple of 8) while the per-request
+counts stay unpadded. Audio never crashed because uniform 16-token chunks land
+on bucket sizes by luck. Fix: slice the stream to the declared total before
+splitting, and complain loudly if it is ever SHORTER than declared. Verified on
+the exact cell that used to kill the engine: 24 video users, 96/96 turns.
+
+**Door 2: async scheduling killed the talker one second into any browser video
+session.** With async on, the engine schedules step N+1 before step N's finishes
+are known, leaving a −1 placeholder where the previous sampled token will be
+backfilled. Video sessions produce prefill-only appends (frames, no query),
+whose talker segments are boundary-capped: they finish on their FIRST sample, so
+nothing ever backfills the placeholder — and the −1 walks into the codec
+embedding (vocabulary 3,072) and dies with a device-side assert. Audio never
+makes prefill-only segments, which is why the audio ladder stayed green for a
+whole night while one real browser call died in a second. A diagnostic guard
+caught the value red-handed (`values=[-1]`), and clamping at the embedding alone
+was not enough — the MTP code predictor consumes the same ids. Fix: clamp
+negatives once at the runner's input chokepoint (a no-op for text stages), so
+every consumer is covered. Verified with the browser-recipe driver: engine dead
+after turn 1 → 6/6 turns, health 200.
+
+**Door 3: the colocated speech pair ran video glacially** (13 users, fifteen
+minutes, zero turns finished, no errors). Not re-diagnosed — re-TESTED on
+tonight's tree: 52/52 turns, p50 483 ms. Cured by one of the intervening fixes
+(most plausibly door 2's clamp removing the boundary-segment pathology, or the
+MoE-workspace guard); attribution is honestly unknown, the reproduction is
+honestly gone.
+
+**What the unlocked configuration measures** (async + talker graphs + vocoder
+graphs, the first time video runs the full stack):
+
+| cell | best before | tonight | change |
+|---|---|---|---|
+| video 13 users, p50 | 749 ms | **457 ms** | −39% |
+| video 13 users, over 1 s | 31.1% | **11.5%** | tail cut by ⅔ |
+| video 13 users, p95 | ~3,986 ms | **2,200 ms** | −45% |
+| audio 32 users, p50 | 307 ms | **297 ms** | best yet |
+| browser video session on async | dead in ~1 s | 4/4 turns | fixed |
+
+180 turns, zero timeouts, all five quality probes zero, on both the separate-
+process and the colocated boot.
+
+**Still open, found tonight:** stage 1 deterministically ships some segments
+with a 16k+8-token tail (half a codec frame; 44 occurrences per benchmark run,
+identical across boots since at least 08-04). Those chunks decode scrambled for
+their tail frames. Pre-existing, bounded, now loudly logged — the producer hunt
+is queued.
+
+---
+
 ## Where things stand
 
 **Working**
