@@ -1395,6 +1395,77 @@ now be run.
 
 ---
 
+## 21. Where the multi-user p99 comes from — the speech stage, not the thinker
+
+*2026-08-08, commit `ef30abf9`; data under `/data/zx/results/p99aud_none_u*`,
+analysis in `benchmarks/live_agent/analysis/p99_attribution.py`.*
+
+The question: audio-only users, each holding a long session. As the user
+count grows, the worst turns (p99 — the latency of the slowest 1 in 100
+turns) get slower. Slower WHERE?
+
+**The setup.** Six cells: 1, 4, 8, 16, 24, 32 users, each user one 30-turn
+session-scoped conversation, fresh engine per cell, two-process default
+config. New instrument: the bench now stamps every turn with absolute times,
+so for any turn we can count how many OTHER turns were still waiting for
+their first sound, and how many were mid-playback, at the moment it arrived.
+That splits "I queued behind others" from "everything got slower" — the two
+stories a percentile alone cannot tell apart.
+
+**First finding: the scary p99 was a boot artifact.** Every turn slower than
+800 ms in the whole ladder — all 32 of them across six cells — was a FIRST
+turn, arriving within ~2.6 s of the first query after an engine boot. The
+first query on a cold engine pays ~3 s on the thinker side; everyone who
+arrives behind it queues, and the delay drains linearly (at 32 users: the
+t+0 arrival pays 2,961 ms of thinker time, the t+2.3 s arrival pays 682 ms).
+The second session on the same engine pays nothing. This is a once-per-boot
+transient, not a scaling law — and if left in the data it makes p99
+NON-monotonic in user count (24 users "beat" 16), which is how it gave
+itself away. A warm-up query at boot would erase it.
+
+**Steady state (turn ≥ 2): p99 grows 3× from 1 to 32 users, and ~85% of
+the growth is the speech side.** Per turn, thinker side = query → first
+text token; speech side = first text → first audio (the talker's first
+codec batch plus the vocoder's first chunk). The tail's excess over the
+cell median, split within each turn and then averaged:
+
+| users | turns | TTFA p50 | p95 | p99 | thinker p50/p99 | speech p50/p99 | speech share of tail excess |
+|------:|------:|---------:|----:|----:|----------------:|---------------:|---------------------------:|
+| 1     | 58    | 130      | 140 | 146 | 30 / 33         | 99 / 115       | — (no real tail)            |
+| 4     | 116   | 134      | 233 | 248 | 30 / 75         | 105 / 187      | 67%                         |
+| 8     | 232   | 142      | 258 | 291 | 32 / 71         | 110 / 233      | 81%                         |
+| 16    | 464   | 220      | 321 | 362 | 51 / 85         | 168 / 288      | 85%                         |
+| 24    | 696   | 262      | 365 | 403 | 55 / 95         | 203 / 327      | 88%                         |
+| 32    | 928   | 296      | 400 | 435 | 61 / 100        | 235 / 360      | 84%                         |
+
+The thinker never becomes the problem: its p99 stays at or under 100 ms all
+the way to 32 users. The speech side triples.
+
+**Why the speech side: it is serving everyone else's playback while you
+wait for your first sound.** At 32 users, a turn that arrives when nobody
+is mid-playback pays 158 ms of speech-side time; with one concurrent stream
+221 ms; with four or more, ~260 ms, and it saturates there — the batching
+is sublinear, there is no hard serialization. Tail turns are exactly the
+unlucky arrivals: the average tail-turn arrives with twice as many
+concurrent waiters and streams as the average turn.
+
+**Two exonerations.** (1) Context growth is innocent: within a cell, turns
+2–10, 11–20 and 21–30 have flat p50 AND flat p99 (32 users: 296/307/289 ms
+p50) — the long session itself costs nothing, consistent with §13. (2) The
+run was clean: zero timeouts, zero session rolls, zero wedges across 2,532
+turns; the parked-counter guard clamped 2–6 leaks per cell, which is the
+known §12 leak being contained, not a new fault.
+
+**What this buys.** The lever for multi-user p99 is not the thinker and not
+memory — it is priority inside the speech stage: a turn's FIRST audio chunk
+competing against other users' mid-stream chunks. Mid-stream work has slack
+(delivery runs 5–10× faster than playback even at 32 users); first-chunk
+work is the user-visible pause. A first-chunk-first scheduling policy in
+stages 1–2 is the direct attack, and it is the same shape as the
+speech-over-text priority item already on the list.
+
+---
+
 ## Where things stand
 
 **Working**
