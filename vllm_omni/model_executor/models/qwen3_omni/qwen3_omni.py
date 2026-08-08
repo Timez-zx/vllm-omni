@@ -453,7 +453,22 @@ class Qwen3OmniMoeForConditionalGeneration(
             # batches were always size 1 and the fallback happened to be right.
             if seq_token_counts is not None:
                 batch_size = len(seq_token_counts)
-                split_codes = torch.split(input_ids, seq_token_counts, dim=0)
+                declared_total = sum(seq_token_counts)
+                if input_ids.shape[0] < declared_total:
+                    # Fewer codes than the batch composition declared can only
+                    # be an upstream accounting bug; splitting would misassign
+                    # codes across requests and decode garbled audio.
+                    raise RuntimeError(
+                        f"Code2Wav batch shorter than declared: input {input_ids.shape[0]} "
+                        f"< sum(seq_token_counts) {declared_total}"
+                    )
+                # With CUDA graphs on this stage, the runner pads the flat token
+                # stream to the capture bucket (e.g. 81 -> 88) while
+                # seq_token_counts stays unpadded; the tail is padding, drop it
+                # before the per-request split. Uniform 16-token audio batches
+                # land on bucket sizes by luck, which is why only video's
+                # heterogeneous batches (1-token boundary rows) ever crashed.
+                split_codes = torch.split(input_ids[:declared_total], seq_token_counts, dim=0)
                 seq_lens = [(code.shape[0] + 15) // 16 for code in split_codes]
                 max_seq_len = max(seq_lens) if seq_lens else 1
                 codes = torch.zeros((batch_size, 16, max_seq_len), device=input_ids.device, dtype=input_ids.dtype)
