@@ -93,3 +93,29 @@ the fix; with two, partitioning is. The expensive edge's copy is also its
 snapshot — transport and memory-safety are the same line of code. And the
 ordering constraints (stage_id==index, host-earlier, parent-wait==child-build
 order) go from avoidable to mandatory.
+
+## P1+P2a scoreboard (2026-08-08, all gates green throughout)
+
+| cell | separate procs (all-opt) | tri P1 | tri P2a (on-device payloads) |
+|---|---|---|---|
+| audio 32u p50/p95 | 297 / 486 | 337 / 1649 | 349 / 1663 |
+| video 13u p50 / p95 / >1s | 457 / 2200 / 11.5% | 639 / 1702 / 40% | 648 / **1363 / 17.3%** |
+
+Findings that supersede parts of the plan above:
+- The builder-level `.detach().cpu()` sites were NOT paying the D2H -- the device
+  probe showed tensors already arrive on CPU there. The real payment splits in two:
+  (a) the async output snapshot (now gated: full colocation ships the D2D clone,
+  landed as P2a -- this is what bought the video tail back), and (b)
+  `staged_hidden_states_cpu`, pre-staged during forward and HARD-REQUIRED on CPU by
+  the prefix-cache pooler payload ("Prefix-cache hidden-state payload requires
+  staged CPU hidden states", gpu_ar_model_runner.py:888). Removing (b) = redesign
+  that consumer's feed (GPU-side pooler slicing, or a lazy staged copy taken only
+  when a prefix-cache payload is actually needed). NEXT DIG SITE.
+- With streams + in-proc connector + on-device payloads all in, the residual audio
+  gap (349 vs 297, p95 x3) is the GIL: three Python busy loops + ~20 threads. The
+  pair had the same shape and clawed back with graphs/streams/connector; the trio
+  already HAS all three, so the next lever is structural (engine loop off Python /
+  free-threading) -- thesis-scale, not a config.
+- Verdict for serving TODAY: separate-process async config remains the
+  performance choice; tri-coloc is the RESEARCH PLATFORM (one process, unified
+  visibility, per-engine arenas/accounting proven) awaiting the GIL work.
