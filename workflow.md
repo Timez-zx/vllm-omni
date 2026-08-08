@@ -1350,6 +1350,51 @@ is queued.
 
 ---
 
+## 20. Three engines, one process — the platform lands, the GIL keeps the crown
+
+*2026-08-08, commits `f2b1edeb`, `5aa565df`, `6221aa51`; design in
+`benchmarks/live_agent/design/TRI_COLOCATION.md`.*
+
+Section 19 cleared the video path; this section merges the THINKER into the
+process that already housed the talker and the vocoder, so all three stages
+share one CUDA context — the physical prerequisite for a single scheduler that
+owns the whole timeline (the mixed-tenancy chapter's platform).
+
+**Two things had to be true first.** (1) Memory accounting: the per-PID NVML
+diff charges every engine for its housemates — the second KV-bearing engine's
+pool computes to ~zero. Colocated mode now uses the per-engine profiling
+fallback; measured pools in one process: talker 392,720 tokens, thinker
+681,968 — both honest. (2) The MoE scratch arena: vllm's WorkspaceManager
+hands the SAME bytes to every caller, safe with one MoE engine, silent
+corruption with two. Arenas are now keyed by each engine's private CUDA
+stream (four observed, the thinker's at 512 MB).
+
+**It booted on the first try** — 155 s, one process at 93.9 GB, both guests
+handshaking in order (the parent awaits guests in exactly the order the child
+builds them; a mismatch is a silent hang, so both sides derive from one list).
+
+**The scoreboard is honest and mixed.** Correctness: every gate green (audio
+32 users, handheld 13 users, browser-recipe driver, five probes at zero,
+throughout). Performance vs the separate-process config: audio p50 349 vs
+297 ms with a 3× worse tail; video p50 648 vs 457, though shipping payload
+snapshots as on-device clones (instead of pinned-CPU copies) bought the video
+tail back — over-1-second turns 40% → 17.3%, p95 1702 → 1363. The famous
+291 MB copy turned out to be paid twice upstream of where the study pointed:
+once in the async output snapshot (now removed under full colocation) and once
+in a forward-time staging that the prefix-cache pooler REQUIRES on CPU — that
+redesign is the next dig site.
+
+**Verdict.** For serving today, the separate-process async config keeps the
+crown; the residual gap is the GIL (three Python busy loops, ~20 threads, one
+interpreter) — the same structural ceiling the speech pair hit, and the trio
+already carries every remedy that saved the pair. Moving the engine loop off
+Python is thesis-scale work. What tri-colocation delivers TODAY is the
+research platform: one process, unified visibility, partitioned arenas,
+honest per-engine budgets — the room where the mixed-tenancy experiments can
+now be run.
+
+---
+
 ## Where things stand
 
 **Working**
