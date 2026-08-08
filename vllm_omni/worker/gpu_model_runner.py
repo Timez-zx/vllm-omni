@@ -1562,6 +1562,17 @@ class OmniGPUModelRunner(GPUModelRunner):
         is_first_rank = get_pp_group().is_first_rank
         is_encoder_decoder = self.model_config.is_encoder_decoder
 
+        # Async scheduling leaves a -1 placeholder in rows whose previous step
+        # produced no sampled token to backfill -- e.g. a boundary-capped
+        # talker segment that finished on its first sample while its next step
+        # was already pre-scheduled. Such rows are discarded by the engine, but
+        # every consumer of raw ids (codec embedding, the MTP code predictor)
+        # dies on the -1 with a device-side assert first. A negative id is
+        # never legitimate here, so clamp once at the chokepoint; this is a
+        # no-op for text stages whose sampler backfills every live row.
+        if num_scheduled_tokens > 0:
+            self.input_ids.gpu[:num_scheduled_tokens].clamp_(min=0)
+
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
         ec_connector_output = None

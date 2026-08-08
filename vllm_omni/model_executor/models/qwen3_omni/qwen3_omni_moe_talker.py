@@ -1,5 +1,7 @@
 from collections.abc import Iterable
 
+import os
+
 import torch
 import torch.nn as nn
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
@@ -442,4 +444,22 @@ class Qwen3OmniMoeModel(Qwen3MoeLLMForCausalLM):
         input_ids: torch.Tensor,
     ) -> torch.Tensor:
         """Embed codec input IDs."""
+        if os.environ.get("VLLM_OMNI_TALKER_EMBED_GUARD") == "1":
+            # Diagnostic (VLLM_OMNI_TALKER_EMBED_GUARD=1): an out-of-range id
+            # here is a device-side assert and an engine death; report the
+            # actual offending values and clamp so the step survives long
+            # enough to attribute the producer.
+            vocab = self.model.codec_embedding.num_embeddings
+            bad = (input_ids < 0) | (input_ids >= vocab)
+            if bool(bad.any()):
+                bad_vals = input_ids[bad]
+                logger.error(
+                    "[TalkerEmbedGuard] %d/%d ids out of range [0,%d): values=%s positions=%s",
+                    int(bad.sum()),
+                    input_ids.numel(),
+                    vocab,
+                    bad_vals[:16].tolist(),
+                    bad.nonzero(as_tuple=False).flatten()[:16].tolist(),
+                )
+                input_ids = input_ids.clamp(min=0, max=vocab - 1)
         return self.model.codec_embedding(input_ids)
