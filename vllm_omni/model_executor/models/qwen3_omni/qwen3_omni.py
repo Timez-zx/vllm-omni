@@ -477,18 +477,33 @@ class Qwen3OmniMoeForConditionalGeneration(
                         # Expected for boundary-capped 1-token segments; the
                         # consumer floors to count // 16 frames, so the padded
                         # remainder is never decoded into audible samples.
-                        if code.shape[0] > 16:
-                            # A request LARGER than one frame that is not
+                        if code.shape[0] > 16 and runtime_additional_information is not None:
+                            # REAL traffic larger than one frame that is not
                             # 16-aligned cannot come from the current producer
-                            # (frames ship as [F, 16] transposed flat). Flat-end
+                            # (frames ship as [F, 16] transposed flat); flat-end
                             # padding would row-shift the quantizer layout and
-                            # decode SCRAMBLED-but-valid audio -- make that a
-                            # loud event instead of silent garble.
+                            # decode scrambled-but-valid audio, so scream with
+                            # the head/tail VALUES (codec ids are < 3072;
+                            # anything else is a foreign token in the stream).
+                            #
+                            # Warmup/capture dummy sweeps hit this branch too --
+                            # zero-filled batches at every non-16-aligned CUDA
+                            # graph capture size (the historical "deterministic
+                            # 44 warnings per run" were exactly that, all zeros
+                            # in the same second, never real audio). Dummies
+                            # carry no runtime_additional_information, which is
+                            # the gate; their D2H .tolist() during capture was
+                            # also a boot-killer.
+                            req_id = (runtime_additional_information[idx] or {}).get("request_id", "?") if idx < len(
+                                runtime_additional_information
+                            ) else "?"
                             logger.warning(
-                                "Code2Wav: request shipped %d codec tokens, not frame-aligned; "
-                                "its decoded frames will be scrambled. Upstream must ship "
-                                "16-aligned frames or a single boundary token.",
+                                "Code2Wav: request %s shipped %d codec tokens, not frame-aligned; "
+                                "its decoded frames will be scrambled. head=%s tail=%s",
+                                req_id,
                                 code.shape[0],
+                                code[:8].tolist(),
+                                code[-(code.shape[0] % 16) :].tolist(),
                             )
                         code = torch.cat(
                             [code, code.new_zeros(16 - code.shape[0] % 16)]
