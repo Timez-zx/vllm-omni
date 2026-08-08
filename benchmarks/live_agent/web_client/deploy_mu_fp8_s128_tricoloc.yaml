@@ -1,0 +1,143 @@
+# TRI-COLOCATION: stages 0+1+2 in ONE process (VLLM_OMNI_COLOCATE_STAGES=2:1,0:1,
+# host = stage 1). Derived from deploy_mu_fp8_s128_coloc.yaml; the coloc
+# connector already routes from_stage_0, so listing stage 0 in the env var
+# flips the s0->s1 edge to in-process automatically. Memory fractions keep
+# their per-engine meaning because colocated mode now uses the per-engine
+# profiling fallback instead of the per-PID NVML diff.
+# s128_graph_t15 with ONE change: stage 2 (code2wav) drops enforce_eager so
+# its private CUDA-graph decoder wrapper activates. Exists for the speech-pair
+# merge (VLLM_OMNI_COLOCATE_STAGES=2:1): in one process the vocoder's eager
+# launch bursts contend with the talker's Python loop for the GIL.
+# deploy_mu_fp8_s64_graph.yaml with the memory split moved toward the SPEECH
+# stage: stage-1 0.10 -> 0.15 (its 116k-token KV pool was the wall at 64
+# audio users -- every talker request preempted once, p99 57 s) and stage-0
+# 0.70 -> 0.67 so total stays inside the card with jkim's MPS resident.
+# Expected stage-1 pool ~3x (KV-available 2.35 GiB -> ~7 GiB); stage-0 pool
+# shrinks ~8%, irrelevant for audio and covered by the pool-aware trigger
+# for video.
+# deploy_mu_fp8_s32_graph.yaml with max_num_seqs 32 -> 64 on all three
+# stages, nothing else changed. Exists because at 32 slots the audio-only
+# scenario with talker CUDA graphs shows NO binding physical wall (rtf p10
+# 2.65, DRAMA 0.27, starvation ~0) -- the ceiling is the slot count again.
+# Watch on boot: total memory (32-slot graph boot used 92.2 of 97.9 GB;
+# stage-0 graphs grow with max batch size) and the stage-1 KV pool
+# (123,040 tokens -- the most livelock-suspect pool at 64 users).
+# deploy_mu_fp8_s32.yaml with ONE change: stage 1 (talker) runs with CUDA
+# graphs (enforce_eager removed). Motivation, measured 2026-08-03: at 32
+# audio-only users the talker process has kernels running only 29% of the
+# time, SMACT is 0.23 and DRAMA 0.17 -- the binding wall is per-step launch
+# and organisation overhead, which graphs collapse. Stage 2 (code2wav)
+# STAYS eager on purpose: one variable at a time, and its 65,536-token
+# batch makes graph capture a separate risk. Watch on boot: stage-1 KV
+# pool (eager boot: 123,040 tokens / 2.35 GiB) -- the graph pool eats into
+# the same 0.10 memory share.
+# deploy_mu_fp8.yaml with max_num_seqs 20 -> 32 on all three stages, and
+# NOTHING else changed. Exists for the audio-only capacity probe: at 20 slots
+# the audio scenario is still flat (u13/u16/u20 p50 = 633/639/663 ms,
+# 2026-08-03), so the ceiling we hit was the slot count, not a compute or KV
+# wall. Sessions are persistent engine requests, so stage 0 AND stage 1 both
+# need one slot per user; stage 2 is raised too only to remove doubt.
+# KV arithmetic at 32 audio-only users: stage-0 ~7k tok/session after 48
+# turns -> ~224k of the 731,904 pool; stage-1 grows with SPEECH, ~6k/session
+# -> ~192k of ~266k. Video contents at 32 users are NOT sized here.
+# On-the-fly FP8: OFFICIAL bf16 checkpoint, vLLM quantizes the thinker at
+# load time (quantization: fp8 on stage 0 ONLY; talker and code2wav stay
+# bf16). Exists because the community block-FP8 checkpoint produced
+# degenerate text (verbatim loops) on this fork -- isolated to the weights
+# path with bf16 KV on 2026-08-02. KV stays bf16 here; flip kv_cache_dtype
+# in a second step only after this passes the text gate.
+#
+# Meant to be used with the block-FP8 weights checkpoint:
+#   QWEN_MODEL=marksverdhei/Qwen3-Omni-30B-A3B-FP8 \
+#   DEPLOY_CONFIG=.../deploy_web_fp8.yaml bash run_qwen_server.sh
+#
+# Measured on boot (2026-08-02): FP8 weights alone take the thinker from
+# 59.4 -> 31.7 GiB and the stage-0 KV pool from 106,880 -> 404,736 tokens at
+# bf16 KV (96 KB/token). fp8 KV halves the per-token cost, so the same
+# 37 GiB pool should land around ~810k tokens -- read the boot log line
+# "GPU KV cache size" for the real number, never trust the estimate.
+#
+# Stage 1 (talker) KV stays bf16 ON PURPOSE: the talker feeds the vocoder
+# directly and is the quality-sensitive stage; its own pool (265,888 tokens
+# at FP8 weights) is nowhere near binding anyway. One variable at a time.
+#
+# Everything else is identical to deploy_web_demo.yaml -- see that file for
+# the reasoning behind each value.
+
+async_chunk: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      initial_codec_chunk_frames: 4
+      codec_chunk_frames: 4
+      codec_left_context_frames: 25
+  # Speech pair (stages 1+2 colocated in one process): the s1->s2 edge is a
+  # process-global take-once dict passing tensor REFERENCES -- no msgpack, no
+  # /dev/shm, no GIL-held copy work. Cross-process edges (s0->s1) delegate to
+  # SharedMemoryConnector inside the same connector, routed per edge.
+  connector_coloc_speech:
+    name: ColocInProcConnector
+    extra:
+      initial_codec_chunk_frames: 4
+      codec_chunk_frames: 4
+      codec_left_context_frames: 25
+
+stages:
+  - stage_id: 0                      # thinker: vision + audio encoders + LLM
+    max_num_batched_tokens: 8192
+    max_num_seqs: 128
+    gpu_memory_utilization: 0.67
+    quantization: fp8
+    kv_cache_dtype: fp8
+    trust_remote_code: true
+    enable_prefix_caching: true
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 2048
+
+  - stage_id: 1                      # talker: speech codec token LM
+    max_num_batched_tokens: 8192
+    max_num_seqs: 128
+    gpu_memory_utilization: 0.15
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    enforce_eager: false           # EXPERIMENT: CUDA graphs for the talker
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_coloc_speech
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      seed: 42
+      repetition_penalty: 1.05
+
+  - stage_id: 2                      # code2wav: waveform reconstruction
+    max_num_batched_tokens: 65536
+    max_num_seqs: 128
+    gpu_memory_utilization: 0.08
+    enforce_eager: true           # vocoder CUDA graphs REVERTED: the graph wrapper
+                                  # mishandles heterogeneous VIDEO co-batches
+                                  # (split_with_sizes [1,1,16] != 24 rows: 1-frame
+                                  # boundary chunks co-batched with full ones) and
+                                  # crashes WITH OR WITHOUT colocation. Audio chunks
+                                  # are uniform and ran clean for hours; re-enable only
+                                  # for audio-only deployments until the wrapper is fixed
+    trust_remote_code: true
+    enable_prefix_caching: false
+    enable_chunked_prefill: false
+    async_scheduling: false
+    devices: "0"
+    input_connectors:
+      from_stage_1: connector_coloc_speech
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      repetition_penalty: 1.1

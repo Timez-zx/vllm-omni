@@ -1350,10 +1350,48 @@ def make_workspace_manager_colocation_safe() -> None:
         logger.debug("[colocate] workspace lock skipped (growth stays allowed)")
 
     ws.WorkspaceManager.lock = _lock_noop
+
+    # Tri-colocation upgrade: the manager's single arena is handed out WHOLE
+    # from offset 0 on every get_simultaneous() call. That is safe with ONE
+    # MoE engine per process (the speech pair: only the talker allocates), but
+    # two MoE engines (thinker + talker) stepping concurrently from their own
+    # threads/streams would scribble over the same scratch bytes -- silent
+    # numerical corruption, no crash. Key the arena by the CURRENT CUDA STREAM
+    # instead: every colocated engine both constructs (graph capture) and runs
+    # its busy loop inside its own private stream scope, so the stream is the
+    # engine's identity across threads. Non-colocated processes never install
+    # this patch.
+    import torch as _torch
+
+    def _ensure_workspace_size_stream_keyed(self, required_bytes: int):  # noqa: ANN001, ANN202
+        from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
+        stream_key = _torch.cuda.current_stream().cuda_stream
+        arenas = getattr(self, "_omni_stream_arenas", None)
+        if arenas is None:
+            arenas = {}
+            self._omni_stream_arenas = arenas
+        key = (stream_key, dbo_current_ubatch_id())
+        current_workspace = arenas.get(key)
+        current_size = 0 if current_workspace is None else current_workspace.numel()
+        if current_size < required_bytes:
+            arenas[key] = None
+            del current_workspace
+            _torch.accelerator.empty_cache()
+            arenas[key] = _torch.empty((required_bytes,), dtype=_torch.uint8, device=self._device)
+            current_workspace = arenas[key]
+            logger.info(
+                "[colocate] workspace arena for stream %s grown to %.2f MB",
+                hex(stream_key),
+                required_bytes / (1024**2),
+            )
+        return current_workspace
+
+    ws.WorkspaceManager._ensure_workspace_size = _ensure_workspace_size_stream_keyed
     ws._omni_colocation_safe = True
     logger.warning(
         "[colocate] WorkspaceManager made colocation-safe: init is idempotent, "
-        "lock is a no-op (two engines share one workspace manager)"
+        "lock is a no-op, and arenas are keyed by CUDA stream (one per engine)"
     )
 
 

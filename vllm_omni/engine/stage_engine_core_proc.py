@@ -91,12 +91,14 @@ class StageEngineCoreProc(EngineCoreProc):
         signal_callback: SignalCallback | None = None
         maybe_register_config_serialize_by_value()
 
-        # Colocated sibling stage (speech-pair merge): a second engine core
-        # built in THIS process after the primary's, so both stages share one
-        # CUDA context and their kernels can overlap instead of time-slicing.
-        # Popped before the primary's construction -- it is not an
-        # EngineCoreProc argument.
-        sibling_stage_kwargs: dict[str, Any] | None = kwargs.pop("sibling_stage_kwargs", None)
+        # Colocated sibling stage(s): further engine cores built in THIS
+        # process after the primary's, so all stages share one CUDA context
+        # and their kernels can overlap instead of time-slicing. Popped before
+        # the primary's construction -- not an EngineCoreProc argument. A bare
+        # dict (legacy single-guest form) is normalized to a one-item list.
+        sibling_stage_kwargs: Any = kwargs.pop("sibling_stage_kwargs", None)
+        if isinstance(sibling_stage_kwargs, dict):
+            sibling_stage_kwargs = [sibling_stage_kwargs]
 
         # Register vllm-omni reasoning parsers (e.g. step_audio) in this
         # subprocess so they are available when the engine core resolves
@@ -199,68 +201,78 @@ class StageEngineCoreProc(EngineCoreProc):
                     queue_length_getter=scheduler.get_num_unfinished_requests,
                 )
 
-            sibling_core: StageEngineCoreProc | None = None
-            sibling_thread = None
-            sibling_stream = None
-            if sibling_stage_kwargs is not None:
+            sibling_cores: list[tuple[Any, StageEngineCoreProc, Any]] = []  # (stage_id, core, stream)
+            if sibling_stage_kwargs:
                 import threading as _threading
 
                 import torch as _torch
 
-                sib = dict(sibling_stage_kwargs)
-                sib_stage_id = sib.pop("omni_stage_id", None)
-                sib_replica_id = sib.pop("omni_replica_id", 0)
-                sib_dp_rank = sib.pop("dp_rank", 0)
-                # Sequential construction on THIS thread, after the primary:
-                # vllm's env cache froze at the primary's init, and the two
-                # engines' CUDA graph captures must not interleave.
-                maybe_apply_audex_cfg_patches(sib.get("vllm_config"))
-                logger.info(
-                    "[colocate] building sibling stage %s core inside stage %s process",
-                    sib_stage_id, omni_stage_id,
-                )
-                # The sibling lives on its OWN CUDA stream so its kernels can
-                # overlap the host's instead of queueing behind them on the
-                # default stream. Construction happens inside the stream scope
-                # too: its graph captures then replay on the same stream.
-                sibling_stream = _torch.cuda.Stream()
-                with _torch.cuda.stream(sibling_stream):
-                    sibling_core = StageEngineCoreProc(
-                        engine_index=sib_dp_rank,
-                        **sib,
+                # PHASE 1 -- construct ALL guest cores sequentially on THIS
+                # thread, before ANY guest loop starts: vllm's env cache froze
+                # at the primary's init, and no engine's CUDA graph capture may
+                # interleave with another engine's running loop. Build order ==
+                # the parent's wait_for_engine_startup order (same list).
+                for sibling_entry in sibling_stage_kwargs:
+                    sib = dict(sibling_entry)
+                    sib_stage_id = sib.pop("omni_stage_id", None)
+                    sib_replica_id = sib.pop("omni_replica_id", 0)
+                    sib_dp_rank = sib.pop("dp_rank", 0)
+                    maybe_apply_audex_cfg_patches(sib.get("vllm_config"))
+                    logger.info(
+                        "[colocate] building sibling stage %s core inside stage %s process",
+                        sib_stage_id, omni_stage_id,
                     )
-                logger.info(
-                    "[colocate] sibling stage %s core built (replica %s); starting its busy loop thread",
-                    sib_stage_id, sib_replica_id,
-                )
-
-                def _sibling_loop() -> None:
-                    # Presence-over-absence: this function's EXIT is the death
-                    # signal. A silent return would leave the client waiting
-                    # forever, so both paths log at ERROR/WARNING and notify.
-                    try:
-                        with _torch.cuda.stream(sibling_stream):
-                            sibling_core.run_busy_loop()
-                        logger.warning(
-                            "[colocate] sibling stage %s busy loop RETURNED (clean shutdown)",
-                            sib_stage_id,
+                    # Each sibling lives on its OWN CUDA stream so its kernels
+                    # can overlap the others' instead of queueing behind them
+                    # on the default stream. Construction happens inside the
+                    # stream scope too: graph captures then replay there, and
+                    # the stream doubles as the engine's identity for the
+                    # stream-keyed MoE workspace arenas.
+                    sib_stream = _torch.cuda.Stream()
+                    with _torch.cuda.stream(sib_stream):
+                        sib_core = StageEngineCoreProc(
+                            engine_index=sib_dp_rank,
+                            **sib,
                         )
-                    except SystemExit:
-                        logger.warning("[colocate] sibling stage %s busy loop exited via SystemExit", sib_stage_id)
-                    except Exception:
-                        logger.exception(
-                            "[colocate] sibling stage %s busy loop DIED; notifying its client",
-                            sib_stage_id,
-                        )
-                        with contextlib.suppress(Exception):
-                            sibling_core._send_engine_dead()
+                    sibling_cores.append((sib_stage_id, sib_core, sib_stream))
+                    logger.info(
+                        "[colocate] sibling stage %s core built (replica %s)",
+                        sib_stage_id, sib_replica_id,
+                    )
 
-                sibling_thread = _threading.Thread(
-                    target=_sibling_loop,
-                    name=f"StageEngineCore_colocated_stage{sib_stage_id}",
-                    daemon=True,
-                )
-                sibling_thread.start()
+                # PHASE 2 -- start every guest's busy loop thread.
+                def _make_sibling_loop(loop_stage_id: Any, loop_core: StageEngineCoreProc, loop_stream: Any):
+                    def _sibling_loop() -> None:
+                        # Presence-over-absence: this function's EXIT is the
+                        # death signal. A silent return would leave the client
+                        # waiting forever, so both paths log and notify.
+                        try:
+                            with _torch.cuda.stream(loop_stream):
+                                loop_core.run_busy_loop()
+                            logger.warning(
+                                "[colocate] sibling stage %s busy loop RETURNED (clean shutdown)",
+                                loop_stage_id,
+                            )
+                        except SystemExit:
+                            logger.warning(
+                                "[colocate] sibling stage %s busy loop exited via SystemExit", loop_stage_id
+                            )
+                        except Exception:
+                            logger.exception(
+                                "[colocate] sibling stage %s busy loop DIED; notifying its client",
+                                loop_stage_id,
+                            )
+                            with contextlib.suppress(Exception):
+                                loop_core._send_engine_dead()
+
+                    return _sibling_loop
+
+                for sib_stage_id, sib_core, sib_stream in sibling_cores:
+                    _threading.Thread(
+                        target=_make_sibling_loop(sib_stage_id, sib_core, sib_stream),
+                        name=f"StageEngineCore_colocated_stage{sib_stage_id}",
+                        daemon=True,
+                    ).start()
 
             def wakeup_engine() -> None:
                 engine_core.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
@@ -269,10 +281,10 @@ class StageEngineCoreProc(EngineCoreProc):
 
             def signal_handler(signum: int, frame: Any) -> None:
                 engine_core.shutdown_state = EngineShutdownState.REQUESTED
-                if sibling_core is not None:
-                    sibling_core.shutdown_state = EngineShutdownState.REQUESTED
+                for _, guest_core, _ in sibling_cores:
+                    guest_core.shutdown_state = EngineShutdownState.REQUESTED
                     with contextlib.suppress(Exception):
-                        sibling_core.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+                        guest_core.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
                 signal_callback.trigger()
                 raise SystemExit(_signal_exit_code(signum))
 

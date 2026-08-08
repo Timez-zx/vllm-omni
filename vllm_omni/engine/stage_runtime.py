@@ -458,6 +458,17 @@ class StageRuntime:
             for replica in plan.replicas:
                 init_groups.setdefault(self._replica_init_group_key(replica), []).append((plan.stage_idx, replica))
 
+        # Colocated guests must initialize AFTER their host (the guest's init
+        # turn attaches to addresses the host's launch stashed). Stage ids are
+        # forced to equal config order, so a host with a lower-id guest (e.g.
+        # thinker 0 riding in talker 1's process) cannot be expressed by
+        # reordering the yaml -- reorder the init group instead. Stable sort:
+        # non-guests keep config order, guests sink below them.
+        coloc_for_order = self._colocation_map()
+        if coloc_for_order:
+            for group in init_groups.values():
+                group.sort(key=lambda item: 1 if item[1].metadata.stage_id in coloc_for_order else 0)
+
         def _init_group(group: list[tuple[int, ReplicaInitPlan]]) -> None:
             """Initialize replicas in one scheduling group sequentially."""
             nonlocal primary_exc
@@ -553,7 +564,13 @@ class StageRuntime:
         out: dict[int, int] = {}
         for pair in raw.split(","):
             guest_s, _, host_s = pair.partition(":")
-            out[int(guest_s)] = int(host_s)
+            out[int(guest_s.strip())] = int(host_s.strip())
+        # A stage that is both guest and host would take the guest short-circuit
+        # in _initialize_local_llm_replica and never launch ITS guest, which
+        # then hangs forever on an empty stash -- refuse chains loudly.
+        chained = set(out) & set(out.values())
+        if chained:
+            raise ValueError(f"VLLM_OMNI_COLOCATE_STAGES chains are unsupported: stages {sorted(chained)}")
         return out
 
     def _initialize_local_llm_replica(
@@ -597,29 +614,33 @@ class StageRuntime:
             # this stage's process, hand its launch bundle to our spawn. The
             # guest's own init turn (later in the same sequential group) then
             # attaches to the stashed addresses instead of spawning.
-            sibling = None
-            guest_ids = [g for g, h in self._colocation_map().items() if h == plan.metadata.stage_id]
+            # Guests are built by the child and awaited by the parent IN THIS
+            # LIST ORDER (sorted ascending) -- both sides derive the order from
+            # the same list, and a mismatch is a silent boot hang.
+            siblings: list[SiblingStageLaunch] = []
+            guest_ids = sorted(g for g, h in self._colocation_map().items() if h == plan.metadata.stage_id)
             if guest_ids and plan.replica_id == 0:
-                if len(guest_ids) > 1:
-                    raise ValueError(f"stage {plan.metadata.stage_id} hosts more than one guest: {guest_ids}")
-                guest_plan_group = self._plans_by_stage_id.get(guest_ids[0])
-                if guest_plan_group is None:
-                    raise ValueError(f"colocated guest stage {guest_ids[0]} not found in deploy config")
-                if len(guest_plan_group.replicas) != 1:
-                    raise ValueError("colocated guest stages support exactly one replica")
-                guest_replica = guest_plan_group.replicas[0]
-                if guest_replica.stage_vllm_config is None or guest_replica.executor_class is None:
-                    raise ValueError(f"colocated guest stage {guest_ids[0]} is not a local LLM stage")
-                sibling = SiblingStageLaunch(
-                    vllm_config=guest_replica.stage_vllm_config,
-                    executor_class=guest_replica.executor_class,
-                    stage_id=guest_ids[0],
-                    replica_id=guest_replica.replica_id,
-                    log_stats=False,
-                )
+                for guest_id in guest_ids:
+                    guest_plan_group = self._plans_by_stage_id.get(guest_id)
+                    if guest_plan_group is None:
+                        raise ValueError(f"colocated guest stage {guest_id} not found in deploy config")
+                    if len(guest_plan_group.replicas) != 1:
+                        raise ValueError("colocated guest stages support exactly one replica")
+                    guest_replica = guest_plan_group.replicas[0]
+                    if guest_replica.stage_vllm_config is None or guest_replica.executor_class is None:
+                        raise ValueError(f"colocated guest stage {guest_id} is not a local LLM stage")
+                    siblings.append(
+                        SiblingStageLaunch(
+                            vllm_config=guest_replica.stage_vllm_config,
+                            executor_class=guest_replica.executor_class,
+                            stage_id=guest_id,
+                            replica_id=guest_replica.replica_id,
+                            log_stats=False,
+                        )
+                    )
                 logger.info(
-                    "[colocate] stage %s will host stage %s in its process",
-                    plan.metadata.stage_id, guest_ids[0],
+                    "[colocate] stage %s will host stage(s) %s in its process",
+                    plan.metadata.stage_id, guest_ids,
                 )
 
             # Serialize engine-core spawning across all LLM replicas to avoid
@@ -636,15 +657,16 @@ class StageRuntime:
                     omni_coordinator_address=self._get_coordinator_address(),
                     stage_visible_devices=physical_devices,
                     spawn_device_lock=self._spawn_device_lock,
-                    sibling=sibling,
+                    siblings=siblings,
                 ) as resources:
                     pass
 
-            if sibling is not None and resources is not None:
-                self._colocated_guest_stash[sibling.stage_id] = StageReplicaResources(
-                    manager=resources.manager,
-                    addresses=resources.sibling_addresses,
-                )
+            if siblings and resources is not None:
+                for launch in siblings:
+                    self._colocated_guest_stash[launch.stage_id] = StageReplicaResources(
+                        manager=resources.manager,
+                        addresses=resources.sibling_addresses[launch.stage_id],
+                    )
 
             logger.info("[StageRuntime] Stage %s engine startup completed", plan.metadata.stage_id)
             if resources is None:

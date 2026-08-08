@@ -131,11 +131,13 @@ class StageReplicaResources:
     coordinator: Any | None = None
     addresses: EngineZmqAddresses | None = None
     lock_fds: list[int] = field(default_factory=list)
-    # When this replica HOSTS a colocated sibling stage (speech-pair merge:
-    # stage 2 rides inside stage 1's process so their kernels share one CUDA
-    # context), the sibling's ZMQ addresses land here. The sibling's client
-    # attaches to these; there is no separate process to manage.
-    sibling_addresses: EngineZmqAddresses | None = None
+    # When this replica HOSTS colocated sibling stage(s) (stage 2 -- and for
+    # tri-colocation stage 0 -- ride inside stage 1's process so their kernels
+    # share one CUDA context), each sibling's ZMQ addresses land here keyed by
+    # its stage id. Sibling clients attach to these; there is no separate
+    # process to manage. Doubles as the single-guest field's replacement --
+    # callers index by stage id.
+    sibling_addresses: dict[int, EngineZmqAddresses] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1086,7 +1088,7 @@ def launch_stage_replica(
     omni_coordinator_address: str | None = None,
     stage_visible_devices: str | None = None,
     spawn_device_lock: threading.Lock | None = None,
-    sibling: SiblingStageLaunch | None = None,
+    siblings: list[SiblingStageLaunch] | None = None,
 ) -> Iterator[StageReplicaResources]:
     """Launch a local LLM stage replica.
 
@@ -1096,15 +1098,18 @@ def launch_stage_replica(
     Colocated launches use an IPC handshake without master registration but
     keep the same returned resource bundle.
 
-    ``sibling`` (colocated mode only): a second stage whose engine core is
-    built INSIDE this replica's process instead of its own, so the two stages
+    ``siblings`` (colocated mode only): further stages whose engine cores are
+    built INSIDE this replica's process instead of their own, so all stages
     share one CUDA context and their kernels can overlap. This function then
-    allocates the sibling's ZMQ addresses, binds its handshake ROUTER before
-    the spawn (the sibling's HELLO arrives only after the host's model has
-    loaded -- the ROUTER queues it), and performs BOTH startup handshakes
-    sequentially on context exit.
+    allocates each sibling's ZMQ addresses, binds each handshake ROUTER before
+    the spawn (a sibling's HELLO arrives only after the host's model has
+    loaded -- the ROUTER queues it), and performs ALL startup handshakes
+    sequentially on context exit. The child builds guests in the order of this
+    list and the parent awaits them in the same order -- an order mismatch is
+    a silent boot hang, so both sides must derive from the SAME list.
     """
-    if sibling is not None and omni_master_server is not None:
+    siblings = siblings or []
+    if siblings and omni_master_server is not None:
         raise ValueError("sibling colocation is only supported in colocated (non-master) mode")
     if omni_master_server is not None:
         with _launch_omni_core_engines(
@@ -1135,24 +1140,28 @@ def launch_stage_replica(
     handshake_address = get_open_zmq_ipc_path()
     engines_to_handshake = [CoreEngine(index=0, local=True)]
 
-    sibling_addresses: EngineZmqAddresses | None = None
-    sibling_handshake_address: str | None = None
-    sibling_kwargs: dict[str, Any] | None = None
-    if sibling is not None:
-        sibling_addresses = get_engine_zmq_addresses(sibling.vllm_config)
-        sibling_handshake_address = get_open_zmq_ipc_path()
+    sibling_addresses: dict[int, EngineZmqAddresses] = {}
+    sibling_handshake_addresses: list[tuple[SiblingStageLaunch, str]] = []
+    sibling_kwargs: list[dict[str, Any]] = []
+    for launch in siblings:
+        addresses_for_guest = get_engine_zmq_addresses(launch.vllm_config)
+        guest_handshake_address = get_open_zmq_ipc_path()
+        sibling_addresses[launch.stage_id] = addresses_for_guest
+        sibling_handshake_addresses.append((launch, guest_handshake_address))
         # Mirrors the spawn kwargs of a standalone stage process; consumed by
-        # run_stage_core to build the second engine core after the host's.
-        sibling_kwargs = {
-            "vllm_config": sibling.vllm_config,
-            "local_client": True,
-            "handshake_address": sibling_handshake_address,
-            "executor_class": sibling.executor_class,
-            "log_stats": sibling.log_stats,
-            "omni_stage_id": int(sibling.stage_id),
-            "omni_replica_id": int(sibling.replica_id),
-            "dp_rank": 0,
-        }
+        # run_stage_core to build each guest engine core after the host's.
+        sibling_kwargs.append(
+            {
+                "vllm_config": launch.vllm_config,
+                "local_client": True,
+                "handshake_address": guest_handshake_address,
+                "executor_class": launch.executor_class,
+                "log_stats": launch.log_stats,
+                "omni_stage_id": int(launch.stage_id),
+                "omni_replica_id": int(launch.replica_id),
+                "dp_rank": 0,
+            }
+        )
 
     with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock):
         engine_manager = StageEngineCoreProcManager(
@@ -1172,12 +1181,15 @@ def launch_stage_replica(
 
     with contextlib.ExitStack() as stack:
         handshake_socket = stack.enter_context(zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True))
-        sibling_socket = None
-        if sibling_handshake_address is not None:
-            # Bind BEFORE yielding: the sibling's HELLO arrives minutes later
+        sibling_sockets: list[tuple[SiblingStageLaunch, Any]] = []
+        for launch, guest_handshake_address in sibling_handshake_addresses:
+            # Bind BEFORE yielding: a sibling's HELLO arrives minutes later
             # (after the host model loads) and the ROUTER queues it meanwhile.
-            sibling_socket = stack.enter_context(
-                zmq_socket_ctx(sibling_handshake_address, zmq.ROUTER, bind=True)
+            sibling_sockets.append(
+                (
+                    launch,
+                    stack.enter_context(zmq_socket_ctx(guest_handshake_address, zmq.ROUTER, bind=True)),
+                )
             )
         yield StageReplicaResources(
             manager=engine_manager,
@@ -1194,24 +1206,24 @@ def launch_stage_replica(
             engine_manager,
             None,  # coordinator_proc
         )
-        if sibling is not None:
-            assert sibling_socket is not None and sibling_addresses is not None
+        # Await guests in list order == the child's build order.
+        for launch, guest_socket in sibling_sockets:
             logger.info(
                 "[colocate] host stage %s ready; waiting for sibling stage %s handshake",
-                stage_id, sibling.stage_id,
+                stage_id, launch.stage_id,
             )
             wait_for_engine_startup(
-                sibling_socket,
-                sibling_addresses,
+                guest_socket,
+                sibling_addresses[launch.stage_id],
                 [CoreEngine(index=0, local=True)],
-                sibling.vllm_config.parallel_config,
+                launch.vllm_config.parallel_config,
                 False,  # coordinated_dp
-                sibling.vllm_config.cache_config,
+                launch.vllm_config.cache_config,
                 engine_manager,
                 None,  # coordinator_proc
             )
             logger.info("[colocate] sibling stage %s ready in host stage %s process",
-                        sibling.stage_id, stage_id)
+                        launch.stage_id, stage_id)
 
 
 def launch_headless_llm_replica(
