@@ -1401,6 +1401,79 @@ stage state) is identified but not yet written.
 
 ---
 
+## 20. Shrinking the duplex clock: 1000 ms → 200 ms, and the knife it took
+
+**The ask.** Xiao proposed running MiniCPM's duplex at a 160 ms audio tick with
+one video frame every 8 ticks (1280 ms), intermediate ticks reusing the last
+frame through the KV cache — because the 1000 ms clock's reaction feels too slow.
+
+**Why 160 ms is off the table without retraining.** The audio tower emits exactly
+one embedding per 100 ms of sound (10 ms mel hop → CNN stride 2 → average-pool 5,
+flooring). 160 is not on the 100 ms grid: every tick would silently lose 60 ms of
+audio. The clock snapped to 200 ms (2 embeddings per tick — exact); video every
+6 ticks = 1200 ms ≈ the asked 1280. "Reuse the last frame via KV" needed no code:
+a tick without a frame appends no vision tokens, and attention keeps the previous
+frame visible; the camera send period IS the frame-rate knob.
+
+**One knob, everything derived.** `VLLM_OMNI_DUPLEX_UNIT_MS` (default 1000 =
+bit-identical to before) is read once in the policy class; the scheduler budget
+per unit (2 + unit/100 tokens — the old literal 12), the per-unit speak caps
+(scaled to hold the trained ~20 tokens/s text RATE constant), the first mel
+window (unit + 35 ms fixed margin), the silence continuation unit, and the
+serving `chunk_period_ms` all follow. Confirmed by a three-way import test
+(unset/200/160) and a worker-side presence log.
+
+**Act 1 — the clock works, the model goes mute.** At 200 ms: admits at exactly
+5/s for 60 s, zero budget errors — and zero words in 3 question cycles. Same at
+400 ms. The 1000 ms control (same binaries, probe on) answered 3/3 at 376 ms
+first-audio — the edits are invisible at the default clock; the mute is the fine
+clock itself.
+
+**Act 2 — the probe finds a soft collapse, and the sampler is the executioner.**
+A decision-position probe (one line per unit: sampled token + the four gate
+flags, plus raw probabilities) showed: no forced listen anywhere — the model
+FREELY chose listen in 156/156 eligible units at 200 ms (rule of three: per-unit
+speak probability < 2% where the 1000 ms model opens near-deterministically).
+But the raw probabilities said the intent survives: p(speak) ≈ 2% on average
+(max 20%), always the rank-2 token. The kill mechanism is top_p = 0.8: whenever
+p(listen) > 0.8 — always, here — nucleus sampling removes <|speak|> from the
+candidate set entirely. Soft collapse + nucleus sampling = structural silence.
+
+**Act 3 — the knife.** `VLLM_OMNI_DUPLEX_SPEAK_BIAS` adds a logit bias (we used
+3.0 ≈ 20× odds) to <|speak|> at the decision position — but only on silence
+units (never during user speech), only after `VLLM_OMNI_DUPLEX_SPEAK_BIAS_AFTER`
+consecutive silence units (800 ms worth: 2 units at 400 ms, 4 at 200 ms), and
+only when the model is not already speaking. Ungated bias answered the FIRST
+HALF of the test question — the wav hides a 1.6 s pause between two phrases, and
+at fine clocks word gaps become visible silence units that a naive bias ignites.
+Post-reply silence cannot re-ignite: the existing after-turn force masks
+everything but listen, and bias on −inf is still −inf.
+
+**Result at 200 ms + gated knife (3 cycles):** 3/3 answered, 9.3–14.3 s of audio
+per reply (the 4-token-per-tick text cap does not starve the TTS), no client
+underruns, cadence still exactly 5 admits/s. Commit-relative first audio: 67 ms,
+59 ms, 1694 ms — median far below the 1000 ms baseline's 376 ms (two replies
+began during the trailing silence, before the client even committed), with a
+long tail because ignition is stochastic per armed tick (~30%/tick at bias 3;
+observed hangovers 0.6 s, 1.2 s, 5.2 s). One opening fired one tick BEFORE the
+gate armed — the model's own semantic judgment still occasionally surfaces.
+
+**What the experiment actually measured.** The trained 1000 ms decision head
+does SEMANTIC end-of-turn detection — the control waits through the 1.6 s
+mid-question pause. The bias knife re-arms the fine clock but detection becomes
+DURATION-based (K × unit hangover), which answers long pauses. The fine clock's
+reaction gain is real, but it is paid for twice: 5× more decode steps per
+session, and semantic turn-taking degraded to a threshold. That is the
+80/480/1000 ms axis reproduced inside a single checkpoint with the clock as the
+only variable — the clock is a training-time commitment; serving can only rent
+it back with a knife.
+
+**Open items.** Perceptual audio quality at 200 ms (prosody with 2-embedding
+ticks and ~6-char TTS chunks) awaits a live listen; bias 4.0 should tighten the
+ignition tail (untested); multi-user cost of the 5× decode rate unmeasured.
+
+---
+
 ## Where things stand
 
 **Working**

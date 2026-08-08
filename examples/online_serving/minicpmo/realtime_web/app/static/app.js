@@ -26,6 +26,11 @@
   const ECHO_GUARD_MS = 300;
   const INITIAL_PLAYBACK_BUFFER_MS = 400;
   const SESSION_CLOSE_TIMEOUT_MS = 1000;
+  // Camera capture period; frames attach to model units server-side, so this
+  // is the video cadence knob (?camera_ms=1200 -> one frame per 6 x 200 ms
+  // units). Default matches the official 1 fps omni cadence.
+  const CAMERA_PERIOD_MS = Math.max(
+    200, parseInt(new URLSearchParams(window.location.search).get('camera_ms') || '1000', 10) || 1000);
 
   // Default prompts mirroring the official MiniCPM-o-Demo presets
   // (assets/presets/{omni,audio_duplex}/*.yaml).
@@ -556,10 +561,10 @@
       cameraCanvas.height = cameraPreview.videoHeight;
       cameraCanvas.getContext('2d').drawImage(cameraPreview, 0, 0);
       cameraPendingFrame = cameraCanvas.toDataURL('image/jpeg', 0.7).split(',')[1];
-    }, 1000);
+    }, CAMERA_PERIOD_MS);
     cameraButton.textContent = 'Camera off';
     cameraButton.classList.add('is-active');
-    appendLog('camera on (1 fps omni frames)');
+    appendLog('camera on (one frame per ' + CAMERA_PERIOD_MS + ' ms)');
   }
 
   function stopCamera() {

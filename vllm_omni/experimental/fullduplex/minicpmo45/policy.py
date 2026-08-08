@@ -1,6 +1,23 @@
 from __future__ import annotations
 
+import os
 from typing import Any
+
+
+def _duplex_unit_ms_from_env() -> int:
+    """Experimental clock override: VLLM_OMNI_DUPLEX_UNIT_MS (default 1000).
+
+    The audio tower emits exactly one embedding per 100 ms of input (10 ms mel
+    hop -> CNN stride 2 -> AvgPool1d(5) with floor), so a unit length off the
+    100 ms grid would silently drop the tail of every unit; snap to the grid.
+    Must be set in the environment of the API server (engine cores inherit it).
+    """
+    try:
+        value = int(os.environ.get("VLLM_OMNI_DUPLEX_UNIT_MS", "1000"))
+    except ValueError:
+        value = 1000
+    value = max(100, min(value, 2000))
+    return (value + 50) // 100 * 100
 
 
 class MiniCPMO45DuplexPolicy:
@@ -12,24 +29,31 @@ class MiniCPMO45DuplexPolicy:
     """
 
     # Audio framing contract shared by serving, orchestrator, and worker.
-    # MiniCPM-o consumes 1 s units at 16 kHz and pools audio to one embedding
-    # per 100 ms, so a unit contributes exactly 10 audio embeddings plus the
-    # <unit> open (and a </unit> closure for every unit after the first).
+    # MiniCPM-o consumes UNIT_MS units at 16 kHz (official cadence: 1000 ms)
+    # and pools audio to one embedding per 100 ms, so a unit contributes
+    # exactly UNIT_MS/100 audio embeddings plus the <unit> open (and a </unit>
+    # closure for every unit after the first).
     # Scheduler token budgets must match the worker-built embeddings exactly:
     # surplus slots become pad embeddings inside the KV and measurably corrupt
     # the model's listen/speak behavior.
     SAMPLE_RATE_HZ = 16000
-    CHUNK_SAMPLES = 16000
+    UNIT_MS = _duplex_unit_ms_from_env()
+    CHUNK_SAMPLES = SAMPLE_RATE_HZ * UNIT_MS // 1000
     SAMPLES_PER_AUDIO_TOKEN = 1600
+    AUDIO_TOKENS_PER_UNIT = CHUNK_SAMPLES // SAMPLES_PER_AUDIO_TOKEN
+    TOKENS_PER_UNIT = 2 + AUDIO_TOKENS_PER_UNIT
     # Vision framing contract (omni duplex). Official streaming_prefill feeds
     # each frame as <image> + 64 resampler embeddings + </image> inside the
     # unit, ahead of the unit's audio embeddings (max_slice_nums=1 in
     # streaming, so exactly one 64-token block per frame).
     VISION_EMBEDS_PER_FRAME = 64
     VISION_TOKENS_PER_FRAME = VISION_EMBEDS_PER_FRAME + 2  # <image> + embeds + </image>
-    DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK = 20
-    DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK = 28
-    DEFAULT_MIN_NEW_SPEAK_TOKENS_BEFORE_CHUNK_BOUNDARY = 8
+    # Per-unit speak budgets hold the trained TEXT RATE (~20 tokens, ~28 chars
+    # per second of speech) constant across unit lengths; a shorter unit gets
+    # a proportionally smaller slice per unit, not a smaller overall rate.
+    DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK = max(4, 20 * UNIT_MS // 1000)
+    DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK = max(6, 28 * UNIT_MS // 1000)
+    DEFAULT_MIN_NEW_SPEAK_TOKENS_BEFORE_CHUNK_BOUNDARY = max(2, 8 * UNIT_MS // 1000)
     REPETITION_HISTORY_SIZE = 512
 
     @classmethod

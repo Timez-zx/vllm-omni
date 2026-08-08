@@ -98,6 +98,12 @@ class DuplexCapabilities:
 
     @classmethod
     def minicpmo45_native(cls, *, max_sessions: int = 1) -> DuplexCapabilities:
+        # Late import: policy owns the (env-configurable) unit length so the
+        # serving layer, scheduler budgets, and worker all agree on one value.
+        from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
+            MiniCPMO45DuplexPolicy,
+        )
+
         supports_multi_session = max_sessions > 1
         return cls(
             supports_model_native_turn_policy=True,
@@ -128,7 +134,7 @@ class DuplexCapabilities:
             input_modes=["append_audio_chunk"],
             signal_sources=["model_native", "client_event", "server_policy"],
             stage_handoff_transport="scheduler_data_plane",
-            chunk_period_ms=1000,
+            chunk_period_ms=MiniCPMO45DuplexPolicy.UNIT_MS,
             target_barge_in_latency_ms=None,
         )
 

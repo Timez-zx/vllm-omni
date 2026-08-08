@@ -144,7 +144,11 @@ class MiniCPMO45NativeDuplexServingAdapter:
         config: DuplexSessionConfig,
         model_config: Any,
     ) -> None:
-        stage0_max_tokens = config.max_tokens if isinstance(config.max_tokens, int) and config.max_tokens > 0 else 20
+        stage0_max_tokens = (
+            config.max_tokens
+            if isinstance(config.max_tokens, int) and config.max_tokens > 0
+            else MiniCPMO45DuplexPolicy.DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK
+        )
         runtime_config["duplex_stage_max_tokens"] = {"0": stage0_max_tokens, "1": 8192}
         stage0_params: dict[str, object] = {
             "temperature": config.temperature if config.temperature is not None else 0.7,

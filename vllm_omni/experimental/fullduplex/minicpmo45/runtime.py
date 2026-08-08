@@ -16,12 +16,13 @@ from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
     DuplexOutputDecision,
 )
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
+from vllm_omni.experimental.fullduplex.minicpmo45.policy import MiniCPMO45DuplexPolicy
 
-_DUPLEX_CHUNK_SAMPLES = 16000
-_DUPLEX_SAMPLES_PER_AUDIO_TOKEN = 1600
-# <image> + 64 resampler embeddings + </image> per frame (max_slice_nums=1),
-# matching MiniCPMO45DuplexPolicy.VISION_TOKENS_PER_FRAME.
-_DUPLEX_VISION_TOKENS_PER_FRAME = 66
+_DUPLEX_CHUNK_SAMPLES = MiniCPMO45DuplexPolicy.CHUNK_SAMPLES
+_DUPLEX_SAMPLES_PER_AUDIO_TOKEN = MiniCPMO45DuplexPolicy.SAMPLES_PER_AUDIO_TOKEN
+_DUPLEX_VISION_TOKENS_PER_FRAME = MiniCPMO45DuplexPolicy.VISION_TOKENS_PER_FRAME
+# <unit> open + decision slot + one audio embedding per 100 ms of unit.
+_DUPLEX_TOKENS_PER_UNIT = MiniCPMO45DuplexPolicy.TOKENS_PER_UNIT
 
 
 def _duplex_frame_count(payload: object) -> int:
@@ -115,12 +116,15 @@ def build_duplex_data_plane_prompt(
         first_units = duplex_first_append_unit_count(payload)
         if first_units is not None:
             token_budget = (
-                context_reserve + first_units * 12 - 1 + _duplex_frame_count(payload) * _DUPLEX_VISION_TOKENS_PER_FRAME
+                context_reserve
+                + first_units * _DUPLEX_TOKENS_PER_UNIT
+                - 1
+                + _duplex_frame_count(payload) * _DUPLEX_VISION_TOKENS_PER_FRAME
             )
     if seq > 1 and duplex_payload_is_exact_chunks(payload):
         token_budget += 1
     if final and duplex_payload_is_exact_chunks(payload):
-        token_budget += 12
+        token_budget += _DUPLEX_TOKENS_PER_UNIT
     extra_body = session_config.get("extra_body")
     raw_token_id = runtime_config.get("duplex_scheduler_token_id")
     try:

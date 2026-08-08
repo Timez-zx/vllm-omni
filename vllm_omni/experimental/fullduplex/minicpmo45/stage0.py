@@ -9,8 +9,11 @@ from threading import Lock
 from typing import Any
 
 import numpy as np
+from vllm.logger import init_logger
 
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import MiniCPMO45DuplexPolicy
+
+logger = init_logger(__name__)
 
 _MINICPMO45_SPECIAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS
 _MINICPMO45_OPTIONAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.OPTIONAL_TOKEN_FIELDS
@@ -84,10 +87,22 @@ class MiniCPMO45Stage0DuplexRuntime:
             return
         set_streaming_mode = getattr(processor, "set_streaming_mode", None)
         if callable(set_streaming_mode):
+            # First window = unit + 35 ms: 15 ms mel window/hop overlap plus
+            # 20 ms CNN redundancy, a fixed margin independent of unit length
+            # (official 1000 ms cadence uses 1035).
+            chunk_ms = int(self._stage_param("chunk_ms", MiniCPMO45DuplexPolicy.UNIT_MS))
+            first_chunk_ms = int(self._stage_param("first_chunk_ms", MiniCPMO45DuplexPolicy.UNIT_MS + 35))
+            # Worker-side confirmation that the configured unit length reached
+            # this process; keep OUTSIDE any region that can silently stop.
+            logger.info(
+                "[MiniCPMO45Stage0] streaming configured: chunk_ms=%d first_chunk_ms=%d",
+                chunk_ms,
+                first_chunk_ms,
+            )
             set_streaming_mode(
                 mode="exact",
-                chunk_ms=int(self._stage_param("chunk_ms", 1000)),
-                first_chunk_ms=int(self._stage_param("first_chunk_ms", 1035)),
+                chunk_ms=chunk_ms,
+                first_chunk_ms=first_chunk_ms,
                 cnn_redundancy_ms=int(self._stage_param("cnn_redundancy_ms", 20)),
                 enable_sliding_window=True,
                 slide_trigger_seconds=30.0,
@@ -102,7 +117,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         configure_streaming = getattr(processor, "configure_streaming", None)
         if callable(configure_streaming):
             configure_streaming(
-                chunk_ms=int(self._stage_param("chunk_ms", 1000)),
+                chunk_ms=int(self._stage_param("chunk_ms", MiniCPMO45DuplexPolicy.UNIT_MS)),
                 enable_sliding_window=True,
                 slide_trigger_seconds=30.0,
                 slide_stride_seconds=10.0,
@@ -361,7 +376,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         get_chunk = getattr(processor, "get_streaming_chunk_size", None)
         if callable(get_chunk):
             return int(get_chunk())
-        return 16000
+        return MiniCPMO45DuplexPolicy.CHUNK_SAMPLES
 
     def _sample_rate(self, processor: Any | None = None) -> int:
         processor = processor or self.processor
@@ -376,7 +391,11 @@ class MiniCPMO45Stage0DuplexRuntime:
         processor = processor or self.processor
         if getattr(processor, "_streaming_mel_processor", None) is None:
             return default_chunk_size
-        return int(self._stage_param("first_chunk_ms", 1035) * self._sample_rate(processor) / 1000)
+        return int(
+            self._stage_param("first_chunk_ms", MiniCPMO45DuplexPolicy.UNIT_MS + 35)
+            * self._sample_rate(processor)
+            / 1000
+        )
 
     def _pad_first_audio_chunk_if_needed(
         self,
@@ -413,14 +432,19 @@ class MiniCPMO45Stage0DuplexRuntime:
     ) -> int:
         processor = processor or self.processor
         if chunk_idx != 0:
-            chunk_ms = int(self._stage_param("chunk_ms", 1000))
+            chunk_ms = int(self._stage_param("chunk_ms", MiniCPMO45DuplexPolicy.UNIT_MS))
             return int(chunk_ms * self._sample_rate(processor) / 1000)
         mel_processor = getattr(processor, "_streaming_mel_processor", None)
         get_config = getattr(mel_processor, "get_config", None)
         if callable(get_config):
             cfg = get_config()
             if isinstance(cfg, dict):
-                consumed_ms = int(cfg.get("effective_first_chunk_ms", self._stage_param("first_chunk_ms", 1035)))
+                consumed_ms = int(
+                    cfg.get(
+                        "effective_first_chunk_ms",
+                        self._stage_param("first_chunk_ms", MiniCPMO45DuplexPolicy.UNIT_MS + 35),
+                    )
+                )
                 return int(consumed_ms * self._sample_rate(processor) / 1000)
         return default_chunk_size
 

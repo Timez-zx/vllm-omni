@@ -11,6 +11,9 @@ from vllm.logger import init_logger
 from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlRequestError
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import duplex_data_plane_request_info
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
+from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
+    MiniCPMO45DuplexPolicy as _MiniCPMO45DuplexPolicy,
+)
 from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexSession,
     DuplexSessionState,
@@ -313,11 +316,15 @@ class NativeRuntimeBridgeMixin:
         native.data_plane_task = task
         return True
 
-    # One model unit (1 s at 16 kHz) of pcm_f32le silence, matching the
+    # One model unit (UNIT_MS at 16 kHz) of pcm_f32le silence, matching the
     # official full-duplex behavior where the microphone keeps streaming
-    # silence while the assistant speaks; replies span multiple units.
-    _NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO = base64.b64encode(bytes(16000 * 4)).decode("ascii")
-    _NATIVE_RESPONSE_MAX_CONTINUATION_UNITS = 8
+    # silence while the assistant speaks; replies span multiple units. The
+    # continuation cap is a wall-clock budget (~8 s), not a unit count, so it
+    # scales with the configured unit length.
+    _NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO = base64.b64encode(
+        bytes(_MiniCPMO45DuplexPolicy.CHUNK_SAMPLES * 4)
+    ).decode("ascii")
+    _NATIVE_RESPONSE_MAX_CONTINUATION_UNITS = max(8, 8000 // _MiniCPMO45DuplexPolicy.UNIT_MS)
 
     def _native_silence_unit_payload(self) -> dict[str, object]:
         return {

@@ -17,6 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from collections.abc import Iterable
 from contextlib import suppress
 from functools import cached_property
@@ -47,6 +48,38 @@ from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+# Diagnostic probe for per-unit listen/speak decisions (workers inherit the
+# env from the API server process).
+_DUPLEX_DECISION_PROBE = os.environ.get("VLLM_OMNI_DUPLEX_PROBE") == "1"
+
+
+def _duplex_speak_bias_from_env() -> float:
+    """VLLM_OMNI_DUPLEX_SPEAK_BIAS: logit bias added to <|speak|> at the
+    decision position of free (not force-listen) SILENCE units.
+
+    Rationale: at sub-second unit clocks the checkpoint's open decision
+    collapses softly (raw p_speak ~2%, always rank 2) and top_p=0.8 then
+    removes <|speak|> from the nucleus entirely whenever p_listen > 0.8 —
+    silence becomes structural. A bias of b multiplies the speak odds by
+    e^b (b=3 -> 2% becomes ~29%) while the model still owns the timing.
+    Speech units are never biased, so the user is not talked over."""
+    try:
+        return float(os.environ.get("VLLM_OMNI_DUPLEX_SPEAK_BIAS", "0") or 0.0)
+    except ValueError:
+        return 0.0
+
+
+_DUPLEX_SPEAK_BIAS = _duplex_speak_bias_from_env()
+
+# Arm the speak bias only after this many CONSECUTIVE silence units (and only
+# while the model is not already speaking). Intra-question word gaps at fine
+# clocks read as 1-unit silences and must not ignite an interruption; true
+# end-of-turn silence runs longer. Default 2 units.
+try:
+    _DUPLEX_SPEAK_BIAS_AFTER_UNITS = max(1, int(os.environ.get("VLLM_OMNI_DUPLEX_SPEAK_BIAS_AFTER", "2")))
+except ValueError:
+    _DUPLEX_SPEAK_BIAS_AFTER_UNITS = 2
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -702,11 +735,63 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 row_idx=row_idx,
                 token_ids=token_ids,
             )
+            if _DUPLEX_DECISION_PROBE:
+                self._probe_minicpmo45_duplex_decision(row_idx, sampled, sampling_metadata, token_ids, row_logits)
             self._record_minicpmo45_duplex_terminator(row_idx, sampled, token_ids)
             sampled_ids.append(sampled)
         return SamplerOutput(
             sampled_token_ids=torch.tensor(sampled_ids, device=logits.device, dtype=torch.int32).unsqueeze(-1),
             logprobs_tensors=None,
+        )
+
+    def _probe_minicpmo45_duplex_decision(
+        self,
+        row_idx: int,
+        sampled: int,
+        sampling_metadata: SamplingMetadata,
+        token_ids: dict[str, int],
+        row_logits: torch.Tensor | None = None,
+    ) -> None:
+        """VLLM_OMNI_DUPLEX_PROBE=1: log the sampled token at each segment's
+        decision position, with the state flags that gate forced listen —
+        read BEFORE _record_minicpmo45_duplex_terminator mutates them.
+        Also logs raw (temp=1, unmasked) probabilities of listen/speak/tts_bos
+        and the top-3 tokens, to tell a soft collapse (bias-recoverable) from
+        a hard one."""
+        outs = getattr(sampling_metadata, "output_token_ids", None) or []
+        n_out = len(outs[row_idx]) if row_idx < len(outs) else -1
+        if n_out != 0:
+            return
+        state = self._minicpmo45_duplex_state_for_row(row_idx)
+        payload = self._minicpmo45_duplex_payload_for_row(row_idx)
+        id_to_name = {v: k for k, v in token_ids.items() if isinstance(v, int)}
+        name = id_to_name.get(sampled)
+        probs_txt = ""
+        if row_logits is not None and row_logits.ndim == 2 and row_logits.shape[0] == 1:
+            probs = F.softmax(row_logits[0].float(), dim=-1)
+            key = {
+                "listen": token_ids.get("listen_token_id", -1),
+                "speak": token_ids.get("speak_token_id", -1),
+                "tts_bos": token_ids.get("tts_bos_token_id", -1),
+            }
+            parts = [
+                f"p_{label}={probs[idx].item():.2e}" for label, idx in key.items() if 0 <= idx < probs.shape[-1]
+            ]
+            top = torch.topk(probs, k=min(3, probs.shape[-1]))
+            tops = ",".join(
+                f"{id_to_name.get(int(i), int(i))}:{v.item():.2f}"
+                for v, i in zip(top.values, top.indices, strict=False)
+            )
+            probs_txt = " " + " ".join(parts) + f" top3=[{tops}]"
+        logger.info(
+            "[DuplexProbe] row=%d decision=%s is_speech=%s force=%s turn_ended=%s pending_ctx=%s%s",
+            row_idx,
+            name or f"text:{sampled}",
+            payload.get("is_speech") if isinstance(payload, dict) else None,
+            payload.get("force_listen") if isinstance(payload, dict) else None,
+            getattr(state, "current_turn_ended", None),
+            getattr(state, "pending_speech_context", None),
+            probs_txt,
         )
 
     def _sample_minicpmo45_native_duplex_row(
@@ -722,6 +807,22 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         output_token_ids = getattr(sampling_metadata, "output_token_ids", None) or []
         raw_recent_tokens = output_token_ids[row_idx] if row_idx < len(output_token_ids) else []
         recent_tokens = [int(token_id) for token_id in raw_recent_tokens if isinstance(token_id, int) and token_id >= 0]
+        if _DUPLEX_SPEAK_BIAS != 0.0 and not recent_tokens:
+            speak_id = token_ids.get("speak_token_id", -1)
+            bias_payload = self._minicpmo45_duplex_payload_for_row(row_idx)
+            bias_state = self._minicpmo45_duplex_state_for_row(row_idx)
+            if 0 <= speak_id < logits.shape[-1] and isinstance(bias_payload, dict) and bias_state is not None:
+                if bias_payload.get("is_speech") is True:
+                    bias_state.silence_units_run = 0
+                else:
+                    run = int(getattr(bias_state, "silence_units_run", 0)) + 1
+                    bias_state.silence_units_run = run
+                    if (
+                        run >= _DUPLEX_SPEAK_BIAS_AFTER_UNITS
+                        and bias_payload.get("force_listen") is not True
+                        and getattr(bias_state, "current_turn_ended", True)
+                    ):
+                        logits[0, speak_id] += _DUPLEX_SPEAK_BIAS
         temperature = float(self._sampling_metadata_value(sampling_metadata, "temperature", row_idx, 0.7))
         top_k = int(self._sampling_metadata_value(sampling_metadata, "top_k", row_idx, 100))
         top_p = float(self._sampling_metadata_value(sampling_metadata, "top_p", row_idx, 0.8))
