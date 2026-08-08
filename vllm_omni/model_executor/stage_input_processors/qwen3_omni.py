@@ -37,6 +37,65 @@ logger = logging.getLogger(__name__)
 # Pooling output layer keys: "0" = word embedding, "24" = accept_hidden_layer
 _EMBED_LAYER_KEY = "0"
 _HIDDEN_LAYER_KEY = "24"
+
+
+def _s01_edge_is_intra_process() -> bool:
+    """True when stages 0 and 1 are colocated in one process.
+
+    Mirrors ColocInProcConnector's flat-group parse of
+    VLLM_OMNI_COLOCATE_STAGES. When true, payloads on the thinker->talker edge
+    pass by reference through the in-process store, so the transport copy to
+    CPU is pure waste (measured: 291 MB and 57-77% of the talker's added
+    latency at long contexts).
+    """
+    import os
+
+    raw = os.environ.get("VLLM_OMNI_COLOCATE_STAGES", "").strip()
+    if not raw:
+        return False
+    members: set[int] = set()
+    for pair in raw.split(","):
+        guest_s, _, host_s = pair.partition(":")
+        try:
+            members.add(int(guest_s.strip()))
+            members.add(int(host_s.strip()))
+        except ValueError:
+            return False
+    return 0 in members and 1 in members
+
+
+_S01_INTRA_PROCESS = _s01_edge_is_intra_process()
+_SNAPSHOT_DEVICE_LOGGED = False
+
+
+def _snapshot_for_talker(t: torch.Tensor) -> torch.Tensor:
+    """Detach-and-snapshot a thinker tensor for shipment to the talker.
+
+    The copy is load-bearing beyond transport: it decouples the payload from
+    GPU buffers the next engine step overwrites (async scheduling relies on
+    that). Separate-process mode must go through CPU anyway (SHM transport).
+    In-process mode keeps the snapshot but takes it as a same-device clone --
+    a D2D copy instead of a pageable D2H, and the consumer's .to(device)
+    becomes a no-op. The synchronize matches the implicit sync today's
+    .cpu() performs, so payload-readiness semantics are unchanged across the
+    producer thread / consumer stream boundary.
+    """
+    global _SNAPSHOT_DEVICE_LOGGED
+    if not _SNAPSHOT_DEVICE_LOGGED:
+        _SNAPSHOT_DEVICE_LOGGED = True
+        logger.warning(
+            "[stage0->1] first payload tensor: device=%s intra_process=%s "
+            "(cuda+intra = D2D snapshot active; cpu = an upstream copy already paid the D2H)",
+            t.device,
+            _S01_INTRA_PROCESS,
+        )
+    if _S01_INTRA_PROCESS and t.is_cuda:
+        # Already a decoupled snapshot: under full tri-colocation the runner's
+        # async output path ships its D2D clone (keep_on_device) instead of a
+        # CPU copy, and this builder is that payload's sole owner -- pass the
+        # reference through, no further copy needed.
+        return t.detach()
+    return t.detach().cpu()
 # Per-model REPLACE-keys for the full-payload accumulator.  Keys in this
 # set use REPLACE semantics (subsequent emissions discard prior chunks)
 # instead of CONCAT.  qwen3-omni currently has none — model_outputs is
@@ -301,8 +360,8 @@ def _construct_thinker2talker_streaming_input_async_chunk(
     speaker = extract_speaker_from_request(request)
     language = extract_language_from_request(request)
     finished = torch.tensor(is_finished, dtype=torch.bool)
-    emb_cpu = thinker_emb.detach().cpu()
-    hid_cpu = thinker_hid.detach().cpu()
+    emb_cpu = _snapshot_for_talker(thinker_emb)
+    hid_cpu = _snapshot_for_talker(thinker_hid)
 
     # Has the engine finished prefilling every prompt token it has been given?
     # This is the ENGINE's own bookkeeping, and it is the only trustworthy answer:
@@ -607,19 +666,19 @@ def thinker2talker_async_chunk(
     language = extract_language_from_request(request)
 
     def _maybe_cpu(t: Any) -> torch.Tensor | None:
-        return t.detach().cpu() if isinstance(t, torch.Tensor) else None
+        return _snapshot_for_talker(t) if isinstance(t, torch.Tensor) else None
 
     if chunk_id == 0:
         all_token_ids = _ensure_list(request.all_token_ids)
         prompt_token_ids = _ensure_list(request.prompt_token_ids)
         payload = OmniPayloadStruct(
             embed=EmbeddingsStruct(
-                prefill=thinker_emb.detach().cpu(),
+                prefill=_snapshot_for_talker(thinker_emb),
                 tts_bos=_maybe_cpu(thinker_embed.get("tts_bos")),
                 tts_eos=_maybe_cpu(thinker_embed.get("tts_eos")),
                 tts_pad=_maybe_cpu(thinker_embed.get("tts_pad")),
             ),
-            hidden_states=HiddenStatesStruct(output=thinker_hid.detach().cpu()),
+            hidden_states=HiddenStatesStruct(output=_snapshot_for_talker(thinker_hid)),
             ids=IdsStruct(all=all_token_ids, prompt=prompt_token_ids),
             meta=MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool)),
             speaker=speaker,
@@ -659,7 +718,7 @@ def thinker2talker_async_chunk(
         meta = MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool))
         payload = OmniPayloadStruct(
             meta=meta,
-            embed=EmbeddingsStruct(decode=thinker_emb.detach().cpu()),
+            embed=EmbeddingsStruct(decode=_snapshot_for_talker(thinker_emb)),
             speaker=speaker,
             language=language,
         )

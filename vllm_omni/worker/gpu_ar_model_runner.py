@@ -7,6 +7,7 @@ and also outputs sampled tokens.
 from __future__ import annotations
 
 import gc
+import os
 import threading
 from collections.abc import Callable, Sequence
 from contextlib import nullcontext
@@ -121,11 +122,40 @@ class _AsyncCPUPayloadSnapshot:
         self._waited = True
 
 
+def _tri_colocation_keeps_payload_on_device() -> bool:
+    """True only under FULL tri-colocation (stages 0, 1, 2 in one process).
+
+    Then every connector edge is an in-process reference handoff and the
+    async snapshot's CPU stage is pure transport waste: the D2D clone in
+    _clone_cuda_tensor_payload already provides the buffer decoupling that
+    async scheduling needs, and the downstream stage consumes the tensor on
+    the same device anyway (its .to(device) becomes a no-op). The pair
+    config (2:1) keeps the CPU path: stage 0 lives in another process there
+    and its payloads must cross a SharedMemory hop.
+    """
+    raw = os.environ.get("VLLM_OMNI_COLOCATE_STAGES", "").strip()
+    if not raw:
+        return False
+    members: set[int] = set()
+    for pair in raw.split(","):
+        guest_s, _, host_s = pair.partition(":")
+        try:
+            members.add(int(guest_s.strip()))
+            members.add(int(host_s.strip()))
+        except ValueError:
+            return False
+    return {0, 1, 2} <= members
+
+
+_OMNI_PAYLOAD_KEEP_ON_DEVICE = _tri_colocation_keeps_payload_on_device()
+
+
 def _snapshot_tensor_payload_to_cpu_async(
     value: Any,
     *,
     copy_stream: torch.cuda.Stream,
     pin_memory: bool,
+    keep_on_device: bool = False,
 ) -> _AsyncCPUPayloadSnapshot:
     cuda_sources: list[torch.Tensor] = []
     cloned = _clone_cuda_tensor_payload(value, cuda_sources)
@@ -134,6 +164,12 @@ def _snapshot_tensor_payload_to_cpu_async(
 
     source_stream = torch.cuda.current_stream()
     ready_event = torch.cuda.Event()
+    if keep_on_device:
+        # Ship the decoupling clone itself; readiness = clone completion on
+        # the source stream. wait() still synchronizes the event before the
+        # payload leaves the builder, matching the CPU path's semantics.
+        ready_event.record(source_stream)
+        return _AsyncCPUPayloadSnapshot(cloned, ready_event, cuda_sources)
     with torch.cuda.stream(copy_stream):
         copy_stream.wait_stream(source_stream)
         cpu_payload = _copy_tensor_payload_to_cpu(cloned, pin_memory)
@@ -1664,6 +1700,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 # on the 17.5k-token Thinker prefill). Resolve pinning from the
                 # platform helper so the copy is a true async cudaMemcpyAsync.
                 pin_memory=is_pin_memory_available(),
+                keep_on_device=_OMNI_PAYLOAD_KEEP_ON_DEVICE,
             )
 
         payload = async_payload_snapshot.payload
