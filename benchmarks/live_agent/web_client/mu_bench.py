@@ -260,6 +260,8 @@ class User:
                 consecutive_timeouts += 1
                 self.records.append({
                     "user": self.name, "turn": i + 1, "q": q, "status": "timeout",
+                    "t_q": t_q, "t_ft": self.cur["t_first_text"],
+                    "t_fa": self.cur["t_first_audio"], "t_done": None,
                     "ttfa_ms": None, "ttft_ms": None, "wall_s": None,
                     "audio_s": self.cur["audio_samples"] / 24000.0,
                     "chars_stream": len(self.cur["text_stream"]),
@@ -278,6 +280,13 @@ class User:
             deliver_s = (cur["t_done"] - cur["t_first_audio"]) if cur["t_first_audio"] else None
             self.records.append({
                 "user": self.name, "turn": i + 1, "q": q, "status": "ok",
+                # Absolute monotonic stamps (one clock: all users share this
+                # process). They let the analysis reconstruct, for any turn,
+                # how many OTHER turns were mid-TTFA or mid-delivery when this
+                # one arrived -- the split between "queued behind others" and
+                # "everything got slower" that percentiles alone cannot give.
+                "t_q": t_q, "t_ft": cur["t_first_text"],
+                "t_fa": cur["t_first_audio"], "t_done": cur["t_done"],
                 "ttfa_ms": ttfa, "ttft_ms": ttft, "wall_s": wall,
                 "audio_s": audio_s,
                 "rtf_deliver": (audio_s / deliver_s) if deliver_s and deliver_s > 0 else None,
