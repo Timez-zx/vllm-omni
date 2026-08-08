@@ -1307,6 +1307,56 @@ def make_forward_context_thread_local() -> None:
     )
 
 
+def make_workspace_manager_colocation_safe() -> None:
+    """Stop the second engine's init from destroying the first's MoE workspace.
+
+    vllm's WorkspaceManager is a process-global singleton. In a colocated
+    process, the GUEST engine's GPUModelRunner.__init__ calls
+    init_workspace_manager again -- which REPLACES the manager (dropping the
+    host talker's grown buffers) -- and its post-warmup lock_workspace() then
+    locks the fresh EMPTY manager. The talker's next new-shape allocation dies:
+    "Workspace is locked but allocation requires 1.99 MB, current size is
+    0.00 MB" (boot_coloc6, first 128-user turn).
+
+    Two surgical changes, colocated mode only:
+      * init_workspace_manager becomes idempotent (keep the existing manager;
+        the second caller shares it) -- __code__ transplant because callers
+        import it by value;
+      * WorkspaceManager.lock becomes a no-op via class-attribute rebind
+        (method lookup goes through the class, no transplant needed). Growth
+        after "lock" is a perf-hygiene guard, not a correctness invariant;
+        with two engines sharing one manager the sizes are only final after
+        BOTH have warmed, so the guard cannot be kept as-is anyway.
+    """
+    import vllm.v1.worker.workspace as ws
+
+    if getattr(ws, "_omni_colocation_safe", False):
+        return
+
+    def init_workspace_manager(device, num_ubatches=None):  # noqa: ANN001, ANN202
+        global _manager  # noqa: PLW0603
+        if _manager is not None:
+            logger.info(
+                "WorkspaceManager already initialized on device %s; keeping it "
+                "(colocated engines share one manager)",
+                _manager._device,
+            )
+            return
+        _manager = WorkspaceManager(device, num_ubatches)  # noqa: F821
+
+    ws.init_workspace_manager.__code__ = init_workspace_manager.__code__
+
+    def _lock_noop(self) -> None:
+        logger.debug("[colocate] workspace lock skipped (growth stays allowed)")
+
+    ws.WorkspaceManager.lock = _lock_noop
+    ws._omni_colocation_safe = True
+    logger.warning(
+        "[colocate] WorkspaceManager made colocation-safe: init is idempotent, "
+        "lock is a no-op (two engines share one workspace manager)"
+    )
+
+
 def maybe_apply_audex_cfg_patches(vllm_config: Any) -> None:
     """Install the Audex CFG scheduler patches for CFG-configured engines.
 
