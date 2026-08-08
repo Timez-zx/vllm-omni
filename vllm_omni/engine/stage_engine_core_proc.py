@@ -32,6 +32,7 @@ from vllm_omni.distributed.omni_coordinator import create_stage_coord_client
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.stage_init_utils import (
     make_forward_context_thread_local,
+    make_workspace_manager_colocation_safe,
     maybe_apply_audex_cfg_patches,
     set_death_signal,
 )
@@ -151,6 +152,9 @@ class StageEngineCoreProc(EngineCoreProc):
                 # vllm's module-global forward context must become
                 # thread-local BEFORE either core runs a forward.
                 make_forward_context_thread_local()
+                # And the guest's init must not replace-and-lock the shared
+                # MoE workspace singleton out from under the host.
+                make_workspace_manager_colocation_safe()
 
             # With a colocated sibling, the HOST must leave the legacy default
             # stream too: the default stream synchronizes with every other
