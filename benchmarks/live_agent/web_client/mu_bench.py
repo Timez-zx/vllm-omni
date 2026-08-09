@@ -73,6 +73,13 @@ if SAVE_WAV_DIR:
 DUPLEX = os.environ.get("MU_DUPLEX") == "1"
 DUPLEX_CHUNK_MS = int(os.environ.get("MU_DUPLEX_CHUNK_MS", "100"))
 DUPLEX_SPEAK_S = float(os.environ.get("MU_DUPLEX_SPEAK_S", "1.5"))
+# Pure-ingestion hold: after the turn loop finishes, keep the websocket open
+# and the audio pump running for this many seconds. With --turns 1 this is the
+# "thinker-only duplex" shape: one opening turn arms the session request, then
+# the model only ingests at the append cadence and steps -- no queries, no
+# speech, the talker's odometer frozen. The measurement is the ACHIEVED append
+# cadence vs the nominal group period: the duplex deadline-miss analogue.
+DUPLEX_HOLD_S = float(os.environ.get("MU_DUPLEX_HOLD_S", "0"))
 
 QUESTIONS = [
     "Name one primary color.",
@@ -200,6 +207,8 @@ class User:
                 try:
                     await asyncio.sleep(WARMUP_S + self.rng.uniform(*STAGGER_S))
                     await self._turn_loop(ws)
+                    if DUPLEX and DUPLEX_HOLD_S > 0:
+                        await asyncio.sleep(DUPLEX_HOLD_S)
                 finally:
                     pump.cancel()
                     if audio_pump is not None:
