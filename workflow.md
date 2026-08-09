@@ -1746,15 +1746,20 @@ three arms, 10 turns each:
 | arm | TTFA p50 | p95 | rtf p50 | appends |
 |---|---:|---:|---:|---:|
 | control (turn-based feeding) | 181 | 254 | 8.84 | 0 |
-| duplex, group 480 ms | 183 | 351 | 7.61 | 909 |
 | duplex, group 960 ms | 174 | 278 | **8.85** | 433 |
+| duplex, group 480 ms | 183 | 351 | 7.61 | 909 |
+| duplex, group 200 ms | 278 | 428 | 6.10 | 2,212 |
 
-The duty cycle is **free at the median** (+2 ms) and pays at the tail
-(+97 ms p95) and in delivery margin (−14% rtf) at 480 ms grouping — and
-halving the append rate (960 ms groups) buys almost all of it back, rtf
-fully recovered. That is §23's "organizing tax" turned into a knob: the
-tail cost is append/turn collisions, priced per append, not per token.
-Zero timeouts, zero >1 s turns, probes clean in all arms.
+The duty cycle is **free at the median** at 480 ms grouping (+2 ms) and
+pays at the tail (+97 ms p95) and in delivery margin (−14% rtf); 960 ms
+buys almost all of it back, rtf fully recovered; and 200 ms — a 5/s
+append cadence — is where the median itself starts paying (+97 ms) and
+rtf gives up 31%. Three points, one reading: §23's "organizing tax"
+turned into a knob, priced per APPEND and **superlinear in append rate**
+(the collisions compound). Zero timeouts, zero >1 s turns, probes clean
+in all arms. Xiao set **200 ms as the serving default** the next morning
+(a finer duplex tick, priced as above); capacity ladders that want the
+coarser price override per cell via MU_SESSION_CFG_JSON.
 
 **What this is for.** The Qwen stack now emulates the resource side of a
 SeedRealtime-class workload end to end: constant context growth (~18–25

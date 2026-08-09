@@ -733,12 +733,14 @@ class StreamingVideoSessionConfig(BaseModel):
         ),
     )
     audio_prefill_group_ms: int = Field(
-        default=480,
+        default=200,
         description=(
             "Minimum milliseconds of arrived PCM before an on-arrival audio append fires. "
             "Smaller = fresher context and finer duplex tick, but more appends per second "
-            "(each pays an encoder call, a prefill and one discarded sampled token). 480 ms "
-            "~= 12 audio tokens per append at the encoder's ~25 tok/s."
+            "(each pays an encoder call, a prefill and one discarded sampled token). "
+            "Measured at 8 users (section 24): 480 ms -> p95 +97 ms / rtf -14% vs "
+            "turn-based; 960 ms buys almost all of it back. 200 ms is the default by "
+            "Xiao's call -- a finer duplex tick, priced accordingly."
         ),
     )
 
