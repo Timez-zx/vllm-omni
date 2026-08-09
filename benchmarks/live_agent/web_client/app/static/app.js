@@ -332,6 +332,12 @@
       // context, which is the leading suspect for desynchronising the talker's span
       // accounting. A latency win is not worth a dead engine.
       prefill_frames_on_arrival: true,
+      // Duplex-shaped feeding (section 24): the mic stream is encoded and
+      // prefilled AS IT ARRIVES, silence included, grouped server-side per
+      // audio_prefill_group_ms (server default, 200 ms). The context grows
+      // around the clock like a duplex model's; the turn only sweeps the
+      // ungrouped tail instead of the whole utterance.
+      prefill_audio_on_arrival: true,
       session_roll_at_talker_tokens: 45000,
       session_roll_history_turns: 8,
     };
