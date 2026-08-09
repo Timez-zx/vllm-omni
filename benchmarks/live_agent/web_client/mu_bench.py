@@ -56,6 +56,14 @@ GIVE_UP_AFTER = 3               # consecutive timeouts before a user stops
 SYSTEM_PROMPT = ("You are a voice assistant. "
                  "Answer each question out loud in one short sentence.")
 
+# Optional listening artifacts: dump each ok turn's audio as
+# <dir>/<user>_tNN.wav (24 kHz mono PCM). Env-driven like MU_SESSION_CFG_JSON
+# so the ladder scripts need no new flags. Meant for small cells (u1); at 32
+# users this writes ~1k files.
+SAVE_WAV_DIR = os.environ.get("MU_SAVE_WAV_DIR")
+if SAVE_WAV_DIR:
+    os.makedirs(SAVE_WAV_DIR, exist_ok=True)
+
 QUESTIONS = [
     "Name one primary color.",
     "What is two plus three?",
@@ -230,7 +238,10 @@ class User:
             elif t == "response.audio.delta":
                 if cur["t_first_audio"] is None:
                     cur["t_first_audio"] = t_now
-                samples = (len(base64.b64decode(msg["data"])) - 44) // 2
+                data = base64.b64decode(msg["data"])
+                samples = (len(data) - 44) // 2
+                if SAVE_WAV_DIR:
+                    cur["pcm"] += data[44:]
                 # starvation: a player that started at the first delta has
                 # consumed (t_now - t_first) seconds; was that much delivered?
                 played = t_now - cur["t_first_audio"]
@@ -250,6 +261,7 @@ class User:
                 "t_first_text": None, "t_first_audio": None, "t_done": None,
                 "text_stream": "", "text_at_first_sound": "",
                 "audio_samples": 0, "n_deltas": 0, "max_starve_s": 0.0,
+                "pcm": bytearray(),
             }
             self.done_evt.clear()
             t_q = time.monotonic()
@@ -296,6 +308,14 @@ class User:
                 "chars_at_first_sound": len(cur["text_at_first_sound"]),
                 "text": cur["text_stream"][:200],
             })
+            if SAVE_WAV_DIR and cur["pcm"]:
+                import wave
+                p = pathlib.Path(SAVE_WAV_DIR) / f"{self.name}_t{i + 1:02d}.wav"
+                with wave.open(str(p), "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(24000)
+                    w.writeframes(bytes(cur["pcm"]))
             await asyncio.sleep(self.rng.uniform(*THINK_S))
 
     def _mark_skipped(self, start: int | None = None, reason: str = "") -> None:

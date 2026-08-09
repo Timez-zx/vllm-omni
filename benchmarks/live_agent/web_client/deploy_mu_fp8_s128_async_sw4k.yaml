@@ -1,0 +1,95 @@
+# deploy_mu_fp8_s128_async.yaml with ONE change: the talker (stage 1) runs a
+# 4,096-token SLIDING ATTENTION WINDOW, injected via hf_overrides so no model
+# code changes. Exists to cap per-user talker KV residency at ~window size
+# (~80 MB) instead of growing to the 45k roll line (~0.88 GiB) -- the audio
+# capacity binder (8 users all-at-45k -> ~90 by pool arithmetic).
+#
+# Mechanics (verified in code 2026-08-08): the nested override lands on
+# talker_config.text_config.sliding_window -> ModelConfig.get_sliding_window()
+# -> CacheConfig.sliding_window -> every talker Attention layer becomes a
+# uniform SlidingWindowSpec; vLLM v1 frees out-of-window blocks DURING decode
+# (remove_skipped_blocks in allocate_slots), block tables stay
+# position-indexed so M-RoPE is untouched. A FLAT {sliding_window: 4096}
+# override would land on the top-level Omni config and be SILENTLY ignored --
+# it must be nested exactly as below.
+#
+# Boot receipts: stage-1 "Maximum concurrency for 65,536 tokens per request"
+# must jump vs the ~6x of the full-attention pool; per-layer confirmation
+# needs VLLM_LOGGING_LEVEL=DEBUG ("Layer ...: sliding_window=4096").
+#
+# What this does NOT change: the 65,536 stage-1 max_model_len array wall and
+# the 45k session roll cadence (positions keep growing; only KV residency
+# plateaus). Quality risk: the checkpoint was trained full-attention; listen
+# to speech AFTER ~45 s of cumulative model speech (the window boundary).
+
+async_chunk: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      initial_codec_chunk_frames: 4
+      codec_chunk_frames: 4
+      codec_left_context_frames: 25
+  connector_coloc_speech:
+    name: ColocInProcConnector
+    extra:
+      initial_codec_chunk_frames: 4
+      codec_chunk_frames: 4
+      codec_left_context_frames: 25
+
+stages:
+  - stage_id: 0                      # thinker: vision + audio encoders + LLM
+    max_num_batched_tokens: 8192
+    max_num_seqs: 128
+    gpu_memory_utilization: 0.67
+    quantization: fp8
+    kv_cache_dtype: fp8
+    trust_remote_code: true
+    enable_prefix_caching: true
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 2048
+
+  - stage_id: 1                      # talker: speech codec token LM
+    max_num_batched_tokens: 8192
+    max_num_seqs: 128
+    gpu_memory_utilization: 0.15
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    enforce_eager: false
+    hf_overrides:                    # 4k sliding attention window, talker only.
+      talker_config:                 # MUST be nested: a flat sliding_window key
+        text_config:                 # lands on the Omni wrapper config and is
+          sliding_window: 4096       # silently ignored (no error, no savings).
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_coloc_speech
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      seed: 42
+      repetition_penalty: 1.05
+
+  - stage_id: 2                      # code2wav: waveform reconstruction
+    max_num_batched_tokens: 65536
+    max_num_seqs: 128
+    gpu_memory_utilization: 0.08
+    enforce_eager: false
+    trust_remote_code: true
+    enable_prefix_caching: false
+    enable_chunked_prefill: false
+    async_scheduling: false
+    devices: "0"
+    input_connectors:
+      from_stage_1: connector_coloc_speech
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      repetition_penalty: 1.1

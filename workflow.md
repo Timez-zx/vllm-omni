@@ -1466,6 +1466,94 @@ speech-over-text priority item already on the list.
 
 ---
 
+## 22. A 4k sliding window on the talker — the 8-user memory wall was self-inflicted
+
+*2026-08-08; config `benchmarks/live_agent/web_client/deploy_mu_fp8_s128_async_sw4k.yaml`,
+data under `/data/zx/results/sw4k_verify_u{1,8}`, listening samples in
+`/data/zx/results/sw4k_verify_u1/wavs/`.*
+
+The question from the capacity ledger: at the 45k roll line, one audio user
+parks 45,000 × 20 KB ≈ 0.88 GiB in the talker's KV pool, so the 7.49 GiB
+pool holds 8 users. But the talker does not NEED 45k of history — its job
+is to continue the voice of the last few sentences, and every session roll
+already proves it (we throw the whole speech history away and reseed with 8
+turns of text, and nobody hears it). Can the talker keep only a 4,096-token
+attention window while the session, the roll line, and the user-visible
+context stay exactly as they are?
+
+**Yes, and it is one yaml stanza.** No model code changes: vLLM's Attention
+constructor takes a model-level window from the engine's cache config, and
+the V1 KV manager frees out-of-window blocks WHILE a request decodes —
+block tables stay position-indexed (freed slots become null blocks), so
+positions keep growing and M-RoPE is untouched. The stanza, on stage 1
+only:
+
+```yaml
+hf_overrides:
+  talker_config:
+    text_config:
+      sliding_window: 4096
+```
+
+**The trap that makes this worth writing down:** a FLAT
+`hf_overrides: {sliding_window: 4096}` lands on the top-level Omni wrapper
+config and is **silently ignored** — no error, no warning, no savings. The
+override must be nested to `talker_config.text_config`, because that is
+what stage 1 resolves as its text config. We verified the landing offline
+(config parse only) before burning a boot.
+
+**Boot receipts (same 7.49 GiB pool, same everything else):**
+
+| stage-1 boot line                        | full attention | 4k window |
+|------------------------------------------|---------------:|----------:|
+| Maximum concurrency for 65,536 tokens    | 5.99×          | **19.16×** |
+| GPU KV cache size (tokens)               | 392,720        | 1,255,722 |
+| thinker pool (untouched)                 | 677,968        | 677,968   |
+
+Two reading rules. First, 19.16× is the GUARANTEED floor: the admission
+bound per request is window 4,095 + 16,384 of scheduler in-flight allowance
+(2 × 8,192 batched tokens) ≈ 20,479 tokens — the pool admits 19 users even
+if every one of them is mid-prefill of a maximal batch simultaneously. In
+steady state a session holds only ~window, so the realistic ceiling is
+392,720 physical tokens / ~4k ≈ **~90 users**, up from 8. Second, the "GPU
+KV cache size: 1,255,722 tokens" line is EQUIVALENT capacity under the
+sliding window, not physical bytes — the pool is still 7.49 GiB at 20
+KB/token; dividing those and getting 6.4 KB/token means you misread the
+line, not that KV got cheaper.
+
+**Mechanics verified across the boundary.** One user, 40 turns, one
+session; cumulative model speech crosses 4,096 talker tokens at turn 25:
+
+- TTFA p50 129 ms on turns 2–20 (before the window fills), 132 ms on turns
+  25–40 (window sliding every step). Flat.
+- Text stays correct and non-repetitive through turn 40; audio seconds per
+  turn flat (1.85 s before / 2.02 s after); rtf 9.1–11.7 throughout.
+- Engine probes all zero; the only >1 s turn was the once-per-boot cold
+  start (§21).
+
+Eight users co-batching (the interaction sliding window × CUDA graphs ×
+async scheduling, which one user cannot exercise): 80/80 turns, p50
+138.5 ms / p95 276.2 ms vs the full-attention baseline's 145.8 / 275.9 —
+the same numbers. `counter_leak_clamped: 4` is the §12 guard containing
+the known leak, in its normal 2–6 band.
+
+**What is NOT settled: how it sounds.** The checkpoint was trained
+full-attention; once the window slides, the earliest tokens — including
+whatever anchoring role they play — are gone, and text LLMs have a history
+of degrading exactly there (the attention-sink lesson). The numbers above
+say mechanics and latency are clean; only ears can pass the audio. The 40
+per-turn wavs are on disk (the boundary is t25; compare t02–t05 against
+t25–t40), and the sliding-window engine is left running for live listening.
+If 4k fails the ear test, 8k/16k still buy 2.5–6× capacity.
+
+**What this does not change:** the 65,536 stage-1 array wall and the 45k
+roll cadence. Positions keep growing; only the KV residency plateaus. The
+sliding window converts the talker pool from the binding capacity wall
+into a bystander — after this, the walls that remain are slots
+(max_num_seqs 128) and the speech-stage latency slope of §21.
+
+---
+
 ## Where things stand
 
 **Working**
