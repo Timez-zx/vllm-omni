@@ -1639,6 +1639,30 @@ that mid-stream chunks can donate) and none at 128 (p10 rtf < 1: there
 is nothing left to reshuffle; only more throughput helps — co-batch
 efficiency, vocoder batching, the engine-loop/GIL dig sites).
 
+**Addendum — "is the SM exploding?" No. The 128-user roof is software,
+not silicon.** Xiao asked whether the saturation is actual SM
+saturation. nvidia-smi's utilization cannot answer (it reads ~96% from
+32 users onward — a kernel is almost always running SOMEWHERE — while
+rtf collapsed 5.27 → 1.19 underneath it). DCGM on a live re-run of both
+rungs, same boot, jkim idle (device SMACT 0.00 before the probe):
+
+| window (10 turns) | TTFA p50 | rtf p50 | SMACT | SMOCC | TENSO | DRAMA |
+|---|---:|---:|---:|---:|---:|---:|
+| 32 users  | 295 ms | 5.03 | 0.42 | 0.05 | 0.05 | 0.29 |
+| 128 users | 964 ms | 1.20 | **0.65** | **0.16** | 0.13 | **0.46** |
+
+At the exact operating point where latency bursts, the SMs sit idle 35%
+of the time, warp occupancy is 16%, and the memory bus is half used.
+Users went ×4 (aggregate audio production ~×4) while SMACT rose only
+×1.55 — co-batching amortizes beautifully; the hardware is nowhere near
+its roof. The service-rate ceiling that pins rtf at ~1.19 is therefore
+the SOFTWARE path between kernels: Python engine loops and the GIL
+shared by the colocated speech pair, per-step launch/organisation gaps,
+connector handoffs. Same diagnosis as the pre-graphs talker (SMACT 0.23
+at 32 users) one tier up. Consequence: capacity beyond 128 audio users
+does not require more FLOPs — it requires the engine-loop/GIL dig sites;
+the silicon is already paid for and idle.
+
 **Working**
 
 - One user, camera and microphone on, long continuous conversation
