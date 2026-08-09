@@ -973,6 +973,7 @@ class OmniStreamingVideoHandler:
                 "arrival_tokens": 0,
                 "arrival_audio_appends": 0,
                 "arrival_audio_ms": 0,
+                "arrival_audio_dropped_ms": 0,
             }
             session_request_id = main_ctx["rid"]
 
@@ -1226,13 +1227,17 @@ class OmniStreamingVideoHandler:
                                 )
                             if _segment_finish_reason(output) is not None:
                                 await websocket.send_json({"type": "response.audio.done"})
+                                # Prefer the submission stamp: st["t0"] is the
+                                # previous turn's end, which under duplex
+                                # feeding is minutes of think-time away.
+                                _t0 = max(st["t0"], sess.get("turn_t0") or 0.0)
                                 logger.info(
                                     "[session] turn=%d done first_text=%.3fs "
                                     "first_audio=%.3fs audio_chunks=%d chars=%d "
                                     "arrival_skipped=%d frames_dropped=%d",
                                     sess["turn_idx"],
-                                    (st["t_first_text"] - st["t0"]) if st["t_first_text"] else -1.0,
-                                    (st["t_first_audio"] - st["t0"]) if st["t_first_audio"] else -1.0,
+                                    (st["t_first_text"] - _t0) if st["t_first_text"] else -1.0,
+                                    (st["t_first_audio"] - _t0) if st["t_first_audio"] else -1.0,
                                     st["audio_chunks"], len("".join(st["text_parts"])),
                                     sess.get("arrival_skipped", 0),
                                     sess.get("frames_dropped", 0),
@@ -1497,19 +1502,70 @@ class OmniStreamingVideoHandler:
                 if len(audio_buffer) < group_bytes:
                     return False
                 n = min(len(audio_buffer), _ARRIVAL_AUDIO_MAX_MS * _PCM_BYTES_PER_MS)
+                # CLAIM the bytes before the slow part. The turn path sweeps this
+                # bytearray wholesale, and two consumers of one buffer cannot both
+                # be right -- what is claimed is no longer sweepable.
                 pcm = bytes(audio_buffer[:n])
-                chunk = await self._build_session_chunk(
-                    config, [], bytearray(pcm), "", frame_pil_cache,
-                    is_first=False,
-                )
-                if chunk is None or not isinstance(chunk, dict):
+                del audio_buffer[:n]
+                claim_turn = sess["turn_idx"]
+                ms = n // _PCM_BYTES_PER_MS
+
+                def _render() -> Any:
+                    # A scratch event loop in a worker thread. The render
+                    # (chat template + audio feature extraction) is a pure
+                    # request->prompt transformation, but it is CPU work that
+                    # measured ~400 ms per group in real browser use -- run
+                    # inline it blocks THE process's one event loop, which
+                    # also carries every session's message intake and audio
+                    # delivery. The first browser test showed exactly that:
+                    # queries stuck ~5 s behind a wall of audio.chunk
+                    # messages (turn=1 first_text=5.9 s), then the client
+                    # gave up. Nothing in the transformation touches the
+                    # outer loop, so a fresh loop in a thread is safe.
+                    return asyncio.run(self._build_session_chunk(
+                        config, [], bytearray(pcm), "", frame_pil_cache,
+                        is_first=False,
+                    ))
+
+                try:
+                    chunk = await asyncio.to_thread(_render)
+                except Exception:
+                    logger.exception(
+                        "[session] prefill-on-arrival: audio render failed; "
+                        "re-banking %d ms", ms)
+                    audio_buffer[0:0] = pcm
                     return False
-                if not _strip_chatml_scaffolding(chunk):
-                    logger.warning(
-                        "[session] prefill-on-arrival: could not reduce the delta to its "
-                        "audio tokens; skipping the append (the audio stays buffered)"
-                    )
+
+                # The world may have moved while the thread rendered: re-check
+                # the same gate before touching the queue. Two outcomes for
+                # the claimed bytes on refusal:
+                #   * no turn ran meanwhile -> put them back at the FRONT
+                #     (chronological order intact), retry next tick;
+                #   * a turn ran -> that turn already swept NEWER audio into
+                #     the context; re-banking these older bytes would splice
+                #     stale sound after fresher sound. Drop them and count it
+                #     -- at most one group per collision, and it is the audio
+                #     from just BEFORE the utterance the turn carried.
+                ok_shape = isinstance(chunk, dict) and _strip_chatml_scaffolding(chunk)
+                unsafe = (sess.get("turn_busy") or sess.get("query_claimed")
+                          or sess.get("shadow") is not None or sess["fatal"]
+                          or sess["queue"].qsize() > 0)
+                if not ok_shape or unsafe:
+                    if sess["turn_idx"] == claim_turn and not sess["fatal"]:
+                        audio_buffer[0:0] = pcm
+                    else:
+                        sess["arrival_audio_dropped_ms"] = (
+                            sess.get("arrival_audio_dropped_ms", 0) + ms)
+                        logger.info(
+                            "[session] prefill-on-arrival: dropped %d ms of "
+                            "claimed audio (turn intervened; total dropped %d ms)",
+                            ms, sess["arrival_audio_dropped_ms"])
+                    if not ok_shape and chunk is not None:
+                        logger.warning(
+                            "[session] prefill-on-arrival: could not reduce the "
+                            "delta to its audio tokens; audio re-banked")
                     return False
+
                 from vllm_omni.engine import (
                     AdditionalInformationEntry,
                     AdditionalInformationPayload,
@@ -1524,11 +1580,10 @@ class OmniStreamingVideoHandler:
                 try:
                     sess["queue"].put_nowait((chunk, 1))
                 except asyncio.QueueFull:
+                    audio_buffer[0:0] = pcm
                     return False
                 sess["audio_seg_fifo"].append("append")
-                del audio_buffer[:n]
                 ntok = len(chunk.get("prompt_token_ids") or ())
-                ms = n // _PCM_BYTES_PER_MS
                 sess["arrival_appends"] += 1
                 sess["arrival_audio_appends"] += 1
                 sess["arrival_audio_ms"] += ms
@@ -1546,6 +1601,31 @@ class OmniStreamingVideoHandler:
                 if _warmup_due() and _shadow_allowed():
                     _launch_shadow_warmup("arrival")
                 return True
+
+            async def _audio_feeder() -> None:
+                """Drive on-arrival audio appends OFF the websocket receive path.
+
+                The receive handler only banks bytes (microseconds); this task
+                claims, renders in a worker thread, and appends on its own
+                clock. A slow render therefore delays only the NEXT append,
+                never message intake or audio delivery. On a successful append
+                it loops immediately so a banked backlog (e.g. a turn's
+                refusal window) drains at render speed; when idle or refused
+                it sleeps one group period.
+                """
+                period = max(0.05, config.audio_prefill_group_ms / 1000.0)
+                while not sess["fatal"]:
+                    try:
+                        appended = await _prefill_audio_on_arrival()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception(
+                            "[session] audio feeder: append attempt failed; "
+                            "audio stays banked")
+                        appended = False
+                    if not appended:
+                        await asyncio.sleep(period)
 
             async def _run_session_turn(*, query_text: str) -> None:
                 """Serialise turns, and refuse to overlap two of them.
@@ -1693,6 +1773,15 @@ class OmniStreamingVideoHandler:
                 if tlen > 0:
                     sess["talker_tokens"] = sess.get("talker_tokens", 0) + tlen
                 budget = config.session_talker_token_budget
+                # The turn stopwatch. The output loop's per-turn state is born
+                # when the PREVIOUS turn closes, which made its t0 a fine
+                # anchor when turns were the only input events -- but under
+                # duplex feeding there is always input in flight, and
+                # first_text measured from the previous turn's end reads as
+                # think-time + speak-window + latency (~6 s that alarmed a
+                # whole debugging session while the client correctly saw
+                # 150 ms). Anchor on the delta's submission instead.
+                sess["turn_t0"] = _time.monotonic()
                 logger.info(
                     "[session] turn=%d queue delta: %d new frames, %d tokens, "
                     "cum=%d, talker_placeholder=%d, talker_est=%d%s, first=%s",
@@ -2593,12 +2682,10 @@ class OmniStreamingVideoHandler:
                             audio_buffer.clear()
                             continue
                         audio_buffer.extend(pcm_bytes)
-                        # Duplex-shaped feeding: encode-and-prefill the accumulated
-                        # audio now instead of at the query. Refusals leave the bytes
-                        # in audio_buffer; the query-time sweep is the safety net.
-                        if (config.prefill_audio_on_arrival
-                                and config.session_scoped_request):
-                            await _prefill_audio_on_arrival()
+                        # Duplex-shaped feeding is driven by _audio_feeder, NOT
+                        # from here: the render costs ~400 ms of CPU per group,
+                        # and this loop also carries every other message. The
+                        # handler's whole job is to bank the bytes.
 
                     elif msg_type == "video.query":
                         query_text = msg.get("text", "")
@@ -2632,6 +2719,10 @@ class OmniStreamingVideoHandler:
                     else:
                         await self._send_error(websocket, f"Unknown type: {msg_type}")
 
+            if config.prefill_audio_on_arrival and config.session_scoped_request:
+                _feeder_task = asyncio.create_task(_audio_feeder())
+                prewarm_tasks.add(_feeder_task)
+                _feeder_task.add_done_callback(prewarm_tasks.discard)
             reader_task = asyncio.create_task(_reader())
             try:
                 await _processor()

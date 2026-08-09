@@ -1778,6 +1778,35 @@ first turn as one large audio chunk. (3) One discarded sampled token per
 append means the append rate is also a context-growth rate: ~2/s at
 480 ms grouping adds ~2 junk tokens/s on top of the audio tokens.
 
+**Addendum — the first real browser session found the flaw the bench
+could not.** Xiao tried the page and got "thinks forever, then errors".
+Two defects, one real and one a lying meter:
+
+1. *The real one:* the append's render (chat template + audio feature
+   extraction) is ~400 ms of CPU, and v1 ran it INLINE in the websocket
+   receive loop — the one loop that also carries every session's message
+   intake and audio delivery. A browser ships ~7.5 audio messages/s plus
+   camera frames; the loop saturated, the user's queries sat ~5 s behind
+   a wall of audio.chunk messages, and the client eventually gave up (the
+   engine then reported the request DROPPED). The bench never saw it:
+   no frames, coarser groups, and a client that patiently waits. Fix: a
+   per-session FEEDER task drives appends off the receive path and runs
+   the render in a worker thread (scratch event loop — the render is a
+   pure request→prompt transformation); the receive handler only banks
+   bytes. The claimed bytes follow a re-check protocol after the thread
+   returns: no turn intervened → re-bank at the front (order intact);
+   a turn intervened → drop that one group and count it (re-banking
+   would splice stale audio after fresher audio).
+2. *The lying meter:* the turn log's `first_text` was anchored on the
+   previous turn's END — fine when turns were the only input events,
+   but under duplex feeding there is always input in flight, and it read
+   think-time + speak-window + latency (~6 s) while the client correctly
+   measured 150 ms. Re-anchored on the delta's submission.
+
+Re-verified after both fixes, browser-shaped arm (frames + duplex audio,
+u1): server-side first_text 0.034–0.070 s on steady turns, first_audio
+0.117–0.166 s, client p50 175 ms, probes clean.
+
 ---
 
 ## Where things stand
