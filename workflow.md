@@ -1580,7 +1580,64 @@ to both against full-attention memory before either becomes the default.
 
 ---
 
-## Where things stand
+## 23. Where audio bursts past one second — the tail at 96 users, the median at 128, all of it the speech stage
+
+*2026-08-08; ladder config `deploy_mu_sw4k_kvfp8_t15.yaml` (talker share
+back to 0.15 so the pool CANNOT be the culprit), data
+`/data/zx/results/burst_none_u{32,48,64,96,128}`, full detail
+`/data/zx/results/burst_attribution.json`.*
+
+The question: on the new default stack (talker 4k window + FP8 KV), at how
+many audio users does latency burst past 1 s, and what is the mechanism?
+Design choice up front: the ladder runs with the talker share at 0.15 —
+785k FP8 tokens, 6.1k per user at 128 users, ~30% above even uncapped
+30-turn growth — so pool exhaustion is excluded BY CONSTRUCTION and
+whatever bursts is compute or scheduling.
+
+**The curve (steady state, turn ≥ 2; each cell 30-turn sessions, fresh
+engine):**
+
+| users | turns | TTFA p50 | p95 | p99 | >1s % | thinker p50/p99 | speech p50/p99 | rtf p50/p10 | stalls >0.3s |
+|------:|------:|---------:|----:|----:|------:|----------------:|---------------:|------------:|-------------:|
+| 32    | 928   | 296      | 404 | 480 | 0     | 60 / 97         | 234 / 402      | 5.27 / 3.72 | 0%           |
+| 48    | 1,392 | 375      | 486 | 536 | 0     | 69 / 107        | 304 / 470      | 3.79 / 2.86 | 0%           |
+| 64    | 1,856 | 477      | 610 | 668 | 0     | 79 / 120        | 396 / 575      | 2.88 / 2.23 | 0%           |
+| 96    | 2,784 | 711      | 920 | **1,064** | 2.5 | 90 / 139   | 618 / 970      | 1.75 / 1.40 | 1.6%         |
+| 128   | 3,712 | 971      | 1,265 | 1,523 | **42.1** | 100 / 160 | 870 / 1,427   | 1.19 / 0.96 | 29.2%        |
+
+**Answer one — the burst line.** The tail first crosses 1 s at **96
+users** (p99 1,064 ms, 2.5% of turns over). At **128** it is no longer a
+tail: 42% of ALL turns exceed 1 s and the median itself sits at 971 ms.
+64 users is the last cleanly healthy cell (p99 668 ms, zero turns over
+1 s). Hygiene: zero timeouts, zero rolls, zero preemptions across 10,752
+turns — even the 128-user cell completes 3,840/3,840. The pre-FP8 stack
+died logically at 8 users; this one degrades smoothly to the slot cap.
+
+**Answer two — where.** Entirely the speech stage. The >1 s turns'
+excess over the cell median splits thinker/speech = -0.01/1.01 at 96 and
+0.02/0.99 at 128; the thinker's p99 stays at or under 160 ms even at 128
+users. (The raw table without the turn-1 cut shows thinker p99 2,389 ms
+at 128 — that is the §21 once-per-boot cold-start drain again, 128
+turn-1s deep. Excluded, as always.)
+
+**Answer three — the mechanism is throughput exhaustion, not an event.**
+Real-time factor (delivered audio seconds per wall second) decays
+smoothly: 5.27 → 3.79 → 2.88 → 1.75 → 1.19 at the median. At 128 users
+the p10 dips under 1.0 — one turn in ten delivers SLOWER than playback,
+and 29% of turns stall mid-playback for >0.3 s. Nothing broke; the two
+speech stages simply ran out of compute, and the first audio chunk of
+each turn queues behind everyone else's mid-stream chunks (a tail
+arrival at 128 users finds ~37 other turns mid-TTFA). Per added user the
+median speech stage pays ~6.6 ms; the thinker pays 0.4 ms.
+
+**What this fixes in the ledger.** The capacity story for audio on this
+card is now measured end to end: memory stopped being the wall in §22,
+and the wall that remains is speech-stage compute at ~96 users (tail) /
+~128 (median). The §21 lever — first-chunk-first priority in stages 1–2
+— has real room at 96 (rtf margin 1.75 = 43% of delivery time is slack
+that mid-stream chunks can donate) and none at 128 (p10 rtf < 1: there
+is nothing left to reshuffle; only more throughput helps — co-batch
+efficiency, vocoder batching, the engine-loop/GIL dig sites).
 
 **Working**
 

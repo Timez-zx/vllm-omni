@@ -26,7 +26,9 @@ WC=$FORK/benchmarks/live_agent/web_client
 PYBIN=/home/zx/miniconda3/envs/omni-minicpm/bin/python
 RES=/data/zx/results
 LOG="${QWEN_LOG:-/data/zx/results/qwen_live.log}"
-DEPLOY=$WC/deploy_mu_fp8_s128_async.yaml
+# Follows the project default (talker 4k window + FP8 KV since 2026-08-08);
+# LADDER_DEPLOY overrides for A/B ladders against other configs.
+DEPLOY="${LADDER_DEPLOY:-$WC/deploy_mu_sw4k_kvfp8.yaml}"
 PORT=8091
 
 USERS=${ONLY_USERS:-"1 4 8 16 24 32"}
