@@ -30,7 +30,11 @@ PORT=8091
 # which delegates to SharedMemory automatically for cross-process edges, so
 # ONE yaml serves every mode.
 export VLLM_OMNI_COLOCATE_STAGES="${VLLM_OMNI_COLOCATE_STAGES-2:1}"
-DEPLOY="${DEPLOY_CONFIG:-$FORK/benchmarks/live_agent/web_client/deploy_mu_fp8_s128_async.yaml}"
+# DEFAULT DEPLOY (2026-08-08, workflow section 22): talker runs a 4k sliding
+# attention window + FP8 KV, shares 0.72/0.10/0.08 -- per-user talker
+# residency capped at ~window, audio capacity no longer pool-bound. The
+# previous default (full-attention talker) is deploy_mu_fp8_s128_async.yaml.
+DEPLOY="${DEPLOY_CONFIG:-$FORK/benchmarks/live_agent/web_client/deploy_mu_sw4k_kvfp8.yaml}"
 # QWEN_MODEL swaps the checkpoint without touching this file -- used for the
 # FP8 experiment: marksverdhei/Qwen3-Omni-30B-A3B-FP8 is a block-FP8 E4M3
 # quant of the SAME Instruct base (thinker+talker FP8; encoders, code2wav,
