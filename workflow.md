@@ -1695,6 +1695,88 @@ users, 6% → 15% → 37% at 16/32/128, but its latency contribution stays
 sit in series: first-chunk-first priority (#19) must cover stages 1 AND
 2 to move TTFA.
 
+---
+
+## 24. Duplex-shaped feeding — the session pays around the clock, and the meter works
+
+*2026-08-09; server knob `prefill_audio_on_arrival` + `audio_prefill_group_ms`
+(video_stream_base.py), bench mode `MU_DUPLEX=1` (mu_bench.py); data under
+`/data/zx/results/duplex_t{1,3b,4,5,6}*`.*
+
+Xiao's instruction before sleep: make the Qwen session ingest like a duplex
+model — audio at a fixed cadence, **digital silence when nobody talks** — so
+the workload carries a duplex's defining property: 100% duty cycle, context
+growing whether or not anyone speaks. Built; every planned test passed.
+
+**What was built.** Two sides of one pipe:
+
+- *Server*: `prefill_audio_on_arrival` — the audio mirror of the frame path.
+  Arrived PCM is grouped into `audio_prefill_group_ms` slices (default 480),
+  rendered as an audio-only delta, reduced to its placeholder run (the
+  scaffolding stripper is modality-agnostic), marked prefill-only, and
+  appended to the live request. Same refusal set as frames (turn in flight,
+  shadow warming, queue busy, first chunk not sent), same soft-failure
+  contract: a refused append leaves every byte in the buffer for the
+  query-time sweep — audio cannot be lost. Consumption is from the front, so
+  what remains is always the newest tail.
+- *Bench*: `MU_DUPLEX=1` — every simulated user streams one `audio.chunk`
+  per `MU_DUPLEX_CHUNK_MS` (default 100) forever: silence between
+  utterances, speech-like PCM for `MU_DUPLEX_SPEAK_S` (default 1.5) before
+  each query. The always-on microphone of a duplex client.
+
+**The meter is exact.** In every run, engine `stops` = arrival appends +
+turns to the digit (71 = 65+6; 537 = 492+45; 989 = 909+80) — each append is
+one scheduled, prefilled, stopped micro-generation, none unaccounted.
+Silence enters the context at a measured **~18 tokens/second** (9 tokens
+per 500 ms group).
+
+**Single user: mechanics, and the compression crossing.**
+
+- u1 × 6 turns: 65 appends, answers correct throughout, TTFA p50 147 ms
+  after the boot transient.
+- u1 × 45 turns with the compression trigger lowered to 4,096: the SILENT
+  STREAM alone carried the context across the trigger (cum 4,104), a
+  shadow warmed and swapped at turn 34 — and the whole run's worst turn
+  was **171 ms**. The invisible swap holds under duplex feeding; §17's
+  machinery needed no changes.
+
+**Eight users: the first measured price of a 100% duty cycle.** Same boot,
+three arms, 10 turns each:
+
+| arm | TTFA p50 | p95 | rtf p50 | appends |
+|---|---:|---:|---:|---:|
+| control (turn-based feeding) | 181 | 254 | 8.84 | 0 |
+| duplex, group 480 ms | 183 | 351 | 7.61 | 909 |
+| duplex, group 960 ms | 174 | 278 | **8.85** | 433 |
+
+The duty cycle is **free at the median** (+2 ms) and pays at the tail
+(+97 ms p95) and in delivery margin (−14% rtf) at 480 ms grouping — and
+halving the append rate (960 ms groups) buys almost all of it back, rtf
+fully recovered. That is §23's "organizing tax" turned into a knob: the
+tail cost is append/turn collisions, priced per append, not per token.
+Zero timeouts, zero >1 s turns, probes clean in all arms.
+
+**What this is for.** The Qwen stack now emulates the resource side of a
+SeedRealtime-class workload end to end: constant context growth (~18–25
+tok/s per user around the clock), tick-paced ingestion with a tunable
+group size, duty-cycled speech on top, and every existing instrument
+(per-turn stamps, probes, pool ledgers) attached. The decision side (the
+model choosing when to speak) remains client-triggered — that is the
+synthetic RT tenant's clock, by design.
+
+**Known limits, stated plainly.** (1) During a pure-silence stretch a
+READY shadow waits for the next turn to swap, and appends are refused
+while it warms — audio banks in the buffer and is swept later; harmless at
+conversational cadences, revisit if sessions can go many minutes with no
+turn at all. (2) The pre-first-turn backlog (warm-up + stagger) rides the
+first turn as one large audio chunk. (3) One discarded sampled token per
+append means the append rate is also a context-growth rate: ~2/s at
+480 ms grouping adds ~2 junk tokens/s on top of the audio tokens.
+
+---
+
+## Where things stand
+
 **Working**
 
 - One user, camera and microphone on, long continuous conversation

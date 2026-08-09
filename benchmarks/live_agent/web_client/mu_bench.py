@@ -36,7 +36,7 @@ import sys
 import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from probe import session_config  # noqa: E402
+from probe import RATE, session_config, synth_speechlike_pcm  # noqa: E402
 
 # The engine's CURRENT log file. Boots write wherever the launch redirected
 # them, so the default here can silently go stale (probes then count an empty
@@ -63,6 +63,16 @@ SYSTEM_PROMPT = ("You are a voice assistant. "
 SAVE_WAV_DIR = os.environ.get("MU_SAVE_WAV_DIR")
 if SAVE_WAV_DIR:
     os.makedirs(SAVE_WAV_DIR, exist_ok=True)
+
+# Duplex-shaped feeding (MU_DUPLEX=1): every user streams audio.chunk messages
+# around the clock -- digital silence between utterances, speech-like PCM for
+# MU_DUPLEX_SPEAK_S before each query -- at one chunk per MU_DUPLEX_CHUNK_MS.
+# Pair with the server-side prefill_audio_on_arrival (set here automatically)
+# and the session's context grows at the encoder's ~25 tok/s whether or not
+# anyone talks: the 100% duty cycle of a duplex workload, on the Qwen session.
+DUPLEX = os.environ.get("MU_DUPLEX") == "1"
+DUPLEX_CHUNK_MS = int(os.environ.get("MU_DUPLEX_CHUNK_MS", "100"))
+DUPLEX_SPEAK_S = float(os.environ.get("MU_DUPLEX_SPEAK_S", "1.5"))
 
 QUESTIONS = [
     "Name one primary color.",
@@ -110,6 +120,7 @@ LOG_PROBES_BAD = {
 LOG_PROBES_INFO = {
     "segment_stops": r"\[session\] audio segment stop",
     "arrival_prefill": r"prefill-on-arrival",
+    "arrival_audio": r"prefill-on-arrival: audio",
     "compress_warm": r"COMPRESS: warming shadow",
     "compress_swap": r"COMPRESS #\d+ at turn",
     "warmup_queued": r"warm-up queued",
@@ -161,6 +172,8 @@ class User:
         self.errors: list[str] = []
         self.cur: dict | None = None
         self.done_evt = asyncio.Event()
+        self.speaking = False           # duplex mode: pump sends speech vs silence
+        self.audio_chunks_sent = 0
 
     async def run(self) -> None:
         import websockets
@@ -169,6 +182,8 @@ class User:
         cfg["frame_filter_min_gap"] = 0
         cfg["frame_filter_max_gap"] = 4
         cfg["prefill_frames_on_arrival"] = True
+        if DUPLEX:
+            cfg["prefill_audio_on_arrival"] = True
         # Session-config overrides injected by the harness (e.g. context compression
         # knobs) without forking the bench: MU_SESSION_CFG_JSON='{"key": value}'.
         _extra = os.environ.get("MU_SESSION_CFG_JSON")
@@ -180,15 +195,44 @@ class User:
                 await ws.send(json.dumps(cfg))
                 reader = asyncio.create_task(self._reader(ws))
                 pump = asyncio.create_task(self._frame_pump(ws))
+                audio_pump = (asyncio.create_task(self._audio_pump(ws))
+                              if DUPLEX else None)
                 try:
                     await asyncio.sleep(WARMUP_S + self.rng.uniform(*STAGGER_S))
                     await self._turn_loop(ws)
                 finally:
                     pump.cancel()
+                    if audio_pump is not None:
+                        audio_pump.cancel()
                     reader.cancel()
         except Exception as e:  # connection refused / dropped mid-run
             self.errors.append(f"connection: {e!r:.200}")
             self._mark_skipped(reason="connection_lost")
+
+    async def _audio_pump(self, ws) -> None:
+        """Duplex feeding: one audio.chunk per DUPLEX_CHUNK_MS, forever.
+
+        Digital silence between utterances, speech-like PCM while self.speaking
+        is set by the turn loop -- the always-on microphone of a duplex client.
+        The server sees a constant chunk cadence either way; what varies is only
+        the content, exactly like a real full-duplex call.
+        """
+        chunk_bytes = int(RATE * DUPLEX_CHUNK_MS / 1000) * 2
+        silence = bytes(chunk_bytes)
+        speech = b""
+        while True:
+            if self.speaking:
+                if len(speech) < chunk_bytes:
+                    speech = synth_speechlike_pcm(2.0)
+                payload, speech = speech[:chunk_bytes], speech[chunk_bytes:]
+            else:
+                payload = silence
+            await ws.send(json.dumps({
+                "type": "audio.chunk",
+                "data": base64.b64encode(payload).decode(),
+            }))
+            self.audio_chunks_sent += 1
+            await asyncio.sleep(DUPLEX_CHUNK_MS / 1000)
 
     async def _frame_pump(self, ws) -> None:
         if not self.frames:
@@ -264,6 +308,13 @@ class User:
                 "pcm": bytearray(),
             }
             self.done_evt.clear()
+            if DUPLEX:
+                # The utterance precedes the question: the pump streams
+                # speech-like PCM for DUPLEX_SPEAK_S, then the query lands --
+                # by then most of that audio is already prefilled on arrival.
+                self.speaking = True
+                await asyncio.sleep(DUPLEX_SPEAK_S)
+                self.speaking = False
             t_q = time.monotonic()
             await ws.send(json.dumps({"type": "video.query", "text": q}))
             try:
@@ -405,6 +456,9 @@ async def main() -> int:
     meta = {"users": args.users, "content": args.content, "turns_per_user": args.turns,
             "repeat_sessions": args.repeat_sessions, "seed": args.seed,
             "wall_s": time.monotonic() - t_start}
+    if DUPLEX:
+        meta["duplex"] = {"chunk_ms": DUPLEX_CHUNK_MS, "speak_s": DUPLEX_SPEAK_S,
+                          "audio_chunks_sent": sum(u.audio_chunks_sent for u in all_users)}
     summary = summarize(records, all_users, meta, log_slice)
     (out / "summary.json").write_text(json.dumps(summary, indent=1))
 

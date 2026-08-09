@@ -75,6 +75,13 @@ _DEFAULT_CONFIG_TIMEOUT = 10.0
 _MAX_FRAME_SIZE = 10 * 1024 * 1024  # 10MB per frame
 _MAX_BUFFER_FRAMES = 64
 _MAX_AUDIO_BUFFER_BYTES = 4 * 1024 * 1024
+# 16 kHz mono PCM16: 32 bytes per millisecond. Used by the on-arrival audio
+# append to convert audio_prefill_group_ms into a byte threshold.
+_PCM_BYTES_PER_MS = 32
+# Upper bound on ONE on-arrival audio append. A turn's refusal window can bank
+# many seconds of PCM; appending it as one chunk is fine, but the append must
+# not grow without bound (encoder memory, and a single delta's prefill time).
+_ARRIVAL_AUDIO_MAX_MS = 10_000
 _MAX_MSG_QUEUE = 200
 _CODEC_FRAME_SAMPLES = 1920  # CausalConv leading-edge artifact length
 _BAD_FRAME = object()
@@ -709,6 +716,31 @@ class StreamingVideoSessionConfig(BaseModel):
             "Needs session_scoped_request; without a live request there is nothing to append to."
         ),
     )
+    prefill_audio_on_arrival: bool = Field(
+        default=False,
+        description=(
+            "The audio mirror of prefill_frames_on_arrival: encode and prefill incoming "
+            "audio WHILE THE USER IS STILL TALKING (or silent), instead of holding the whole "
+            "buffer for the query. Arrived PCM is grouped into audio_prefill_group_ms slices "
+            "and appended through the same prefill-only path frames use; a refused append "
+            "(turn in flight, shadow warming, queue busy) simply leaves the audio in the "
+            "buffer for the ordinary query-time sweep -- nothing can be lost.\n\n"
+            "This is the ingestion half of a DUPLEX-shaped workload: with a client that "
+            "streams silence between utterances, the session pays a constant token stream "
+            "(~25 tok/s of context growth) whether or not anybody speaks -- the 100% duty "
+            "cycle that turn-based feeding cannot express. Needs session_scoped_request and "
+            "audio in modalities."
+        ),
+    )
+    audio_prefill_group_ms: int = Field(
+        default=480,
+        description=(
+            "Minimum milliseconds of arrived PCM before an on-arrival audio append fires. "
+            "Smaller = fresher context and finer duplex tick, but more appends per second "
+            "(each pays an encoder call, a prefill and one discarded sampled token). 480 ms "
+            "~= 12 audio tokens per append at the encoder's ~25 tok/s."
+        ),
+    )
 
 
 class OmniStreamingVideoHandler:
@@ -937,6 +969,8 @@ class OmniStreamingVideoHandler:
                 "arrival_appends": 0,
                 "arrival_frames": 0,
                 "arrival_tokens": 0,
+                "arrival_audio_appends": 0,
+                "arrival_audio_ms": 0,
             }
             session_request_id = main_ctx["rid"]
 
@@ -1422,6 +1456,91 @@ class OmniStreamingVideoHandler:
                 # Frames alone can carry the context across the compression trigger during
                 # a long silence; without this hook the warm-up would only start at the
                 # next turn and the swap would slip one turn further.
+                if _warmup_due() and _shadow_allowed():
+                    _launch_shadow_warmup("arrival")
+                return True
+
+            async def _prefill_audio_on_arrival() -> bool:
+                """Append the audio that has arrived so far to the live request.
+
+                The audio mirror of _prefill_frame_on_arrival, with the same refusal
+                set and the same soft-failure contract: a refusal leaves every byte in
+                audio_buffer for the query-time sweep, so audio cannot be lost. The
+                differences are mechanical:
+
+                * Grouping. Frames are natural units; PCM is a stream. An append fires
+                  only once >= audio_prefill_group_ms has accumulated, and consumes at
+                  most _ARRIVAL_AUDIO_MAX_MS in one go (a turn's refusal window can
+                  bank many seconds; one oversized append is cheaper than a burst of
+                  small ones, but it must not grow without bound).
+                * Consumption order. Bytes leave audio_buffer ONLY after the append is
+                  queued, and from the front -- what remains is always the newest tail,
+                  so a later turn hears the most recent audio.
+
+                With a client that streams silence between utterances this is the
+                ingestion half of a duplex workload: the context grows at the encoder's
+                ~25 tok/s around the clock, and the query-time chunk shrinks to roughly
+                one group's worth of tail audio.
+                """
+                if (not sess["first_sent"] or sess.get("turn_busy")
+                        or sess.get("query_claimed") or sess["fatal"]):
+                    return False
+                if sess.get("shadow") is not None:
+                    return False
+                if "audio" not in (config.modalities or []):
+                    return False
+                if sess["queue"].qsize() > 0:
+                    return False
+                group_bytes = max(1, config.audio_prefill_group_ms) * _PCM_BYTES_PER_MS
+                if len(audio_buffer) < group_bytes:
+                    return False
+                n = min(len(audio_buffer), _ARRIVAL_AUDIO_MAX_MS * _PCM_BYTES_PER_MS)
+                pcm = bytes(audio_buffer[:n])
+                chunk = await self._build_session_chunk(
+                    config, [], bytearray(pcm), "", frame_pil_cache,
+                    is_first=False,
+                )
+                if chunk is None or not isinstance(chunk, dict):
+                    return False
+                if not _strip_chatml_scaffolding(chunk):
+                    logger.warning(
+                        "[session] prefill-on-arrival: could not reduce the delta to its "
+                        "audio tokens; skipping the append (the audio stays buffered)"
+                    )
+                    return False
+                from vllm_omni.engine import (
+                    AdditionalInformationEntry,
+                    AdditionalInformationPayload,
+                )
+
+                entries = {}
+                existing = chunk.get("additional_information")
+                if isinstance(getattr(existing, "entries", None), dict):
+                    entries.update(existing.entries)
+                entries[_PREFILL_ONLY_KEY] = AdditionalInformationEntry(list_data=["1"])
+                chunk["additional_information"] = AdditionalInformationPayload(entries=entries)
+                try:
+                    sess["queue"].put_nowait((chunk, 1))
+                except asyncio.QueueFull:
+                    return False
+                sess["audio_seg_fifo"].append("append")
+                del audio_buffer[:n]
+                ntok = len(chunk.get("prompt_token_ids") or ())
+                ms = n // _PCM_BYTES_PER_MS
+                sess["arrival_appends"] += 1
+                sess["arrival_audio_appends"] += 1
+                sess["arrival_audio_ms"] += ms
+                sess["arrival_tokens"] += ntok
+                sess["cum_tokens"] = sess.get("cum_tokens", 0) + ntok
+                logger.info(
+                    "[session] prefill-on-arrival: audio %dms -> %d tokens "
+                    "(audio_appends=%d audio_ms=%d cum=%d)",
+                    ms, ntok, sess["arrival_audio_appends"],
+                    sess["arrival_audio_ms"], sess.get("cum_tokens", 0),
+                )
+                # A silent-audio stream crosses the compression trigger with no turn in
+                # sight -- the duplex feeding pattern makes this the COMMON case, not the
+                # corner: the warm-up must be able to start from here.
                 if _warmup_due() and _shadow_allowed():
                     _launch_shadow_warmup("arrival")
                 return True
@@ -2472,6 +2591,12 @@ class OmniStreamingVideoHandler:
                             audio_buffer.clear()
                             continue
                         audio_buffer.extend(pcm_bytes)
+                        # Duplex-shaped feeding: encode-and-prefill the accumulated
+                        # audio now instead of at the query. Refusals leave the bytes
+                        # in audio_buffer; the query-time sweep is the safety net.
+                        if (config.prefill_audio_on_arrival
+                                and config.session_scoped_request):
+                            await _prefill_audio_on_arrival()
 
                     elif msg_type == "video.query":
                         query_text = msg.get("text", "")
