@@ -1663,6 +1663,38 @@ at 32 users) one tier up. Consequence: capacity beyond 128 audio users
 does not require more FLOPs — it requires the engine-loop/GIL dig sites;
 the silicon is already paid for and idle.
 
+**Second addendum — inside the speech side: talker vs code2wav now split
+the bill evenly, and a natural experiment fingers the handoffs.** Xiao
+asked which half of the speech side binds: token generation (talker) or
+token→waveform (code2wav). py-spy is blocked on this host
+(ptrace_scope=1, no sudo) and both stages share one process in pair
+mode, so the split was measured the §19 way: boot the SAME t15 yaml with
+`VLLM_OMNI_COLOCATE_STAGES=""` (three processes) and read per-process
+sm% under a 128-user probe:
+
+| stage (128 users, 3-proc) | sm% p50 | sm% p90 | mem% p50 |
+|---|---:|---:|---:|
+| thinker  | 37 | 58 | 16 |
+| talker   | 27 | 48 | 12 |
+| code2wav | 27 | 53 | 12 |
+
+Two findings. First, **code2wav is no longer the 4% bystander of §19**
+(32 users, pre-graphs): its work scales linearly with audio seconds
+produced (~×4 from 32→128 users) while graphs made the talker cheaper,
+and at 128 users the two speech stages cost the same GPU time. Neither
+saturates anything (device SMACT 0.65 stands). Second, the probe itself
+is a natural experiment: the SAME work, re-arranged from pair-colocated
+into three processes, drops rtf 1.06 → 0.85 and pushes >1s turns 65% →
+90% — re-plumbing WHO HANDS WHAT TO WHOM costs 20% of throughput while
+the GPU math is untouched. The handoff/organisation layer is not just
+where the slack lives; it is itself a first-order term. (Caveat: probe
+cells ran hotter than the ladder — pmon+observer load — compare shapes,
+not absolute p50s. The thinker's GPU share also keeps growing with
+users, 6% → 15% → 37% at 16/32/128, but its latency contribution stays
+≤160 ms p99 — it co-batches well.) For the first-audio path both stages
+sit in series: first-chunk-first priority (#19) must cover stages 1 AND
+2 to move TTFA.
+
 **Working**
 
 - One user, camera and microphone on, long continuous conversation
