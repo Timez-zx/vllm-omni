@@ -1552,6 +1552,32 @@ sliding window converts the talker pool from the binding capacity wall
 into a bystander — after this, the walls that remain are slots
 (max_num_seqs 128) and the speech-stage latency slope of §21.
 
+**Addendum, same evening — talker KV to FP8, and the share moves to the
+thinker** (`deploy_mu_sw4k_kvfp8.yaml`, data
+`/data/zx/results/sw4k_kvfp8_verify_u{1,8}`). Two more ledger moves, no
+compute touched: stage-1 `kv_cache_dtype: fp8` (weights stay bf16 — the
+talker feeds the vocoder, and the FP8-weights trap of the config header
+was the weights path), and the freed share to the thinker: 0.67/0.15/0.08
+→ **0.72/0.10/0.08**. Xiao asked for thinker 0.80; it does not fit inside
+the 0.90 shared-card envelope: the talker process carries ~7 GB of fixed
+overhead, so share cuts come straight out of its pool — at 0.08 the pool
+is ~0.6 GiB (~16 users even with window+FP8), worse than before §22.
+0.72 is the thinker maximum with a functional talker.
+
+Boot receipts: thinker pool 31.04 → **35.78 GiB** (677,968 → 781,696
+tokens, +15%); talker physical pool 2.74 GiB with guaranteed concurrency
+**14.03×** — and that line is itself the FP8 receipt: at bf16 a 2.74 GiB
+pool could only guarantee ~7×; 14.03× is only arithmetic at 10 KB/token
+(287k physical tokens → ~71 users at the 4k steady-state window).
+Functional, same protocol as §22: u1 × 40 crossing the boundary at t25 —
+TTFA p50 128 pre / 131 ms post, audio seconds 1.96/1.95, no repetition
+through t40, probes zero; u8 co-batch 80/80, p50 161.9 / p95 268.8 (p95
+the best of the three arms; the p50 sits inside the baseline's per-user
+spread of 137–195, one cell cannot separate it from noise). The ear test
+now covers TWO stacked variables: `sw4k_verify_u1/wavs` is the
+bf16+window arm, `sw4k_kvfp8_verify_u1/wavs` the FP8+window arm — listen
+to both against full-attention memory before either becomes the default.
+
 ---
 
 ## Where things stand
