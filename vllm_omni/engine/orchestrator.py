@@ -30,7 +30,7 @@ from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
-from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.messages import (
@@ -59,19 +59,31 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
 from vllm_omni.outputs import OmniRequestOutput
 
 
-def _sampling_params_mark_prefill_only(sampling_params_list: Any) -> bool:
-    """Does this streaming update's stage-0 sampling params carry the prefill-only marker?
+def _prompt_is_prefill_only(prompt: Any) -> bool:
+    """Does this streaming update's PROMPT carry the prefill-only marker?
 
-    The key is imported, not re-typed: the entrypoint, the stage processors and this
-    fan-out gate must agree on one string, and two of the three drifting is the failure
-    mode that makes the model speak unasked with nothing pointing at the cause.
+    Replaces a helper that read sampling_params.extra_args and was never
+    called -- a dead gate whose channel assumption was also wrong (arrival
+    appends are dual-marked; additional_information on the prompt dict is the
+    one channel guaranteed to survive every boundary). The key is imported,
+    not re-typed: the entrypoint, the stage processors, the scheduler and this
+    fan-out gate must agree on one string, and two of them drifting is the
+    failure mode that makes the model speak unasked with nothing pointing at
+    the cause.
     """
-    if not sampling_params_list:
+    if not isinstance(prompt, dict):
         return False
-    extra = getattr(sampling_params_list[0], "extra_args", None)
-    return isinstance(extra, dict) and str(extra.get(_PREFILL_ONLY_KEY, "")).strip().lower() in (
-        "1", "true", "yes",
-    )
+    info = prompt.get("additional_information")
+    entries = getattr(info, "entries", None)
+    if not isinstance(entries, dict) or _PREFILL_ONLY_KEY not in entries:
+        return False
+    entry = entries[_PREFILL_ONLY_KEY]
+    list_data = getattr(entry, "list_data", None)
+    if isinstance(list_data, list) and list_data:
+        entry = list_data[0]
+    if isinstance(entry, list) and entry:
+        entry = entry[0]
+    return str(entry).strip().lower() in ("1", "true", "yes")
 
 logger = init_logger(__name__)
 
@@ -151,9 +163,14 @@ def build_engine_core_request_from_tokens(
     prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
     raw_additional_information = prompt.get("additional_information")
     model_intermediate_buffer = prompt.get("model_intermediate_buffer")
-    wire_payload: dict[str, Any] | None = None
+    wire_payload: dict[str, Any] | AdditionalInformationPayload | None = None
     if isinstance(raw_additional_information, dict):
         wire_payload = dict(raw_additional_information)
+    elif isinstance(raw_additional_information, AdditionalInformationPayload):
+        # Pass real payload structs through -- the serializer accepts them
+        # verbatim; the dict-only filter silently dropped the entrypoint's
+        # structs (e.g. the prefill-only marker) on this path.
+        wire_payload = raw_additional_information
     additional_info_payload = serialize_additional_information(
         wire_payload,
         log_prefix=f"build_engine_core_request_from_tokens req={request_id}",
@@ -739,7 +756,14 @@ class Orchestrator:
         )
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
-            await self._prewarm_async_chunk_stages(request_id, request, req_state)
+            # Prefill-only appends are invisible below stage 0 (section 25):
+            # the engine parks them with zero output and ships no boundary, so
+            # prewarming stages 1..N here would push one placeholder update
+            # per append into streaming queues that nothing ever drains --
+            # measured as unbounded queue growth and, at teardown, stage-1
+            # requests that can never finish (the four-session-wedge shape).
+            if not _prompt_is_prefill_only(request):
+                await self._prewarm_async_chunk_stages(request_id, request, req_state)
 
     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
         """Handle an add_companion_request message: submit companion to stage 0."""

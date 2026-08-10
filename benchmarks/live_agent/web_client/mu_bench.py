@@ -80,6 +80,38 @@ DUPLEX_SPEAK_S = float(os.environ.get("MU_DUPLEX_SPEAK_S", "1.5"))
 # speech, the talker's odometer frozen. The measurement is the ACHIEVED append
 # cadence vs the nominal group period: the duplex deadline-miss analogue.
 DUPLEX_HOLD_S = float(os.environ.get("MU_DUPLEX_HOLD_S", "0"))
+# Text-only sessions (MU_TEXT_ONLY=1): modalities ["text"], turns close on
+# response.text.done, ttfa is undefined. Pair with a thinker-only engine to
+# measure the brain with no talker anywhere in the building.
+TEXT_ONLY = os.environ.get("MU_TEXT_ONLY") == "1"
+# Real user speech for the duplex pump: a directory of wav files (any rate,
+# mono PCM16) concatenated into a looping bank. Falls back to the synthetic
+# tone when unset. 24 kHz talker outputs from earlier listening tests work.
+SPEECH_WAV_DIR = os.environ.get("MU_SPEECH_WAV_DIR")
+
+
+def _load_speech_bank(directory: str) -> bytes:
+    import wave as _wave
+
+    import numpy as np
+
+    chunks = []
+    for name in sorted(os.listdir(directory)):
+        if not name.endswith(".wav"):
+            continue
+        with _wave.open(os.path.join(directory, name), "rb") as w:
+            rate, n = w.getframerate(), w.getnframes()
+            pcm = np.frombuffer(w.readframes(n), dtype=np.int16)
+        if rate != 16000:
+            idx = np.linspace(0, len(pcm) - 1, int(len(pcm) * 16000 / rate))
+            pcm = pcm[np.clip(idx.round().astype(int), 0, len(pcm) - 1)]
+        chunks.append(pcm.astype(np.int16).tobytes())
+    if not chunks:
+        raise RuntimeError(f"no wav files in {directory}")
+    return b"".join(chunks)
+
+
+SPEECH_BANK = _load_speech_bank(SPEECH_WAV_DIR) if (DUPLEX and SPEECH_WAV_DIR) else b""
 
 QUESTIONS = [
     "Name one primary color.",
@@ -191,6 +223,9 @@ class User:
         cfg["prefill_frames_on_arrival"] = True
         if DUPLEX:
             cfg["prefill_audio_on_arrival"] = True
+        if TEXT_ONLY:
+            cfg["modalities"] = ["text"]
+            cfg["prefill_frames_on_arrival"] = False
         # Session-config overrides injected by the harness (e.g. context compression
         # knobs) without forking the bench: MU_SESSION_CFG_JSON='{"key": value}'.
         _extra = os.environ.get("MU_SESSION_CFG_JSON")
@@ -229,10 +264,19 @@ class User:
         chunk_bytes = int(RATE * DUPLEX_CHUNK_MS / 1000) * 2
         silence = bytes(chunk_bytes)
         speech = b""
+        bank_pos = (self.uid * 65_536) % max(1, len(SPEECH_BANK) or 1)
         while True:
             if self.speaking:
                 if len(speech) < chunk_bytes:
-                    speech = synth_speechlike_pcm(2.0)
+                    if SPEECH_BANK:
+                        # Real recorded speech, looped; users start at
+                        # different offsets so the engine's caches see a
+                        # population, not one voice in unison.
+                        take = SPEECH_BANK[bank_pos:bank_pos + 65_536]
+                        bank_pos = (bank_pos + len(take)) % len(SPEECH_BANK)
+                        speech += take if take else SPEECH_BANK[:65_536]
+                    else:
+                        speech = synth_speechlike_pcm(2.0)
                 payload, speech = speech[:chunk_bytes], speech[chunk_bytes:]
             else:
                 payload = silence
@@ -288,6 +332,10 @@ class User:
                 cur["text_stream"] += msg.get("delta") or ""
             elif t == "response.text.done":
                 cur["text_at_first_sound"] = msg.get("text") or ""
+                if TEXT_ONLY:
+                    # Text-only turns have no audio.done; this close IS the end.
+                    cur["t_done"] = t_now
+                    self.done_evt.set()
             elif t == "response.audio.delta":
                 if cur["t_first_audio"] is None:
                     cur["t_first_audio"] = t_now

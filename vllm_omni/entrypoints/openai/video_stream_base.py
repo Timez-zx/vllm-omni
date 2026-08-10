@@ -707,8 +707,9 @@ class StreamingVideoSessionConfig(BaseModel):
             "is set as conservatively as it is.\n\n"
             "Requires the prefill-only append path: such a chunk must reach stage 0 and stop "
             "there, because anything that reaches the talker makes the model speak when nobody "
-            "asked it to. Costs one sampled token per append (the engine has no zero-token "
-            "append), which enters the context and is discarded.\n\n"
+            "asked it to. Since section 25 the engine discards the append's sampled token at "
+            "the scheduler and parks the segment with ZERO output -- nothing enters the "
+            "context beyond the appended tokens, nothing ships downstream.\n\n"
             "Needs session_scoped_request; without a live request there is nothing to append to."
         ),
     )
@@ -733,7 +734,8 @@ class StreamingVideoSessionConfig(BaseModel):
         description=(
             "Minimum milliseconds of arrived PCM before an on-arrival audio append fires. "
             "Smaller = fresher context and finer duplex tick, but more appends per second "
-            "(each pays an encoder call, a prefill and one discarded sampled token). "
+            "(each pays an encoder call, a prefill, and one sampled-then-discarded token "
+            "at the scheduler -- section 25 keeps it out of the context and off the wire). "
             "Measured at 8 users (section 24): 480 ms -> p95 +97 ms / rtf -14% vs "
             "turn-based; 960 ms buys almost all of it back. 200 ms is the default by "
             "Xiao's call -- a finer duplex tick, priced accordingly."
@@ -1196,7 +1198,8 @@ class OmniStreamingVideoHandler:
                         # textual belongs on the wire either. Sound only because append
                         # AUDIO is already filtered positively above -- this flag check
                         # alone lost the race for a year of debugging hours.
-                        if (config.prefill_frames_on_arrival
+                        if ((config.prefill_frames_on_arrival
+                                or config.prefill_audio_on_arrival)
                                 and not sess.get("turn_busy")
                                 and not sess.get("query_claimed")):
                             sess["arrival_skipped"] = sess.get("arrival_skipped", 0) + 1
@@ -1303,6 +1306,33 @@ class OmniStreamingVideoHandler:
                                 st = _new_turn_state()
                                 sess["turn_done"].set()
                         else:
+                            if "audio" not in (config.modalities or []):
+                                # Text-only sessions have no audio stops for the FIFO to
+                                # pop on, so the SAME order-based attribution runs on the
+                                # text stops instead: appends and turns enter the engine
+                                # through one queue, and segment k finishes before k+1
+                                # starts, so head-of-FIFO == owner of this text stream.
+                                # An append-owned output (its one junk token and its
+                                # stop) is swallowed whole -- without this, the junk stop
+                                # closes a real turn and the turn's reply streams into
+                                # the void, the exact race the audio branch already
+                                # solved. This is what makes duplex feeding legal on
+                                # text-only (talker-less) sessions.
+                                _fifo = ctx["fifo"]
+                                _owner_t = _fifo[0] if _fifo else None
+                                if _segment_finish_reason(output) is not None and _fifo:
+                                    _fifo.popleft()
+                                    logger.info(
+                                        "[session] text segment stop owner=%s fifo_left=%d",
+                                        _owner_t, len(_fifo),
+                                    )
+                                if _owner_t != "turn":
+                                    if _owner_t is None:
+                                        logger.warning(
+                                            "[session] UNOWNED text output dropped -- "
+                                            "fifo empty, attribution may be shifted")
+                                    sess["arrival_skipped"] = sess.get("arrival_skipped", 0) + 1
+                                    continue
                             delta, st["prev_text"] = self._extract_text_delta(output, st["prev_text"])
                             # Stamp on the first text OUTPUT, not the first non-empty delta.
                             # The first stage-0 output of a turn often carries no new text (it
@@ -1352,10 +1382,11 @@ class OmniStreamingVideoHandler:
             async def _prefill_frame_on_arrival(frame_b64: str) -> None:
                 """Append one just-arrived frame to the live request so stage 0 prefills it now.
 
-                The append carries no query text, and `max_tokens=1` because the engine has no
-                zero-token append -- a streaming update is scheduled, prefills, samples, and
-                stops. That one token lands in the context and is thrown away; at 0.25 retained
-                frames per second it is noise next to the 220 tokens the frame itself costs.
+                The append carries no query text, and `max_tokens=1` because the engine needs
+                a nonzero cap to schedule the chunk. Since section 25 the scheduler discards
+                the sampled token and parks the segment with ZERO output: nothing lands in the
+                context beyond the frame's own tokens, nothing is emitted, nothing ships
+                downstream -- the append is invisible everywhere but this stage's KV.
 
                 Two conditions, both load-bearing:
 
@@ -1430,16 +1461,20 @@ class OmniStreamingVideoHandler:
                 entries[_PREFILL_ONLY_KEY] = AdditionalInformationEntry(list_data=["1"])
                 chunk["additional_information"] = AdditionalInformationPayload(entries=entries)
                 try:
-                    # 1, not 0: the engine schedules, prefills, samples, stops -- there is no
-                    # zero-token append. One token is the floor, and it is discarded.
+                    # max_tokens=1 is still the floor the ENGINE requires to schedule the
+                    # chunk; the scheduler discards that token at sampling time and parks
+                    # the segment with zero output (section 25) -- it never lands in the
+                    # context and never leaves stage 0.
                     sess["queue"].put_nowait((chunk, 1))
                 except asyncio.QueueFull:
                     # The engine is behind. Leave the frame where it is rather than blocking
                     # the receive loop, which also forwards generated audio.
                     return False
-                # put_nowait -> append is synchronous: the event loop cannot interleave a
-                # turn submission between them, so FIFO order == queue order.
-                sess["audio_seg_fifo"].append("append")
+                # NO fifo entry for this append (section 25): the engine parks
+                # a marked segment with zero output, so there is no downstream
+                # stop to pop against -- an entry here would sit at the head
+                # and swallow the next real turn (measured: 240 s "turn
+                # boundary lost" on the first turn after any append).
                 ntok = len(chunk.get("prompt_token_ids") or ())
                 sess["arrival_appends"] += 1
                 sess["arrival_frames"] += 1
@@ -1490,8 +1525,10 @@ class OmniStreamingVideoHandler:
                     return False
                 if sess.get("shadow") is not None:
                     return False
-                if "audio" not in (config.modalities or []):
-                    return False
+                # Text-only sessions are allowed here: their append junk is
+                # FIFO-attributed and swallowed by the output loop's text
+                # branch, the mirror of what the audio branch does. (The FRAME
+                # helper still refuses text-only -- its comment explains why.)
                 if sess["queue"].qsize() > 0:
                     return False
                 group_bytes = max(1, config.audio_prefill_group_ms) * _PCM_BYTES_PER_MS
@@ -1612,7 +1649,8 @@ class OmniStreamingVideoHandler:
                 except asyncio.QueueFull:
                     audio_buffer[0:0] = pcm
                     return False
-                sess["audio_seg_fifo"].append("append")
+                # No fifo entry: zero-output appends produce no stop to pop
+                # (section 25) -- see the frame helper's comment.
                 ntok = len(chunk.get("prompt_token_ids") or ())
                 sess["arrival_appends"] += 1
                 sess["arrival_audio_appends"] += 1
@@ -1853,8 +1891,12 @@ class OmniStreamingVideoHandler:
                 # Tag BEFORE the awaited put: if the put suspends on a full queue no
                 # output for this chunk can exist yet, and appends are refused while
                 # turn_busy, so nothing can interleave a push between these two lines.
-                if "audio" in (config.modalities or []):
-                    sess["audio_seg_fifo"].append("turn")
+                # UNCONDITIONAL since text-only attribution landed: audio sessions pop
+                # this on audio stops, text-only sessions pop it on text stops -- a
+                # turn that never enters the FIFO is swallowed as unowned by whichever
+                # branch is doing the attributing (949 unowned drops, 0/1280 turns in
+                # the first thinker-only run, with the old audio-gated push).
+                sess["audio_seg_fifo"].append("turn")
                 await sess["queue"].put(chunk)
                 # Bounded wait. A lost segment boundary must surface as an error rather
                 # than a hang: the first bring-up attempt used an unusable boundary signal

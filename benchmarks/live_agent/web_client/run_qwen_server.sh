@@ -77,7 +77,7 @@ VLLM_OMNI_LOG_SESSION_OUTPUTS=1 \
 setsid "$PY" serve "$MODEL" \
   --omni --deploy-config "$DEPLOY" \
   --trust-remote-code --host 127.0.0.1 --port "$PORT" \
-  --init-timeout 3000 --stage-init-timeout 1500 >> "$LOG" 2>&1 &
+  --init-timeout 3000 --stage-init-timeout 1500 ${QWEN_EXTRA_ARGS:-} >> "$LOG" 2>&1 &
 
 echo "== waiting for health (about 2-3 minutes) =="
 for i in $(seq 1 200); do

@@ -20,6 +20,47 @@ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutp
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+
+from vllm_omni.model_executor.stage_input_processors.tts_utils import PREFILL_ONLY_KEY
+
+
+def _update_is_prefill_only(update: Any) -> bool:
+    """Does THIS streaming update carry the prefill-only marker?
+
+    Reads the update's own additional_information and nothing else. Two
+    tempting shortcuts are wrong in ways that look like success:
+
+    * request.additional_information keeps the FIRST chunk's payload for the
+      whole session (nothing in the stage-0 update path replaces it), so a
+      request-level read classifies every segment by the opening chunk --
+      either turns park unsampled forever or appends never park.
+    * tts_utils.prefill_only_channel() checks extra_args FIRST, and arrival
+      appends are dual-marked (extra_args stamped by the chunk stream,
+      additional_information by the append builder), so any channel-equality
+      test routed through that helper matches nothing: an inert guard.
+    """
+    info = getattr(update, "additional_information", None)
+    entries = getattr(info, "entries", None)
+    if isinstance(entries, dict) and PREFILL_ONLY_KEY in entries:
+        entry = entries[PREFILL_ONLY_KEY]
+        list_data = getattr(entry, "list_data", None)
+        if isinstance(list_data, list) and list_data:
+            entry = list_data[0]
+        if isinstance(entry, list) and entry:
+            entry = entry[0]
+        if str(entry).strip().lower() in ("1", "true", "yes"):
+            return True
+    # Defense in depth: the update's OWN sampling_params.extra_args -- the
+    # channel that demonstrably survives every transport (it is how the chunk
+    # adapter has been seeing the marker all along, while the payload struct
+    # was being dropped by a dict-only filter upstream). Still a per-update
+    # value: a turn chunk's update carries the turn's params, never a stale
+    # append's.
+    params = getattr(update, "sampling_params", None)
+    extra = getattr(params, "extra_args", None)
+    return (isinstance(extra, dict)
+            and str(extra.get(PREFILL_ONLY_KEY, "")).strip().lower()
+            in ("1", "true", "yes"))
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
@@ -580,6 +621,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self._mute_reported.discard(rid)
                 self._req_seen_t.pop(rid, None)
                 continue
+            if getattr(r, "status", None) == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                # Parked between segments is a session request's healthy
+                # resting state, and with zero-output appends (section 25) a
+                # duplex-fed session legitimately shows no sampled output for
+                # the entire inter-turn window. Only a request that is
+                # RUNNABLE and silent is wedge-suspect.
+                self._mute_reported.discard(rid)
+                self._req_seen_t.pop(rid, None)
+                continue
             t0 = self._req_seen_t.setdefault(rid, now)
             if now - t0 >= self._WEDGE_REPORT_AFTER_S and rid not in self._mute_reported:
                 self._mute_reported.add(rid)
@@ -754,6 +804,45 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             finish_reason = None
             routed_experts = None
 
+            # THE ZERO-OUTPUT APPEND (section 25). A prefill-only arrival
+            # append exists to put its tokens into this stage's KV, nothing
+            # else -- but the runner samples one throwaway token in the same
+            # forward that completes the prefill (the marker cannot reach the
+            # runner: streaming extensions travel as CachedRequestData, which
+            # carries no additional_information). So the discard happens HERE:
+            # drop the sampled token, pre-set the exact status today's
+            # max_tokens=1 append reaches via check_stop, and let the stock
+            # stopped-path park the request. Downstream of this branch the
+            # segment never existed: no EngineCoreOutput (the API server gets
+            # no junk to attribute), no save_async (no boundary to stage 1, no
+            # vocoder flush -- the 19-52% GPU splash measured at 128 users).
+            # The park itself is deliberately NOT re-implemented: only
+            # _handle_stopped_request keeps the streaming-queue drain, the
+            # parked-counter increment and the skipped_waiting enqueue atomic.
+            prefill_only_parked = False
+            if (new_token_ids and not stopped and request.resumable
+                    and getattr(request, "omni_prefill_only_segment", False)):
+                prefill_only_parked = True
+                request.omni_prefill_only_segment = False
+                # Async scheduling already added placeholder(s) for the
+                # token(s) being dropped; without this decrement the rollback
+                # at the stopped-path below would re-prefill the last prompt
+                # token (re-sampling the throwaway) and swallow the next
+                # segment's first real output.
+                if request.num_output_placeholders > 0:
+                    request.num_output_placeholders = max(
+                        0, request.num_output_placeholders - len(new_token_ids))
+                # Presence probe (the inert-guard lesson): the park announces
+                # itself, so its absence under a duplex load is diagnosable.
+                logger.info(
+                    "[prefill-only] parked req=%s: %d sampled token(s) discarded, "
+                    "segment invisible downstream (computed=%d)",
+                    req_id, len(new_token_ids), request.num_computed_tokens,
+                )
+                new_token_ids = []
+                request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+                stopped = True
+
             # Check for stop and update request status.
             if new_token_ids:
                 num_sampled_tokens = len(new_token_ids)
@@ -834,7 +923,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
+            if prefill_only_parked:
+                # A parked prefill-only segment emits NOTHING and ships
+                # NOTHING: skipping the two blocks below IS the fix. The
+                # `stopped` flag would otherwise emit a junk EngineCoreOutput
+                # (the receipt the API server used to have to attribute and
+                # swallow) and save_async would ship the segment boundary
+                # that made stage 1 wake and stage 2 flush per append.
+                pass
+            elif new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     OmniEngineCoreOutput(
@@ -860,9 +957,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
 
-            if self.chunk_transfer_adapter is not None and (
-                inter_stage_output is not None or is_segment_finished or finished
-            ):
+            if (self.chunk_transfer_adapter is not None
+                    and not prefill_only_parked
+                    and (inter_stage_output is not None or is_segment_finished or finished)):
                 self.chunk_transfer_adapter.save_async(
                     inter_stage_output,
                     request,
@@ -1119,6 +1216,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         update_max_tokens = getattr(update, "max_tokens", None)
         if isinstance(update_max_tokens, int) and update_max_tokens > 0:
             session.max_tokens = update_max_tokens
+        # Per-UPDATE prefill-only capture (the zero-output append, section 25).
+        # Marked segments are discarded at sampling time in update_from_output;
+        # the flag is one-shot per segment: set here for the chunk that carried
+        # the marker, overwritten here by every later chunk, and cleared by the
+        # park itself. Assigned unconditionally so a turn following an append
+        # can never inherit a stale True.
+        session.omni_prefill_only_segment = _update_is_prefill_only(update)
 
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
@@ -1402,6 +1506,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Drop the stale bookkeeping that says the adapter is holding it, or the next
                 # pass will believe the request is parked when it is not.
                 getattr(adapter, "requests_origin_status", {}).pop(request.request_id, None)
+            if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                # A PARKED session found in no queue is a real leak, but
+                # forcing it to WAITING is an engine-killer: it is fully
+                # computed, and the waiting path asserts num_new_tokens > 0.
+                # Re-enqueue it AS parked (the enqueue routes blocked statuses
+                # to skipped_waiting) and leave the counter alone -- it was
+                # incremented at the park and never decremented.
+                self._enqueue_waiting_request(request)
+                continue
             request.status = RequestStatus.WAITING
             self._enqueue_waiting_request(request)
 
