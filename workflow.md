@@ -1809,6 +1809,80 @@ u1): server-side first_text 0.034–0.070 s on steady turns, first_audio
 
 ---
 
+## 25. The zero-output append — and the first honest 128-user duplex-brain number
+
+*2026-08-09, commit `7c3d9d3f`; adversarial design review by a 6-agent
+verification pass (findings in the workflow journal); data
+`/data/zx/results/fixa2_*`, `/data/zx/results/thinker_ttft_u128_v4`.*
+
+Fix A's goal: a prefill-only arrival append should leave NOTHING behind
+but its tokens in stage-0 KV. Before: every append forced one throwaway
+sampled token whose ripples cost 19-52% of the GPU on stages 1-2 (junk
+boundary -> talker wake -> vocoder flush), fed junk receipts to the API
+server's attribution, and made talker-less measurement impossible
+(receipt-based accounting needs receipts; in single-stage boots 2 of 3
+receipts never arrived).
+
+**The design that survived review** (the original spec had three faults
+the review caught: "zero sampled" is unreachable -- the marker cannot
+travel to the runner -- so it is sample-then-discard; the marker channels
+were inverted in my head; and engine-only deployment would have been a
+session-killer): the scheduler discards the sampled token at
+update_from_output, pre-sets the same FINISHED_LENGTH_CAPPED status the
+old path reached via check_stop, parks through the stock
+_handle_stopped_request, and suppresses the output emission and the
+downstream save. The gate reads the UPDATE's own marker (request-level
+is stale by construction; the channel helper would have made the gate
+inert). Two transport wrappers that silently dropped payload STRUCTS
+(dict-only filters) explain why the marker historically survived only on
+extra_args -- both now pass structs through.
+
+**Retirement tests, all green:**
+
+| test | result |
+|---|---|
+| R2 marker flip, u1 duplex x5 | parked 132 ≈ appends 133, adapter skips 0 (was 18,801/run), UNOWNED 0, turns 5/5 |
+| R1 atomicity, u8 duplex x10 | 80/80, probes zero, p50/p95 239/377 (junk-era duplex: 278/428) |
+| R3 async scheduler, u1 x5 | 5/5, texts intact (no swallowed first tokens), parked 133 |
+| splash, u64 pure ingestion | speech-pair process KERNEL-SILENT for the whole hold (pre-fix: 16-19% sm p50); append cadence 264 -> 316/s |
+| text-only sessions + audio appends | now legal: turn attribution runs on text stops against the unconditional 'turn' FIFO push |
+
+**Then the measurement fix A existed for — and its answer.** 128 users,
+each streaming REAL speech (recorded wavs) at a 200 ms group cadence,
+text-only turns, a verified single-stage thinker (post-boot assertion:
+zero stage-1/2 processes — the first attempt silently booted a mongrel
+3-stage because QWEN_MODEL did not survive the launcher, and its numbers
+were discarded):
+
+- turn 1 (before feeding starts): TTFT p50 **457 ms** — the brain itself
+  is fine at 128 users;
+- turns 2+: TTFT p50 **20.7 s**, p99 **46 s**, growing linearly with
+  turn index (7.6 s -> 22.3 s -> 32.5 s);
+- append cadence achieved: **88/s** against a 640/s target; machinery
+  ledger perfectly clean (parked 32,212 ≈ appends 34,089, UNOWNED 0).
+
+The reading: **the drowning is real and it is not the model.** The
+thinker's GPU sits near-idle throughout; what saturates is the
+per-append round trip itself (API event loop + engine unpark/prefill/
+park cycle), measured tonight at ~90/s at 128 sessions and ~316/s at 64
+— superlinear collapse. Turns share the per-session pipe with appends,
+so every query waits behind the append backlog, and the wait grows
+without bound: the system never breaks (1,280/1,280 turns, zero
+timeouts) — it just answers 46 seconds late. At a 200 ms tick the
+current implementation carries **~60 duplex users**; 128 needs either
+~1 s groups, batched append submission, or the per-append cost taken
+out of Python. That — not FLOPs, not KV — is the next wall, and it is
+the same wall every measurement this week has pointed at.
+
+Two operational notes: the zero-output wedge watchdog fired 81 times
+here — correctly, the requests really were starving — and its
+per-fire request-table dump put ~10k ERROR lines on the engine-core
+thread during the cell: the log-volume tail risk the design review
+predicted is real and needs a rate limit before the next fleet-scale
+run.
+
+---
+
 ## Where things stand
 
 **Working**
