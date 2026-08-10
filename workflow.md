@@ -1761,15 +1761,21 @@ in all arms. Xiao set **200 ms as the serving default** the next morning
 (a finer duplex tick, priced as above); capacity ladders that want the
 coarser price override per cell via MU_SESSION_CFG_JSON.
 
-*Reverted 2026-08-10 (Xiao's call, after the serving-form review): the
-default is now **480 ms**. Two reasons. Our own price curve: 200 ms is
-the only arm where the MEDIAN pays (+95 ms, rtf −20% on top of 480),
-and §25 showed the append machinery — not the model — is the first
-wall, which a 2.4× append rate hits 2.4× sooner. And realism: every
-published AV duplex system ticks at 480 ms or coarser (DuplexOmni
-480 ms slices, MiniCPM-o 1 s, LongCat 1–2 s chunks; only audio-only
-Moshi runs 80 ms), so the finer tick emulated a system nobody ships.
-200 ms remains available per run for stress cells.*
+*RETIRED 2026-08-10 (Xiao's call): the duplex feeding mode was removed
+from mainline entirely — `prefill_audio_on_arrival`,
+`audio_prefill_group_ms`, the server-side audio feeder, the mu_bench
+silent pump (`MU_DUPLEX*`, `MU_SPEECH_WAV_DIR`), and the browser flag
+are gone; the default workload is turn-based again. The code lives on
+branch `duplex-feeding-archive` (tip c4892062). Reasoning: the
+emulation captured only the ingestion half of a duplex bill (no
+per-tick decode, no always-on mouth), §25 showed at-scale numbers
+measure our append machinery rather than the model, and the 200 ms
+tick was finer than any published AV duplex system (DuplexOmni 480 ms,
+MiniCPM-o 1 s, LongCat 1–2 s). The thesis keeps mixed tenancy;
+duplex is demoted from core experiment. This section's measurements
+stand as the historical record of what the mode cost and showed.
+Fix A (§25) STAYS — zero-output appends serve the frame on-arrival
+path too, not just duplex audio.*
 
 **What this is for.** The Qwen stack now emulates the resource side of a
 SeedRealtime-class workload end to end: constant context growth (~18–25
