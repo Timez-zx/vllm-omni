@@ -348,6 +348,9 @@
     switch (type) {
       case 'response.start':
         turnInFlight = true;
+        // A reply whose text.done went missing (lost event, rolled session) must not
+        // leak into this turn's bubble: close whatever is still open.
+        finishTranscript('assistant');
         // Re-apply the prebuffer for this turn. The worklet node lives for the whole
         // call, so without this the smooth start applies to the first reply only.
         if (playbackNode) {
@@ -442,6 +445,12 @@
     // Empty text: the question is in the audio, which is the point of a voice
     // interface. The server treats video.query purely as a cut marker.
     socket.send(JSON.stringify({ type: 'video.query', text: '' }));
+    // The transcript has no client-side ASR, so the user's words are unknown --
+    // but the exchange boundary is known RIGHT HERE. Close the previous reply's
+    // bubble and drop a voice marker so consecutive replies cannot run together.
+    finishTranscript('assistant');
+    addTranscript('user', '🎤');
+    finishTranscript('user');
     turnInFlight = true;
     sawSpeech = false;
     speechMs = 0;
@@ -557,16 +566,24 @@
       // clearing falls straight back to hidden -- camera running, preview invisible, and
       // no way to tell the two apart from the page. Set the value explicitly.
       cameraPreview.style.display = 'block';
-      await cameraPreview.play().catch(() => {});
       // Say so in words as well as in pixels. A black rectangle looks the same whether the
       // camera failed, the lens is covered, or the first frame has not arrived yet.
-      cameraPreview.addEventListener('loadedmetadata', () => {
+      // Registered BEFORE play() and re-checked after: with a fast camera the metadata
+      // is already loaded by the time play() resolves, the event has come and gone, and
+      // the badge reads "Camera off" for the whole call while frames send fine.
+      let cameraAnnounced = false;
+      const markCameraReady = () => {
+        if (cameraAnnounced || !cameraStream || cameraPreview.videoWidth === 0) return;
+        cameraAnnounced = true;
         log(`camera on: ${cameraPreview.videoWidth}x${cameraPreview.videoHeight}`);
         if (cameraBadge) {
           cameraBadge.textContent = `${cameraPreview.videoWidth}x${cameraPreview.videoHeight}`;
           cameraBadge.dataset.state = 'ok';
         }
-      }, { once: true });
+      };
+      cameraPreview.addEventListener('loadedmetadata', markCameraReady, { once: true });
+      await cameraPreview.play().catch(() => {});
+      markCameraReady();
       cameraTimer = window.setInterval(() => {
         if (!cameraStream || cameraPreview.videoWidth === 0) return;
         cameraCanvas.width = cameraPreview.videoWidth;
