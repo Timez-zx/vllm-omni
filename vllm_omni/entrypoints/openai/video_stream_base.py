@@ -499,6 +499,18 @@ class StreamingVideoSessionConfig(BaseModel):
             "anything even as its content changes completely."
         ),
     )
+    fresh_frame_on_query: bool = Field(
+        default=True,
+        description=(
+            "Ride the newest arrived frame at the END of each query's delta, bypassing the "
+            "similarity filter. Without it the frames adjacent to the question are the ones "
+            "REFUSED during the previous answer -- the oldest in the delta -- and the model "
+            "reads the frames nearest the question as 'now': measured with a digit clock, "
+            "answers ran one query-gap stale at 3 fps (median 4 s) and the filter's "
+            "frame-denominated min_gap added an 8-frame blind window on top. Costs at most "
+            "one duplicate frame (~222 tokens) per turn."
+        ),
+    )
     frame_filter_min_gap: int = Field(
         default=0,
         ge=0,
@@ -855,6 +867,9 @@ class OmniStreamingVideoHandler:
                 )
 
             frame_buffer: list[str] = []  # base64-encoded JPEG frames
+            # Newest arrived frame, similarity-filter-agnostic: the query-time
+            # sweep rides it at the delta's end (fresh_frame_on_query).
+            latest_frame: list[str | None] = [None]
             frame_metadata: list[dict[str, Any]] = []
             # Per-frame PIL cache + uuid for mm_hash reuse. Aligned with frame_buffer by index.
             frame_pil_cache: dict[str, tuple[Any, str] | object] = {}  # b64 -> (PIL.Image, uuid) or _BAD_FRAME
@@ -1545,6 +1560,14 @@ class OmniStreamingVideoHandler:
                     _launch_shadow_warmup("turn start")
 
                 new_frames = list(frame_buffer)
+                n_buffered = len(new_frames)
+                # Freshness (digit-clock study): without this, the frames adjacent to
+                # the question are the ones refused during the PREVIOUS answer -- the
+                # oldest in the delta -- and the model reads the frames nearest the
+                # question as "now". Ride the newest arrival at the delta's end.
+                if (config.fresh_frame_on_query and latest_frame[0] is not None
+                        and (not new_frames or new_frames[-1] != latest_frame[0])):
+                    new_frames.append(latest_frame[0])
                 # The blocking roll's seed is deliberately TEXT-ONLY even when frames are
                 # retained: it prefills in the foreground of a turn the user is waiting
                 # on, and recovery speed beats fidelity on the emergency path. The shadow
@@ -1566,7 +1589,9 @@ class OmniStreamingVideoHandler:
                     return
                 # Delete exactly the consumed prefix, not the whole buffer: frames may have
                 # arrived while the chunk was being built, and those belong to the next turn.
-                del frame_buffer[: len(new_frames)]
+                # n_buffered, NOT len(new_frames): the fresh-frame rider was never in the
+                # buffer, and counting it here would delete one frame that arrived mid-build.
+                del frame_buffer[:n_buffered]
                 if compression_trigger and config.context_compression_carry_frames:
                     # Post-filter list: a frame the chunk dropped as undecodable must not
                     # come back to poison a seed later. Captured before the cache pops
@@ -2401,6 +2426,9 @@ class OmniStreamingVideoHandler:
                             if shrunk is not None:
                                 raw_bytes = shrunk
                                 frame_data = base64.b64encode(shrunk).decode("ascii")
+                        # Stash BEFORE the filter: a dropped frame is still the newest
+                        # picture of the world, and fresh_frame_on_query needs exactly that.
+                        latest_frame[0] = frame_data
                         if frame_filter is not None:
                             try:
                                 # Bracket the GAP between retained frames, in frames. The
