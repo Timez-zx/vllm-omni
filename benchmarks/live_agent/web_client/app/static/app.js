@@ -375,16 +375,35 @@
   function avatarShow() {
     if (avatarPanel && avatarPanel.style.display === 'none') {
       avatarPanel.style.display = '';
-      // Switch the stage into call-screen composition: person centred, controls
-      // beneath, self-view riding the avatar's corner FaceTime-style. Done by
-      // class + one node move so a voice-only deployment (which never gets an
-      // avatar frame) keeps the original compact bar untouched.
+      // Recompose the stage into a call workbench: the person on the left with
+      // the self-view under them, the transcript alongside on the right, and
+      // one full-width control bar (call button, status pill, mic meter,
+      // mute/camera/talk) beneath both. Done as a class plus node moves on the
+      // first avatar frame, so a voice-only deployment -- which never receives
+      // one -- keeps the original layout untouched.
       const stage = avatarPanel.closest('.stage');
-      if (stage) stage.classList.add('avatar-live');
+      if (!stage) return;
+      stage.classList.add('avatar-live');
+      const stageMain = stage.querySelector('.stage-main');
+      const stageSide = stage.querySelector('.stage-side');
       const camBox = cameraPreview ? cameraPreview.closest('.cam') : null;
-      if (camBox && camBox.parentElement !== avatarPanel) {
-        camBox.classList.add('pip');
-        avatarPanel.appendChild(camBox);
+      const status = stage.querySelector('.status');
+      const callBtn = document.getElementById('callButton');
+      // Left column: avatar with the camera as its own tile below (explicitly
+      // not a PiP -- user call).
+      if (camBox && stageMain && camBox.parentElement !== stageMain) {
+        stageMain.appendChild(camBox);
+      }
+      // Control bar: reuse stage-side, pulling the call button and status
+      // (which carries the mic meter) in front of the small buttons.
+      if (stageSide) {
+        if (status) stageSide.prepend(status);
+        if (callBtn) stageSide.prepend(callBtn);
+      }
+      // Right column: the transcript joins the stage grid.
+      const transcriptPanel = conversation ? conversation.closest('section') : null;
+      if (transcriptPanel && transcriptPanel.parentElement !== stage) {
+        stage.appendChild(transcriptPanel);
       }
     }
   }

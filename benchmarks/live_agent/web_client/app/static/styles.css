@@ -139,48 +139,71 @@ body {
 }
 
 /* ------------------------------------------------ call mode (avatar live) */
-/* app.js adds .avatar-live on the first avatar frame. Voice-only deployments
- * never get here, so the compact bar above stays exactly theirs. The grammar
- * is a call screen: the person centred as the subject, every control in a
- * centred column beneath, the self-view riding the portrait's corner. */
+/* app.js adds .avatar-live and regroups nodes on the first avatar frame.
+ * Voice-only deployments never get here, so their layout stays untouched.
+ *
+ * The grammar is a call workbench:
+ *
+ *     ┌ video ────────┐ ┌ chat ─────────────────┐
+ *     │ avatar (tall) │ │ transcript (scrolls,  │
+ *     │ self-view     │ │  same height)         │
+ *     └───────────────┘ └───────────────────────┘
+ *     [ call · status · mic meter · mute/cam/talk ]
+ */
 .stage.avatar-live {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: clamp(240px, 26vw, 310px) minmax(0, 1fr);
+  grid-template-areas:
+    "video chat"
+    "bar   bar";
   align-items: stretch;
-  gap: 14px;
-  padding: 26px 24px 20px;
+  gap: 18px;
+  padding: 22px;
 }
 .stage.avatar-live .stage-main {
+  grid-area: video;
   flex-direction: column;
-  align-items: center;
-  gap: 14px;
-}
-.stage.avatar-live .avatar-frame { height: clamp(320px, 52vh, 480px); }
-.stage.avatar-live .status {
-  min-width: 0;
-  flex-direction: row;
-  align-items: center;
+  align-items: stretch;
   gap: 12px;
 }
-.stage.avatar-live .status-pill { align-self: center; }
-.stage.avatar-live .stage-side { align-items: center; }
-.stage.avatar-live .stage-buttons { justify-content: center; }
-
-/* Self-view as picture-in-picture on the avatar's corner (moved there by
- * app.js when the avatar first appears). */
-.avatar-frame .cam.pip {
-  position: absolute;
-  right: 10px;
-  bottom: 10px;
-  width: 92px;
-  height: 69px;
-  border-radius: 10px;
-  border: 1px solid color-mix(in srgb, #fff 25%, transparent);
-  box-shadow: 0 6px 18px -8px rgb(0 0 0 / .65);
-  z-index: 2;
+/* Width-driven: the portrait fills its column, the 4:7 ratio sets the height,
+ * and the chat column stretches to match. */
+.stage.avatar-live .avatar-frame {
+  width: 100%;
+  height: auto;
+  aspect-ratio: 4 / 7;
 }
-.avatar-frame .cam.pip #cameraPreview { width: 100%; height: 100%; }
-/* The avatar's own badge hugs bottom-left so the PiP owns bottom-right. */
+/* The self-view as its own tile under the person -- deliberately not a PiP. */
+.stage.avatar-live .cam {
+  width: 100%;
+  height: auto;
+  aspect-ratio: 16 / 9;
+}
+.stage.avatar-live .transcript {
+  grid-area: chat;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  box-shadow: none;              /* it sits inside the stage panel already */
+  background: var(--surface-2);
+}
+.stage.avatar-live .conversation {
+  flex: 1;
+  height: auto;
+  min-height: 0;
+}
+/* One full-width control bar. The status block keeps its width so the mic
+ * meter stays a readable size. */
+.stage.avatar-live .stage-side {
+  grid-area: bar;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 14px;
+}
+.stage.avatar-live .stage-side .status { min-width: 220px; }
+.stage.avatar-live .stage-buttons { justify-content: center; }
 .avatar-frame > .cam-badge { left: 10px; right: auto; bottom: 10px; padding-inline: 8px; }
 
 /* The preview frame is ALWAYS there, even with the camera off. An element that appears
@@ -469,8 +492,13 @@ textarea { resize: vertical; line-height: 1.5; }
   #cameraPreview { width: 100%; height: 150px; }
   /* Phone: the person centred on their own row, controls wrapping below. */
   .avatar-frame { margin-inline: auto; height: clamp(240px, 42vh, 360px); }
-  .stage.avatar-live .avatar-frame { height: clamp(280px, 48vh, 420px); }
-  /* The 150px camera rule above is for the sidebar layout; as a PiP the
-   * self-view keeps its corner size. */
-  .avatar-frame .cam.pip #cameraPreview { height: 100%; }
+  /* Call workbench collapses to one column: person, self-view, chat, bar. */
+  .stage.avatar-live {
+    grid-template-columns: 1fr;
+    grid-template-areas: "video" "chat" "bar";
+  }
+  .stage.avatar-live .avatar-frame { width: min(72vw, 300px); margin-inline: auto; }
+  .stage.avatar-live .cam { width: min(72vw, 300px); margin-inline: auto; height: auto; }
+  .stage.avatar-live .cam #cameraPreview { width: 100%; height: 100%; }
+  .stage.avatar-live .conversation { height: min(38vh, 320px); flex: none; }
 }
