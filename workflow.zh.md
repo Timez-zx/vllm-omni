@@ -1628,3 +1628,11 @@ talker 音频 → 桥 tee → 数字人 → JPEG 帧注入回下行）：
 - 纯语音部署不受影响：面板仍是首帧到达才显示。
 
 proxy 静态文件带 asset-version 且 no-store，刷新页面即生效，无需重启。
+
+**改完 UI 之后用户还是只看到一角——不是缓存，是我漏了这个 proxy 的一个
+设计事实**：`index.html` 在 proxy 启动时读入内存并盖上资源版本号
+（这是它防"陈旧 AudioWorklet 假装修好了"的机制），静态 CSS/JS 走磁盘
+即时生效，**HTML 不是**。所以「改了页面结构 → 必须重启 proxy」。
+重启后对外 HTML 里 `avatar-frame` 就位。顺带又踩了一次 `pkill -f` 的
+自匹配（包装 shell 的命令行含同样字符串把自己杀了），用 `server[.]py`
+字符类写法避开。
