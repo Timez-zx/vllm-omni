@@ -59,7 +59,11 @@ def wav_to_pcm24k(wav: bytes) -> bytes:
     already 24 kHz mono 16-bit, so the common path is a plain slice.
     """
     if len(wav) < 12 or wav[0:4] != b"RIFF" or wav[8:12] != b"WAVE":
-        raise ValueError("not a RIFF/WAVE payload")
+        # Some server variants ship raw PCM16 mono 24 kHz instead of a WAV
+        # container (see the protocol note at the top of app.js).  Raw samples
+        # are indistinguishable from garbage by inspection, so trust the
+        # protocol's stated default rather than refusing to speak.
+        return wav[: len(wav) - (len(wav) % 2)]
     channels, rate, bits = 1, AVATAR_SAMPLE_RATE, 16
     data = None
     offset = 12

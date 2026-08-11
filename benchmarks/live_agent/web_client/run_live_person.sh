@@ -64,7 +64,13 @@ else
   fi
   [ -s "$ENGINE_LOG" ] && mv -f "$ENGINE_LOG" "$ENGINE_LOG.prev"
   echo "engine    starting on GPU1 (log: $ENGINE_LOG; first start compiles for ~3-6 min)"
+  # CUDA_HOME: FlashInfer JIT-compiles MoE kernels during KV-cache init and dies
+  # with "Could not find nvcc" without a full toolkit. Must match torch's CUDA
+  # major (cu130 -> 13.x); the 12.8 toolkit that builds the avatar's NVFP4
+  # kernels is NOT interchangeable here.
   HF_HOME=/home/ubuntu/data/hf-omni \
+  CUDA_HOME=/home/ubuntu/miniconda3/envs/cudatk13 \
+  PATH="/home/ubuntu/miniconda3/envs/cudatk13/bin:$PATH" \
   CUDA_VISIBLE_DEVICES=1 \
   VLLM_OMNI_COLOCATE_STAGES="${VLLM_OMNI_COLOCATE_STAGES-2:1}" \
   VLLM_OMNI_TALKER_TEXT_ONLY="${VLLM_OMNI_TALKER_TEXT_ONLY:-1}" \
@@ -73,12 +79,17 @@ else
     --omni --deploy-config "$DEPLOY" \
     --trust-remote-code --host 127.0.0.1 --port "$PORT_ENGINE" \
     --init-timeout 3000 --stage-init-timeout 1500 ${QWEN_EXTRA_ARGS:-} >> "$ENGINE_LOG" 2>&1 &
+  ENGINE_PID=$!
+  echo "$ENGINE_PID" > "$LOGDIR/omni_engine.pid"
 
   echo "          waiting for /health ..."
   for i in $(seq 1 240); do
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$PORT_ENGINE/health" 2>/dev/null)
     [ "$code" = "200" ] && { echo "          READY after ~$((i*5))s"; break; }
-    if ! pgrep -f "vllm-omni serve" >/dev/null; then
+    # Liveness by PID, not by name: vLLM rewrites its process title to
+    # "APIServer", so a pgrep for "vllm-omni serve" stops matching seconds
+    # after launch and reads as a death that never happened.
+    if ! kill -0 "$ENGINE_PID" 2>/dev/null; then
       echo "!! engine process died; last log lines:"; tail -25 "$ENGINE_LOG"; exit 1
     fi
     sleep 5

@@ -1560,3 +1560,21 @@ rid 变化或 pts 回退即重锚。
 thinker 换成 Qwen3-Omni 后该机制不存在，先砍掉，数字人保留呼吸/说话）；
 多用户下的数字人（LiveAct 是单租户全局状态，RTF 0.38 一张卡也就 1~2 路，
 真要做是 stage 化之后的事）；形象上传（数字人侧本来就有，桥先不接）。
+
+**部署时踩的两个坑（都已修进 run_live_person.sh）。**
+
+1. *引擎明明活着，脚本却宣布它死了。* 存活检查用的是
+   `pgrep -f "vllm-omni serve"`，而 vLLM 启动几秒后会把进程标题改写成
+   `APIServer`，于是匹配落空、脚本误判退出（setsid 让引擎本体活了下来，
+   这才没造成真损失）。改成记 PID、用 `kill -0` 查——按名字找会被
+   setproctitle 骗，按 PID 不会。
+2. *KV cache 初始化阶段死于 `Could not find nvcc`。* FlashInfer 的
+   fused-MoE 内核是运行时 JIT 编译的，需要完整 CUDA toolkit。本机为
+   编数字人的 NVFP4 内核装过 CUDA **12.8** toolkit，但本引擎的 torch 是
+   `2.11.0+cu130`——大版本必须对上，12.8 的 nvcc 对 CUDA 13 的头文件
+   不可用。另建 `cudatk13` conda env（13.0.88），`CUDA_HOME` 指过去。
+   同一台机器上两套 toolkit 并存，各服务各的 torch。
+3. *nvcc 之后又缺 `ninja`。* 同一个 JIT 管线的第二只脚。装进 cudatk13 的
+   bin（引擎 PATH 已指向那里）。教训合并成一句：**FlashInfer 的运行时
+   JIT 需要「和 torch 大版本一致的完整 toolchain」= nvcc + 头文件 + ninja，
+   缺哪个都死在 KV cache 初始化，而报错一次只暴露一件。**
