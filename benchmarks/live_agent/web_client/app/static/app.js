@@ -95,7 +95,15 @@
   const AVATAR_START_BUFFER_MS = 250;   // video lead-in before the anchor fires
   const AVATAR_AUDIO_DELAY_MS = 100;    // audio trails video to cover canvas latency
   const AVATAR_LATE_DROP_MS = 160;      // frames later than this are skipped
-  const AVATAR_AUDIO_FALLBACK_MS = 3500; // no video by then -> release audio anyway
+  // How long video may keep the voice waiting, at most. The strict hold gave
+  // the SESSION'S FIRST reply a hard ~2.3s (avatar needs ~1.4s of audio
+  // timeline before its first talking block even exists), while later turns
+  // often rode a still-draining queue and started at once -- which is exactly
+  // the first-reply-is-seconds asymmetry a user hears. Engine TTFA is ~0.45s
+  // per its own [TIMING] lines, so 1400ms means: first sound by ~1.4s worst
+  // case, lips catching up within ~0.8s of reply start. Doubles as the
+  // avatar-down escape hatch (audio must never be held hostage).
+  const AVATAR_AUDIO_HOLD_MAX_MS = 1400;
   const AVATAR_HOLD_THRESHOLD = 1e9;    // "never start on your own"
   const ECHO_GUARD_MS = 300;         // keep uploading this long after playback
 
@@ -540,8 +548,8 @@
         avatarAwaitingCouple = true;
         if (avatarFallbackTimer) clearTimeout(avatarFallbackTimer);
         avatarFallbackTimer = setTimeout(
-          () => avatarReleaseAudio('no video, degrading to voice-only'),
-          AVATAR_AUDIO_FALLBACK_MS,
+          () => avatarReleaseAudio('video not ready in time, voice goes first'),
+          AVATAR_AUDIO_HOLD_MAX_MS,
         );
         break;
       case 'avatar.frame':

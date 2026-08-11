@@ -111,6 +111,15 @@ else
   done
   curl -fsS --max-time 3 "http://127.0.0.1:$PORT_ENGINE/health" >/dev/null 2>&1 || {
     echo "!! engine never became healthy; see $ENGINE_LOG"; exit 1; }
+
+  # Absorb the first-request cliff before a human hits it. The engine's own
+  # [TIMING] log showed first_audio=44.7s on the first request after boot
+  # (Triton kernels JIT-compiling during inference: rotary, mrope, SnakeBeta)
+  # and ~0.45s on every request since. One synthetic turn pays that here.
+  echo "          warmup turn (absorbs first-request JIT) ..."
+  (cd "$FORK/benchmarks/live_agent/web_client" && \
+    timeout 180 "$PROXY_PY" probe.py --direct --turns 1 >/dev/null 2>&1) \
+    && echo "          warmup done" || echo "          warmup skipped (non-fatal)"
 fi
 
 # --- page/proxy (CPU) ---------------------------------------------------------
