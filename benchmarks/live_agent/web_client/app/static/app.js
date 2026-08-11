@@ -372,39 +372,62 @@
   let avatarTimers = [];
   let avatarLateDrops = 0;
 
+  // Recompose the stage into a call workbench: the person on the left with the
+  // self-view under them, the transcript alongside on the right, and one
+  // full-width control bar (call button, status pill, mic meter,
+  // mute/camera/talk) beneath both. Idempotent; a voice-only deployment never
+  // calls it, so its layout stays untouched.
+  function enterCallWorkbench() {
+    const stage = avatarPanel ? avatarPanel.closest('.stage') : null;
+    if (!stage || stage.classList.contains('avatar-live')) return;
+    stage.classList.add('avatar-live');
+    const stageMain = stage.querySelector('.stage-main');
+    const stageSide = stage.querySelector('.stage-side');
+    const camBox = cameraPreview ? cameraPreview.closest('.cam') : null;
+    const status = stage.querySelector('.status');
+    const callBtn = document.getElementById('callButton');
+    // Left column: avatar with the camera as its own tile below (explicitly
+    // not a PiP -- user call).
+    if (camBox && stageMain && camBox.parentElement !== stageMain) {
+      stageMain.appendChild(camBox);
+    }
+    // Control bar: reuse stage-side, pulling the call button and status
+    // (which carries the mic meter) in front of the small buttons.
+    if (stageSide) {
+      if (status) stageSide.prepend(status);
+      if (callBtn) stageSide.prepend(callBtn);
+    }
+    // Right column: the transcript joins the stage grid.
+    const transcriptPanel = conversation ? conversation.closest('section') : null;
+    if (transcriptPanel && transcriptPanel.parentElement !== stage) {
+      stage.appendChild(transcriptPanel);
+    }
+  }
+
+  // Before any frame exists the canvas would be a hard black slab; give the
+  // waiting state a quiet head-and-shoulders placeholder instead.
+  function avatarPaintPlaceholder() {
+    if (!avatarCtx) return;
+    const w = avatarCanvas.width;
+    const h = avatarCanvas.height;
+    const g = avatarCtx.createLinearGradient(0, 0, 0, h);
+    g.addColorStop(0, '#242c34');
+    g.addColorStop(1, '#12171c');
+    avatarCtx.fillStyle = g;
+    avatarCtx.fillRect(0, 0, w, h);
+    avatarCtx.fillStyle = 'rgba(255,255,255,0.07)';
+    avatarCtx.beginPath();
+    avatarCtx.arc(w / 2, h * 0.36, w * 0.155, 0, Math.PI * 2);
+    avatarCtx.fill();
+    avatarCtx.beginPath();
+    avatarCtx.ellipse(w / 2, h * 0.68, w * 0.30, w * 0.22, 0, Math.PI, Math.PI * 2);
+    avatarCtx.fill();
+  }
+
   function avatarShow() {
     if (avatarPanel && avatarPanel.style.display === 'none') {
       avatarPanel.style.display = '';
-      // Recompose the stage into a call workbench: the person on the left with
-      // the self-view under them, the transcript alongside on the right, and
-      // one full-width control bar (call button, status pill, mic meter,
-      // mute/camera/talk) beneath both. Done as a class plus node moves on the
-      // first avatar frame, so a voice-only deployment -- which never receives
-      // one -- keeps the original layout untouched.
-      const stage = avatarPanel.closest('.stage');
-      if (!stage) return;
-      stage.classList.add('avatar-live');
-      const stageMain = stage.querySelector('.stage-main');
-      const stageSide = stage.querySelector('.stage-side');
-      const camBox = cameraPreview ? cameraPreview.closest('.cam') : null;
-      const status = stage.querySelector('.status');
-      const callBtn = document.getElementById('callButton');
-      // Left column: avatar with the camera as its own tile below (explicitly
-      // not a PiP -- user call).
-      if (camBox && stageMain && camBox.parentElement !== stageMain) {
-        stageMain.appendChild(camBox);
-      }
-      // Control bar: reuse stage-side, pulling the call button and status
-      // (which carries the mic meter) in front of the small buttons.
-      if (stageSide) {
-        if (status) stageSide.prepend(status);
-        if (callBtn) stageSide.prepend(callBtn);
-      }
-      // Right column: the transcript joins the stage grid.
-      const transcriptPanel = conversation ? conversation.closest('section') : null;
-      if (transcriptPanel && transcriptPanel.parentElement !== stage) {
-        stage.appendChild(transcriptPanel);
-      }
+      enterCallWorkbench();
     }
   }
 
@@ -915,6 +938,15 @@
   }
 
   if (systemPromptInput && !systemPromptInput.value) systemPromptInput.value = DEFAULT_SYSTEM_PROMPT;
+  // Avatar deployments open straight in the call workbench -- the proxy says so
+  // in the page config -- instead of reshuffling the page under the user at the
+  // first video frame.
+  if (config.avatar && avatarPanel) {
+    avatarPanel.style.display = '';
+    enterCallWorkbench();
+    avatarPaintPlaceholder();
+    if (avatarBadge) avatarBadge.textContent = 'Avatar · waiting';
+  }
   log(`client assets ${config.assetVersion || 'unversioned'}`);
   setConnection('Idle');
   log('ready -- press Start call');

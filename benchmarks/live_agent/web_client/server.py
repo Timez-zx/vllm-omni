@@ -89,7 +89,15 @@ def build_app(ws_backend: str, ws_url_override: str | None, avatar_url: str | No
     # Empty wsUrl makes the page derive ws://<this origin>/ws, which is what the
     # same-origin proxy is for. An override exists for the case where a reverse
     # proxy in front of this server does not forward websocket upgrades.
-    page_config = json.dumps({"wsUrl": ws_url_override or "", "assetVersion": version})
+    # avatar: the page recomposes into the call-workbench layout at LOAD time
+    # when this deployment has one, rather than on the first video frame --
+    # otherwise the user sees the plain layout until the first reply and the
+    # page reshuffles under them.
+    page_config = json.dumps({
+        "wsUrl": ws_url_override or "",
+        "assetVersion": version,
+        "avatar": bool(avatar_url),
+    })
     index_html = (index_template
                   .replace("{{CONFIG_JSON}}", page_config)
                   .replace('href="static/styles.css"', f'href="static/styles.css?v={version}"')
