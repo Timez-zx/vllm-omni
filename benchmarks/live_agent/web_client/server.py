@@ -152,10 +152,34 @@ def build_app(ws_backend: str, ws_url_override: str | None, avatar_url: str | No
             bridge = AvatarBridge(avatar_url, send_client_json)
             await bridge.start()
 
+        # Uplink tracing: with LIVE_PERSON_TRACE=1 the proxy logs each upstream
+        # message type and, for audio.chunk, an occasional running byte total.
+        # This is the only place that sees exactly what the browser sends, so a
+        # "first utterance ignored" bug is decided here -- did a video.query and
+        # audio actually go up, or not? -- rather than guessed.
+        import os as _os
+        trace = _os.getenv("LIVE_PERSON_TRACE") == "1"
+        audio_bytes = 0
+        audio_msgs = 0
+
         async def up() -> None:
+            nonlocal audio_bytes, audio_msgs
             try:
                 while True:
-                    await upstream.send(await client.receive_text())
+                    raw = await client.receive_text()
+                    if trace:
+                        try:
+                            t = json.loads(raw).get("type")
+                        except Exception:
+                            t = "?"
+                        if t == "audio.chunk":
+                            audio_msgs += 1
+                            audio_bytes += len(raw)
+                            if audio_msgs % 10 == 1:
+                                print(f"[trace] up audio.chunk #{audio_msgs} (~{audio_bytes//1024}KB b64)", flush=True)
+                        else:
+                            print(f"[trace] up {t}", flush=True)
+                    await upstream.send(raw)
             except (WebSocketDisconnect, Exception):
                 pass
 

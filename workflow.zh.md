@@ -1746,3 +1746,23 @@ bf16 显存分配（0.74+0.10+0.08，实占 94.9/96GB）没有 graph capture 的
 看门狗，以及本分支新增的数字人锚定状态（awaitingCouple、expectedRid、
 anchor、fallback 计时器、排播队列）。会话状态机的完整生命周期
 从此与通话按钮对齐。
+
+**「第一句没回复」排查（进行中）——先证伪了三个假设。**
+用户报告修了挂断状态复位后，第一句仍然没回复。停止猜测，上工具：
+
+1. proxy 加 `LIVE_PERSON_TRACE=1` 上行 trace（唯一能看到浏览器到底发了
+   什么的地方）；
+2. 新增 `probe_vad.py`：`probe.py` 是显式发 query 的，绕过了客户端静音
+   检测，而 bug 恰恰活在那里。这个脚本逐行复刻 app.js 的
+   `updateSilenceDetector`（RMS 0.012 / 说满 400ms / 静音 700ms 触发），
+   连开两个 session。
+
+结果——**触发链、VAD、引擎、桥在自动化里全部正常**：
+- trace 显示两个 session 都发了 `video.query` 且音频持续上行；
+- 引擎日志对应时刻有 `turn=0 done first_audio≈0.46s`，即第一句确实得到
+  了回复。
+
+所以问题只在**真实浏览器特有的时序**里，自动化复刻不出。下一步需要用户
+那边的 event log 来分岔定位：看有没有 `turn trigger sent (silence
+detected)`——没有=真实麦克风下 VAD 没起步（环境噪声/阈值不合），
+有但无回复=下行被吞。工具已就位，等现场日志。
