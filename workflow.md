@@ -1899,6 +1899,156 @@ run.
 
 ---
 
+## 26. The freshness trade-off — a fresh answer is bought with position, not with frame rate
+
+*2026-08-10. Fix in `fresh_frame_on_query` (commit 6f9e833b); probes and
+data under `/data/zx/results/freshness/`.*
+
+Xiao's observation from using the page: at a low frame rate the model
+sometimes answers about a picture that is no longer on screen. The
+question behind it is a trade-off: does a higher frame rate buy fresher
+answers, and what does it cost?
+
+**How to measure staleness in seconds.** A digit clock is streamed as
+the video: the number on screen increments once per second, and the
+background hue rotates so that the similarity filter cannot dismiss a
+frame as unchanged. Ask "what number is on the screen right now" and the
+answer *is* the timestamp of the picture the reply was based on;
+`displayed − answered` is the staleness in seconds, with no annotator and
+no judgment call. Audio is streamed continuously with speech-like bursts
+at random moments, and the questions arrive at random times — that last
+detail matters more than it looks: an earlier run asked at a fixed
+cadence, which quietly synchronised with the retention period and
+understated the problem by a factor of nine.
+
+**The problem is real, and it was not the frame rate.** Two mechanisms,
+both in our own code:
+
+* The similarity filter's `frame_filter_min_gap` is denominated in
+  FRAMES (8), so in SECONDS the blind window is `min_gap / fps` — eight
+  seconds at 1 fps, 2.7 at 3 fps. Retention was measured at exactly one
+  frame in eight in both arms (16 of 130 sent, 44 of 390).
+* Frames that arrive while the model is speaking are refused on purpose
+  (an append mid-turn lands between a turn's chunk and its answer). They
+  stay buffered and are swept into the NEXT question's delta — so the
+  pictures sitting immediately next to the question are the OLDEST ones
+  in it, and the model reads what is adjacent to the question as "now".
+
+**Raising the frame rate made it worse, not better.** With the filter off
+so that every frame is retained, 1 fps answered the current second in 6
+of 9 turns (median staleness 0 s) while 3 fps ran a full query-gap behind
+(median 4 s), cost 34% more time-to-first-audio, and grew the context
+2.77× faster. More frames per second means more near-duplicate pictures
+crowded around the question, and the newest one is not the one that wins.
+
+**The fix is one frame in the right place.** `fresh_frame_on_query`
+stashes the newest arrival BEFORE the similarity filter looks at it, and
+rides it at the END of the query's delta — adjacent to the question,
+where the model already looks. Measured on the same random-timing
+workload, before → after:
+
+| | 1 fps | 3 fps |
+|---|---|---|
+| answers based on the current or previous second | 1/12 → **9/12** | 8/12 → **12/12** |
+| median staleness | 5 s → **0 s** | 1 s → **0 s** |
+
+Cost: at most one duplicate frame per turn (~222 tokens at 640×352), and
+nothing at all when the newest frame was already in the delta.
+
+**The trade-off, stated properly.** Frame rate and freshness are not the
+same axis. The rate sets only a floor on how old the newest picture can
+be (1/fps — one second at 1 fps, which is already below what a
+conversational turn can notice); everything above that floor is
+scheduling, and scheduling is cheaper to fix than bandwidth. So: buy
+freshness with POSITION (guarantee the newest frame at the query cut),
+and spend frame rate only on what it alone can buy — catching events too
+brief to survive a 1 fps sample. Raising the rate for freshness pays 3×
+the context for a negative return.
+
+Two measurement notes worth keeping. Fixed-interval questioning is
+unsafe in any freshness experiment: it can beat with the retention
+period and hide the effect. And a stimulus whose values contain repeated
+digits ("33", "55") makes a stale read indistinguishable from a
+one-character misread — use distinct-digit codes.
+
+---
+
+## 27. The resolution trade-off — detail is bought by pixels-per-glyph, and it plateaus early
+
+*2026-08-10. Probes and full data under `/data/zx/results/resolution/`.*
+
+The camera path caps frames at 640×352 because §16 measured what wider
+frames cost in latency. What it never measured is what they buy. The
+question: does 1280 read detail — small text especially — that 640
+misses, and where does the extra token spend stop paying?
+
+**On natural images the answer is a clean monotone curve with an early
+plateau.** Two real 1280×720 screenshots (from the screencast stimulus
+set) carry a genuine font hierarchy — a 28 px heading, 17 px box titles,
+15 px body, 13 px browser chrome and photo captions. The same image was
+sent at six widths with eight questions aimed at different tiers. Image
+tokens are `(w/32)·(h/32)`: one token per 32×32 px, from the 16 px patch
+and 2×2 merge the processor reports.
+
+| width | image tokens | items read correctly | first tier to fail |
+|---|---|---|---|
+| 1280 | 880 | 8/8 | — |
+| **960** | **480** | **8/8** | — |
+| 768 | 312 | 7/8 | username (13 px → 8 px) |
+| 640 | 220 | 5/8 | + article count, body year |
+| 512 | 144 | 5/8 | + photo caption |
+| 448 | 98 | 3/8 | only heading, box title, URL survive |
+
+A second, less crowded page held 5/5 down to 640 and fell to 2/5 at 448.
+
+**What governs it is the glyph height that actually reaches the model,
+and the threshold is about 8–10 pixels.** Failure is ordered by font size
+— the largest text survives to 448 — and the errors are classic acuity
+confusions rather than invention: `Ichdunich → kchdunich → schduich →
+Unsearch`, `6,084,154 → 6,084,194 → 6,054,154`, `1982 → 1962 → 1925`.
+Below roughly 6 px a tier is gone. That floor is the one number three
+independent published studies agree on (7–10 px), which is a good sign
+the curve is a property of reading and not of our pipeline. It also
+explains why the two pages disagree: the cliff sits wherever the
+content's SMALLEST interesting text crosses the floor, so it moves with
+the content, not with the resolution setting alone.
+
+**A synthetic-stimulus trap, recorded because it cost half a day.** The
+first version of this study used random 6-character codes on a blank
+canvas, and produced a spectacular non-monotone result: large glyphs
+(≥32 px) failed while small ones read perfectly, and downscaling the very
+same image fixed the read. It reproduced outside our stack (pure
+HuggingFace transformers, official processor, bf16 — the same wrong word,
+`GARDEN → READ`), so it is a real model behaviour, but it is NOT a
+resolution law: with a textured background instead of a blank one, 56 px
+glyphs read 4/4 and even 96 px read 4/4, at the same size and canvas. The
+failure needs large glyphs on a nearly featureless field — an image that
+does not occur in camera or screen content, which is presumably why no
+vendor or paper documents it. Mechanism unknown; the leading untested
+guess is that when almost every visual token is an identical blank patch,
+the few text tokens lose the attention competition and the language prior
+fills in a plausible word.
+
+Two more traps from the same detour: a published measurement finds that
+VLMs rewrite implausible strings into plausible ones at a rate that PEAKS
+at exactly six characters — the length we had chosen — so codes should be
+8+ characters or real words; and asking a model to COUNT characters is
+not a usable perception probe, since the count is wrong at every glyph
+size, including sizes it reads perfectly.
+
+**The trade-off, stated properly.** Pick the width so that the smallest
+text worth reading lands at 10 px or more, then stop — for 1280-source
+screen content with 13 px chrome that is 960 wide, which scores the same
+8/8 as 1280 for 55% of the tokens. 640 remains the right default for
+faces, rooms and motion, where no tier of the image is 13 px text; it is
+the wrong default the moment the user points the camera at a document or
+shares a screen. Because the price is per-frame tokens, this is also a
+latency and capacity knob, not just an accuracy one: 640 → 960 is 2.2×
+the context growth per frame, and the capacity ladders already price what
+context growth per frame costs at 13 users.
+
+---
+
 ## Where things stand
 
 **Working**
