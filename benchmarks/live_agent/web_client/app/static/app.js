@@ -845,9 +845,33 @@
     });
   }
 
+  // Hard-reset the conversational state machine. stop() tears down sockets and
+  // audio contexts but used to leave these flags latched -- hang up while the
+  // assistant is mid-reply and turnInFlight/assistantSpeaking stay true, which
+  // gates BOTH the silence trigger and the mic upload, so the next session's
+  // first utterance goes nowhere until the previous session's 45s watchdog
+  // happens to fire. That is exactly "first sentence never answered, second
+  // one works".
+  function resetConversationState() {
+    turnInFlight = false;
+    assistantSpeaking = false;
+    lastAudioAt = 0;
+    sawSpeech = false;
+    speechMs = 0;
+    silenceMs = 0;
+    if (turnWatchdog !== null) { window.clearTimeout(turnWatchdog); turnWatchdog = null; }
+    // Avatar coupling state belongs to a session too.
+    avatarAwaitingCouple = false;
+    avatarExpectedRid = null;
+    avatarAnchor = null;
+    if (avatarFallbackTimer) { clearTimeout(avatarFallbackTimer); avatarFallbackTimer = null; }
+    avatarResetSchedule();
+  }
+
   async function start() {
     if (running) return;
     running = true;
+    resetConversationState();
     callButton.textContent = 'Hang up';
     callButton.classList.add('is-active');
     setConnection('Connecting');
@@ -873,6 +897,7 @@
 
   function stop() {
     running = false;
+    resetConversationState();
     callButton.textContent = 'Start call';
     callButton.classList.remove('is-active');
     setConnection('Idle');

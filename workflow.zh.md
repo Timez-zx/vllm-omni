@@ -1724,3 +1724,25 @@ proxy 静态文件带 asset-version 且 no-store，刷新页面即生效，无�
 攒音频的墙钟 0.85s→~0.4s，首帧可到 ~1.4s。代价是 deploy_web_demo 的
 bf16 显存分配（0.74+0.10+0.08，实占 94.9/96GB）没有 graph capture 的
 余量，得换 FP8 thinker 的配置族并重启重测。
+
+**「每个 session 第一句没人理」——挂断不清状态。**
+用户反馈每个新 session 的第一句话没有任何回复，第二句才正常。
+
+引擎日志先排除自己：每个 session 都有 turn=0 且 first_audio 0.4s 量级——
+说明引擎眼里的「第一轮」其实是用户的第二句，**第一句根本没变成
+`video.query`**，问题在前端触发链。
+
+根因在 `stop()`：挂断会拆 socket、关音频上下文、清计时器，
+**但对话状态标志一个不碰**。只要挂断时助手正在说话（很常见），
+`turnInFlight` 和 `assistantSpeaking` 就残留为 true，而这两个标志
+同时门控着静音触发器（`updateSilenceDetector` 首行直接 return）
+和麦克风上传（`microphoneUploadEnabled` 返回 false）——
+下一个 session 的第一句既不上传也不触发，直到上一个 session 遗留的
+45 秒看门狗恰好到点把标志清掉。`sendQuery` 的注释其实早就描述过
+这个楔死模式，只是没在挂断路径上兜住。
+
+修法：新增 `resetConversationState()`，`start()` 和 `stop()` 都调——
+复位 turnInFlight / assistantSpeaking / lastAudioAt / VAD 计数器 /
+看门狗，以及本分支新增的数字人锚定状态（awaitingCouple、expectedRid、
+anchor、fallback 计时器、排播队列）。会话状态机的完整生命周期
+从此与通话按钮对齐。
