@@ -82,6 +82,21 @@
   // 4 ms stall. Inaudible, but it is the reason not to shave this further. To widen it,
   // raise `initial_codec_chunk_frames` server-side rather than this.
   const PLAYBACK_PREBUFFER_MS = { fast: 60, smooth: 1400 };
+
+  // ---- Digital human (avatar) -------------------------------------------
+  // Present only when the proxy runs with --avatar. The avatar needs roughly a
+  // second of audio timeline before its first talking video block exists, so in
+  // avatar mode AUDIO WAITS FOR VIDEO: on response.start the playback worklet is
+  // re-armed with an unreachable threshold, and only when the first frame of
+  // that turn is anchored does start_now release it -- audio and lips then start
+  // together. The fallback timer is the escape hatch: if the avatar produces no
+  // frame (crashed, unreachable), audio is released anyway and the call degrades
+  // to voice-only instead of going silent.
+  const AVATAR_START_BUFFER_MS = 250;   // video lead-in before the anchor fires
+  const AVATAR_AUDIO_DELAY_MS = 100;    // audio trails video to cover canvas latency
+  const AVATAR_LATE_DROP_MS = 160;      // frames later than this are skipped
+  const AVATAR_AUDIO_FALLBACK_MS = 3500; // no video by then -> release audio anyway
+  const AVATAR_HOLD_THRESHOLD = 1e9;    // "never start on your own"
   const ECHO_GUARD_MS = 300;         // keep uploading this long after playback
 
   // Silence detection, used only when the trigger mode is 'auto'. These are
@@ -343,6 +358,76 @@
     return `${scheme}://${window.location.host}/ws`;
   }
 
+  // ---- Avatar state & scheduling ----------------------------------------
+  const avatarPanel = el('avatarPanel');
+  const avatarCanvas = el('avatarCanvas');
+  const avatarBadge = el('avatarBadge');
+  const avatarCtx = avatarCanvas ? avatarCanvas.getContext('2d') : null;
+  let avatarActive = false;        // any avatar.* message seen this session
+  let avatarExpectedRid = null;    // rid of the turn we owe an A/V couple to
+  let avatarAwaitingCouple = false;
+  let avatarFallbackTimer = null;
+  let avatarAnchor = null;         // { rid, basePts, clock } for pts pacing
+  let avatarLastPts = -1;
+  let avatarTimers = [];
+  let avatarLateDrops = 0;
+
+  function avatarShow() {
+    if (avatarPanel && avatarPanel.style.display === 'none') {
+      avatarPanel.style.display = '';
+    }
+  }
+
+  function avatarReleaseAudio(reason) {
+    if (avatarFallbackTimer) { clearTimeout(avatarFallbackTimer); avatarFallbackTimer = null; }
+    if (!avatarAwaitingCouple) return;
+    avatarAwaitingCouple = false;
+    if (playbackNode) playbackNode.port.postMessage({ type: 'start_now' });
+    if (reason) log(`avatar: audio released (${reason})`);
+  }
+
+  function avatarResetSchedule() {
+    avatarTimers.forEach(clearTimeout);
+    avatarTimers = [];
+    avatarLastPts = -1;
+  }
+
+  function avatarScheduleFrame(msg) {
+    // Anchor per timeline: a new rid, or pts running backwards, means the
+    // avatar restarted its clock (new turn, or idle loop rebase).
+    if (!avatarAnchor || avatarAnchor.rid !== msg.rid || msg.pts < avatarLastPts) {
+      avatarResetSchedule();
+      avatarAnchor = {
+        rid: msg.rid,
+        basePts: msg.pts,
+        clock: performance.now() + AVATAR_START_BUFFER_MS,
+      };
+      if (avatarAwaitingCouple && msg.rid === avatarExpectedRid) {
+        // First frame of the turn we were holding audio for: lips exist now,
+        // let the voice go right after the video lead-in.
+        const wait = AVATAR_START_BUFFER_MS + AVATAR_AUDIO_DELAY_MS;
+        setTimeout(() => avatarReleaseAudio('video anchored'), wait);
+        if (avatarBadge) { avatarBadge.textContent = 'Speaking'; avatarBadge.dataset.state = 'live'; }
+      }
+    }
+    const target = avatarAnchor.clock + (msg.pts - avatarAnchor.basePts);
+    const late = performance.now() - target;
+    if (late > AVATAR_LATE_DROP_MS) { avatarLateDrops += 1; return; }
+    const jpeg = base64ToBytes(msg.data || '');
+    const pts = msg.pts;
+    createImageBitmap(new Blob([jpeg], { type: 'image/jpeg' })).then((bitmap) => {
+      const delay = Math.max(0, target - performance.now());
+      const timer = setTimeout(() => {
+        if (pts >= avatarLastPts && avatarCtx) {
+          avatarCtx.drawImage(bitmap, 0, 0, avatarCanvas.width, avatarCanvas.height);
+          avatarLastPts = pts;
+        }
+        bitmap.close();
+      }, delay);
+      avatarTimers.push(timer);
+    }).catch(() => {});
+  }
+
   function handleEvent(event) {
     const type = event.type;
     switch (type) {
@@ -353,8 +438,14 @@
         finishTranscript('assistant');
         // Re-apply the prebuffer for this turn. The worklet node lives for the whole
         // call, so without this the smooth start applies to the first reply only.
+        // In avatar mode the threshold is unreachable on purpose: audio must wait
+        // for this turn's first video frame (see avatar.turn / avatarScheduleFrame),
+        // with the fallback timer as the voice-only escape hatch.
         if (playbackNode) {
-          playbackNode.port.postMessage({ type: 'rearm', frames: prebufferFrames() });
+          playbackNode.port.postMessage({
+            type: 'rearm',
+            frames: avatarAwaitingCouple ? AVATAR_HOLD_THRESHOLD : prebufferFrames(),
+          });
         }
         setModel('Thinking');
         log('turn started');
@@ -381,11 +472,50 @@
         // Release the smooth-start threshold: no more audio is coming, so whatever is
         // queued is the whole remainder of the reply. A reply shorter than the target
         // would otherwise sit in the buffer and never play.
+        avatarReleaseAudio(null);
         if (playbackNode) playbackNode.port.postMessage({ type: 'start_now' });
         setPlayback('Draining');
         endTurn(null);
         log('turn done');
         break;
+      case 'avatar.turn':
+        // Arrives just BEFORE this turn's response.start (the bridge tees ahead
+        // of forwarding), so response.start's rearm sees the flags already set.
+        avatarActive = true;
+        avatarShow();
+        avatarExpectedRid = event.rid;
+        avatarAwaitingCouple = true;
+        if (avatarFallbackTimer) clearTimeout(avatarFallbackTimer);
+        avatarFallbackTimer = setTimeout(
+          () => avatarReleaseAudio('no video, degrading to voice-only'),
+          AVATAR_AUDIO_FALLBACK_MS,
+        );
+        break;
+      case 'avatar.frame':
+        avatarActive = true;
+        avatarShow();
+        avatarScheduleFrame(event);
+        break;
+      case 'avatar.status': {
+        avatarActive = true;
+        avatarShow();
+        const name = event.event || 'avatar';
+        if (name === 'avatar_connected') {
+          if (avatarBadge) { avatarBadge.textContent = `Avatar ${event.resolution || ''}`; avatarBadge.dataset.state = 'live'; }
+          log(`avatar connected: ${event.resolution || '?'} @ ${event.fps || '?'} fps`);
+        } else if (name === 'avatar_error') {
+          if (avatarBadge) { avatarBadge.textContent = 'Avatar error'; avatarBadge.dataset.state = 'idle'; }
+          avatarReleaseAudio('avatar error');
+          log(`avatar error: ${event.message || ''}`, true);
+        } else if (name === 'avatar_block') {
+          if (avatarBadge) avatarBadge.textContent = `Avatar ${event.cost_ms || '?'} ms/block`;
+        } else if (name === 'avatar_done') {
+          if (avatarBadge) avatarBadge.textContent = 'Avatar idle';
+        } else {
+          log(`avatar: ${name}`);
+        }
+        break;
+      }
       case 'session.done':
         endTurn('server closed the session');
         break;

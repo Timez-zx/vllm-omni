@@ -71,7 +71,7 @@ def asset_version() -> str:
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:8]
 
 
-def build_app(ws_backend: str, ws_url_override: str | None):
+def build_app(ws_backend: str, ws_url_override: str | None, avatar_url: str | None = None):
     app = FastAPI(title="Qwen3-Omni live session")
     app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")
 
@@ -122,6 +122,28 @@ def build_app(ws_backend: str, ws_url_override: str | None):
             await client.close()
             return
 
+        # With --avatar the proxy stops being byte-transparent for exactly one
+        # reason: two producers now write to the browser socket (the engine's
+        # replies and the avatar's video frames), and FastAPI websockets are not
+        # safe for concurrent sends, so every downstream write goes through one
+        # lock.  Without --avatar none of this machinery is constructed and the
+        # pumps below are the original transparent ones.
+        bridge = None
+        send_lock = asyncio.Lock()
+
+        async def send_client_text(text: str) -> None:
+            async with send_lock:
+                await client.send_text(text)
+
+        async def send_client_json(payload: dict) -> None:
+            await send_client_text(json.dumps(payload))
+
+        if avatar_url:
+            from avatar_bridge import AvatarBridge
+
+            bridge = AvatarBridge(avatar_url, send_client_json)
+            await bridge.start()
+
         async def up() -> None:
             try:
                 while True:
@@ -132,7 +154,14 @@ def build_app(ws_backend: str, ws_url_override: str | None):
         async def down() -> None:
             try:
                 async for message in upstream:
-                    await client.send_text(message if isinstance(message, str) else message.decode())
+                    text = message if isinstance(message, str) else message.decode()
+                    if bridge is not None:
+                        # Tee BEFORE forwarding so the avatar starts chewing on
+                        # the audio while the browser is still parsing the JSON.
+                        await bridge.on_downstream(text)
+                        await send_client_text(text)
+                    else:
+                        await client.send_text(text)
             except Exception:
                 pass
 
@@ -146,6 +175,9 @@ def build_app(ws_backend: str, ws_url_override: str | None):
             for task in (pump_up, pump_down):
                 task.cancel()
             await asyncio.gather(pump_up, pump_down, return_exceptions=True)
+            if bridge is not None:
+                with contextlib_suppress():
+                    await bridge.close()
             with contextlib_suppress():
                 await upstream.close()
             with contextlib_suppress():
@@ -178,6 +210,10 @@ def main() -> int:
                         help="the vLLM-Omni server; /v1/video/chat/stream is appended")
     parser.add_argument("--public-ws-url", default=None,
                         help="only if a front proxy will not forward websocket upgrades")
+    parser.add_argument("--avatar", default=None, metavar="WS_URL",
+                        help="tee reply audio to a SoulX-LiveAct avatar server and inject its "
+                             "video frames into the downstream, e.g. ws://127.0.0.1:6006/ws. "
+                             "Off by default; when off this proxy stays byte-transparent.")
     args = parser.parse_args()
 
     try:
@@ -188,7 +224,10 @@ def main() -> int:
 
     print(f"page      http://{args.host}:{args.port}/", file=sys.stderr)
     print(f"proxying  /ws  ->  {args.ws_backend.rstrip('/')}{UPSTREAM_PATH}", file=sys.stderr)
-    uvicorn.run(build_app(args.ws_backend, args.public_ws_url), host=args.host, port=args.port, log_level="warning")
+    if args.avatar:
+        print(f"avatar    teeing reply audio to {args.avatar}", file=sys.stderr)
+    uvicorn.run(build_app(args.ws_backend, args.public_ws_url, avatar_url=args.avatar),
+                host=args.host, port=args.port, log_level="warning")
     return 0
 
 

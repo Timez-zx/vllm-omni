@@ -1495,3 +1495,68 @@ token 计的,这同时是延迟和容量的旋钮,不只是精度旋钮:640 → 
 `session_roll_history_turns` = 8 轮 · `session_roll_settle_s` = 1 秒 ·
 `context_compression_trigger_tokens` = 自动(模型上限的 75%;0 = 关)·
 `context_compression_target_tokens` = 4096 · `context_compression_warmup_timeout_s` = 30 秒
+
+---
+
+## 二十八、live-person 分支——把数字人挂到音频输出上
+
+*2026-08-11 · 分支 `live-person`（基于 live-agent-web）*
+
+**目标。** 数字人（SoulX-LiveAct，音频驱动的视频生成模型，在另一个 repo
+`mage-liveact-video-call` 里、独占 GPU0、端口 6006）接到本引擎的回复音频上，
+让浏览器里既听到声音、又看到一个口型对上的人。本引擎一行不改——
+数字人只吃 PCM，不关心声音是谁合成的。
+
+**为什么从 proxy 下手，而不是引擎。** 数字人的接口小而稳定：PCM 流 +
+三个控制事件（start/end/idle，带 rid）+ 一张形象图。引擎下行协议里
+`response.start` / `response.audio.delta`(每块一个完整 WAV) /
+`response.audio.done` 恰好一一映射。于是桥放在页面代理层：
+
+```
+浏览器 ←→ server.py(7870) ←→ 引擎(8091)
+              │ tee 回复音频（解 WAV → PCM16 24k）
+              └→ 数字人(6006, GPU0) → JPEG 帧 → 注入下行 websocket
+```
+
+新文件 `avatar_bridge.py`；`server.py` 加 `--avatar` 开关，**不开时字节透明，
+与原来逐字节一致**（透明性是这个 proxy 的设计立场，破坏它必须是显式选择）。
+开了之后两个生产者写同一个浏览器 socket（引擎回复 + 数字人帧），
+FastAPI 的 websocket 不允许并发写，所以下行统一走一把锁。
+
+**音画对齐：音频等视频，而不是各起各的。** 数字人要攒约 1.4 秒音频时间线
+才能生成第一个说话视频块（这是它的窗口几何，训练定的），而引擎音频
+TTFA 只要零点几秒——什么都不做的话，声音会先响、嘴唇晚一秒才动。
+处理方式借了 playback worklet 现成的原语：
+
+* 桥在转发 `response.start` **之前**先注入 `{"type":"avatar.turn","rid":N}`
+  （顺序由那把发送锁保证），客户端由此知道该等哪个 rid 的第一帧；
+* `response.start` 的 rearm 在数字人模式下给一个到不了的阈值（1e9 帧）——
+  音频入队但不播；
+* 该 rid 的第一帧到达并锚定后，`start_now` 放行音频，视频先行 100ms
+  盖住 canvas 绘制延迟（250/100 这两个常数来自旧 repo 已验证的取值）；
+* **3.5 秒兜底**：数字人挂了/不可达时音频照常放行，通话退化为纯语音，
+  而不是被扣成哑巴。桥的每个失败路径都只降级、不拖垮会话。
+
+帧的下行格式选了 JSON+base64（`avatar.frame`，rid/pts/JPEG），
+而不是二进制帧：客户端现有 onmessage 只处理文本，5KB 帧 ×24fps 的
+base64 开销约 213KB/s，对 localhost/SSH 隧道无所谓，换来客户端零协议改造。
+帧按 pts 排播（数字人一次吐一个块 32 帧，不排播会看到 60fps 的抽搐），
+rid 变化或 pts 回退即重锚。
+
+**部署形态（本机，2×96GB）。**
+
+| 卡 | 进程 | 端口 |
+|---|---|---|
+| GPU0 | SoulX-LiveAct（NVFP4，旧 repo 管理，warm 后常驻） | 6006 |
+| GPU1 | Qwen3-Omni 三 stage 同卡（deploy_web_demo.yaml，2:1 共居） | 8091 |
+| CPU | 页面 + 带 tee 的 proxy（`run_live_person.sh`） | 7870 |
+
+环境：conda env `omni`（vllm 0.26.0 + 本 fork editable 安装），
+模型 `Qwen/Qwen3-Omni-30B-A3B-Instruct` 下到 `HF_HOME=/home/ubuntu/data/hf-omni`。
+`run_live_person.sh` 负责起引擎+proxy；数字人由它自己的 repo 起，
+这里只检查不管理（它 warm 一次要几分钟，寿命不该绑在引擎迭代上）。
+
+**明确不做的（这一节）。** 手势控制（旧 repo 靠 Mage-VL 输出动作标签，
+thinker 换成 Qwen3-Omni 后该机制不存在，先砍掉，数字人保留呼吸/说话）；
+多用户下的数字人（LiveAct 是单租户全局状态，RTF 0.38 一张卡也就 1~2 路，
+真要做是 stage 化之后的事）；形象上传（数字人侧本来就有，桥先不接）。

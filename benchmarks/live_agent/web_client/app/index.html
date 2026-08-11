@@ -23,6 +23,13 @@
         </div>
       </div>
       <div class="stage-side">
+        <!-- Digital human. Hidden until the proxy (started with --avatar) injects
+             the first avatar.frame; a plain audio deployment never shows it. -->
+        <div class="cam" id="avatarPanel" style="display:none">
+          <canvas id="avatarCanvas" width="256" height="448"
+                  style="width:100%;display:block;background:#000;border-radius:inherit"></canvas>
+          <span id="avatarBadge" class="cam-badge" data-state="idle">Avatar</span>
+        </div>
         <div class="cam">
           <video id="cameraPreview" muted playsinline></video>
           <span id="cameraBadge" class="cam-badge" data-state="idle">Camera off</span>
