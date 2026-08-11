@@ -1578,3 +1578,35 @@ thinker 换成 Qwen3-Omni 后该机制不存在，先砍掉，数字人保留呼
    bin（引擎 PATH 已指向那里）。教训合并成一句：**FlashInfer 的运行时
    JIT 需要「和 torch 大版本一致的完整 toolchain」= nvcc + 头文件 + ninja，
    缺哪个都死在 KV cache 初始化，而报错一次只暴露一件。**
+4. *toolchain 齐了还是死：`fatal error: cublasLt.h`。* conda 的 CUDA 布局把
+   头文件放在 `targets/x86_64-linux/include`——nvcc 靠内部路径能找到，
+   但 ninja 里的 **host g++ 编译单元**只拿到 `-I$CUDA_HOME/include`，
+   在干净编译十五分钟之后才撞上第一个 host 单元。解法沿用本机给数字人
+   编 NVFP4 时验证过的办法：拼一个符号链接组成的标准布局 shim
+   （`include→targets/…/include`、`lib64→lib`、`bin`、`nvvm`），
+   `CUDA_HOME` 指向 shim。代价：shim 改变了 ninja 的命令行，缓存全部
+   失效，整个 JIT 重编一遍（约 15 分钟，48 核）。
+
+**跑通了。** 首次完整启动 558 秒（其中大头是 FlashInfer 对 sm_120f 的
+一次性 JIT，缓存后重启会快一个量级），三 stage 就位，GPU1 常驻 94.9GB。
+
+`probe_avatar.py` 全链路验证 **PASS**（合成语音+画面 → thinker →
+talker 音频 → 桥 tee → 数字人 → JPEG 帧注入回下行）：
+
+| 检查 | 结果 |
+|---|---|
+| `avatar.turn` 先于 `response.start`（音画锚定的前提） | ✅ 同刻送达，顺序正确 |
+| 帧到达（idle rid=0 + talking rid=1） | ✅ 共 1205 帧 |
+| 首个说话帧落在客户端 3.5s 兜底窗口内 | ✅ +2.017s（含冷启动，稳态会更早） |
+| pts 单调 | ✅ |
+| 数字人遥测 | connected → 3×avatar_block → avatar_done |
+
+首轮回答 3.5s 音频、三个视频块，与预算模型一致：攒 1.4s 音频时间线 +
+首块生成 ~0.5s + 传输。**说话中途不会再有断供**——talker 产音频比数字人
+消耗快好几倍，这正是换这条架构的理由。
+
+遗留（按发现顺序，都不挡试用）：
+- 首轮请求带引擎冷启动开销（prefill 内核预热），第二轮起才是稳态延迟；
+- 数字人是单租户：第二个浏览器标签会把它从第一个手里抢走（旧 repo 同款
+  行为），音频侧不受影响；
+- 手势暂缺（见上文「明确不做的」）。

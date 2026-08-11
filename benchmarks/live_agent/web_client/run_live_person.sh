@@ -68,9 +68,24 @@ else
   # with "Could not find nvcc" without a full toolkit. Must match torch's CUDA
   # major (cu130 -> 13.x); the 12.8 toolkit that builds the avatar's NVFP4
   # kernels is NOT interchangeable here.
+  #
+  # And it must be a shim, not the conda env itself: conda keeps the headers in
+  # targets/x86_64-linux/include, which nvcc resolves internally but the ninja
+  # build's HOST g++ units (-I$cuda_home/include) do not -- they died with
+  # "fatal error: cublasLt.h: No such file or directory" fifteen minutes into
+  # an otherwise-clean compile. Same trick as the 12.8 shim this box already
+  # uses for the avatar's NVFP4 build.
+  CUDATK=/home/ubuntu/miniconda3/envs/cudatk13
+  SHIM=/home/ubuntu/data/cuda-shim-13.0
+  mkdir -p "$SHIM"
+  ln -sfn "$CUDATK/targets/x86_64-linux/include" "$SHIM/include"
+  ln -sfn "$CUDATK/lib" "$SHIM/lib"
+  ln -sfn "$CUDATK/lib" "$SHIM/lib64"
+  ln -sfn "$CUDATK/bin" "$SHIM/bin"
+  [ -d "$CUDATK/nvvm" ] && ln -sfn "$CUDATK/nvvm" "$SHIM/nvvm"
   HF_HOME=/home/ubuntu/data/hf-omni \
-  CUDA_HOME=/home/ubuntu/miniconda3/envs/cudatk13 \
-  PATH="/home/ubuntu/miniconda3/envs/cudatk13/bin:$PATH" \
+  CUDA_HOME="$SHIM" \
+  PATH="$SHIM/bin:$PATH" \
   CUDA_VISIBLE_DEVICES=1 \
   VLLM_OMNI_COLOCATE_STAGES="${VLLM_OMNI_COLOCATE_STAGES-2:1}" \
   VLLM_OMNI_TALKER_TEXT_ONLY="${VLLM_OMNI_TALKER_TEXT_ONLY:-1}" \
