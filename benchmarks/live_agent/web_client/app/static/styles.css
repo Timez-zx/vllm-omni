@@ -138,6 +138,51 @@ body {
   background: #000;
 }
 
+/* ------------------------------------------------ call mode (avatar live) */
+/* app.js adds .avatar-live on the first avatar frame. Voice-only deployments
+ * never get here, so the compact bar above stays exactly theirs. The grammar
+ * is a call screen: the person centred as the subject, every control in a
+ * centred column beneath, the self-view riding the portrait's corner. */
+.stage.avatar-live {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 14px;
+  padding: 26px 24px 20px;
+}
+.stage.avatar-live .stage-main {
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+}
+.stage.avatar-live .avatar-frame { height: clamp(320px, 52vh, 480px); }
+.stage.avatar-live .status {
+  min-width: 0;
+  flex-direction: row;
+  align-items: center;
+  gap: 12px;
+}
+.stage.avatar-live .status-pill { align-self: center; }
+.stage.avatar-live .stage-side { align-items: center; }
+.stage.avatar-live .stage-buttons { justify-content: center; }
+
+/* Self-view as picture-in-picture on the avatar's corner (moved there by
+ * app.js when the avatar first appears). */
+.avatar-frame .cam.pip {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  width: 92px;
+  height: 69px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, #fff 25%, transparent);
+  box-shadow: 0 6px 18px -8px rgb(0 0 0 / .65);
+  z-index: 2;
+}
+.avatar-frame .cam.pip #cameraPreview { width: 100%; height: 100%; }
+/* The avatar's own badge hugs bottom-left so the PiP owns bottom-right. */
+.avatar-frame > .cam-badge { left: 10px; right: auto; bottom: 10px; padding-inline: 8px; }
+
 /* The preview frame is ALWAYS there, even with the camera off. An element that appears
  * from nowhere gives you no way to tell "camera failed" from "camera not started" -- and
  * the first version of this layout did exactly that, because `display:none` moved from the
@@ -424,4 +469,8 @@ textarea { resize: vertical; line-height: 1.5; }
   #cameraPreview { width: 100%; height: 150px; }
   /* Phone: the person centred on their own row, controls wrapping below. */
   .avatar-frame { margin-inline: auto; height: clamp(240px, 42vh, 360px); }
+  .stage.avatar-live .avatar-frame { height: clamp(280px, 48vh, 420px); }
+  /* The 150px camera rule above is for the sidebar layout; as a PiP the
+   * self-view keeps its corner size. */
+  .avatar-frame .cam.pip #cameraPreview { height: 100%; }
 }

@@ -375,6 +375,17 @@
   function avatarShow() {
     if (avatarPanel && avatarPanel.style.display === 'none') {
       avatarPanel.style.display = '';
+      // Switch the stage into call-screen composition: person centred, controls
+      // beneath, self-view riding the avatar's corner FaceTime-style. Done by
+      // class + one node move so a voice-only deployment (which never gets an
+      // avatar frame) keeps the original compact bar untouched.
+      const stage = avatarPanel.closest('.stage');
+      if (stage) stage.classList.add('avatar-live');
+      const camBox = cameraPreview ? cameraPreview.closest('.cam') : null;
+      if (camBox && camBox.parentElement !== avatarPanel) {
+        camBox.classList.add('pip');
+        avatarPanel.appendChild(camBox);
+      }
     }
   }
 
