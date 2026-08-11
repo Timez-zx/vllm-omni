@@ -113,6 +113,31 @@ body {
 .stage-side { display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
 .stage-buttons { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 
+/* The digital human. Portrait 4:7, exactly the model's 128x224 frame, so nothing
+ * is ever cropped -- the first version reused .cam (fixed 148x111 landscape,
+ * overflow:hidden) and the person lost everything below the chin. Sized as the
+ * stage's centrepiece: tall enough to read as "who you are talking to", short
+ * enough that the transcript stays above the fold. */
+.avatar-frame {
+  position: relative;
+  flex: 0 0 auto;
+  height: clamp(220px, 34vh, 320px);
+  aspect-ratio: 4 / 7;
+  border-radius: 14px;
+  overflow: hidden;
+  background:
+    radial-gradient(120% 90% at 50% 0%, color-mix(in srgb, var(--surface-2) 60%, transparent), transparent 70%),
+    var(--surface-2);
+  border: 1px solid var(--rule);
+  box-shadow: 0 10px 28px -18px rgb(0 0 0 / .55);
+}
+.avatar-frame canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  background: #000;
+}
+
 /* The preview frame is ALWAYS there, even with the camera off. An element that appears
  * from nowhere gives you no way to tell "camera failed" from "camera not started" -- and
  * the first version of this layout did exactly that, because `display:none` moved from the
@@ -397,4 +422,6 @@ textarea { resize: vertical; line-height: 1.5; }
   .stage-buttons { justify-content: stretch; }
   .stage-buttons button { flex: 1; }
   #cameraPreview { width: 100%; height: 150px; }
+  /* Phone: the person centred on their own row, controls wrapping below. */
+  .avatar-frame { margin-inline: auto; height: clamp(240px, 42vh, 360px); }
 }

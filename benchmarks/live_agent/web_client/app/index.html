@@ -14,6 +14,15 @@
          not a wall of caveats. Nothing is deleted, only moved. -->
     <section class="stage">
       <div class="stage-main">
+        <!-- Digital human: the person you are talking to, so it gets the stage,
+             not a thumbnail. Portrait 4:7 to match the model's 128x224 output --
+             putting it in a .cam box cropped everything below the face. Hidden
+             until the proxy (started with --avatar) injects the first
+             avatar.frame; a plain audio deployment never shows it. -->
+        <div class="avatar-frame" id="avatarPanel" style="display:none">
+          <canvas id="avatarCanvas" width="256" height="448"></canvas>
+          <span id="avatarBadge" class="cam-badge" data-state="idle">Avatar</span>
+        </div>
         <button id="callButton" type="button" class="big">Start call</button>
         <div class="status">
           <span id="modelState" class="status-pill">Idle</span>
@@ -23,13 +32,6 @@
         </div>
       </div>
       <div class="stage-side">
-        <!-- Digital human. Hidden until the proxy (started with --avatar) injects
-             the first avatar.frame; a plain audio deployment never shows it. -->
-        <div class="cam" id="avatarPanel" style="display:none">
-          <canvas id="avatarCanvas" width="256" height="448"
-                  style="width:100%;display:block;background:#000;border-radius:inherit"></canvas>
-          <span id="avatarBadge" class="cam-badge" data-state="idle">Avatar</span>
-        </div>
         <div class="cam">
           <video id="cameraPreview" muted playsinline></video>
           <span id="cameraBadge" class="cam-badge" data-state="idle">Camera off</span>
