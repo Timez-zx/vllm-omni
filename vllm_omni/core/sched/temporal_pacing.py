@@ -1,0 +1,190 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Temporal pacing: hold ahead-of-realtime requests out of scheduler passes.
+
+The temporal-batching experiment (benchmarks/temporal_batching/DESIGN.zh.md).
+Audio has a natural 12.5 Hz rhythm -- one talker decode step samples one codec
+frame, and one codec frame is 1920 samples @ 24 kHz = 80 ms of playback -- so a
+session that has already generated more audio than playback needs (plus a lead
+margin) gains nothing from generating NOW; it only contends with everyone
+else's steps. The thinker obeys the SAME global clock with a token/s cap: its
+per-tick work is leveled instead of bursty, while staying far above the
+talker's text consumption rate so it can never starve the audio.
+
+The pacer parks ahead-of-schedule requests for the current scheduler pass and
+computes their release on a GLOBAL tick grid (all requests in the stage share
+the grid), so every session's next unit becomes schedulable at the same
+instant and upstream continuous batching naturally forms one large periodic
+batch per tick.
+
+Mechanics copy the chunk adapter's ``_held_non_active`` precedent: requests
+are removed from ``self.running`` immediately before ``super().schedule()``
+and put back before ``schedule()`` returns -- no status change, no counter
+updates; ``has_requests()`` never sees the park, so the engine busy loop keeps
+ticking. A request parked this pass is simply re-examined next pass.
+
+Everything is read from env ONCE per engine-core process:
+
+  VLLM_OMNI_TEMPORAL_TICK_MS          0 = off (default, greedy baseline); 80 / 160.
+  VLLM_OMNI_TEMPORAL_LEAD_MS          allowed lead over realtime playback, default 240.
+  VLLM_OMNI_TEMPORAL_INITIAL_FRAMES   talker per-turn exempt burst, default 4
+                                      (= initial_codec_chunk_frames: the first
+                                      audible chunk is never paced -- TTFA does
+                                      not pay for pacing).
+  VLLM_OMNI_TEMPORAL_THINKER_TPS      thinker rate cap in tokens/s, default 25
+                                      (~5x speech consumption; 0 = thinker unpaced).
+  VLLM_OMNI_TEMPORAL_THINKER_BURST    thinker per-turn exempt burst, default 16.
+  VLLM_OMNI_TEMPORAL_NO_QUANT         1 = rate-limit only, no grid alignment
+                                      (the ablation separating "slower" from
+                                      "together").
+  VLLM_OMNI_LOG_SCHED_STEPS           log one [SCHED-STEP] line per non-idle
+                                      scheduler pass ('' = off; '1'/'all' or a
+                                      comma list of stage ids).
+
+WARNING: parking + re-admitting a live request under async scheduling is the
+documented -1-sentinel crash path (see deploy_web_demo.yaml's stage-1 note).
+Paced stages must run with ``async_scheduling: false``; the experiment deploy
+config (deploy_temporal_2gpu.yaml) sets it on both AR stages, baseline
+included, so all arms compare like with like.
+"""
+from __future__ import annotations
+
+import math
+import os
+from typing import Any
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+# Qwen3 codec: valid codebook-0 ids are [0, 2048); pad/bos/eos live at 4196+
+# and produce no audio frame, so they must not advance the frame count.
+_CODEC_VALID_MAX = 2048
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def _parse_log_steps(stage_id: Any) -> bool:
+    raw = os.environ.get("VLLM_OMNI_LOG_SCHED_STEPS", "").strip()
+    if not raw or raw in ("0", "false", "False"):
+        return False
+    if raw in ("1", "all"):
+        return True
+    return str(stage_id) in {s.strip() for s in raw.split(",")}
+
+
+class TemporalPacer:
+    """Per-stage pacing gate. Constructed by OmniARScheduler.__init__.
+
+    ``self.enabled`` is False unless the env selects a tick AND this stage has
+    a defined rate (thinker/talker); everything else in the scheduler stays on
+    the exact baseline code path.
+    """
+
+    def __init__(self, model_config: Any):
+        tick_ms = _env_float("VLLM_OMNI_TEMPORAL_TICK_MS", 0.0)
+        self.tick_s = max(0.0, tick_ms) / 1000.0
+        self.no_quant = os.environ.get("VLLM_OMNI_TEMPORAL_NO_QUANT", "0") not in ("0", "", "false", "False")
+        self.lead_s = _env_float("VLLM_OMNI_TEMPORAL_LEAD_MS", 240.0) / 1000.0
+        self.stage_id = getattr(model_config, "stage_id", -1)
+        stage = str(getattr(model_config, "model_stage", "") or "")
+
+        if "talker" in stage:
+            # 1 sampled token = 1 codec frame = 80 ms: rate is the playback rate.
+            self.rate = 12.5
+            self.burst = int(_env_float("VLLM_OMNI_TEMPORAL_INITIAL_FRAMES", 4.0))
+            self.codec_only = True
+        elif "thinker" in stage:
+            self.rate = _env_float("VLLM_OMNI_TEMPORAL_THINKER_TPS", 25.0)
+            self.burst = int(_env_float("VLLM_OMNI_TEMPORAL_THINKER_BURST", 16.0))
+            self.codec_only = False
+        else:
+            self.rate = 0.0
+            self.burst = 0
+            self.codec_only = False
+
+        self.enabled = self.tick_s > 0 and self.rate > 0
+        self.log_steps = _parse_log_steps(self.stage_id)
+        # rid -> [output_len_seen, units_this_turn, anchor_t, holds]
+        self._st: dict[str, list] = {}
+
+        if self.enabled:
+            logger.info(
+                "[TemporalPacer] stage=%s(%s) ON: tick=%.0fms rate=%.1f/s lead=%.0fms "
+                "burst=%d quantize=%s",
+                self.stage_id, stage or "?", self.tick_s * 1000, self.rate,
+                self.lead_s * 1000, self.burst, not self.no_quant,
+            )
+
+    # ------------------------------------------------------------------ #
+
+    def split_running(self, running: list, now: float) -> tuple[list, list, float | None]:
+        """Partition ``running`` into (schedulable, held); also return the
+        earliest release time among held requests (for the idle micro-sleep)."""
+        kept: list = []
+        held: list = []
+        next_release: float | None = None
+        for req in running:
+            release = self._release_time(req, now)
+            if release is not None:
+                held.append(req)
+                if next_release is None or release < next_release:
+                    next_release = release
+            else:
+                kept.append(req)
+        return kept, held, next_release
+
+    def _release_time(self, req: Any, now: float) -> float | None:
+        """None = schedule freely this pass; else the (grid-aligned) time at
+        which this request's next unit is due."""
+        toks = req.output_token_ids
+        n = len(toks)
+        st = self._st.get(req.request_id)
+        if st is None:
+            st = [0, 0, None, 0]
+            self._st[req.request_id] = st
+        if n < st[0]:
+            # Outputs were cleared at a segment stop: a NEW TURN began.
+            # Everything is per-turn, so reset (including the anchor).
+            st[0] = 0
+            st[1] = 0
+            st[2] = None
+        if n > st[0]:
+            if self.codec_only:
+                add = 0
+                for i in range(st[0], n):
+                    if toks[i] < _CODEC_VALID_MAX:
+                        add += 1
+                st[1] += add
+            else:
+                st[1] = n
+            st[0] = n
+            if st[2] is None and st[1] > 0:
+                # Anchor at the first output observed this turn, i.e. right
+                # after the first decode step. Prefill runs BEFORE any output
+                # exists, so prefill is naturally exempt from pacing.
+                st[2] = now
+        anchor = st[2]
+        units = st[1]
+        if anchor is None or units <= self.burst:
+            return None
+        # On schedule when (units - burst) / rate <= elapsed + lead.
+        release = anchor + (units - self.burst) / self.rate - self.lead_s
+        if release <= now:
+            return None
+        if not self.no_quant:
+            # GLOBAL grid: monotonic time quantized to tick multiples. Same
+            # grid for every request in this process, so releases coincide and
+            # the batcher forms one periodic batch. (The two stage processes
+            # have independent grid phases; within a stage -- which is where
+            # batches form -- the grid is shared.)
+            release = math.ceil(release / self.tick_s) * self.tick_s
+        st[3] += 1
+        return release
+
+    def on_request_freed(self, request_id: str) -> None:
+        self._st.pop(request_id, None)

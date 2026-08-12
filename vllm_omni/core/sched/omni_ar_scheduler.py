@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterable
+from time import monotonic as _monotonic
+from time import sleep as _sleep
 from time import time
 from typing import Any
 
@@ -68,6 +70,7 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
     uses_full_payload_input_coordinator,
 )
+from vllm_omni.core.sched.temporal_pacing import TemporalPacer
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
@@ -189,6 +192,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.input_coordinator = OmniSchedulingCoordinator(
                 stage_id=getattr(model_config, "stage_id", 0),
             )
+        # [Temporal batching experiment] pacing gate; a no-op unless
+        # VLLM_OMNI_TEMPORAL_TICK_MS selects a tick AND this stage is
+        # thinker/talker. See core/sched/temporal_pacing.py.
+        self.temporal_pacer = TemporalPacer(model_config)
         # When each currently-tracked request was first seen with no sampled output, and which
         # have already been reported as producing nothing. See _check_for_wedged_requests.
         self._req_seen_t: dict[str, float] = {}
@@ -481,6 +488,18 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         self._clamp_streaming_parked_counter()
 
+        # [Temporal pacing] hold ahead-of-realtime requests out of THIS pass.
+        # Same shape as the adapter's _held_non_active: removed from running
+        # here, restored in the finally below -- within one schedule() call, so
+        # status, counters, has_requests() and orphan recovery never see it.
+        _paced_held: list[Request] = []
+        _paced_next_release: float | None = None
+        if self.temporal_pacer.enabled and self.running:
+            _kept, _paced_held, _paced_next_release = self.temporal_pacer.split_running(
+                self.running, _monotonic())
+            if _paced_held:
+                self.running[:] = _kept
+
         original_waiting = None
         if self._should_defer_waiting_admission():
             original_waiting = self.waiting
@@ -494,6 +513,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self._log_request_table("upstream schedule() raised AssertionError")
             raise
         finally:
+            if _paced_held:
+                # Back into running before anything else can look: a paced
+                # request is RUNNING in every observable sense, it just sat
+                # out this one pass.
+                self.running.extend(_paced_held)
             if original_waiting is not None:
                 deferred_waiting = list(self.waiting)
                 if deferred_waiting:
@@ -550,6 +574,32 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             finished_reqs = {}
 
         self._check_for_wedged_requests(scheduler_output)
+
+        # [Temporal pacing] one line per NON-IDLE pass: the raw material for
+        # the batch-size timeline that verifies (or refutes) tick-aligned
+        # batch formation. Idle passes are skipped so greedy baselines log
+        # nothing extra between turns.
+        if self.temporal_pacer.log_steps and scheduler_output.total_num_scheduled_tokens:
+            logger.info(
+                "[SCHED-STEP] stage=%s mono=%.6f nreq=%d ntok=%d held=%d run=%d wait=%d",
+                self.vllm_config.model_config.stage_id,
+                _monotonic(),
+                len(scheduler_output.num_scheduled_tokens),
+                scheduler_output.total_num_scheduled_tokens,
+                len(_paced_held),
+                len(self.running),
+                len(self.waiting),
+            )
+
+        # [Temporal pacing] when EVERYTHING schedulable is parked and this
+        # pass produced no work, the busy loop would spin hot until the next
+        # release. Yield for up to 1 ms (bounded, so a new turn's streaming
+        # update is delayed by at most that much).
+        if (_paced_held and scheduler_output.total_num_scheduled_tokens == 0
+                and not self.waiting):
+            _now2 = _monotonic()
+            if _paced_next_release is not None and _paced_next_release > _now2:
+                _sleep(min(_paced_next_release - _now2, 0.001))
 
         # Wrap in omni scheduler output to carry transfer metadata.
         return self._wrap_omni_scheduler_output(
@@ -1250,6 +1300,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         )
 
         self._omits_kv_transfer_cache.pop(request.request_id, None)
+        self.temporal_pacer.on_request_freed(request.request_id)
 
         # [Upstream compat] Discard request from in-flight prefills set added
         # upstream for routed-experts in-flight reservation tracking.

@@ -56,18 +56,15 @@
 
 async_chunk: true
 
+# Both edges on SharedMemoryConnector, exactly like the proven
+# deploy_web_demo.yaml. A ColocInProcConnector on the 1->2 edge was tried
+# first and BROKE the pipeline silently: the orchestrator's async-chunk
+# prewarm never admitted the request at stage 2 (ADMIT logs showed stages
+# 0/1 only), so the talker's codec chunks piled up unread and the client got
+# text but never audio. The 1->2 chunks are 1-4 KB -- the shm copy is noise.
 connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
-    extra:
-      initial_codec_chunk_frames: 4
-      codec_chunk_frames: 4
-      codec_left_context_frames: 25
-  # s1->s2 edge: in-process reference hand-off when VLLM_OMNI_COLOCATE_STAGES
-  # puts the speech pair in one process; delegates to SharedMemoryConnector
-  # automatically when they are separate processes, so one yaml serves both.
-  connector_coloc_speech:
-    name: ColocInProcConnector
     extra:
       initial_codec_chunk_frames: 4
       codec_chunk_frames: 4
@@ -140,7 +137,7 @@ stages:
     async_scheduling: false
     devices: "1"
     input_connectors:
-      from_stage_1: connector_coloc_speech
+      from_stage_1: connector_of_shared_memory
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0

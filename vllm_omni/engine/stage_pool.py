@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os as _os
 import time as _time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -42,6 +43,10 @@ if TYPE_CHECKING:
     from vllm_omni.engine.orchestrator import OrchestratorRequestState
 
 logger = init_logger(__name__)
+
+# [Temporal batching experiment] per-audio-chunk emit logging, see
+# record_output_timestamps. Read once at import; the launcher exports it.
+_LOG_AUDIO_CHUNKS = _os.environ.get("VLLM_OMNI_LOG_AUDIO_CHUNKS", "0") not in ("0", "", "false", "False")
 
 
 @dataclass
@@ -929,6 +934,15 @@ class StagePool:
             )
             if audio_frames > 0:
                 self._audio_frames_by_request[rid] = self._audio_frames_by_request.get(rid, 0) + audio_frames
+                # [Temporal batching experiment] per-chunk emit timestamps at
+                # the orchestrator: the engine-side ground truth for chunk
+                # cadence, one line per audio chunk per request.
+                if _LOG_AUDIO_CHUNKS:
+                    logger.info(
+                        "[AUDIO-CHUNK] stage=%s req=%s ts=%.6f frames=%d sr=%d",
+                        self.stage_id, rid, output_ts, audio_frames,
+                        audio_sample_rate or 0,
+                    )
             if self._audio_sample_rate_by_request.get(rid, 0) <= 0 and audio_sample_rate > 0:
                 self._audio_sample_rate_by_request[rid] = audio_sample_rate
 
