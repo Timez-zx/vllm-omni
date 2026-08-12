@@ -1527,6 +1527,20 @@ mrope 越界防御补丁)。工程实现:WP1 引擎 tick 心跳(事件间睡眠�
 输出质量四个干净档全绿(0 空文本 0 零音频、字/秒比零离群、temp=0 确定
 性成立;跨臂文本差异为摄像头效应非质量问题)。
 
+**全量实现 + 三臂三负载矩阵**(`ANALYSIS.zh.md`):六个工作包全部落地
+(WP1 心跳、WP2 cohort 重放[运行证据:两 stage 各 500+/1500+ 步]、WP3 以
+勘察收口[FULL graph 已重放]、WP4 双槽 ack 信箱、WP5 增量音频 prefill
+[10s 语音 TTFA 0.16s]、WP6 装箱准入)+ boundary-loss 五丢弃点修复。
+矩阵结论:①质量全绿;②长答=T 主场全维度胜(TTFA 477→329、抖动 2.4→1.08、
+CPU -45%),短答=权衡区(延迟/抖动赢、miss 0.12→0.91% 输——瘦缓冲机制,
+可调参修),混合居中;③thinker/talker 都受益但形态不同(talker=合批+心跳
++graph,thinker=削爆发不挤人);④瓶颈=GPU1(paced 长答 u24 均值 68%,
+vocoder 7.25x 重算是第一优化对象),GPU0/CPU 不是,当前真封顶=mass-teardown
+挂起 bug(臂无关,u24 各臂 20-32% 挂起轮,u16 全净);⑤M vs T:客户端
+指标 T≈M(节奏化的第一性收益在调度语义),T 的增量=适度 CPU 节省+长输入
+TTFA+结构性能力(硬保证/graph 恒定/扩展地基)——demo 场景 M 拿到 ~90%
+收益,SLA 服务需要 T。
+
 **节拍引擎设计**(`benchmarks/temporal_batching/TICK_ENGINE.zh.md`):源码
 证实 vLLM v1 对周期性零感知(主循环无时钟、调度唯吞吐、Request 仅
 arrival_time)。设计:全局时钟+stage 锁相脉动流水、cohort 计划(调度每
