@@ -109,6 +109,26 @@ QUESTIONS = [
     "What do you wear on your feet?",
 ]
 
+# MU_QUESTIONS=long: answers of ~4 sentences (~15-25 s of speech) instead of
+# one short sentence. Triples the sustained talker/code2wav duty per session,
+# which is the knob that separates "idle box, everything is easy" from a load
+# where mid-turn scheduling collisions can actually happen.
+if os.environ.get("MU_QUESTIONS") == "long":
+    QUESTIONS = [
+        "Describe what a sunrise over the ocean looks like, in about four sentences.",
+        "Explain how bread is made, in about four sentences.",
+        "Describe a walk through a quiet forest, in about four sentences.",
+        "Explain why the sky is blue, in about four sentences.",
+        "Describe what a busy train station feels like, in about four sentences.",
+        "Explain how bees make honey, in about four sentences.",
+        "Describe a thunderstorm from indoors, in about four sentences.",
+        "Explain how a bicycle stays upright, in about four sentences.",
+        "Describe a small mountain village in winter, in about four sentences.",
+        "Explain how rain forms, in about four sentences.",
+        "Describe the smell and sounds of a bakery in the morning, in about four sentences.",
+        "Explain what makes autumn leaves change color, in about four sentences.",
+    ]
+
 # The engine-side probes worth counting over each cell's log slice. All of
 # them are presence checks -- a healthy run has nonzero segment stops and
 # zero everything in "bad".
