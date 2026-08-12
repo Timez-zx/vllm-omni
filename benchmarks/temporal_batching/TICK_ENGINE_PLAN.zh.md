@@ -160,19 +160,20 @@ postprocess 挂载。相位抖动进入点:每次线程唤醒、可变序列化(
 + graph 是硬骨头);WP4 1 周;WP5 1-2 周(编码器验证);WP6 3-4 天。
 到 M4 约 6-8 周。
 
-## 实施状态(2026-08-12 对比矩阵冻结时点)
+## 实施状态(2026-08-12 第二轮:全量实现后)
 
 | 工作包 | 状态 | 说明 |
 |---|---|---|
-| WP1 tick 心跳 | ✅ 已实现 | 引擎循环事件间睡眠、输入随到随醒、收 chunk stage 2ms 上限;空闲 CPU 2-3% |
-| WP2 事件计划+重放 | ◐ 以屏障实现 | 拍屏障+子格+lead 追赶 = 计划的行为等价近似;完整"每事件编译+每拍重放"暂缓——实测每步调度 CPU <1%,正确性风险不对称 |
-| WP3 runner 重放 | ◐ 部分 | talker 1帧/拍天然 uniform decode → CUDA graph 命中;code2wav graph 打开(共享配置);attention advance/输入计划编译暂缓(1.5-2 周项) |
-| WP4 定相信箱 | ◐ lite | 内联发送已实现(删 save 线程跳);持久双槽信箱经评审**主动不进本轮**:1 深槽位对按 chunk 号轮询的协议有丢 chunk 风险(消费端卡 >2 拍即数据丢失),会制造与既有 boundary-loss 同形的新故障污染对比;完整版需 ack 流控协议 |
-| WP5 输入节拍化 | ⬜ 暂缓 | 音频编码器流式化 = 模型级改动 + 音质回归门,超出本轮范围 |
-| WP6 双车道/准入 | ◐ QoS 门 | 容量判定即准入语义;运行时准入拒绝未实现 |
+| WP1 tick 心跳 | ✅ | 引擎循环事件间睡眠、输入随到随醒、收 chunk stage 2ms 上限;空闲 CPU 2-3% |
+| WP2 事件计划+重放 | ✅ | **cohort 重放快路已实现**(REPLAY=1):纯 decode + cohort 不变时跳过完整 pass,所有有状态操作复用上游构件(allocate_slots/make_cached/update_after),有效性门全量,分配失败让位完整路径;无模板无指纹 |
+| WP3 runner 重放 | ✅(以勘察结论收口) | **核心目标已达成**:FA2 uniform-batch 下 FULL CUDA graph 重放在两 AR stage 已发生(17 个 capture size;thinker 2tok/拍被子格拆成 2 个 query_len=1 步天然 uniform)。残余 Python 微优化(跳过逐字节相同 H2D/numpy 重建)勘察结论:命中率受 pacer 轮换的 input_batch 重排压制、总成本 <1% tick、与 WP2 新路径交互风险——**风险调整后价值为负,记录不实施**(FA2 metadata build 纯 Python 零 GPU 工作,advance() API 无必要) |
+| WP4 定相信箱 | ✅ | **带 ack 流控的持久双槽信箱已实现**(MAILBOX=1):seqlock 双槽 + 读者 ack;槽忙/超容量/异常一律回退 legacy(绝不丢 chunk 不阻塞),混合序列 ack 自修复;工厂层 env 替换,yaml 三臂共享 |
+| WP5 输入节拍化 | ✅(serving 层) | **增量音频 prefill 已实现**(prefill_audio_on_arrival):整秒对齐前缀走 prefill-only append;勘察证明 Qwen3 音频编码器本就分块(1s conv/8s attention),8s 对齐切分逐比特一致,1s 档为延迟最优权衡;真·每秒流式(左上下文重编码)仍需模型级改动,保持暂缓 |
+| WP6 双车道/准入 | ✅ | 运行时装箱准入门已实现(ADMIT_MAX_SESSIONS):超出即优雅拒绝,不排队 |
+| 稳定性 | ✅ | boundary-loss 五个静默丢弃点全关(边界 task 不吞、put 重试、connector 泄漏卫生、segment flag 不对称、mrope 自愈) |
 
-三臂定义:A = 全关(原版);M = 仅 WP2 屏障族(TICK+BARRIER);
-T = M + WP1 + WP4-lite(全优化冻结版)。
+三臂定义(第二轮矩阵):A = 全关(原版);M = 仅屏障族(TICK+BARRIER);
+T = M + WP1 + WP2 重放 + WP4 信箱 + 内联发送(+WP5 由 session 配置开启)。
 
 ## 风险表
 
