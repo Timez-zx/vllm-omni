@@ -129,6 +129,14 @@ class TemporalPacer:
         self.catchup = max(1.0, _env_float("VLLM_OMNI_TEMPORAL_CATCHUP", 2.0))
         # Per-tick budget in output units (thinker: tokens, talker: frames).
         self.tick_budget = max(1, round(self.rate * self.tick_s)) if self.rate > 0 else 0
+        # Intra-tick SUB-SLOT grid: the k-th unit of a window releases at
+        # window_open + k*sub_slot, so catch-up units also step TOGETHER
+        # instead of trickling in whenever each request's data lands. Without
+        # this, round 1 is one big batch but every later unit runs solo at
+        # its own chunk-arrival moment (measured: 2481 nreq=1 steps, frame
+        # efficiency 3.9 vs 6.1). Slots cover the worst-case catchup budget.
+        max_units = max(1, int(math.ceil(self.tick_budget * self.catchup))) if self.tick_budget else 1
+        self.sub_slot = self.tick_s / max_units if self.tick_s > 0 else 0.0
         # Barrier state: the boundary that opened the CURRENT tick window, and
         # each request's unit count snapshotted at that boundary.
         self._tick_open: float = 0.0
@@ -214,8 +222,17 @@ class TemporalPacer:
             # and holds ~lead_s of client buffer; the ahead-cap above stops
             # it from growing past that.
             budget = self.tick_budget * (self.catchup if ahead < self.lead_s * 0.75 else 1.0)
-            if units - base >= budget:
+            used = units - base
+            if used >= budget:
                 held.append(req)
+                continue
+            # Sub-slot barrier: the k-th unit of this window releases at
+            # open + k*sub_slot -- catch-up units gather and step together.
+            slot_open = self._tick_open + used * self.sub_slot
+            if now < slot_open:
+                held.append(req)
+                if slot_open < next_boundary:
+                    next_boundary = slot_open  # earliest wake for the micro-sleep
             else:
                 kept.append(req)
         return kept, held, (next_boundary if held else None)
@@ -283,3 +300,58 @@ class TemporalPacer:
     def on_request_freed(self, request_id: str) -> None:
         self._st.pop(request_id, None)
         self._units_at_tick.pop(request_id, None)
+
+
+class ChunkTickGate:
+    """80 ms timetable for a CHUNK-CONSUMING stage (code2wav / LLM_GENERATION).
+
+    The stage's work items are whole upstream chunks whose arrival times are
+    scattered by the async transport (save thread -> shm -> poll). Greedy
+    consumption runs one vocoder call per arrival, at arrival phase; this gate
+    holds fresh chunk work until the next tick boundary so every session's
+    ready chunk is vocoded in ONE batched step -- the same barrier idea as the
+    AR stages, applied at this consumption point.
+
+    The FIRST chunk of each segment bypasses the gate: it carries the reply's
+    opening audio and holding it would bill TTFA for the timetable. Later
+    chunks refill a client buffer that is already >= lead_s deep, so +<=1 tick
+    of delivery delay is inaudible.
+
+    Enabled by the same env pair as the pacer: VLLM_OMNI_TEMPORAL_TICK_MS > 0
+    and VLLM_OMNI_TEMPORAL_BARRIER=1.
+    """
+
+    def __init__(self, model_config: Any):
+        tick_ms = _env_float("VLLM_OMNI_TEMPORAL_TICK_MS", 0.0)
+        barrier = os.environ.get("VLLM_OMNI_TEMPORAL_BARRIER", "0") not in ("0", "", "false", "False")
+        self.tick_s = max(0.0, tick_ms) / 1000.0
+        self.enabled = self.tick_s > 0 and barrier
+        self.stage_id = getattr(model_config, "stage_id", -1)
+        # rid -> [chunks_seen_this_segment, release_t | None]
+        # release None = no pending gated work; 0.0 = released/pass-through.
+        self._st: dict[str, list] = {}
+        if self.enabled:
+            logger.info("[ChunkTickGate] stage=%s ON: tick=%.0fms (first chunk per segment exempt)",
+                        self.stage_id, self.tick_s * 1000)
+
+    def should_hold(self, request_id: str, now: float) -> bool:
+        st = self._st.setdefault(request_id, [0, None])
+        if st[1] is None:
+            # New chunk work just became visible.
+            st[0] += 1
+            if st[0] <= 1:
+                st[1] = 0.0  # segment's first chunk: TTFA bypass
+                return False
+            st[1] = math.ceil(now / self.tick_s) * self.tick_s
+        return now < st[1]
+
+    def on_work_consumed(self, request_id: str) -> None:
+        st = self._st.get(request_id)
+        if st is not None:
+            st[1] = None
+
+    def on_segment_end(self, request_id: str) -> None:
+        self._st[request_id] = [0, None]
+
+    def on_request_freed(self, request_id: str) -> None:
+        self._st.pop(request_id, None)

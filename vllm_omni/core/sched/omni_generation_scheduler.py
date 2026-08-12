@@ -30,6 +30,7 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     uses_full_payload_input_coordinator,
 )
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
+from vllm_omni.core.sched.temporal_pacing import ChunkTickGate
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
@@ -55,6 +56,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 stage_id=getattr(model_config, "stage_id", 0),
             )
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
+        # [Temporal batching experiment] 80ms timetable at THIS consumption
+        # point: fresh chunk work (a vocoder call's worth) waits for the next
+        # tick boundary so all sessions' ready chunks batch into one step.
+        # No-op unless VLLM_OMNI_TEMPORAL_TICK_MS>0 and ..._BARRIER=1.
+        self.chunk_tick_gate = ChunkTickGate(model_config)
 
     def _handle_stopped_request(self, request: Request) -> bool:
         if (
@@ -68,6 +74,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             # schedulable before the base class can park them in skipped_waiting.
             request.status = RequestStatus.WAITING
             self._enqueue_waiting_request(request)
+            # Segment boundary: the next segment's first chunk is TTFA-exempt.
+            self.chunk_tick_gate.on_segment_end(request.request_id)
             return False
         return super()._handle_stopped_request(request)
 
@@ -131,6 +139,15 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     request.request_id
                 ):
                     self._pending_finish_reqs.append(request)
+                self.chunk_tick_gate.on_work_consumed(request.request_id)
+                req_index += 1
+                continue
+            # [Temporal batching] hold fresh chunk work to the next tick
+            # boundary so all sessions' ready chunks vocode as one batch
+            # (first chunk per segment passes straight through).
+            if self.chunk_tick_gate.enabled and self.chunk_tick_gate.should_hold(
+                request.request_id, scheduled_timestamp
+            ):
                 req_index += 1
                 continue
             num_new_tokens = min(required_tokens, token_budget)
@@ -191,6 +208,12 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     self.waiting.pop_request()
                     skipped_waiting_requests.prepend_request(request)
                     continue
+
+            # [Temporal batching] register the segment's first chunk with the
+            # tick gate (it always passes -- TTFA exempt) so the SECOND chunk
+            # is correctly the first gated one.
+            if self.chunk_tick_gate.enabled:
+                self.chunk_tick_gate.should_hold(request.request_id, scheduled_timestamp)
 
             # Allocate all input tokens for the request in one shot
             # (allocate 1 placeholder if zero)
@@ -411,6 +434,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        self.chunk_tick_gate.on_request_freed(request.request_id)
         if self.input_coordinator is None:
             return super()._free_request(request, delay_free_blocks)
 
