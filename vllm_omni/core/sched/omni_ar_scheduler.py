@@ -70,6 +70,7 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
     uses_full_payload_input_coordinator,
 )
+from vllm_omni.core.sched.temporal_pacing import TICK_ENGINE_LOOP as _TICK_ENGINE_LOOP
 from vllm_omni.core.sched.temporal_pacing import TemporalPacer
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
@@ -439,6 +440,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # invisible to every check below, with the loop parked. This line is the only way to
         # tell that state from a healthy idle stage, because it reports presence rather than
         # absence.
+        # [Tick engine WP1] safe default; the tail sets the real value.
+        self.omni_tick_idle = False
         _hb_now = time()
         if _hb_now - self._last_heartbeat_t >= self._HEARTBEAT_EVERY_S:
             self._last_heartbeat_t = _hb_now
@@ -591,11 +594,21 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 len(self.waiting),
             )
 
+        # [Tick engine WP1] tell the engine loop whether this pass found any
+        # schedulable work. True -> the loop may sleep until the pacer's
+        # next_wake (handling client input the moment it arrives); False ->
+        # step again immediately (prefill/slack work never waits for a tick).
+        self.omni_tick_idle = (scheduler_output.total_num_scheduled_tokens == 0
+                               and not self.waiting)
+
         # [Temporal pacing] when EVERYTHING schedulable is parked and this
         # pass produced no work, the busy loop would spin hot until the next
         # release. Yield for up to 1 ms (bounded, so a new turn's streaming
-        # update is delayed by at most that much).
-        if (_paced_held and scheduler_output.total_num_scheduled_tokens == 0
+        # update is delayed by at most that much). With the tick engine loop
+        # (VLLM_OMNI_TEMPORAL_ENGINE=1) the loop itself owns the wait, so the
+        # bounded yield here is skipped.
+        if (not _TICK_ENGINE_LOOP and _paced_held
+                and scheduler_output.total_num_scheduled_tokens == 0
                 and not self.waiting):
             _now2 = _monotonic()
             if _paced_next_release is not None and _paced_next_release > _now2:

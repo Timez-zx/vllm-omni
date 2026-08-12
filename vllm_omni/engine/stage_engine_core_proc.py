@@ -8,8 +8,11 @@ busy loop in a subprocess, communicating with StageEngineCoreClient via ZMQ.
 from __future__ import annotations
 
 import contextlib
+import math
 import os
+import queue as _queue
 import signal
+import time as _time
 from typing import Any
 
 import vllm.v1.engine.core as _vllm_engine_core_module
@@ -62,6 +65,54 @@ class StageEngineCoreProc(EngineCoreProc):
         scheduler_request.additional_information = request.additional_information
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
         return scheduler_request, current_wave
+
+    # ------------------------------------------------------------------ #
+    # [Tick engine WP1] Between pacing events the upstream busy loop would
+    # hot-spin through empty scheduler passes (has_work() is true whenever
+    # requests exist, even if every one is paced out). With
+    # VLLM_OMNI_TEMPORAL_ENGINE=1 the loop instead SLEEPS on the input queue
+    # until the schedulers' next pacing event -- and any client request
+    # (new turn, abort) wakes it instantly, so admission latency is
+    # unaffected. Stages that RECEIVE upstream chunks cap the sleep at 2 ms:
+    # chunk arrival is discovered by a poll, and a turn's first chunk is
+    # TTFA-critical (the full fix is the WP4 phase mailbox).
+    # ------------------------------------------------------------------ #
+
+    _TICK_CHUNK_POLL_S = 0.002
+
+    def _process_input_queue(self):
+        from vllm_omni.core.sched.temporal_pacing import TICK_ENGINE_LOOP, TICK_S
+
+        sched = getattr(self, "scheduler", None)
+        if (not TICK_ENGINE_LOOP or sched is None
+                or not getattr(sched, "omni_tick_idle", False)
+                or not sched.has_requests()):
+            return super()._process_input_queue()
+
+        now = _time.monotonic()
+        deadline = None
+        for attr in ("temporal_pacer", "chunk_tick_gate"):
+            hint = getattr(getattr(sched, attr, None), "next_wake", None)
+            if hint is not None and hint > now:
+                deadline = hint if deadline is None else min(deadline, hint)
+        if deadline is None:
+            # No pending pacing event recorded: fall to the next grid edge.
+            deadline = (math.floor(now / TICK_S) + 1) * TICK_S if TICK_S > 0 else now
+        adapter = getattr(sched, "chunk_transfer_adapter", None)
+        if adapter is not None and getattr(adapter, "receives_chunks", False):
+            deadline = min(deadline, now + self._TICK_CHUNK_POLL_S)
+
+        remaining = deadline - now
+        if remaining > 0:
+            try:
+                req = self.input_queue.get(timeout=remaining)
+                # A client request is potential new work (turn start, abort):
+                # handle it and return so the loop steps immediately.
+                self._handle_client_request(*req)
+            except _queue.Empty:
+                pass
+        while not self.input_queue.empty():
+            self._handle_client_request(*self.input_queue.get_nowait())
 
     @staticmethod
     def run_stage_core(

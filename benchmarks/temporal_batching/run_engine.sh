@@ -29,7 +29,7 @@ LOGDIR=/home/ubuntu/data/logs
 ENGINE_LOG=$LOGDIR/temporal_engine.log
 PORT=8091
 MODEL="${QWEN_MODEL:-Qwen/Qwen3-Omni-30B-A3B-Instruct}"
-DEPLOY="$HERE/deploy_temporal_2gpu.yaml"
+DEPLOY="${TB_DEPLOY:-$HERE/deploy_temporal_2gpu.yaml}"
 
 mkdir -p "$LOGDIR"
 
@@ -74,8 +74,8 @@ ln -sfn "$CUDATK/bin" "$SHIM/bin"
 [ -s "$ENGINE_LOG" ] && mv -f "$ENGINE_LOG" "$ENGINE_LOG.prev"
 
 TICK="${VLLM_OMNI_TEMPORAL_TICK_MS:-0}"
-echo "engine starting: thinker->GPU0, talker+code2wav->GPU1"
-echo "  pacing: tick=${TICK}ms lead=${VLLM_OMNI_TEMPORAL_LEAD_MS:-240} thinker_tps=${VLLM_OMNI_TEMPORAL_THINKER_TPS:-25} no_quant=${VLLM_OMNI_TEMPORAL_NO_QUANT:-0}"
+echo "engine starting: thinker->GPU0, talker+code2wav->GPU1  (deploy: $(basename "$DEPLOY"))"
+echo "  pacing: tick=${TICK}ms barrier=${VLLM_OMNI_TEMPORAL_BARRIER:-0} engine_loop=${VLLM_OMNI_TEMPORAL_ENGINE:-0} inline_send=${VLLM_OMNI_TEMPORAL_INLINE_SEND:-0} lead=${VLLM_OMNI_TEMPORAL_LEAD_MS:-240} thinker_tps=${VLLM_OMNI_TEMPORAL_THINKER_TPS:-25}"
 echo "  log: $ENGINE_LOG"
 
 HF_HOME=/home/ubuntu/data/hf-omni \

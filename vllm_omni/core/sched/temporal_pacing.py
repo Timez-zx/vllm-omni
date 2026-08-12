@@ -78,6 +78,16 @@ logger = init_logger(__name__)
 # and produce no audio frame, so they must not advance the frame count.
 _CODEC_VALID_MAX = 2048
 
+# [WP1] VLLM_OMNI_TEMPORAL_ENGINE=1 turns the engine-core busy loop into a
+# tick loop: between pacing events it SLEEPS on the input queue (waking
+# instantly for client requests) instead of hot-spinning through empty
+# scheduler passes. Read once per engine-core process.
+TICK_ENGINE_LOOP = (
+    os.environ.get("VLLM_OMNI_TEMPORAL_ENGINE", "0") not in ("0", "", "false", "False")
+    and float(os.environ.get("VLLM_OMNI_TEMPORAL_TICK_MS", "0") or 0) > 0
+)
+TICK_S = float(os.environ.get("VLLM_OMNI_TEMPORAL_TICK_MS", "0") or 0) / 1000.0
+
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -144,6 +154,9 @@ class TemporalPacer:
 
         self.enabled = self.tick_s > 0 and self.rate > 0
         self.log_steps = _parse_log_steps(self.stage_id)
+        # Earliest pending release among held requests, refreshed by every
+        # split_running call. The tick engine loop (WP1) sleeps until this.
+        self.next_wake: float | None = None
         # rid -> [output_len_seen, units_this_turn, anchor_t, holds]
         self._st: dict[str, list] = {}
 
@@ -162,7 +175,9 @@ class TemporalPacer:
         """Partition ``running`` into (schedulable, held); also return the
         earliest release time among held requests (for the idle micro-sleep)."""
         if self.barrier:
-            return self._split_barrier(running, now)
+            kept, held, next_release = self._split_barrier(running, now)
+            self.next_wake = next_release
+            return kept, held, next_release
         kept: list = []
         held: list = []
         next_release: float | None = None
@@ -174,6 +189,7 @@ class TemporalPacer:
                     next_release = release
             else:
                 kept.append(req)
+        self.next_wake = next_release
         return kept, held, next_release
 
     def _split_barrier(self, running: list, now: float) -> tuple[list, list, float | None]:
@@ -327,6 +343,8 @@ class ChunkTickGate:
         self.tick_s = max(0.0, tick_ms) / 1000.0
         self.enabled = self.tick_s > 0 and barrier
         self.stage_id = getattr(model_config, "stage_id", -1)
+        # Earliest pending release; the tick engine loop sleeps until this.
+        self.next_wake: float | None = None
         # rid -> [chunks_seen_this_segment, release_t | None]
         # release None = no pending gated work; 0.0 = released/pass-through.
         self._st: dict[str, list] = {}
@@ -343,7 +361,11 @@ class ChunkTickGate:
                 st[1] = 0.0  # segment's first chunk: TTFA bypass
                 return False
             st[1] = math.ceil(now / self.tick_s) * self.tick_s
-        return now < st[1]
+        if now < st[1]:
+            if self.next_wake is None or self.next_wake <= now or st[1] < self.next_wake:
+                self.next_wake = st[1]
+            return True
+        return False
 
     def on_work_consumed(self, request_id: str) -> None:
         st = self._st.get(request_id)

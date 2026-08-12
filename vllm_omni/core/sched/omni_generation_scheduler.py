@@ -91,6 +91,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self._pause_state == PauseState.PAUSED_ALL:
             token_budget = 0
         scheduled_timestamp = time.monotonic()
+        # Safe default for the tick-engine idle hint; the assembly tail sets
+        # the real value. Fallback/early-return paths must never leave a
+        # stale True behind (the loop would sleep on schedulable work).
+        self.omni_tick_idle = False
 
         self.kv_cache_manager.new_step_starts()
 
@@ -306,6 +310,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         )
 
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+
+        # [Tick engine WP1] idle hint for the engine loop: nothing scheduled
+        # this pass means every pending chunk is gated (or absent) -- the loop
+        # may sleep until the gate's next_wake / the chunk-poll cap.
+        self.omni_tick_idle = total_num_scheduled_tokens == 0
 
         # Record the request ids scheduled in this step (v0.14.0 behavior).
         self.prev_step_scheduled_req_ids.clear()

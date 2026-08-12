@@ -26,6 +26,11 @@ logger = get_connector_logger(__name__)
 # so a caller can read them without turning logging on.
 _LOG_TRANSFER = os.environ.get("VLLM_OMNI_LOG_TRANSFER", "0") not in ("0", "false", "False", "")
 
+# [Tick engine WP4-lite] VLLM_OMNI_TEMPORAL_INLINE_SEND=1: chunk sends happen
+# synchronously at the point save_async is called (T+0 of the producing step)
+# instead of via the background save thread. See save_async.
+_INLINE_SEND = os.environ.get("VLLM_OMNI_TEMPORAL_INLINE_SEND", "0") not in ("0", "false", "False", "")
+
 
 
 def _request_is_prefill_only(request: Any) -> bool:
@@ -241,6 +246,22 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # captured while the segment's state is live, not re-derived later.
             "prefill_only": _request_is_prefill_only(request),
         }
+        if _INLINE_SEND:
+            # [Tick engine WP4-lite] send at T+0 on the scheduler thread
+            # instead of hopping through the save-thread queue. Removes one
+            # thread wakeup + queue-order head-of-line from the chunk path,
+            # and the enqueue-time snapshot races documented above become
+            # moot (state is live at send time). Cost: payload build + shm
+            # put inline -- sub-ms for decode chunks, ~10 ms once per turn
+            # for the first chunk's prefill embeds, paid from tick slack.
+            try:
+                self._send_single_request(task)
+            except Exception as e:
+                logger.warning(
+                    f"[OmniTransfer] inline send failed for "
+                    f"{getattr(request, 'external_req_id', '?')}: {e}"
+                )
+            return
         self._pending_save_reqs.append(task)
         with self._save_cond:
             self._save_cond.notify()
