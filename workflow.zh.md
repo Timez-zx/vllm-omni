@@ -1466,6 +1466,21 @@ burst 豁免)、失去贪心积累的客户端缓冲(需要 lead 余量)、tick 
 都周期化;**视频不设自己的时钟**——帧间隔取音频颗粒度的整数倍(实验:音频
 80ms/块流式进,视频 480ms/帧),帧落在音频格点上。
 
+**实现与部署踩坑记录。** (1) pacing gate 在 `core/sched/temporal_pacing.py`,
+挂进 OmniARScheduler.schedule():超前请求本 pass 从 running 摘除、finally
+放回(照抄 chunk adapter 的 `_held_non_active` 先例——不改 status、不动计数
+器,引擎忙循环完全无感);释放时刻 ceil 到全局 tick 格。1 个 talker token =
+1 codec 帧这一点由代码确认(codebook-0 由 LM 采样,其余 codebook 由 code
+predictor 同 step 补齐)。(2) 两卡部署第一次引导就分对了卡(thinker KV 池
+275k tokens @GPU0,talker 1.14M @GPU1),但**有字无声**:文本秒回、音频永
+不到。用 VLLM_OMNI_LOG_TRANSFER=1 逐边追踪,0→1、1→2 两条边的 chunk 都在
+put,最后发现请求只在 stage 0/1 有 ADMIT——侦察稿给 1→2 边用的
+ColocInProcConnector 让 async-chunk 的 prewarm 没向 stage 2 提交 placeholder
+请求,codec chunk 堆在 connector 里无人读。回退 SharedMemoryConnector
+(chunk 仅 1-4KB,拷贝成本为零)即愈。(3) async_scheduling 在 stage 0/1
+全部关掉且基线同关:停车/再入在 async 调度下踩 -1 哨兵 crash(repo 有既往
+记录),统一关闭保证四个条件比的是调度策略本身。
+
 **实验设计**(完整版:`benchmarks/temporal_batching/DESIGN.zh.md`):
 {基线贪心, tick=80ms, tick=160ms, 只限速不量化(消融)} × N∈{1,2,4,8,16}
 并发 session,engine 直连、thinker temp=0 使各条件回复长度一致;指标是
