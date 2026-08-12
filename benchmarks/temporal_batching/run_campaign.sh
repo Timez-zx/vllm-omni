@@ -67,6 +67,10 @@ run_cell() {  # workload users turns
   fi
   local QENV=()
   [ "$WL" != short ] && QENV=(MU_QUESTIONS=$WL)
+  # T arm: input-side tick-ization (WP5) is part of the fully-optimized
+  # engine's story -- enabled via session config, 1 s chunks (3 s utterances
+  # never reach the 8 s bit-faithful grain; the 1 s trade is documented).
+  [ "$ARM" = T ] && QENV+=(MU_SESSION_CFG_JSON='{"prefill_audio_on_arrival": true, "audio_prefill_chunk_s": 1.0}')
   echo "--- cell: $ARM/$WL/u$U (turns=$TURNS)"
   (cd "$WEB" && env MU_ENGINE_LOG="$ENGINE_LOG" ${QENV[@]:+"${QENV[@]}"} \
      timeout 3600 "$MAGE_PY" mu_bench.py \
