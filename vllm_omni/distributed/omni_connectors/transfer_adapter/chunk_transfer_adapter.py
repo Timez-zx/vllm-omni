@@ -226,7 +226,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 f"request.num_output_placeholders={getattr(request, 'num_output_placeholders', 0)}, "
                 f"previous_chunks_sent={self.requests_num_chunks_sent.get(request.external_req_id, 0)}"
             )
-            return
+            # [Boundary-loss fix, drop point A] a task carrying the SEGMENT
+            # BOUNDARY must never be silently consumed: the flag is emitted
+            # exactly once (talker stop) and nothing downstream re-emits it --
+            # dropping it here leaves the consumer stage waiting forever and
+            # the client's turn hangs to its 240 s watchdog. Ship a
+            # boundary-only chunk (payload stripped) instead of returning.
+            if not (is_finished or is_segment_finished):
+                return
+            multimodal_output = None
 
         self.requests_num_chunks_sent[request.external_req_id] = confirmed_num_computed_tokens
         task = {
@@ -571,6 +579,27 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             put_key=connector_put_key,
             data=payload_data,
         )
+        # [Boundary-loss fix, drop point B] a failed put normally just loses
+        # one data chunk (bad but survivable); losing the chunk that carries
+        # finished/is_segment_finished hangs the consumer stage forever, and
+        # nothing re-emits it. Retry flagged chunks, loudly.
+        if not success and (is_finished or is_segment_finished):
+            for _attempt in range(3):
+                time.sleep(0.005 * (_attempt + 1))
+                success, size, metadata = self.connector.put(
+                    from_stage=str(stage_id),
+                    to_stage=str(next_stage_id),
+                    put_key=connector_put_key,
+                    data=payload_data,
+                )
+                if success:
+                    break
+            if not success:
+                logger.error(
+                    "[OmniTransfer] BOUNDARY chunk PUT FAILED after retries: %s "
+                    "(stage %s->%s) -- downstream segment will hang",
+                    connector_put_key, stage_id, next_stage_id,
+                )
         _put_ms = (time.perf_counter() - _t_put0) * 1000.0
 
         if success:
@@ -704,6 +733,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:
             cached_ic.pop(external_req_id, None)
+
+        # [Boundary-loss fix, hygiene] unconsumed connector segments used to
+        # outlive the request forever: this adapter never told the connector
+        # to reclaim them, so every aborted/rolled session leaked its unread
+        # /dev/shm segments and one 0-byte lockfile per chunk key (measured:
+        # 475 leaked lockfiles after one day's experiments). Best-effort by
+        # contract -- the connector matches keys by request-id prefix.
+        try:
+            self.connector.cleanup(external_req_id)
+        except Exception:
+            logger.debug("connector cleanup failed for %s", external_req_id, exc_info=True)
 
     def cleanup(
         self,

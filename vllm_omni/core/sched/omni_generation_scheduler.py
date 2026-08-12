@@ -639,6 +639,15 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             finish_reason = request.get_finished_reason()
             finished = self._handle_stopped_request(request)
             is_segment_finished = not finished
+            # [Boundary-loss fix, drop point D] the MAIN stop path discards
+            # the adapter's segment_finished flag when it consumes a segment
+            # boundary; this path did not -- a request finished here kept a
+            # stale "done receiving" flag, and the NEXT segment on the same
+            # resumable request stopped instantly with a junk finish_reason,
+            # permanently desyncing the serving layer's owner FIFO (the exact
+            # "zero audio for every later turn" signature).
+            if self.chunk_transfer_adapter is not None:
+                self.chunk_transfer_adapter.segment_finished_requests.discard(request.request_id)
             kv_transfer_params = None
             if finished:
                 kv_transfer_params, _ = self._free_request(request)

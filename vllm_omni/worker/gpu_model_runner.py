@@ -469,10 +469,26 @@ class OmniGPUModelRunner(GPUModelRunner):
                         context_len=src_start + covered,
                         num_new_tokens=prompt_part_len - covered,
                     )
+                    # SELF-HEAL: append the generated span to the cached
+                    # request state, so later steps read a consistent buffer
+                    # instead of re-entering this path (and so downstream
+                    # position-dependent behavior -- notably EOS emission --
+                    # sees monotone positions rather than a permanent hole).
+                    try:
+                        fill = torch.from_numpy(
+                            self.mrope_positions.np[:, dst_start + covered : dst_start + prompt_part_len].copy()
+                        ).to(req.mrope_positions.dtype)
+                        req.mrope_positions = torch.cat(
+                            [req.mrope_positions[:, : src_start + covered], fill], dim=1
+                        )
+                        if req.mrope_position_delta is None:
+                            req.mrope_position_delta = delta
+                    except Exception:
+                        logger.debug("mrope self-heal append failed for %s", req_id, exc_info=True)
                     logger.warning(
-                        "[OmniGPUModelRunner] req %s: mrope_positions covers %d tokens but "
-                        "prompt slice needs [%d:%d); filled %d positions linearly "
-                        "(stale state after live prompt replacement)",
+                        "[OmniGPUModelRunner] req %s: mrope_positions covered %d tokens but "
+                        "prompt slice needs [%d:%d); filled %d positions linearly and "
+                        "extended the cached state (stale after live prompt replacement)",
                         req_id, available, src_start, src_end, prompt_part_len - covered,
                     )
                 mrope_pos_ptr += prompt_part_len
