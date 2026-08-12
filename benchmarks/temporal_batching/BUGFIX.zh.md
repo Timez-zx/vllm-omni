@@ -80,4 +80,17 @@ SHORT/mrope 告警,引擎单次启动扛完全部三 cell(旧 campaign 在此负
 且这是在 KV 冻结波(最大搅动环境)下取得的。
 冒烟(4 用户×3 turn):12/12 ok,TTFA p50 168ms,文本正常。
 
-**疾病 2 解药验证**:带压缩配置的 mixed_u24 对照(结果见下节/RESULTS 增补)。
+**疾病 2 解药验证(闭环)**:同引擎同负载,仅加压缩配置(trigger 8594 / target 4297):
+**192/192 ok、零超时、零致命**(未压缩:22 超时 + ~170s 全体冻结)。代价如实:
+p95 7.5s、>1s 占 16.7%——24 个 session 在相近时刻越线,进程级 2 个 warm-up permit
+排不开,部分退化为 blocking roll(冷 turn ~3.7× TTFA)。这是有界上下文服务的
+真实锯齿形态;两臂同价,不影响 M/T 对比公平。counter_leak_clamped=5(既有
+安全网正常工作)。
+
+## 五、对后续实验的约束
+
+- 一切 N≥24 的实验必须带按 N 缩放的压缩配置(run_pressure.sh / run_video_freq.sh 已内置);
+- u48 时 trigger≈4.3k(≈17 帧窗口),压缩 churn 占比上升,解读时把"压缩税"
+  与调度机制的贡献分开看(两臂同税);
+- 遗留改进(未做):满池时的优雅降级(空闲 parked session 的 KV 逐出 =
+  按占空比付费的 KV 语义)、warm-up permit 随池余量自适应。
