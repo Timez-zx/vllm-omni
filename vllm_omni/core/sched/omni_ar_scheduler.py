@@ -729,6 +729,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self.defer_block_free:
             self.sched_step_seq += 1
         self._update_after_schedule(scheduler_output)
+        # Evidence counter: without this line there is no way to verify the
+        # fast path is actually taken in a live run.
+        self._replay_steps = getattr(self, "_replay_steps", 0) + 1
+        if self._replay_steps % 500 == 1:
+            logger.info("[OmniARScheduler] stage %s cohort-replay steps=%d (batch=%d)",
+                        self.vllm_config.model_config.stage_id, self._replay_steps, len(kept))
         return scheduler_output
 
     def _check_for_wedged_requests(self, scheduler_output: SchedulerOutput) -> None:

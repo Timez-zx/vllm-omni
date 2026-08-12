@@ -32,6 +32,7 @@ import base64
 import hashlib
 import io
 import json
+import math
 import os
 import time as _time
 import uuid
@@ -721,6 +722,28 @@ class StreamingVideoSessionConfig(BaseModel):
             "context beyond the appended tokens, nothing ships downstream.\n\n"
             "Needs session_scoped_request; without a live request there is nothing to append to."
         ),
+    )
+    prefill_audio_on_arrival: bool = Field(
+        default=False,
+        description=(
+            "[Tick engine WP5] Prefill the mic audio INCREMENTALLY while the user is "
+            "still speaking, in whole-second chunks, instead of paying the whole "
+            "utterance's audio prefill at query time. Reuses the prefill-only append "
+            "path (see prefill_frames_on_arrival). Qwen3-Omni's audio encoder is "
+            "chunk-structured (1 s conv chunks, 8 s attention blocks), so 8 s-aligned "
+            "splits are bit-faithful to whole-utterance encoding; sub-8 s chunks keep "
+            "the conv/positional grid exact but shrink the attention context to the "
+            "chunk -- a measured-quality trade, keep audio_prefill_chunk_s=8 unless "
+            "TTFA at long utterances matters more. Needs session_scoped_request."
+        ),
+    )
+    audio_prefill_chunk_s: float = Field(
+        default=8.0,
+        description="Whole-second chunk size for prefill_audio_on_arrival; 8 = encoder-faithful, 1 = latency-optimal.",
+    )
+    audio_prefill_reserve_s: float = Field(
+        default=1.0,
+        description="Residual seconds always left in the buffer for the turn-time tail splice.",
     )
 
 
@@ -1491,6 +1514,79 @@ class OmniStreamingVideoHandler:
                 # Frames alone can carry the context across the compression trigger during
                 # a long silence; without this hook the warm-up would only start at the
                 # next turn and the swap would slip one turn further.
+                if _warmup_due() and _shadow_allowed():
+                    _launch_shadow_warmup("arrival")
+                return True
+
+            async def _prefill_audio_on_arrival() -> bool:
+                """[Tick engine WP5] prefill buffered mic audio while the user speaks.
+
+                A whole-second-aligned prefix of audio_buffer becomes a
+                prefill-only append (same engine path as frames-on-arrival:
+                zero-output park, nothing reaches the talker). Consumption is
+                in multiples of audio_prefill_chunk_s so every piece -- and
+                the residual tail spliced at turn time -- stays on the audio
+                encoder's 1 s conv grid; 8 s chunks additionally respect its
+                8 s attention blocks (bit-faithful split). Failure is soft:
+                the audio stays buffered and the turn-time path takes it all.
+                """
+                if (not sess["first_sent"] or sess.get("turn_busy")
+                        or sess.get("query_claimed") or sess["fatal"]):
+                    return False
+                if sess.get("shadow") is not None:
+                    return False
+                if "audio" not in (config.modalities or []):
+                    return False
+                if sess["queue"].qsize() > 0:
+                    return False
+                bytes_per_s = 32000  # PCM16 mono 16 kHz
+                chunk_s = max(1, int(config.audio_prefill_chunk_s or 8))
+                reserve_s = max(0, int(math.ceil(config.audio_prefill_reserve_s or 0)))
+                usable_s = len(audio_buffer) // bytes_per_s - reserve_s
+                consume_s = (usable_s // chunk_s) * chunk_s
+                if consume_s <= 0:
+                    return False
+                k = consume_s * bytes_per_s
+                prefix = bytes(audio_buffer[:k])
+                chunk = await self._build_session_chunk(
+                    config, [], bytearray(prefix), "", frame_pil_cache,
+                    is_first=False,
+                )
+                if chunk is None or not isinstance(chunk, dict):
+                    return False
+                if not _strip_chatml_scaffolding(chunk):
+                    logger.warning(
+                        "[session] audio prefill-on-arrival: could not reduce the delta "
+                        "to its audio tokens; skipping (audio stays buffered)")
+                    return False
+                from vllm_omni.engine import (
+                    AdditionalInformationEntry,
+                    AdditionalInformationPayload,
+                )
+
+                entries = {}
+                existing = chunk.get("additional_information")
+                if isinstance(getattr(existing, "entries", None), dict):
+                    entries.update(existing.entries)
+                entries[_PREFILL_ONLY_KEY] = AdditionalInformationEntry(list_data=["1"])
+                chunk["additional_information"] = AdditionalInformationPayload(entries=entries)
+                try:
+                    sess["queue"].put_nowait((chunk, 1))
+                except asyncio.QueueFull:
+                    return False
+                # Only now is the prefix truly out of our hands: consume it so
+                # the turn-time chunk carries just the residual tail.
+                del audio_buffer[:k]
+                ntok = len(chunk.get("prompt_token_ids") or ())
+                sess["arrival_appends"] += 1
+                sess["arrival_tokens"] += ntok
+                sess["cum_tokens"] = sess.get("cum_tokens", 0) + ntok
+                logger.info(
+                    "[session] audio prefill-on-arrival: %ds -> %d tokens "
+                    "(appends=%d tokens=%d cum=%d)",
+                    consume_s, ntok, sess["arrival_appends"],
+                    sess["arrival_tokens"], sess.get("cum_tokens", 0),
+                )
                 if _warmup_due() and _shadow_allowed():
                     _launch_shadow_warmup("arrival")
                 return True
@@ -2567,6 +2663,15 @@ class OmniStreamingVideoHandler:
                             audio_buffer.clear()
                             continue
                         audio_buffer.extend(pcm_bytes)
+                        # [Tick engine WP5] opportunistic incremental prefill of
+                        # the buffered speech; soft-fails and leaves the buffer.
+                        if (config.prefill_audio_on_arrival
+                                and config.session_scoped_request):
+                            try:
+                                await _prefill_audio_on_arrival()
+                            except Exception:
+                                logger.debug("audio prefill-on-arrival failed",
+                                             exc_info=True)
 
                     elif msg_type == "video.query":
                         query_text = msg.get("text", "")
