@@ -111,6 +111,29 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
         self.requests_with_ready_chunks = set()
         self.requests_origin_status = {}
+        # Requests whose most recently loaded chunk OPENED a new segment.
+        # Two producer conventions mark that: an explicit
+        # meta.replace_streaming_prompt (MiniCPM-o), or -- the Qwen3-Omni
+        # append-style convention, which ships no marker -- the first
+        # data-bearing chunk after a segment_finished chunk (tracked via
+        # _expect_segment_opener). Such a request must re-enter scheduling
+        # through the WAITING path so the runner receives it as
+        # NewRequestData and runs its full segment refresh
+        # (_update_streaming_request + _update_streaming_input_additional_info:
+        # prompt/mrope re-init, num_processed_tokens=0). Resuming it as
+        # RUNNING delivers the payload on the cached path, which refreshes
+        # none of that; the stale num_processed_tokens then slices past the
+        # fresh (shorter) prefill rows and the model runs on empty or
+        # uninitialized embeddings. Observed as all three campaign death
+        # modes: IndexError on a 0-row hidden_states, vectorized_gather
+        # device-side asserts from batch-mates, and clamped-prefix audio
+        # corruption with no exception.
+        self._segment_replaced_reqs: set[str] = set()
+        # Receive-side boundary memory: req ids whose last consumed chunk
+        # ended a segment, so the next data-bearing chunk is a segment
+        # opener. Survives boundary-only segments in between (those are
+        # segment_finished with no data and keep the flag set).
+        self._expect_segment_opener: set[str] = set()
         self._active_streams: dict[str, Any] = {}
         # Private hold-queue for non-active running requests. Restored to
         # running_queue inside restore_queues(). Avoids calling
@@ -326,6 +349,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             if self.model_mode == "ar":
                 request.additional_information = payload_data
                 replace_prompt = meta.get("replace_streaming_prompt") is True
+                # Segment-opener detection for the resume in
+                # _process_chunk_queue (see _segment_replaced_reqs): either
+                # the producer says so explicitly (replace_prompt), or this
+                # is the first data-bearing chunk after a segment_finished
+                # chunk (append-style producers ship no marker).
+                if replace_prompt or (
+                    req_id in self._expect_segment_opener and self._payload_has_data(payload_data)
+                ):
+                    self._segment_replaced_reqs.add(req_id)
+                    self._expect_segment_opener.discard(req_id)
                 if getattr(request, "resumable", False) and (chunk_id > 0 or replace_prompt):
                     # For new streaming input segment, we should update prompt from payload
                     construct_next_stage_streaming_input_prompt(payload_data, request)
@@ -367,6 +400,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     request.resumable = False
                 if payload_segment_finished:
                     self.segment_finished_requests.add(req_id)
+                    # The next data-bearing chunk for this request opens a
+                    # new segment (boundary-only segments in between keep
+                    # this set: they are segment_finished with no data).
+                    self._expect_segment_opener.add(req_id)
             else:
                 if payload_finished:
                     self.upstream_exhausted_requests.add(req_id)
@@ -685,6 +722,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.segment_payload_chunks.pop(request_id, None)
         self._boundary_cap_saved_max_tokens.pop(request_id, None)
         self.requests_with_ready_chunks.discard(request_id)
+        self._segment_replaced_reqs.discard(request_id)
+        self._expect_segment_opener.discard(request_id)
         self.request_ids_mapping.pop(request_id, None)
         self.requests_origin_status.pop(request_id, None)
         self._discard_from_chunk_deque(self.waiting_for_chunk_waiting_requests, request_id)
@@ -882,6 +921,45 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self._held_non_active.append(request)
             index -= 1
 
+    def _resume_loaded_request(self, request: Request, queue: Any, target_status: RequestStatus) -> None:
+        """Restore a request whose async chunk load just completed.
+
+        Normal case: flip back to the status of the queue it parked from.
+
+        Segment-boundary case: if the loaded payload REPLACED the streaming
+        prompt (new segment), a RUNNING resume is forbidden -- it would ship
+        the payload to the runner on the cached path, which performs none of
+        the per-segment state refresh (see _segment_replaced_reqs). Route the
+        request through WAITING instead: pull it off the running queue and
+        park it in waiting_for_chunk_waiting_requests, which restore_queues()
+        re-admits into the waiting queue after this scheduler pass; the next
+        pass then emits it as NewRequestData with the fresh payload attached.
+        """
+        req_id = request.request_id
+        self.requests_with_ready_chunks.add(req_id)
+        replaced = req_id in self._segment_replaced_reqs
+        self._segment_replaced_reqs.discard(req_id)
+        if replaced and target_status == RequestStatus.RUNNING:
+            # Loud on purpose: this is the exact interleaving that used to
+            # kill the engine (stale num_processed_tokens -> empty prefill
+            # rows -> IndexError / device-side assert). A count here is the
+            # proof the guard is earning its keep.
+            logger.warning(
+                "[OmniTransfer] req %s: new-segment payload landed while parked "
+                "from RUNNING; rerouting through WAITING so the runner refreshes "
+                "segment state (NewRequestData path)",
+                req_id,
+            )
+            request.status = RequestStatus.WAITING
+            try:
+                queue.remove(request)
+            except ValueError:
+                pass
+            self.requests_origin_status[req_id] = RequestStatus.WAITING
+            self.waiting_for_chunk_waiting_requests.append(request)
+            return
+        request.status = target_status
+
     def _process_chunk_queue_legacy(
         self,
         queue: Any,
@@ -904,9 +982,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 request.status = RequestStatus.WAITING_FOR_CHUNK
             else:
                 if request.request_id in finished_load_reqs:
-                    request.status = target_status
                     finished_load_reqs.remove(request.request_id)
-                    self.requests_with_ready_chunks.add(request.request_id)
+                    self._resume_loaded_request(request, queue, target_status)
                     continue
             queue.remove(request)
             self.requests_origin_status[request.request_id] = target_status
@@ -1047,9 +1124,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 request.status = RequestStatus.WAITING_FOR_CHUNK
             else:
                 if request.request_id in finished_load_reqs:
-                    request.status = target_status
                     finished_load_reqs.remove(request.request_id)
-                    self.requests_with_ready_chunks.add(request.request_id)
+                    self._resume_loaded_request(request, queue, target_status)
                     continue
             queue.remove(request)
             self.requests_origin_status[request.request_id] = target_status

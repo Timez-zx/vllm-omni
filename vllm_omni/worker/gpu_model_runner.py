@@ -1603,6 +1603,37 @@ class OmniGPUModelRunner(GPUModelRunner):
                     decoded_info = deserialize_additional_information(req_infos)
                     if decoded_info:
                         self._update_intermediate_buffer(req_id, decoded_info)
+                        # A new-segment payload on the CACHED path skips the
+                        # per-segment refresh the NewRequestData path performs
+                        # (_update_streaming_input_additional_info). The chunk
+                        # adapter now reroutes segment openers through WAITING,
+                        # so this should be unreachable -- but if any
+                        # interleaving still lands one here, resetting the
+                        # consumption cursor is the difference between one
+                        # degraded reply and the model slicing past the fresh
+                        # prefill rows: empty/garbage embeddings, IndexError or
+                        # device-side asserts, engine death for every user on
+                        # the stage. Openers are recognized by the explicit
+                        # replace marker (MiniCPM-o) or by carrying fresh
+                        # prefill embeddings (Qwen3-Omni ships embed.prefill
+                        # exactly once, on a segment's first chunk).
+                        meta_in = decoded_info.get("meta")
+                        embed_in = decoded_info.get("embed")
+                        is_segment_opener = (
+                            isinstance(meta_in, dict) and meta_in.get("replace_streaming_prompt") is True
+                        ) or (isinstance(embed_in, dict) and embed_in.get("prefill") is not None)
+                        if is_segment_opener:
+                            logger.error(
+                                "[OmniGPUModelRunner] req %s: new-segment payload arrived on the "
+                                "CACHED path (adapter reroute missed); forcing "
+                                "num_processed_tokens=0 to keep the prefill-row cursor sane",
+                                req_id,
+                            )
+                            buf = self.model_intermediate_buffer.get(req_id)
+                            if isinstance(buf, dict):
+                                buf_meta = buf.setdefault("meta", {})
+                                buf_meta["num_processed_tokens"] = 0
+                                buf_meta["resumable"] = True
 
     def _maybe_attach_mimo_audio_req_infos(
         self,

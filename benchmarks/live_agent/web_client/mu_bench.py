@@ -194,6 +194,13 @@ class User:
         self.name = f"r{rep}u{uid}"
         self.opts = opts
         self.video_interval_s = (opts.video_interval_ms / 1000.0) if opts else FRAME_INTERVAL_S
+        # Dynamic video cadence: a real camera client raises frame rate while
+        # the user speaks / the reply plays (the model may want to see) and
+        # drops it while idle. When set, the pump uses this interval from
+        # speech start until response done, and video_interval_s otherwise.
+        _act = getattr(opts, "video_interval_active_ms", None) if opts else None
+        self.video_interval_active_s = (_act / 1000.0) if _act else None
+        self.turn_active = False
         self.audio_input_s = opts.audio_input_s if opts else 0.0
         self.think_s = opts.think_range if opts else THINK_S
         if opts is not None and opts.content == "synthetic":
@@ -258,7 +265,10 @@ class User:
             }))
             self.frame_pos = (self.frame_pos + 1) % len(self.frames)
             seq += 1
-            await asyncio.sleep(self.video_interval_s)
+            interval = self.video_interval_s
+            if self.video_interval_active_s is not None and self.turn_active:
+                interval = self.video_interval_active_s
+            await asyncio.sleep(interval)
 
     async def _reader(self, ws) -> None:
         async for raw in ws:
@@ -338,6 +348,7 @@ class User:
         consecutive_timeouts = 0
         for i in range(self.turns):
             q = QUESTIONS[(self.q_offset + i) % len(QUESTIONS)]
+            self.turn_active = True
             if self.audio_input_s > 0:
                 await self._stream_audio_input(ws)
             self.cur = {
@@ -352,6 +363,7 @@ class User:
             try:
                 await asyncio.wait_for(self.done_evt.wait(), timeout=TURN_TIMEOUT_S)
             except asyncio.TimeoutError:
+                self.turn_active = False
                 consecutive_timeouts += 1
                 self.records.append({
                     "user": self.name, "turn": i + 1, "q": q, "status": "timeout",
@@ -367,6 +379,7 @@ class User:
                     return
                 continue
             consecutive_timeouts = 0
+            self.turn_active = False
             cur, self.cur = self.cur, None
             ttfa = (cur["t_first_audio"] - t_q) * 1000 if cur["t_first_audio"] else None
             ttft = (cur["t_first_text"] - t_q) * 1000 if cur["t_first_text"] else None
@@ -462,6 +475,9 @@ async def main() -> int:
     ap.add_argument("--out", required=True)
     # Temporal-batching experiment knobs (DESIGN.zh.md): video rides the audio
     # grid at an integer multiple of 80 ms; audio input streams at 80 ms/chunk.
+    ap.add_argument("--video-interval-active-ms", type=int, default=None,
+                    help="when set, frame interval while a turn is active (speech start -> "
+                         "response done); --video-interval-ms then applies only to idle/think time")
     ap.add_argument("--video-interval-ms", type=int, default=int(FRAME_INTERVAL_S * 1000),
                     help="frame pump interval; use a multiple of 80 (e.g. 480)")
     ap.add_argument("--audio-input-s", type=float, default=0.0,

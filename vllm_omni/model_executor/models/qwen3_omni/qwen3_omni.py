@@ -1000,7 +1000,33 @@ class Qwen3OmniMoeForConditionalGeneration(
         update_dict.setdefault("meta", {})["prefill_consumed_text_tokens"] = 1
         self._talker_cache_thinker_decode_embeds(embed, update_dict)
 
-        return req_input_ids[start_index:end_index], req_embeds[start_index:end_index], update_dict
+        out_ids = req_input_ids[start_index:end_index]
+        out_embeds = req_embeds[start_index:end_index]
+        span = end_index - start_index
+        if out_embeds.shape[0] < span:
+            # The consumption cursor (num_processed_tokens) points past the
+            # rows this payload actually carries -- upstream segment-state
+            # desync. Returning short rows here is what killed whole engines:
+            # the worker clamps seg_len to what it got, leaving this request's
+            # slots as torch.empty garbage (device-side asserts for every
+            # batch-mate) or, alone in the batch, a 0-row forward (IndexError
+            # in execute_model). Pad to the scheduled span so shapes stay
+            # aligned; this request's audio for the segment is degraded, the
+            # engine and the other users survive.
+            missing = span - out_embeds.shape[0]
+            logger.error(
+                "[talker-text-only] prefill row shortfall: span [%d,%d) wants %d rows, "
+                "payload has %d total; padding %d zero row(s). Upstream segment-state "
+                "desync -- this segment's audio is degraded but the batch stays aligned.",
+                start_index, end_index, span, req_embeds.shape[0], missing,
+            )
+            pad_embeds = torch.zeros(
+                (missing, req_embeds.shape[-1]), dtype=req_embeds.dtype, device=req_embeds.device
+            )
+            out_embeds = torch.cat((out_embeds, pad_embeds), dim=0)
+            pad_ids = torch.zeros((missing,), dtype=req_input_ids.dtype, device=req_input_ids.device)
+            out_ids = torch.cat((out_ids.reshape(-1), pad_ids), dim=0)
+        return out_ids, out_embeds, update_dict
 
     def _talker_cache_thinker_decode_embeds(
         self,

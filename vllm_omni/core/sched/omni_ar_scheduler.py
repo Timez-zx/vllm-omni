@@ -454,6 +454,26 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 len(self.running),
             )
 
+        # Encoder-cache deadlock breaker. Upstream frees a request's passed
+        # encoder inputs only in update_from_output -- i.e. only for requests
+        # that STEPPED. Under a collective multimodal arrival wave (24 users x
+        # ~10 video frames x ~222 embeds > the 62,720-embed cache) every
+        # request ends up truncated at its next frame (num_new_tokens=0, cache
+        # full), so nobody steps, so nobody frees the frames they already
+        # computed, so the cache stays full: a self-sustaining stall that only
+        # a client-timeout abort used to break (measured: all 24 sessions
+        # frozen for ~170-180 s in the u24-mixed and u32-short cells, all
+        # arms). Sweeping the frees at schedule() time instead of step time
+        # removes the step->free dependency and with it the deadlock: a
+        # request's already-passed frames release as soon as the scheduler
+        # runs, whether or not the request itself can move. The condition
+        # inside _free_encoder_inputs (positions fully computed and past
+        # placeholders) is what makes this safe to call at any moment; cost is
+        # O(tracked x cached-ids) over small sets.
+        for _req in self.requests.values():
+            if _req.has_encoder_inputs:
+                self._free_encoder_inputs(_req)
+
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
         # async abort (e.g. client disconnect during TTS streaming) to leave
