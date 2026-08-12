@@ -1461,12 +1461,17 @@ continuous batching 能合批,但轮与轮在时间上未必重叠,平均 batch 
 burst 豁免)、失去贪心积累的客户端缓冲(需要 lead 余量)、tick 量化平均
 +tick/2 延迟。
 
+**Pacing 覆盖整条流水线**:thinker 和 talker 遵守同一个全局 tick 时钟
+(thinker 每 tick 固定 token 配额,talker 每 tick 播放所需帧),两张卡的批
+都周期化;**视频不设自己的时钟**——帧间隔取音频颗粒度的整数倍(实验:音频
+80ms/块流式进,视频 480ms/帧),帧落在音频格点上。
+
 **实验设计**(完整版:`benchmarks/temporal_batching/DESIGN.zh.md`):
 {基线贪心, tick=80ms, tick=160ms, 只限速不量化(消融)} × N∈{1,2,4,8,16}
 并发 session,engine 直连、thinker temp=0 使各条件回复长度一致;指标是
 TTFA、deadline miss rate、inter-chunk jitter p99/p50、聚合吞吐、
-"RTF<1 且 miss<1%"的最大容量;两卡隔离部署(thinker 独占 GPU0,
-talker+code2wav 在 GPU1)消除跨 stage 干扰。
+"RTF<1 且 miss<1%"的最大容量、thinker 引发的 talker 饥饿(新失败模式);
+两卡隔离部署(thinker 独占 GPU0,talker+code2wav 在 GPU1)消除跨 stage 干扰。
 
 ## 现在的状态
 
