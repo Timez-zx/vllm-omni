@@ -133,9 +133,11 @@ stages:
     # 0.10 x ~95 GiB = ~9.5 GiB on the now-roomy GPU1 (was 0.08 squeezed
     # next to the thinker). Stock 2xH100 also uses 0.1 here.
     gpu_memory_utilization: 0.10
-    enforce_eager: true              # vocoder graph wrapper crashes on
-                                     # heterogeneous video co-batches; audio-only
-                                     # runs may set false (measured clean for hours)
+    # Campaign change (ALL arms, shared config, fair): the vocoder graph
+    # wrapper's known crash is on heterogeneous VIDEO co-batches; this
+    # pipeline's output is audio-only, documented "measured clean for hours".
+    # Graphs collapse the vocoder's launch overhead -- GPU1 headroom.
+    enforce_eager: false
     trust_remote_code: true
     enable_prefix_caching: false
     enable_chunked_prefill: false

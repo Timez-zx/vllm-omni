@@ -113,7 +113,10 @@ QUESTIONS = [
 # one short sentence. Triples the sustained talker/code2wav duty per session,
 # which is the knob that separates "idle box, everything is easy" from a load
 # where mid-turn scheduling collisions can actually happen.
-if os.environ.get("MU_QUESTIONS") == "long":
+# MU_QUESTIONS=mixed: alternate short and long -- the realistic conversation
+# shape (quick factual turns interleaved with long descriptive ones).
+_SHORT_QUESTIONS = QUESTIONS
+if os.environ.get("MU_QUESTIONS") in ("long", "mixed"):
     QUESTIONS = [
         "Describe what a sunrise over the ocean looks like, in about four sentences.",
         "Explain how bread is made, in about four sentences.",
@@ -128,6 +131,8 @@ if os.environ.get("MU_QUESTIONS") == "long":
         "Describe the smell and sounds of a bakery in the morning, in about four sentences.",
         "Explain what makes autumn leaves change color, in about four sentences.",
     ]
+if os.environ.get("MU_QUESTIONS") == "mixed":
+    QUESTIONS = [q for pair in zip(_SHORT_QUESTIONS, QUESTIONS) for q in pair]
 
 # The engine-side probes worth counting over each cell's log slice. All of
 # them are presence checks -- a healthy run has nonzero segment stops and
