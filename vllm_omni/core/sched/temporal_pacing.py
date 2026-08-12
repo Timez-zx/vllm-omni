@@ -36,6 +36,24 @@ Everything is read from env ONCE per engine-core process:
   VLLM_OMNI_TEMPORAL_NO_QUANT         1 = rate-limit only, no grid alignment
                                       (the ablation separating "slower" from
                                       "together").
+  VLLM_OMNI_TEMPORAL_BARRIER          1 = stage-wide TICK BARRIER instead of
+                                      per-request release times: at each tick
+                                      boundary every active request gets its
+                                      per-tick budget (rate*tick units); a
+                                      request that used its budget is held to
+                                      the NEXT boundary -- including requests
+                                      that are BEHIND schedule (they get a
+                                      catch-up multiplier, not a free run).
+                                      This is what actually consolidates
+                                      batches: the v1 per-request gate let any
+                                      delayed request fall off the grid and
+                                      free-run (release<=now passed it through
+                                      every pass), measured as batch p50=2
+                                      under pacing vs 7 under greedy at 16
+                                      users. Burst exemption still bypasses
+                                      the barrier so TTFA is untouched.
+  VLLM_OMNI_TEMPORAL_CATCHUP          barrier mode: budget multiplier for
+                                      requests behind schedule (default 2).
   VLLM_OMNI_LOG_SCHED_STEPS           log one [SCHED-STEP] line per non-idle
                                       scheduler pass ('' = off; '1'/'all' or a
                                       comma list of stage ids).
@@ -107,6 +125,15 @@ class TemporalPacer:
             self.burst = 0
             self.codec_only = False
 
+        self.barrier = os.environ.get("VLLM_OMNI_TEMPORAL_BARRIER", "0") not in ("0", "", "false", "False")
+        self.catchup = max(1.0, _env_float("VLLM_OMNI_TEMPORAL_CATCHUP", 2.0))
+        # Per-tick budget in output units (thinker: tokens, talker: frames).
+        self.tick_budget = max(1, round(self.rate * self.tick_s)) if self.rate > 0 else 0
+        # Barrier state: the boundary that opened the CURRENT tick window, and
+        # each request's unit count snapshotted at that boundary.
+        self._tick_open: float = 0.0
+        self._units_at_tick: dict[str, int] = {}
+
         self.enabled = self.tick_s > 0 and self.rate > 0
         self.log_steps = _parse_log_steps(self.stage_id)
         # rid -> [output_len_seen, units_this_turn, anchor_t, holds]
@@ -115,9 +142,10 @@ class TemporalPacer:
         if self.enabled:
             logger.info(
                 "[TemporalPacer] stage=%s(%s) ON: tick=%.0fms rate=%.1f/s lead=%.0fms "
-                "burst=%d quantize=%s",
+                "burst=%d quantize=%s barrier=%s budget/tick=%d catchup=%.1fx",
                 self.stage_id, stage or "?", self.tick_s * 1000, self.rate,
                 self.lead_s * 1000, self.burst, not self.no_quant,
+                self.barrier, self.tick_budget, self.catchup,
             )
 
     # ------------------------------------------------------------------ #
@@ -125,6 +153,8 @@ class TemporalPacer:
     def split_running(self, running: list, now: float) -> tuple[list, list, float | None]:
         """Partition ``running`` into (schedulable, held); also return the
         earliest release time among held requests (for the idle micro-sleep)."""
+        if self.barrier:
+            return self._split_barrier(running, now)
         kept: list = []
         held: list = []
         next_release: float | None = None
@@ -138,9 +168,53 @@ class TemporalPacer:
                 kept.append(req)
         return kept, held, next_release
 
-    def _release_time(self, req: Any, now: float) -> float | None:
-        """None = schedule freely this pass; else the (grid-aligned) time at
-        which this request's next unit is due."""
+    def _split_barrier(self, running: list, now: float) -> tuple[list, list, float | None]:
+        """Stage-wide tick barrier.
+
+        A tick WINDOW opens at each grid boundary. Every request present at
+        the opening gets its per-tick budget (catch-up multiplier when behind
+        playback schedule); budget spent -> held to the next boundary. A
+        request that joins mid-window (its thinker chunk just arrived, or it
+        was chunk-parked at the opening) is held to the next boundary too --
+        that is exactly the re-alignment the v1 per-request gate lacked.
+        Requests still inside their per-turn burst bypass everything, so TTFA
+        never pays for the barrier.
+        """
+        boundary = math.floor(now / self.tick_s) * self.tick_s
+        fresh = boundary > self._tick_open
+        if fresh:
+            self._tick_open = boundary
+            self._units_at_tick = {}
+        next_boundary = self._tick_open + self.tick_s
+        kept: list = []
+        held: list = []
+        for req in running:
+            units, anchor = self._observe(req, now)
+            rid = req.request_id
+            if anchor is None or units <= self.burst:
+                kept.append(req)
+                continue
+            if fresh:
+                self._units_at_tick[rid] = units
+            base = self._units_at_tick.get(rid)
+            if base is None:
+                # Joined mid-window: wait for the boundary, where everyone
+                # steps together.
+                held.append(req)
+                continue
+            ahead = (units - self.burst) / self.rate - (now - anchor)
+            if ahead > self.lead_s:
+                held.append(req)
+                continue
+            budget = self.tick_budget * (self.catchup if ahead < -self.tick_s else 1.0)
+            if units - base >= budget:
+                held.append(req)
+            else:
+                kept.append(req)
+        return kept, held, (next_boundary if held else None)
+
+    def _observe(self, req: Any, now: float) -> tuple[int, float | None]:
+        """Update per-turn unit counters for one request; return (units, anchor)."""
         toks = req.output_token_ids
         n = len(toks)
         st = self._st.get(req.request_id)
@@ -168,8 +242,21 @@ class TemporalPacer:
                 # after the first decode step. Prefill runs BEFORE any output
                 # exists, so prefill is naturally exempt from pacing.
                 st[2] = now
-        anchor = st[2]
-        units = st[1]
+        return st[1], st[2]
+
+    def _release_time(self, req: Any, now: float) -> float | None:
+        """None = schedule freely this pass; else the (grid-aligned) time at
+        which this request's next unit is due.
+
+        KNOWN LIMITATION (measured, kept for the ablation record): a request
+        whose release time is already in the past is passed through every
+        pass, so anything ever delayed (a big co-scheduled prefill, a chunk
+        wait) falls off the grid and free-runs -- batch consolidation never
+        happens. Use VLLM_OMNI_TEMPORAL_BARRIER=1 for the version that holds
+        the grid.
+        """
+        units, anchor = self._observe(req, now)
+        st = self._st[req.request_id]
         if anchor is None or units <= self.burst:
             return None
         # On schedule when (units - burst) / rate <= elapsed + lead.
@@ -188,3 +275,4 @@ class TemporalPacer:
 
     def on_request_freed(self, request_id: str) -> None:
         self._st.pop(request_id, None)
+        self._units_at_tick.pop(request_id, None)
