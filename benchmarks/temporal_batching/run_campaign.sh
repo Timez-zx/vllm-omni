@@ -54,6 +54,16 @@ run_cell() {  # workload users turns
   nvidia-smi --query-gpu=timestamp,index,utilization.gpu,power.draw,memory.used \
     --format=csv,noheader -l 1 > "$OUT/gpu.csv" 2>/dev/null &
   local SMI_PID=$!
+  # Engine-process CPU trace: the M-vs-T question ("does engine-level
+  # periodicity matter once the MODEL is already paced?") is answered here,
+  # not in client metrics -- M's loop hot-spins between ticks, T sleeps.
+  local ENG_PIDS
+  ENG_PIDS=$(pgrep -d, -f "StageEngineCore|APIServer" 2>/dev/null || true)
+  local PIDSTAT_PID=""
+  if [ -n "$ENG_PIDS" ]; then
+    pidstat -h -u -p "$ENG_PIDS" 2 > "$OUT/cpu.txt" 2>/dev/null &
+    PIDSTAT_PID=$!
+  fi
   local QENV=()
   [ "$WL" != short ] && QENV=(MU_QUESTIONS=$WL)
   echo "--- cell: $ARM/$WL/u$U (turns=$TURNS)"
@@ -63,6 +73,7 @@ run_cell() {  # workload users turns
      --audio-input-s 3 --video-interval-ms 480 --think 2,6 --seed 7 \
      --out "$OUT") || echo "!! cell $WL u$U failed (continuing)"
   kill "$SMI_PID" 2>/dev/null
+  [ -n "$PIDSTAT_PID" ] && kill "$PIDSTAT_PID" 2>/dev/null
   tail -c +$((LOG_OFF + 1)) "$ENGINE_LOG" > "$OUT/engine_slice.log" 2>/dev/null || true
 }
 
