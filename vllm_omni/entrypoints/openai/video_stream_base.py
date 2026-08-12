@@ -839,6 +839,23 @@ class OmniStreamingVideoHandler:
                         "session without preempting existing ones")
                     return
 
+            # [Tick engine WP6] bin-packing admission: with paced generation
+            # every session costs a KNOWN per-tick quantum, so capacity is a
+            # number, not a hope. VLLM_OMNI_ADMIT_MAX_SESSIONS is that number
+            # (measured: the largest N whose per-tick work fits the tick at
+            # the target utilization). Overload is REFUSED, never queued --
+            # queueing a periodic stream is already an SLA violation.
+            _cap = int(os.environ.get("VLLM_OMNI_ADMIT_MAX_SESSIONS", "0") or 0)
+            if _cap > 0 and self._active_sessions > _cap:
+                logger.warning(
+                    "[session] REFUSED at admission: tick-capacity cap %d reached "
+                    "(active=%d)", _cap, self._active_sessions)
+                await self._send_error(
+                    websocket,
+                    f"at capacity: this instance is provisioned for {_cap} "
+                    "concurrent realtime sessions")
+                return
+
             # Resolve the compression trigger once per session. None anchors to the
             # MODEL: 75% of stage-0 max_model_len -- the single-user default only guards
             # the lifetime wall. The blocking-roll backstop must sit BELOW that wall:
