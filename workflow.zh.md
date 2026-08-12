@@ -1514,6 +1514,19 @@ stage 按 80ms 心跳)、每步交付帧效率追平贪心。严格实时配额�
 40ms/thinker 20ms),code2wav 新 chunk 压到下一格点(段首 chunk 豁免保
 TTFA)。碎步 -35%,帧效率 3.9→6.6(贪心 6.9),客户端全指标保持。
 
+**压测终局**(`benchmarks/temporal_batching/STRESS.zh.md`):同配置同负载
+(音频 80ms 流式 + 视频 480ms 常开 + 长回答 + 真实思考时间),QoS =
+miss<1% & TTFA p99<2s & RTF≥0.98。**容量:原版 16 用户,周期版 24 用户
+(+50%)**;原版在 24 档 TTFA p99 = 20.8s(20 个大延迟轮全落在同一 9 秒
+窗口——跨轮堆积被贪心串成车队;周期版同负载同到达离散度下 0 个 >2s 轮,
+p99 0.79s)。T 在自己容量点的延迟仍优于 A 在其容量点(371/966 vs
+439/900ms,抖动 1.15 vs 2.36)。32+ 用户测量被两臂共有的既有 bug 封顶
+(talker device-side assert 越界 id;高并发段边界信号丢失;已修其一:
+mrope 越界防御补丁)。工程实现:WP1 引擎 tick 心跳(事件间睡眠、输入随
+到随醒、收 chunk stage 2ms 上限)、WP4-lite 内联发送、mns56 压测配置。
+输出质量四个干净档全绿(0 空文本 0 零音频、字/秒比零离群、temp=0 确定
+性成立;跨臂文本差异为摄像头效应非质量问题)。
+
 **节拍引擎设计**(`benchmarks/temporal_batching/TICK_ENGINE.zh.md`):源码
 证实 vLLM v1 对周期性零感知(主循环无时钟、调度唯吞吐、Request 仅
 arrival_time)。设计:全局时钟+stage 锁相脉动流水、cohort 计划(调度每
