@@ -88,9 +88,27 @@ batch 8 的 step 都足够快,合不合批无感。**量化不是免费的**:B u
 session 在轮中,齐步合批没有原料。"tick 化"在低占空比下改变的是**节奏**,
 不是**批**。
 
-**长回答 u16**(每轮 ~26s 音频,任意时刻 ~12 个 session 同时在轮中):
+**长回答 u16**(每轮 ~26s 音频,任意时刻 ~12 个 session 同时在轮中)——
+合批的直接检验,结果**推翻了"齐步合批"子机制**:
 
-(待补:tb_sched_A_long / tb_sched_B_long 的 batch 直方图——合批的直接检验。)
+| talker/stage 1 | A 贪心 | B tick=80 |
+|---|---|---|
+| 步数 / 跨度 | 4473 步 / 109s(40.9 步/s) | **13120 步** / 216s(60.7 步/s) |
+| batch nreq mean / p50 / max | **7.09 / 7 / 14** | **2.34 / 2 / 12** |
+| 每步被停车数 mean | 0 | 8.93 |
+| 步进间隔 p50/p99 | 21.7 / 59.4 ms | 14.4 / 57.7 ms |
+
+- 高占空比下,**原生 continuous batching 自己就把批合大了**(贪心 batch
+  p50=7):12 个 session 同时在轮中,它们的解码步自然共批。
+- pacing 侧**合批没有发生**(batch p50=2,步数反而是贪心的 3 倍)。释放
+  时刻确实对齐到了全局格(数学上验证过:各 session 的 release 都 ceil 到
+  同一组 tick 边界),但 talker 的**可调度性**还受 thinker→talker chunk
+  到达的门控——chunk 走 save 线程→共享内存→recv 线程轮询,到达相位在
+  tick 内散布,一个在 tick 边界还在等 chunk 的请求会在 chunk 到达的瞬间
+  (格外的任意时刻)被释放并单独解码。释放格的对齐在下游被解耦了。
+- 推论:**B 的所有客户端收益(零卡顿、节拍器、TTFA 反超)都来自限速本身,
+  量化目前是惰性的**——这正是 D≈B 的机制解释。且按现状实现,pacing 每帧
+  的调度/步进开销更高(更多更小的步),对 H2 的效率论证是**反向证据**。
 
 ## 四、长回答加压(u16,~26s 音频/轮)——负载翻转结论的区域
 
@@ -116,4 +134,59 @@ session 每 tick 只拿一点"反而让新轮的首帧更快挤进来。
 
 ## 五、边界与结论
 
-(待补:合批直方图 + 最终结论。)
+### 逐假设终裁
+
+| 假设 | 裁决 | 依据 |
+|---|---|---|
+| **H1 抖动可预测性** | **成立,所有负载,随 N 增强** | gap p99/p50:贪心 1.46→2.51(随 N),pacing 恒 1.07–1.22;长回答下贪心 10.4% 轮卡顿 vs pacing 0% |
+| **H2 吞吐/容量(齐步合批摊薄成本)** | **不成立(按当前实现)** | 合批未发生(batch p50=2 vs 贪心 7),chunk 到达相位散布解耦了释放格;paced 步数反而 ×3;闭环吞吐差异是负载模型产物,非容量 |
+| **H3 新轮首帧有界/公平** | **依占空比翻转**:低占空比反向(p99 +240ms),高占空比成立(p50 反超 70ms,卡顿 0%) | 贪心的排队之痛只在爆发开始互相碰撞后出现 |
+| **D 消融** | 量化惰性,限速是全部有效成分 | D≈B 所有指标;机制见第三节 |
+
+### 实验边界(诚实声明)
+
+1. **闭环负载**:pacing 拉长交付→轮速下降,吞吐列不可比。容量裁决需要
+   开环/固定到达率负载,且本盒(mns=20、275k thinker KV)推不到贪心的
+   饱和悬崖。
+2. **合成音频输入**(AM 调制音,非真实语音)+ 合成视频帧;语义由文本
+   query 驱动,输入管线的计算负载真实。
+3. 单次运行/cell(每 cell 8-16 session × 8-10 轮已给出稳定的分布指标,
+   但未做多 seed 重复);async_scheduling 全关(基线同关,内部效度优先,
+   绝对值比生产配置略保守)。
+4. tick 只测了 80/160ms;thinker TPS 只测了 25。
+
+### 结论
+
+**"按音频周期限速"被证明有效;"按 tick 齐步合批"在当前架构下未兑现。**
+
+对于 video+audio 输入、audio 输出的多用户 streaming 负载:
+
+1. **值得要**:temporal pacing(限速到播放速率 + initial burst 豁免 +
+   lead 缓冲)在高占空比多用户场景同时赢下延迟可预测性(节拍器级 cadence、
+   零卡顿)和 TTFA(排队消失)。代价只在低占空比场景付(TTFA 尾部
+   +100-240ms)——而低占空比场景本来就没有问题需要解决。**按需开关**:
+   并发 session 数 × 平均音频占空比超过某阈值时打开 pacing 是合理的
+   生产策略。
+2. **要兑现合批/效率收益,对齐必须打穿整条 chunk 流水线**:光对齐调度器
+   的释放时刻不够,thinker→talker 的 chunk 递送(save 线程、shm 轮询)
+   也要挂到同一时钟,否则下游可调度性把相位打散。这是明确的后续工程方向,
+   也是这次实验最重要的机制发现。
+3. 12.5Hz(80ms)这个颗粒度本身被验证是正确的节奏单位:1 talker token =
+   1 codec 帧 = 80ms 在代码层面是精确的 1:1:1,tick=80 与 tick=160 的
+   客户端指标无差异(160 的实现即每 tick 放 2 帧)。
+
+### 复现
+
+```
+# 引擎(每 arm 一次引导)
+bash benchmarks/temporal_batching/run_engine.sh          # A
+VLLM_OMNI_TEMPORAL_TICK_MS=80 bash .../run_engine.sh    # B
+# 负载 + 分析
+bash benchmarks/temporal_batching/run_sweep.sh A|B|C|D
+python benchmarks/temporal_batching/analyze.py /home/ubuntu/data/results/tb_*_u*
+# 机制证据
+INSTRUMENTED=1 bash .../run_sweep.sh B 8
+python benchmarks/temporal_batching/sched_steps.py <engine log> --stage 1
+```
+
+原始数据:`/home/ubuntu/data/results/tb_*`(turns.jsonl 含逐 delta 时间线)。

@@ -1488,6 +1488,20 @@ TTFA、deadline miss rate、inter-chunk jitter p99/p50、聚合吞吐、
 "RTF<1 且 miss<1%"的最大容量、thinker 引发的 talker 饥饿(新失败模式);
 两卡隔离部署(thinker 独占 GPU0,talker+code2wav 在 GPU1)消除跨 stage 干扰。
 
+**结果**(全量:`benchmarks/temporal_batching/RESULTS.zh.md`;620+ 轮全成
+功):**限速被证明有效,齐步合批未兑现**。(1) H1 抖动可预测性成立且随 N
+增强——贪心 gap p99/p50 1.46→2.51,pacing 恒 1.07–1.22,80ms tick 直接印
+在 talker 步进间隔上(p99 81.6ms vs 贪心 895ms 突发+空转)。(2) H3 依占空
+比翻转:短回答(机器空闲)pacing 的 TTFA 尾部反差 ~240ms;长回答(~26s/轮,
+u16)贪心出现排队(TTFA p50 259→531ms)和 **10.4% 轮内卡顿**,pacing 零卡
+顿、16 路全贴实时(RTF 1.02)、TTFA p50 反超 70ms。(3) H2 合批机制被插桩
+数据推翻:高占空比下原生 continuous batching 自己合出 batch p50=7,而
+pacing 侧只有 p50=2、步数 ×3——释放时刻对齐了全局格,但 thinker→talker 的
+chunk 递送相位(save 线程→shm→轮询)把可调度性在 tick 内打散,对齐在下游
+被解耦;这正是 D≈B(量化惰性,限速是全部有效成分)的机制解释。要兑现合批
+收益,对齐必须打穿整条 chunk 流水线——最重要的后续方向。生产建议:按
+"并发数 × 音频占空比"阈值开关 pacing。
+
 ## 现在的状态
 
 **能用的**
