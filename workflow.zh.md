@@ -1446,6 +1446,28 @@ token 计的,这同时是延迟和容量的旋钮,不只是精度旋钮:640 → 
 每帧上下文增速 2.2 倍,而每帧上下文增速在 13 人时值多少钱,容量梯子
 已经标好价了。
 
+## 二十八、Temporal batching——按音频的 80ms 周期齐步走(实验分支)
+
+**动机。** talker 对每轮回复是贪心解码:音频帧以远快于播放的速度爆发生成
+(单轮 RTF≈0.1–0.3),然后闲置到下一轮。播放端只消费 12.5 帧/秒(1 codec
+帧 = 1920 样本 @24kHz = 80ms)。多用户下各 session 的"爆发"随机碰撞——
+continuous batching 能合批,但轮与轮在时间上未必重叠,平均 batch 小、
+碰撞时后到的轮排队,chunk 到达抖动不可预测。
+
+**假设。** 把所有 session 的生成节奏对齐到全局 80/160ms tick 格,每 tick
+每 session 只生成播放进度所需的帧:批的组成变成周期性的(H1 抖动可预测)、
+稳态 batch≈N 且 decode 访存受限所以每帧成本摊薄(H2 吞吐不降反升)、新轮
+首帧延迟有界(H3 公平性)。预期代价也写清楚了:TTFA 可能变差(需要 initial
+burst 豁免)、失去贪心积累的客户端缓冲(需要 lead 余量)、tick 量化平均
++tick/2 延迟。
+
+**实验设计**(完整版:`benchmarks/temporal_batching/DESIGN.zh.md`):
+{基线贪心, tick=80ms, tick=160ms, 只限速不量化(消融)} × N∈{1,2,4,8,16}
+并发 session,engine 直连、thinker temp=0 使各条件回复长度一致;指标是
+TTFA、deadline miss rate、inter-chunk jitter p99/p50、聚合吞吐、
+"RTF<1 且 miss<1%"的最大容量;两卡隔离部署(thinker 独占 GPU0,
+talker+code2wav 在 GPU1)消除跨 stage 干扰。
+
 ## 现在的状态
 
 **能用的**
