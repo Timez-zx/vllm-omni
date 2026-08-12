@@ -1508,8 +1508,19 @@ chunk 递送相位(save 线程→shm→轮询)把可调度性在 tick 内打散,
 stage 按 80ms 心跳)、每步交付帧效率追平贪心。严格实时配额有个新坑——客户
 端零缓冲,miss 5.26%;把追赶目标改成"维持 lead 缓冲"(ahead<0.75*lead 给
 2× 配额)后,**u16 长回答下每一项客户端指标同时优于或持平贪心**:TTFA p50
-531→390、抖动 2.45→1.17、卡顿轮 10.4%→~1%、miss 0.08%。剩余优化:追赶帧
-的 intra-tick 二次屏障(消 nreq=1 小步)、输入侧音频每 tick 增量 prefill。
+531→390、抖动 2.45→1.17、卡顿轮 10.4%→~1%、miss 0.08%。
+
+**v3(每个消费点各自 80ms 时刻表)**:追赶单位按拍内子格集合(talker
+40ms/thinker 20ms),code2wav 新 chunk 压到下一格点(段首 chunk 豁免保
+TTFA)。碎步 -35%,帧效率 3.9→6.6(贪心 6.9),客户端全指标保持。
+
+**节拍引擎设计**(`benchmarks/temporal_batching/TICK_ENGINE.zh.md`):源码
+证实 vLLM v1 对周期性零感知(主循环无时钟、调度唯吞吐、Request 仅
+arrival_time)。设计:全局时钟+stage 锁相脉动流水、cohort 计划(调度每
+事件而非每步)、静态批 CUDA graph 逐拍重放、双缓冲信箱去队列去轮询、
+prefill 进松弛槽——换 batch=N by construction、硬容量语义、尾延迟结构性
+消失。落地:v4a cohort 重放 → v4b 双缓冲 → v4c 输入节拍化 → v5 独立
+tick 循环。剩余工程:输入侧音频每 tick 增量 prefill(编码器流式化)。
 
 ## 现在的状态
 
