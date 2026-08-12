@@ -206,7 +206,14 @@ class TemporalPacer:
             if ahead > self.lead_s:
                 held.append(req)
                 continue
-            budget = self.tick_budget * (self.catchup if ahead < -self.tick_s else 1.0)
+            # Catch up TOWARD THE LEAD BUFFER, not merely back to zero
+            # deficit. Budget = exactly realtime leaves the client no slack:
+            # measured 5.26% deadline misses at 16 users because one hiccup
+            # was one audible stall and 2x-only-when-behind recovered too
+            # slowly. Running at catchup-x while below the lead target builds
+            # and holds ~lead_s of client buffer; the ahead-cap above stops
+            # it from growing past that.
+            budget = self.tick_budget * (self.catchup if ahead < self.lead_s * 0.75 else 1.0)
             if units - base >= budget:
                 held.append(req)
             else:
