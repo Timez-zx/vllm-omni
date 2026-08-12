@@ -69,6 +69,18 @@ def _create_mooncake_store_connector(config: dict[str, Any]) -> OmniConnectorBas
 
 
 def _create_shm_connector(config: dict[str, Any]) -> OmniConnectorBase:
+    # [Tick engine WP4] VLLM_OMNI_TEMPORAL_MAILBOX=1 substitutes the
+    # persistent two-slot mailbox wherever the deploy yaml says
+    # SharedMemoryConnector -- experiment arms keep ONE shared yaml and
+    # differ only by env. The mailbox inherits the legacy path as its
+    # universal fallback, so behavior is a superset.
+    if os.environ.get("VLLM_OMNI_TEMPORAL_MAILBOX", "0") not in ("0", "", "false", "False"):
+        try:
+            from .connectors.tick_mailbox_connector import TickMailboxConnector
+
+            return TickMailboxConnector(config)
+        except Exception as e:
+            logger.warning(f"TickMailboxConnector unavailable ({e}); using SharedMemoryConnector")
     try:
         from .connectors.shm_connector import SharedMemoryConnector
     except ImportError:
