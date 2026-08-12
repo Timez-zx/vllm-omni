@@ -71,6 +71,7 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     uses_full_payload_input_coordinator,
 )
 from vllm_omni.core.sched.temporal_pacing import TICK_ENGINE_LOOP as _TICK_ENGINE_LOOP
+from vllm_omni.core.sched.temporal_pacing import TICK_REPLAY as _TICK_REPLAY
 from vllm_omni.core.sched.temporal_pacing import TemporalPacer
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
@@ -509,7 +510,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.waiting = create_request_queue(self.policy)
 
         try:
-            scheduler_output = super().schedule(throttle_prefills)
+            # [WP2 cohort replay] a pure-decode step for an unchanged cohort
+            # needs none of the full pass's queue scans / budget arithmetic /
+            # encoder logic -- emit it directly. Returns None (-> full path)
+            # whenever ANY validity gate fails.
+            scheduler_output = self._try_replay_schedule()
+            if scheduler_output is None:
+                scheduler_output = super().schedule(throttle_prefills)
         except AssertionError:
             # Upstream asserts kill the engine-core process. Dump the state before it dies,
             # or the only evidence is a traceback with no request in it.
@@ -619,6 +626,110 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             scheduler_output,
             finished_requests_needing_kv_transfer=finished_reqs,
         )
+
+    def _try_replay_schedule(self) -> SchedulerOutput | None:
+        """[Tick engine WP2] cohort-replay fast path.
+
+        For a step where every schedulable request is a decode-ready member
+        of an unchanged cohort (1 new token each), the full upstream pass
+        computes nothing this method does not: the per-step diff is exactly
+        {num_computed_tokens, num_output_tokens, new_block_ids-on-crossing}
+        (verified against vllm 0.26 scheduler.py line by line -- see
+        TICK_ENGINE_PLAN.zh.md). Everything stateful is REUSED from upstream
+        (allocate_slots per request -- proven side-effect-equivalent for
+        running decode, incl. the prefix-cache fill commit; \
+        _make_cached_request_data -- which also handles the MRV1
+        all_token_ids re-send for requests the pacer held out of the
+        previous step; _update_after_schedule -- computed/in-flight advance
+        and finished/preempted set rebind).
+
+        Returns None -> caller runs the full path. Never partially commits:
+        the only mutations before the last possible bail are current_step,
+        new_step_starts() and allocate_slots(), each of which the full path
+        tolerates (counter drift is benign, new_step_starts is idempotent
+        for these managers, and re-running allocate_slots after a partial
+        allocation needs 0 new blocks).
+        """
+        if not (_TICK_REPLAY and self.temporal_pacer.enabled and self.temporal_pacer.barrier):
+            return None
+        if (self._pause_state != PauseState.UNPAUSED or self.waiting
+                or not self.running):
+            return None
+        # Config gates: features whose per-step logic the replay does not
+        # reproduce. All are False/None in the target deploy; any of them
+        # being active simply disables the fast path.
+        if (self.kv_transfer_criteria is not None
+                or self.input_coordinator is not None
+                or self.connector is not None
+                or getattr(self, "ec_connector", None) is not None
+                or self.num_spec_tokens
+                or getattr(self, "dynamic_sd_lookup", None) is not None):
+            return None
+        for r in self.running:
+            # decode-ready: exactly one uncomputed token (the one sampled by
+            # the previous step), no async placeholders, none of the
+            # per-request features the full pass special-cases.
+            if (r.num_tokens - r.num_computed_tokens != 1
+                    or r.num_output_placeholders
+                    or r.use_structured_output
+                    or r.lora_request is not None
+                    or r.pooling_params is not None
+                    or self.current_step + 1 < getattr(r, "next_decode_eligible_step", 0)):
+                return None
+
+        # ---- commit ----
+        self.current_step += 1
+        scheduled_timestamp = _monotonic()
+        self.kv_cache_manager.new_step_starts()
+
+        kept = list(self.running)
+        num_scheduled_tokens: dict[str, int] = {}
+        req_to_new_blocks = {}
+        for r in kept:
+            new_blocks = self.kv_cache_manager.allocate_slots(
+                r, 1, num_lookahead_tokens=self.num_lookahead_tokens)
+            if new_blocks is None:
+                # Block-pool pressure: the full path owns preemption.
+                return None
+            req_to_new_blocks[r.request_id] = new_blocks
+            num_scheduled_tokens[r.request_id] = 1
+            if self.log_stats:
+                r.record_event(EngineCoreEventType.SCHEDULED, scheduled_timestamp)
+
+        cached_reqs_data = self._make_cached_request_data(
+            kept, [], num_scheduled_tokens, {}, req_to_new_blocks)
+        if not self.use_v2_model_runner:
+            self.prev_step_scheduled_req_ids.clear()
+            self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
+
+        kv_cache_block_copies, cow_retained_blocks = (
+            self.kv_cache_manager.take_kv_cache_block_copies())
+        if kv_cache_block_copies:
+            self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
+
+        num_common_prefix_blocks = self.kv_cache_manager.get_num_common_prefix_blocks(
+            kept[0].request_id)
+
+        scheduler_output = SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=cached_reqs_data,
+            num_scheduled_tokens=num_scheduled_tokens,
+            total_num_scheduled_tokens=len(kept),
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            scheduled_encoder_input_stats=None,
+            num_common_prefix_blocks=num_common_prefix_blocks,
+            preempted_req_ids=self.reset_preempted_req_ids,
+            finished_req_ids=self.finished_req_ids,
+            free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
+            kv_cache_block_copies=kv_cache_block_copies or None,
+            num_spec_tokens_to_schedule=self.num_spec_tokens,
+        )
+        if self.defer_block_free:
+            self.sched_step_seq += 1
+        self._update_after_schedule(scheduler_output)
+        return scheduler_output
 
     def _check_for_wedged_requests(self, scheduler_output: SchedulerOutput) -> None:
         """Dump state once if a stage stops making PROGRESS while requests are tracked.

@@ -75,7 +75,7 @@ ln -sfn "$CUDATK/bin" "$SHIM/bin"
 
 TICK="${VLLM_OMNI_TEMPORAL_TICK_MS:-0}"
 echo "engine starting: thinker->GPU0, talker+code2wav->GPU1  (deploy: $(basename "$DEPLOY"))"
-echo "  pacing: tick=${TICK}ms barrier=${VLLM_OMNI_TEMPORAL_BARRIER:-0} engine_loop=${VLLM_OMNI_TEMPORAL_ENGINE:-0} inline_send=${VLLM_OMNI_TEMPORAL_INLINE_SEND:-0} lead=${VLLM_OMNI_TEMPORAL_LEAD_MS:-240} thinker_tps=${VLLM_OMNI_TEMPORAL_THINKER_TPS:-25}"
+echo "  pacing: tick=${TICK}ms barrier=${VLLM_OMNI_TEMPORAL_BARRIER:-0} engine_loop=${VLLM_OMNI_TEMPORAL_ENGINE:-0} inline_send=${VLLM_OMNI_TEMPORAL_INLINE_SEND:-0} replay=${VLLM_OMNI_TEMPORAL_REPLAY:-0} mailbox=${VLLM_OMNI_TEMPORAL_MAILBOX:-0} lead=${VLLM_OMNI_TEMPORAL_LEAD_MS:-240} thinker_tps=${VLLM_OMNI_TEMPORAL_THINKER_TPS:-25}"
 echo "  log: $ENGINE_LOG"
 
 HF_HOME=/home/ubuntu/data/hf-omni \

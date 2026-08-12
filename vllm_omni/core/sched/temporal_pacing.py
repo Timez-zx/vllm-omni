@@ -88,6 +88,11 @@ TICK_ENGINE_LOOP = (
 )
 TICK_S = float(os.environ.get("VLLM_OMNI_TEMPORAL_TICK_MS", "0") or 0) / 1000.0
 
+# [WP2] VLLM_OMNI_TEMPORAL_REPLAY=1: pure-decode steps of an unchanged cohort
+# are emitted by the scheduler's cohort-replay fast path instead of the full
+# upstream scheduling pass. See OmniARScheduler._try_replay_schedule.
+TICK_REPLAY = os.environ.get("VLLM_OMNI_TEMPORAL_REPLAY", "0") not in ("0", "", "false", "False")
+
 
 def _env_float(name: str, default: float) -> float:
     try:
