@@ -77,9 +77,13 @@ connectors:
 
 stages:
   - stage_id: 0                      # thinker: vision + audio encoders + LLM
-    max_num_batched_tokens: 8192     # streaming chunks are small; raise toward
-                                     # 32768 (stock) only if prefill throughput
-                                     # binds at 16 users -- it costs KV pool.
+    max_num_batched_tokens: 16384    # RAISED from 8192 (2026-08-13): the
+                                     # roll-waive fix left an 8-turn prefill-
+                                     # queueing tail (1.8-7.7 s TTFT, all in the
+                                     # compression window) -- swap-turn + seed
+                                     # prefills bind on this budget. Original
+                                     # note: raise toward 32768 (stock) only if
+                                     # prefill throughput binds -- it now does.
     max_num_seqs: 56
     # Whole 96 GB card to itself now: 0.90 as in the stock 2xH100 config.
     # Weights are 59.4 GiB bf16; 0.74 gave a 106,880-token pool (96 KB/token

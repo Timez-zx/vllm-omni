@@ -899,6 +899,19 @@ class OmniStreamingVideoHandler:
                 compression_trigger = int(0.75 * _mml) if _mml else 0
             else:
                 compression_trigger = max(0, config.context_compression_trigger_tokens)
+            if compression_trigger:
+                # De-synchronize the cohort. Sessions that start together and grow
+                # at the same rate cross the SAME trigger in the SAME turn, and the
+                # simultaneous swap-turn + seed prefills queue on stage-0's
+                # per-step token budget -- measured as the entire residual TTFA
+                # tail after the roll-waive fix (8/128 turns at 1.8-7.7 s, all in
+                # the compression window, all thinker-first-token). A per-session
+                # factor in [0.80, 1.00) spreads the crossings over ~2 turns of
+                # growth. DOWNWARD only, so the wave-peak budget that makes
+                # waiving pool-safe (hard 1.5t + seed 0.5t = 2t <= pool/N when
+                # trigger = share/2) still holds for every session.
+                _jit = 0.80 + 0.20 * (int(uuid.uuid4().hex[:8], 16) / 0xFFFFFFFF)
+                compression_trigger = max(256, int(compression_trigger * _jit))
             compression_hard = 0
             if compression_trigger:
                 compression_hard = int(1.5 * compression_trigger)
