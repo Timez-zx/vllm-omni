@@ -119,6 +119,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # path). Logged by the scheduler's step probe.
         self._inline_recv_hits = 0
         self._inline_recv_misses = 0
+        self._inline_recv_skips = 0
+        # Requests whose fetch is currently owned by the recv thread; the
+        # scheduler's inline poll must not touch these. See load_async.
+        self._async_load_registered: set[str] = set()
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
@@ -223,6 +227,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if not hasattr(request, "additional_information"):
             request.additional_information = None
         self._cancelled_load_reqs.discard(request.request_id)
+        # [P8] Registered with the recv thread until a fetch SUCCEEDS. recv_loop
+        # re-appends a request whose poll returned False and retries it forever,
+        # while restore_queues hands the same request back to the running queue
+        # every pass -- so without this registry the scheduler's inline poll and
+        # the recv thread poll the SAME request concurrently. Both can succeed
+        # on the same key, each bumping get_req_chunk, which skips the next
+        # chunk id outright. Measured consequence (u56, first inline-recv run):
+        # skipped segment-opener payloads -> talker prefill with no assistant
+        # span -> engine core dead, 43 turns timed out.
+        self._async_load_registered.add(request.request_id)
         self._pending_load_reqs.append(request)
         with self._recv_cond:
             self._recv_cond.notify()
@@ -472,7 +486,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     # first DAC frame arrives.
                     return False
 
-            # Mark as finished for consumption
+            # Mark as finished for consumption. The fetch is done, so whichever
+            # thread ran it releases ownership here: recv_loop only re-appends
+            # on FAILURE, so a success is exactly when the request leaves the
+            # thread's retry set and inline polling becomes safe again.
+            self._async_load_registered.discard(req_id)
             self._finished_load_reqs.add(req_id)
             logger.debug(f"[Stage-{stage_id}] Received one chunk for key {connector_get_key}")
             return True
@@ -745,6 +763,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         self._cancelled_load_reqs.add(request_id)
         self._finished_load_reqs.discard(request_id)
+        # [P8] A cancelled load leaves the recv thread's retry set (recv_loop
+        # drops cancelled ids), so ownership must be released with it or this
+        # request could never be inline-polled again after a reuse.
+        self._async_load_registered.discard(request_id)
 
     @staticmethod
     def _discard_from_chunk_deque(deque_list: deque[Any], request_id: str) -> None:
@@ -1173,7 +1195,21 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 # producer runs 25 tok/s vs the 12.5 rows/s consumed, so it
                 # usually is). A miss costs one failed shm_open and falls
                 # through to exactly the old parked path.
-                if _INLINE_RECV and target_status == RequestStatus.RUNNING:
+                if (
+                    _INLINE_RECV
+                    and target_status == RequestStatus.RUNNING
+                    # Scoped to the AR text path, where ONE payload buys ONE
+                    # decode step and the ceiling therefore binds. A non-AR
+                    # consumer (the vocoder) takes a whole 320 ms chunk per
+                    # payload and needs ~3 deliveries/s against ~21 passes/s,
+                    # so the park costs it nothing and there is no reason to
+                    # widen the blast radius to its prompt-replacing path.
+                    and self.model_mode == "ar"
+                    # Never poll a key the recv thread owns: exactly one fetcher
+                    # per request, or get_req_chunk double-advances and a
+                    # payload is skipped (see load_async).
+                    and request.request_id not in self._async_load_registered
+                ):
                     self.request_ids_mapping[request.request_id] = request.external_req_id
                     try:
                         got_inline = bool(self._poll_single_request(request))
@@ -1194,6 +1230,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                         self._resume_loaded_request(request, queue, target_status)
                         continue
                     self._inline_recv_misses += 1
+                elif _INLINE_RECV and target_status == RequestStatus.RUNNING:
+                    self._inline_recv_skips += 1
                 # Requests that waiting for chunk
                 self.load_async(request)
                 request.status = RequestStatus.WAITING_FOR_CHUNK
@@ -1255,5 +1293,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self.upstream_exhausted_requests.discard(req_id)
             self._finished_load_reqs.discard(req_id)
             self._cancelled_load_reqs.add(req_id)
+            self._async_load_registered.discard(req_id)  # [P8] see load_async
 
         return []

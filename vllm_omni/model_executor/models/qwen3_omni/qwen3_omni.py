@@ -1170,7 +1170,18 @@ class Qwen3OmniMoeForConditionalGeneration(
                 "shipping zero rows instead of crashing the engine core.",
                 int(input_ids.shape[0]) if input_ids is not None else -1,
             )
-            zero_e = input_embeds.new_zeros((0, input_embeds.shape[-1]))
+            # `input_embeds` is not in scope here (it belongs to the CALLER,
+            # talker_preprocess_prefill) -- this guard raised NameError the
+            # first time it ever fired, killing the stage-1 core it was written
+            # to protect. Build the zero rows from what this function actually
+            # has: talker text width, on the talker's device, matching the
+            # dtype of the rows the success path returns (bfloat16, see
+            # _get_talker_user_parts).
+            zero_e = torch.zeros(
+                (0, self.config.talker_config.text_config.hidden_size),
+                device=input_ids.device,
+                dtype=torch.bfloat16,
+            )
             zero_i = input_ids.new_zeros((0,))
             return zero_i, zero_e, trailing_text_hidden_all
         talker_input_embed = torch.cat([embed.to(input_ids.device) for embed in talker_input_embeds], dim=0)
