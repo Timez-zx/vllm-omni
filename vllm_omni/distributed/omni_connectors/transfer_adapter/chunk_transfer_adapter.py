@@ -943,7 +943,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # the talker's text pieces resume here -- the last unstamped
         # dependency of frame production. Same env as the other chunk stamps.
         if _LOG_CHUNK_ARRIVALS:
-            logger.info("[TEXT-CHUNK] rid=%s mono=%.6f", req_id, time.monotonic())
+            logger.info("[TEXT-CHUNK] stage=%s rid=%s mono=%.6f",
+                        getattr(self.connector, "stage_id", "?"), req_id, time.monotonic())
         self.requests_with_ready_chunks.add(req_id)
         replaced = req_id in self._segment_replaced_reqs
         self._segment_replaced_reqs.discard(req_id)
