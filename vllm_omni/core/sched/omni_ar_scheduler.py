@@ -90,6 +90,13 @@ _SLACK_TOKENS = int(float(live_env("VLLM_OMNI_TEMPORAL_SLACK_TOKENS") or 0))
 _TIME_SLACK = live_env_on("VLLM_OMNI_TEMPORAL_TIME_SLACK")
 _DECODE_ZONE_S = float(live_env("VLLM_OMNI_TEMPORAL_DECODE_ZONE_MS") or 0) / 1000.0
 
+# [diagnosis] VLLM_OMNI_LOG_SEG_CYCLES=1: one line per streaming-segment
+# lifecycle event (park = segment done and the NEXT one has not arrived;
+# cont = next segment was already queued, no park; wake = update arrived for
+# a parked session). The instrument that convicts or acquits the park/wake
+# duty-cycle hypothesis for the u56 production slips.
+_LOG_SEG_CYCLES = live_env_on("VLLM_OMNI_LOG_SEG_CYCLES")
+
 
 def _slack_is_background(request: Any) -> bool:
     sp = getattr(request, "sampling_params", None)
@@ -1450,6 +1457,18 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self._free_input_coordinator_request(request.request_id)
         return finished
 
+    def _handle_stopped_request(self, request: Request) -> bool:
+        had_queued = bool(getattr(request, "streaming_queue", None))
+        finished = super()._handle_stopped_request(request)
+        if _LOG_SEG_CYCLES and not finished:
+            logger.info(
+                "[SEG-CYCLE] stage=%s rid=%s ev=%s mono=%.6f out=%d",
+                self.vllm_config.model_config.stage_id, request.request_id,
+                "cont" if had_queued else "park", _monotonic(),
+                len(request.output_token_ids),
+            )
+        return finished
+
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
         """
         Override: Only extend prompt at stage 0, and replace
@@ -1541,6 +1560,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         _ea = getattr(_sp, "extra_args", None) if _sp is not None else None
         if _ea and _SLACK_CLASS_KEY in _ea:
             _ea.pop(_SLACK_CLASS_KEY, None)
+
+        if _LOG_SEG_CYCLES:
+            logger.info(
+                "[SEG-CYCLE] stage=%s rid=%s ev=wake mono=%.6f new_toks=%d",
+                self.vllm_config.model_config.stage_id, req_id, _monotonic(),
+                len(update.prompt_token_ids),
+            )
         # Per-UPDATE prefill-only capture (the zero-output append, section 25).
         # Marked segments are discarded at sampling time in update_from_output;
         # the flag is one-shot per segment: set here for the chunk that carried
