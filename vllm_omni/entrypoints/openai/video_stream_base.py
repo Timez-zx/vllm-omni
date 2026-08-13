@@ -624,6 +624,36 @@ class StreamingVideoSessionConfig(BaseModel):
             "of a preemption storm). None = guard off."
         ),
     )
+    stage0_kv_pool_tokens: int | None = Field(
+        default=None,
+        description=(
+            "[live-vllm P3] Size of the THINKER stage's shared KV pool in tokens (boot "
+            "log's stage-0 'GPU KV cache size'). Same admission ledger as "
+            "stage1_kv_pool_tokens: a session whose 0.75*pool/active share would fall "
+            "below stage0_admission_floor_tokens is refused gracefully -- the wall is "
+            "shared, so the guard must divide by the number of tenants. None = off."
+        ),
+    )
+    stage0_admission_floor_tokens: int = Field(
+        default=4096,
+        ge=256,
+        description=(
+            "[live-vllm P3] Minimum viable per-session thinker-context share. Below "
+            "this, compression triggers at 0.75*share leave less than ~2 turns of "
+            "context plus a seed -- the session would thrash, degrading everyone."
+        ),
+    )
+    engine_max_seqs: int | None = Field(
+        default=None,
+        description=(
+            "[live-vllm P3] The engine's max_num_seqs (deploy yaml). Sessions are "
+            "persistent engine requests and compression shadows transiently hold one "
+            "slot each, so the slot ledger is: active + shadow permits + margin(2) "
+            "<= max_num_seqs. Refusal at admission beats the alternative -- measured "
+            "as the early-warm regression: 32 live + 32 parked shadows > 56 slots "
+            "slowed the whole fleet. None = off."
+        ),
+    )
     session_roll_settle_s: float = Field(
         default=1.0,
         ge=0.0,
@@ -886,6 +916,40 @@ class OmniStreamingVideoHandler:
                         websocket,
                         "at capacity: the speech stage's KV pool cannot hold another "
                         "session without preempting existing ones")
+                    return
+
+            # [live-vllm P3] Stage-0 twin of the guard above: same shared-wall
+            # arithmetic, thinker pool edition.
+            if config.stage0_kv_pool_tokens and config.session_scoped_request:
+                _share0 = int(0.75 * config.stage0_kv_pool_tokens
+                              / max(1, self._active_sessions))
+                if _share0 < config.stage0_admission_floor_tokens:
+                    logger.warning(
+                        "[session] REFUSED at admission: stage-0 pool share %d < floor %d "
+                        "(pool=%d, active=%d)", _share0,
+                        config.stage0_admission_floor_tokens,
+                        config.stage0_kv_pool_tokens, self._active_sessions)
+                    await self._send_error(
+                        websocket,
+                        "at capacity: the thinker's KV pool cannot hold another "
+                        "session at a viable context share")
+                    return
+
+            # [live-vllm P3] Slot ledger: persistent requests + transient
+            # shadow slots + roll margin must fit max_num_seqs. The early-warm
+            # regression is the measured failure mode this refuses.
+            if config.engine_max_seqs and config.session_scoped_request:
+                _need = self._active_sessions + _MAX_CONCURRENT_SHADOW_WARMUPS + 2
+                if _need > config.engine_max_seqs:
+                    logger.warning(
+                        "[session] REFUSED at admission: slot ledger %d (active=%d + "
+                        "shadows=%d + margin 2) > max_num_seqs=%d",
+                        _need, self._active_sessions,
+                        _MAX_CONCURRENT_SHADOW_WARMUPS, config.engine_max_seqs)
+                    await self._send_error(
+                        websocket,
+                        "at capacity: engine slots exhausted (sessions are persistent "
+                        "requests; shadows and rolls need headroom)")
                     return
 
             # [Tick engine WP6] bin-packing admission: with paced generation
