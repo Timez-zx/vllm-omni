@@ -84,6 +84,16 @@ stages:
                                      # prefills bind on this budget. Original
                                      # note: raise toward 32768 (stock) only if
                                      # prefill throughput binds -- it now does.
+    # GLOBAL FP8 (default since 2026-08-13, user decision): weights are
+    # quantized AT LOAD TIME from the official bf16 checkpoint -- do NOT
+    # point QWEN_MODEL at the community block-FP8 checkpoint, it produced
+    # degenerate text (verbatim loops) on this fork (deploy_mu_fp8_s32.yaml,
+    # 2026-08-02). Measured there: fp8 weights take the thinker 59.4 ->
+    # 31.7 GiB; fp8 KV halves the 96 KB/token cost. Both together grow the
+    # stage-0 pool from 275,008 tokens by roughly 6x -- read the boot log's
+    # "GPU KV cache size" line for the real number, never trust estimates.
+    quantization: fp8
+    kv_cache_dtype: fp8
     max_num_seqs: 56
     # Whole 96 GB card to itself now: 0.90 as in the stock 2xH100 config.
     # Weights are 59.4 GiB bf16; 0.74 gave a 106,880-token pool (96 KB/token
@@ -106,6 +116,16 @@ stages:
 
   - stage_id: 1                      # talker: speech codec token LM
     max_num_batched_tokens: 8192
+    # GLOBAL FP8 (default since 2026-08-13, user decision): fp8 KV on the
+    # talker has a clean precedent (deploy_mu_sw4k_kvfp8.yaml: 20 -> 10
+    # KB/token, SlidingWindowSpec carries kv_quant_mode). fp8 WEIGHTS on the
+    # talker are NEW here -- every earlier fp8 config kept talker weights
+    # bf16 ("one variable at a time" + the vocoder-feeding stage is quality-
+    # sensitive). On-the-fly quantization from the official checkpoint, same
+    # as stage 0. Gate: any bench with this file must show 0 empty replies
+    # and sane chars/s before results count.
+    quantization: fp8
+    kv_cache_dtype: fp8
     max_num_seqs: 56
     # GPU1 is shared only with code2wav now. 0.30 x ~95 GiB = ~28.5 GiB;
     # minus ~7 GiB fixed (weights + graphs) leaves ~21 GiB of KV at ~20 KB

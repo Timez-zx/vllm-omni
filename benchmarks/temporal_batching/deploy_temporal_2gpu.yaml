@@ -72,6 +72,12 @@ connectors:
 
 stages:
   - stage_id: 0                      # thinker: vision + audio encoders + LLM
+    # GLOBAL FP8 default (2026-08-13, user decision) -- weights quantized at
+    # load from the OFFICIAL bf16 checkpoint (community block-FP8 ckpt is a
+    # known trap: degenerate text). See deploy_temporal_2gpu_mns56.yaml for
+    # the full notes and measured memory receipts.
+    quantization: fp8
+    kv_cache_dtype: fp8
     max_num_batched_tokens: 8192     # streaming chunks are small; raise toward
                                      # 32768 (stock) only if prefill throughput
                                      # binds at 16 users -- it costs KV pool.
@@ -96,6 +102,9 @@ stages:
       max_tokens: 2048
 
   - stage_id: 1                      # talker: speech codec token LM
+    # GLOBAL FP8 default (2026-08-13) -- see deploy_temporal_2gpu_mns56.yaml.
+    quantization: fp8
+    kv_cache_dtype: fp8
     max_num_batched_tokens: 8192
     max_num_seqs: 20
     # GPU1 is shared only with code2wav now. 0.30 x ~95 GiB = ~28.5 GiB;
