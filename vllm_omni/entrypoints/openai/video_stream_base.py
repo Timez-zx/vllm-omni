@@ -1901,7 +1901,15 @@ class OmniStreamingVideoHandler:
 
             def _warmup_due() -> bool:
                 """Should a shadow start warming? Thresholds sit BELOW the walls so the
-                shadow is normally ready before any wall forces a blocking roll."""
+                shadow is normally ready before any wall forces a blocking roll.
+
+                Warming earlier than the trigger was tried (0.6x, swap gated
+                at the trigger) and REGRESSED the whole distribution (p50
+                2.8 s, 107/128 slow turns): a parked-ready shadow holds an
+                engine slot, and 32 sessions' long-lived shadows + 32 live
+                requests exceeded max_num_seqs=56 -- short-lived shadows were
+                themselves the slot-pressure valve. With text-only seeds
+                (~200 tokens) an early warm buys nothing anyway."""
                 if compression_trigger and sess.get("cum_tokens", 0) >= compression_trigger:
                     return True
                 roll_at = _talker_roll_at()
