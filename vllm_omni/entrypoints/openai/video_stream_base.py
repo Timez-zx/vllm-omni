@@ -223,12 +223,17 @@ _COMPRESSION_TRANSCRIPT_KEEP = 96
 # is a few MB per session where unbounded retention would grow forever.
 _FRAME_KEEP_TURNS = 40
 # Process-wide cap on concurrent shadow warm-ups. A warming seed holds up to
-# target_tokens of KV on top of the live requests, and the pool slack at full
-# capacity is thin: 731,904-token pool - 13 users x 49,152 trigger = 92,928, which
-# fits TWO 32k seeds and not three. The permit covers warm-up only (seed submit ->
-# ready); a hook that finds the limit busy skips silently and re-fires at the next
-# hook, because cum_tokens keeps growing until a swap resets it.
-_MAX_CONCURRENT_SHADOW_WARMUPS = 2
+# target_tokens of KV on top of the live requests. The original 2 was sized for
+# the 13-user/49k-trigger regime (731,904-token pool - 13 x 49,152 = 92,928,
+# which fits TWO 32k seeds and not three). Under per-N-scaled triggers
+# (trigger = 0.75 * pool / N, target = trigger / 2) the steady state uses about
+# half the pool and a seed is only ~2-4k tokens, so six warm-ups cost < 8% of
+# the pool -- and 2 was the bottleneck that turned synchronized trigger
+# crossings into blocking-roll waves (39-63% of compressions degraded at u48).
+# The permit covers warm-up only (seed submit -> ready); a hook that finds the
+# limit busy skips silently and re-fires at the next hook, because cum_tokens
+# keeps growing until a swap resets it.
+_MAX_CONCURRENT_SHADOW_WARMUPS = 6
 
 
 def _summarise_audio_payload(audio_data: Any) -> str:
@@ -1663,12 +1668,35 @@ class OmniStreamingVideoHandler:
                         and not shadow["ctx"].get("failed")):
                     carry = await _swap_to_shadow()
                 elif _must_roll_now():
-                    await _roll_session()
-                    if sess["fatal"]:
-                        await self._send_error(
-                            websocket, f"Session failed: {sess['fatal']}"
+                    if _can_defer_roll():
+                        # [roll-waive] Housekeeping never blocks the user. A
+                        # compression-cap roll with no ready shadow is simply
+                        # WAIVED: the turn is served on the live request (a
+                        # thick context is slow-ish, not wrong) and the swap
+                        # happens whenever a shadow lands, via the ready-shadow
+                        # branch above. Deferring the blocking roll to the
+                        # turn-end silence was tried first and made the wave
+                        # WORSE (p99 64.5 s -> 99.9 s): the roll itself takes
+                        # tens of seconds under a synchronized wave, think time
+                        # is 2-6 s, so the NEXT turn inherited the remainder --
+                        # and turn-end deferral stampeded 32 permit-less
+                        # rebuilds at once. The only blocking roll left is the
+                        # emergency ceiling in _can_defer_roll.
+                        if _shadow_allowed():
+                            _launch_shadow_warmup("hard-cap-waive")
+                        logger.info(
+                            "[session] roll waived: turn=%d served on live "
+                            "request (cum=%d >= hard=%d); waiting for a shadow",
+                            sess["turn_idx"], sess.get("cum_tokens", 0),
+                            compression_hard,
                         )
-                        return
+                    else:
+                        await _roll_session()
+                        if sess["fatal"]:
+                            await self._send_error(
+                                websocket, f"Session failed: {sess['fatal']}"
+                            )
+                            return
                 elif _warmup_due() and _shadow_allowed():
                     _launch_shadow_warmup("turn start")
 
@@ -1849,6 +1877,30 @@ class OmniStreamingVideoHandler:
                     return True
                 roll_at = _talker_roll_at()
                 return bool(roll_at and sess.get("talker_tokens", 0) >= 0.85 * roll_at)
+
+            def _can_defer_roll() -> bool:
+                """May a hard-cap roll be waived for this turn?
+
+                Waivable only when the pressure is the COMPRESSION cap: that
+                cap is a scheduling convenience (1.5x trigger), not a wall.
+                The emergency ceiling (2x trigger, capped at half the model
+                context) bounds how far a session can ride the live request
+                while its shadow warms; with working warm-ups the overshoot is
+                about one turn, and only a session whose shadows keep failing
+                ever reaches the ceiling and pays the old blocking roll. The
+                TALKER wall keeps its blocking semantics -- it does not fail
+                cleanly (preemption storms on the shared stage-1 pool), so a
+                turn must never be served past it.
+                """
+                roll_at = _talker_roll_at()
+                if roll_at and sess.get("talker_tokens", 0) >= roll_at:
+                    return False
+                emergency = 0
+                if compression_trigger:
+                    emergency = 2 * compression_trigger
+                    if _mml:
+                        emergency = min(emergency, int(0.5 * _mml))
+                return bool(emergency and sess.get("cum_tokens", 0) < emergency)
 
             def _must_roll_now() -> bool:
                 """A wall that cannot wait for a shadow. The talker trigger keeps its
