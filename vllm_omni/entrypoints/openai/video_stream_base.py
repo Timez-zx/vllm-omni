@@ -89,6 +89,14 @@ _MAX_FRAME_SIZE = 10 * 1024 * 1024  # 10MB per frame
 # Gated separately from VLLM_OMNI_TEMPORAL_TICK_MS because the M arm sets the
 # tick env too; this is a T-family treatment and must be opt-in.
 from vllm_omni.core.sched.temporal_pacing import live_env, live_env_on as _live_env_on
+from vllm_omni.entrypoints.openai import media_pipeline as _media_pipeline
+
+# [live-vllm CPU-plane] spawn the media workers before the first frame needs
+# them (spawn-context startup is seconds); daemon thread so shutdown is free.
+if _media_pipeline.enabled():
+    import threading as _threading
+
+    _threading.Thread(target=_media_pipeline.prewarm_pool, daemon=True).start()
 
 _FRAME_TICK_S: float = 0.0
 if _live_env_on("VLLM_OMNI_TEMPORAL_FRAME_TICK"):  # live-vllm: default ON
@@ -871,11 +879,40 @@ class OmniStreamingVideoHandler:
 
     async def handle_session(self, websocket: WebSocket) -> None:
         """Count the session in, run it, count it out -- whatever happens."""
+        self._ensure_loop_lag_probe()
         self._active_sessions += 1
         try:
             await self._handle_session_inner(websocket)
         finally:
             self._active_sessions -= 1
+
+    def _ensure_loop_lag_probe(self) -> None:
+        """[live-vllm V3] One per process: measure the serving loop's wakeup
+        drift. This is the VALIDITY GATE for capacity results -- a ceiling
+        cell may be attributed to GPU/design only while [loop-lag] stays
+        healthy; otherwise the wall being measured is this process's CPU
+        plane (the u56 lesson: GPUs at 40%, misses at 14%, all serving-side).
+        """
+        if getattr(self, "_loop_lag_task", None) is not None:
+            return
+
+        async def _probe() -> None:
+            lags: list[float] = []
+            loop = asyncio.get_running_loop()
+            while True:
+                t0 = loop.time()
+                await asyncio.sleep(0.1)
+                lags.append(max(0.0, (loop.time() - t0 - 0.1) * 1000.0))
+                if len(lags) >= 100:  # one line per ~10 s
+                    lags.sort()
+                    logger.info(
+                        "[loop-lag] p50=%.1fms p99=%.1fms max=%.1fms (n=%d, sessions=%d)",
+                        lags[50], lags[99], lags[-1], len(lags),
+                        self._active_sessions,
+                    )
+                    lags = []
+
+        self._loop_lag_task = asyncio.get_running_loop().create_task(_probe())
 
     async def _handle_session_inner(self, websocket: WebSocket) -> None:
         """Main session loop for a single WebSocket connection."""
@@ -2763,7 +2800,28 @@ class OmniStreamingVideoHandler:
                         # decode upstream already judged worth offloading. Awaiting cannot
                         # reorder frames -- this loop reads one message at a time, so the next
                         # frame is not picked up until this one has been buffered.
-                        if config.max_frame_width and config.max_frame_height:
+                        # [live-vllm CPU-plane] One decode per frame, in a worker
+                        # PROCESS (outside this loop's GIL): downscale + filter
+                        # thumbnail + PIL-cache RGB come back together. The
+                        # legacy path decoded the same frame up to 3x, with the
+                        # filter's decode INLINE on this loop -- measured as the
+                        # chunk-delivery tail at u56 (gap p99 569ms, GPUs 40%).
+                        _mp_res = None
+                        if _media_pipeline.enabled():
+                            try:
+                                _mp_res = await _media_pipeline.process_frame(
+                                    raw_bytes,
+                                    config.max_frame_width or 0,
+                                    config.max_frame_height or 0,
+                                    config.frame_jpeg_quality,
+                                )
+                            except Exception:
+                                await self._send_error(websocket, "Invalid image data")
+                                continue
+                            if _mp_res.shrunk_jpeg is not None:
+                                raw_bytes = _mp_res.shrunk_jpeg
+                                frame_data = base64.b64encode(raw_bytes).decode("ascii")
+                        elif config.max_frame_width and config.max_frame_height:
                             try:
                                 shrunk = await asyncio.to_thread(
                                     _downscale_frame_bytes,
@@ -2801,7 +2859,15 @@ class OmniStreamingVideoHandler:
                                     continue
                                 if config.frame_filter_max_gap and frames_since_retained >= config.frame_filter_max_gap:
                                     frame_filter.force_next_retain()
-                                if not frame_filter.should_retain(raw_bytes):
+                                # [CPU-plane] with the media pool, the filter's
+                                # expensive half (decode) already ran in the
+                                # worker; only the microsecond compare runs here.
+                                _retain = (
+                                    frame_filter.should_retain_thumb(_mp_res.thumb)
+                                    if _mp_res is not None
+                                    else frame_filter.should_retain(raw_bytes)
+                                )
+                                if not _retain:
                                     await self._send_frame_ack(
                                         websocket,
                                         msg,
@@ -2862,7 +2928,14 @@ class OmniStreamingVideoHandler:
                         )
                         # Prewarm: decode PIL off the event loop so query-time chat_template
                         # can skip base64+Image.open. uuid=md5 lets mm_cache dedupe identical frames.
-                        if frame_data not in frame_pil_cache:
+                        # [CPU-plane] With the media pool the decode already happened in the
+                        # worker: rebuild the PIL via frombytes (a memcpy) and skip the task.
+                        if _mp_res is not None and frame_data not in frame_pil_cache:
+                            frame_pil_cache[frame_data] = (
+                                Image.frombytes("RGB", _mp_res.size, _mp_res.rgb),
+                                _mp_res.md5,
+                            )
+                        elif frame_data not in frame_pil_cache:
                             mm_uuid = hashlib.md5(raw_bytes, usedforsecurity=False).hexdigest()
 
                             async def _prewarm(b64: str, b: bytes, u: str) -> None:

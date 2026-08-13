@@ -11,6 +11,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import json
+import os
 import queue
 import threading
 import time
@@ -259,6 +260,23 @@ class AsyncOmniEngine:
         self.request_queue: janus.Queue[EngineQueueMessage] = janus.Queue(maxsize=_REQUEST_QUEUE_MAXSIZE)
         self.output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
         self.rpc_output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
+        # [live-vllm CPU-plane] input preprocessing (tokenization + multimodal,
+        # inside _build_add_request_message) used to run SYNCHRONOUSLY on the
+        # serving event loop -- measured as a top GIL load at 56 users, each
+        # frame append stalling audio delivery for every session. The async
+        # add_request/add_streaming_update wrappers now run the whole sync body
+        # on this dedicated pool; janus.sync_q.put is thread-safe by design.
+        # VLLM_OMNI_INPUT_THREADS=0 restores the inline behavior.
+        _n_inp = os.environ.get("VLLM_OMNI_INPUT_THREADS", "")
+        try:
+            _n_inp = int(_n_inp) if _n_inp.strip() != "" else 4
+        except ValueError:
+            _n_inp = 4
+        self._input_executor = (
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=_n_inp, thread_name_prefix="omni-input")
+            if _n_inp > 0 else None
+        )
         self._shutdown_called = False
         self._weak_finalizer: weakref.finalize | None = None
         self._correlated_rpc_client: CorrelatedRpcClient | None = None
@@ -1360,8 +1378,15 @@ class AsyncOmniEngine:
         *,
         resumable: bool = False,
     ) -> None:
-        """Async add_request API."""
-        self.add_request(
+        """Async add_request API.
+
+        [live-vllm CPU-plane] The sync body runs tokenization + multimodal
+        preprocessing; off-loop on the input pool so a big prefill can never
+        stall audio delivery. Ordering note: the SAME session's first chunk is
+        awaited before any update is submitted (handle_inputs awaits each
+        chunk in turn), so per-request ordering is preserved.
+        """
+        _submit = lambda: self.add_request(
             request_id=request_id,
             prompt=prompt,
             prompt_text=prompt_text,
@@ -1377,6 +1402,11 @@ class AsyncOmniEngine:
             reasoning_ended=reasoning_ended,
             resumable=resumable,
         )
+        if self._input_executor is None:
+            _submit()
+        else:
+            await asyncio.get_running_loop().run_in_executor(
+                self._input_executor, _submit)
 
     def add_streaming_update(
         self,
@@ -1416,8 +1446,14 @@ class AsyncOmniEngine:
         *,
         resumable: bool = True,
     ) -> None:
-        """Async wrapper for add_streaming_update()."""
-        self.add_streaming_update(
+        """Async wrapper for add_streaming_update().
+
+        [live-vllm CPU-plane] Same off-loop treatment as add_request_async;
+        same per-session ordering guarantee (handle_inputs awaits chunks
+        sequentially, and cross-thread put order into janus.sync_q follows
+        the executor submission the await serializes).
+        """
+        _submit = lambda: self.add_streaming_update(
             request_id=request_id,
             prompt=prompt,
             prompt_text=prompt_text,
@@ -1427,6 +1463,11 @@ class AsyncOmniEngine:
             arrival_time=arrival_time,
             resumable=resumable,
         )
+        if self._input_executor is None:
+            _submit()
+        else:
+            await asyncio.get_running_loop().run_in_executor(
+                self._input_executor, _submit)
 
     def open_duplex_session(
         self,
