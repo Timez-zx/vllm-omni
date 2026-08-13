@@ -132,6 +132,18 @@ _LIVE_DEFAULTS = {
     # SLACK_TOKENS cap only).
     "VLLM_OMNI_TEMPORAL_TIME_SLACK": "1",
     "VLLM_OMNI_TEMPORAL_DECODE_ZONE_MS": "18",
+    # [T2T coalesce] thinker->talker text transport granularity. One payload
+    # per thinker TOKEN (the original protocol) makes the talker pause once
+    # per token to take delivery (park -> connector load -> resume, >= 1
+    # scheduler pass each). At u56 that is ~4 deliveries per audio chunk on a
+    # stage whose pass cadence (46 ms) only affords ~1.7 passes per tick:
+    # measured chunk cadence 377 ms vs the 320 ms contract for exactly the
+    # first ~30% of every turn (while text still streams) -- which is where
+    # 96% of all client misses live. Rows after the first EXEMPT flushes of a
+    # segment accumulate to TOKENS rows per payload; segment end always
+    # flushes. 1 disables (per-token protocol, the control arm).
+    "VLLM_OMNI_TEXT_COALESCE_TOKENS": "8",
+    "VLLM_OMNI_TEXT_COALESCE_EXEMPT": "4",
     # [P5] streaming vocoder conv window: the conv/upsample stack's measured
     # left receptive field is 10 codec frames (autograd probe; the 25-frame
     # left_context is a heuristic sized for the pre-transformer's attention,

@@ -1205,9 +1205,29 @@ class Qwen3OmniMoeForConditionalGeneration(
                 update_dict.setdefault("embed", {})["cached_decode"] = cached_thinker_decode_embeds
 
         elif thinker_decode_embed is not None:
-            thinker_embed = thinker_decode_embed
-            if thinker_embed.device != device:
-                thinker_embed = thinker_embed.to(device)
+            rows = thinker_decode_embed.to(device)
+            if rows.ndim == 1:
+                rows = rows.view(1, -1)
+            # [T2T coalesce] identical to the old branch for a [1,D] payload
+            # (rows[0:1] IS the whole tensor). A batched payload landing with
+            # no live cache consumes row 0 this step and BANKS the rest in
+            # cached_decode, aligned to the cursor's index space: the cache
+            # is padded up to (start_index+1) rows with filler the monotonic
+            # cursor can never re-read, so cached[start_index + i] lands on
+            # payload row i for every following step.
+            thinker_embed = rows[0:1]
+            if rows.shape[0] > 1:
+                base = (
+                    cached_thinker_decode_embeds.to(device=device, dtype=rows.dtype)
+                    if cached_thinker_decode_embeds is not None
+                    else rows[:0]
+                )
+                gap = (start_index + 1) - base.shape[0]
+                if gap > 0:
+                    base = torch.cat([base, rows.new_zeros((gap, rows.shape[-1]))], dim=0)
+                else:
+                    base = base[: start_index + 1]
+                update_dict.setdefault("embed", {})["cached_decode"] = torch.cat([base, rows[1:]], dim=0)
 
         else:
             # When the tokens output by the thinker are exhausted, an EOS token needs to be appended.

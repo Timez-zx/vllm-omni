@@ -40,6 +40,33 @@ import os as _os
 
 _LOG_CHUNK_EMIT = _os.environ.get("VLLM_OMNI_LOG_AUDIO_CHUNKS", "0") not in ("0", "", "false", "False")
 
+# [T2T coalesce] see the VLLM_OMNI_TEXT_COALESCE_* entry in _LIVE_DEFAULTS
+# for the sizing argument. Resolved through live_env so the default cannot
+# fork from the other tick-engine knobs.
+from vllm_omni.core.sched.temporal_pacing import live_env as _live_env
+
+try:
+    _T2T_COALESCE_TOKENS = max(1, int(float(_live_env("VLLM_OMNI_TEXT_COALESCE_TOKENS") or 1)))
+except ValueError:
+    _T2T_COALESCE_TOKENS = 1
+try:
+    _T2T_COALESCE_EXEMPT = max(0, int(float(_live_env("VLLM_OMNI_TEXT_COALESCE_EXEMPT") or 0)))
+except ValueError:
+    _T2T_COALESCE_EXEMPT = 0
+
+
+def _t2t_coalesce_entry(transfer_manager: Any, request_id: str) -> list:
+    """Per-request text-row accumulator: [emb|None, hid|None, flushes]."""
+    buf = getattr(transfer_manager, "_t2t_text_buf", None)
+    if buf is None:
+        buf = {}
+        transfer_manager._t2t_text_buf = buf
+    entry = buf.get(request_id)
+    if entry is None:
+        entry = [None, None, 0]
+        buf[request_id] = entry
+    return entry
+
 # Pooling output layer keys: "0" = word embedding, "24" = accept_hidden_layer
 _EMBED_LAYER_KEY = "0"
 _HIDDEN_LAYER_KEY = "24"
@@ -405,6 +432,14 @@ def _construct_thinker2talker_streaming_input_async_chunk(
             # guarded the failure goes SILENT instead -- the talker conditioned on an
             # assistant header alone, because compute_talker_prompt_ids_length reads
             # the same truncated ids and returns 9.
+            # [T2T coalesce] a new segment's prefill supersedes anything still
+            # buffered from the previous segment: its rows were flushed by the
+            # segment-end send, so a survivor here is from an aborted segment
+            # and must not leak into this one. Also restarts the per-segment
+            # exempt counter (the first flushes of EVERY turn ship per-token,
+            # TTFA depends on them).
+            if _T2T_COALESCE_TOKENS > 1:
+                _t2t_coalesce_entry(transfer_manager, request_id)[:] = [None, None, 0]
             prev = transfer_manager._pending_streaming_prefills.get(request_id)
             prompt_rows = int(thinker_emb.shape[0])
             if prev is not None:
@@ -476,6 +511,34 @@ def _construct_thinker2talker_streaming_input_async_chunk(
                         speaker=speaker,
                         language=language,
                     )
+            # [T2T coalesce] batch text rows instead of shipping one payload
+            # per thinker token. The talker's cached_decode intake is
+            # torch.cat + per-row consumption (see
+            # _talker_cache_thinker_decode_embeds), so a multi-row decode
+            # payload needs no receiver change; ids.output already ships the
+            # request's FULL output list on every payload, so batching cannot
+            # desync it. Buffered rows survive a preemption unsent and flush,
+            # once and in order, with the next payload.
+            if _T2T_COALESCE_TOKENS > 1:
+                entry = _t2t_coalesce_entry(transfer_manager, request_id)
+                entry[0] = emb_cpu if entry[0] is None else torch.cat((entry[0], emb_cpu), dim=0)
+                entry[1] = hid_cpu if entry[1] is None else torch.cat((entry[1], hid_cpu), dim=0)
+                # Geometric ramp after the exempt window (2, 4, then TOKENS):
+                # a fixed jump straight to TOKENS opens a starvation window at
+                # turn start if the thinker dips below ~TOKENS x 12.5/runway
+                # tok/s; ramping keeps the talker's banked runway ahead of
+                # each batch's fill time at any thinker rate that can sustain
+                # realtime at all.
+                if entry[2] < _T2T_COALESCE_EXEMPT:
+                    need = 1
+                else:
+                    need = min(_T2T_COALESCE_TOKENS, 2 << (entry[2] - _T2T_COALESCE_EXEMPT))
+                if not is_finished and int(entry[0].shape[0]) < need:
+                    return None
+                emb_cpu, hid_cpu = entry[0], entry[1]
+                entry[0] = None
+                entry[1] = None
+                entry[2] += 1
             return OmniPayloadStruct(
                 meta=MetaStruct(
                     finished=finished,
@@ -490,6 +553,18 @@ def _construct_thinker2talker_streaming_input_async_chunk(
         if not is_finished:
             # do not send async chunk mode placeholder token or embedding/hidden of the stop token
             return None
+        # [T2T coalesce] the segment can end on a step whose outputs were
+        # already cleared by the scheduler (this branch): any text rows still
+        # buffered must ride out with this terminal payload, or the talker
+        # never hears those words.
+        if _T2T_COALESCE_TOKENS > 1:
+            entry = _t2t_coalesce_entry(transfer_manager, request_id)
+            if entry[0] is not None:
+                emb_cpu = torch.cat((entry[0], emb_cpu), dim=0)
+                hid_cpu = torch.cat((entry[1], hid_cpu), dim=0)
+                entry[0] = None
+                entry[1] = None
+                entry[2] += 1
         return OmniPayloadStruct(
             meta=MetaStruct(finished=finished),
             embed=EmbeddingsStruct(decode=emb_cpu),
