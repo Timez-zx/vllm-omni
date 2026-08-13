@@ -98,6 +98,13 @@ if _media_pipeline.enabled():
 
     _threading.Thread(target=_media_pipeline.prewarm_pool, daemon=True).start()
 
+# [live-vllm anti-wave #2] global min interval between compression warmup
+# launches (seconds); 0 disables the calendar.
+try:
+    _COMPRESS_MIN_INTERVAL_S = float(os.environ.get("VLLM_OMNI_COMPRESS_MIN_INTERVAL_S", "2.0"))
+except ValueError:
+    _COMPRESS_MIN_INTERVAL_S = 2.0
+
 _FRAME_TICK_S: float = 0.0
 if _live_env_on("VLLM_OMNI_TEMPORAL_FRAME_TICK"):  # live-vllm: default ON
     _FRAME_TICK_S = max(
@@ -818,6 +825,11 @@ class OmniStreamingVideoHandler:
     triggering, prompt construction, and history updates.
     """
 
+    # [live-vllm anti-wave] process-wide compression choreography state:
+    # the deterministic trigger-phase ladder and the global launch calendar.
+    _trigger_phase_counter: int = 0
+    _last_warmup_launch: float = 0.0
+
     def should_trigger_turn(self, trigger: VideoStreamTurnTrigger) -> bool:
         """Auto-trigger after ``video.frame`` when True (default: never)."""
         return False
@@ -1032,7 +1044,18 @@ class OmniStreamingVideoHandler:
                 # growth. DOWNWARD only, so the wave-peak budget that makes
                 # waiving pool-safe (hard 1.5t + seed 0.5t = 2t <= pool/N when
                 # trigger = share/2) still holds for every session.
-                _jit = 0.80 + 0.20 * (int(uuid.uuid4().hex[:8], 16) / 0xFFFFFFFF)
+                # [live-vllm anti-wave #1] DETERMINISTIC phase spread over
+                # [0.55, 1.00): admission ordinal i takes 0.55 + 0.45*(i%16)/16.
+                # The +/-20% random jitter above was measured insufficient at
+                # u56: growth-rate homogeneity re-bunched 108 first
+                # compressions into a ~90 s window (t+120..210) whose density
+                # (1.2 events/s) produced the reproducible 11-15% slip storm
+                # (LIVE_VLLM.zh.md section 9). A 45% deterministic ladder
+                # spreads first crossings ~3.5x wider; DOWNWARD only, so the
+                # waive pool-budget argument still holds for every session.
+                _slot = OmniStreamingVideoHandler._trigger_phase_counter % 16
+                OmniStreamingVideoHandler._trigger_phase_counter += 1
+                _jit = 0.55 + 0.45 * (_slot / 16.0)
                 compression_trigger = max(256, int(compression_trigger * _jit))
             compression_hard = 0
             if compression_trigger:
@@ -2135,11 +2158,24 @@ class OmniStreamingVideoHandler:
                     return False
                 if not config.session_scoped_request:
                     return False
+                # [live-vllm anti-wave #2] Global compression calendar: at
+                # most one warmup LAUNCH per interval across all sessions.
+                # The u56 storm was 1.2 launches/s for 90 s; steady-state
+                # demand is ~0.25/s (56 sessions / ~230 s per cycle), so a
+                # 2 s min-interval (0.5/s) caps the wave at storm-free
+                # density while never backlogging the steady state. A denied
+                # session simply retries at its next arrival/turn event --
+                # the waive machinery already makes riding past the trigger
+                # safe to 2x.
+                if (_time.monotonic() - OmniStreamingVideoHandler._last_warmup_launch
+                        < _COMPRESS_MIN_INTERVAL_S):
+                    return False
                 # Cooldown after a failed warm-up, so a broken shadow path degrades to
                 # the blocking roll instead of spinning warm-up attempts.
                 return (_time.monotonic() - sess.get("shadow_failed_at", 0.0)) > 60.0
 
             def _launch_shadow_warmup(where: str) -> None:
+                OmniStreamingVideoHandler._last_warmup_launch = _time.monotonic()
                 t = asyncio.create_task(_start_shadow_warmup(where))
                 prewarm_tasks.add(t)
                 t.add_done_callback(prewarm_tasks.discard)
