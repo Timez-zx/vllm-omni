@@ -105,6 +105,15 @@ _LIVE_DEFAULTS = {
     # delivery delay -- inside the lead buffer, same argument as the gate's
     # own +<=1 tick. 0/1 disables (plain next-edge release).
     "VLLM_OMNI_TEMPORAL_VOCODE_PHASES": "4",
+    # [P5] streaming vocoder conv window: the conv/upsample stack's measured
+    # left receptive field is 10 codec frames (autograd probe; the 25-frame
+    # left_context is a heuristic sized for the pre-transformer's attention,
+    # not the convs). With this ON, the pre-transformer still sees the full
+    # 25+new window (attention semantics unchanged, quality-approved) but the
+    # conv stack -- the FLOPs-dominant half, running at 1920x upsampled
+    # resolution -- only processes the last (new + 11) frames. Emitted
+    # samples are mathematically identical. 0 = full-window convs.
+    "VLLM_OMNI_STREAM_VOCODER": "1",
 }
 
 # [P2] Priority-class marker for aperiodic work, riding SamplingParams
