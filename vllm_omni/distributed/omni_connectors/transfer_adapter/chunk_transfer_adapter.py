@@ -1010,6 +1010,57 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return
         request.status = target_status
 
+    def _try_inline_receive(
+        self,
+        request: Request,
+        queue: Any,
+        target_status: RequestStatus,
+        finished_load_reqs: set[str],
+    ) -> bool:
+        """Take delivery on the scheduler thread. True = request keeps its slot.
+
+        Shared by both queue-processing paths: the active-window variant and
+        the legacy one. The legacy path is what production actually runs
+        (``_active_window`` is 0 unless a stream window is configured), and
+        hosting this only in the other one is why the first attempt measured
+        irecv=0/0 -- the code was never reached at all.
+        """
+        if not _INLINE_RECV or target_status != RequestStatus.RUNNING:
+            return False
+        # Scoped to the AR text path, where ONE payload buys ONE decode step
+        # and the ceiling therefore binds. A non-AR consumer (the vocoder)
+        # takes a whole 320 ms chunk per payload and needs ~3 deliveries/s
+        # against ~21 passes/s, so the park costs it nothing and there is no
+        # reason to widen the blast radius to its prompt-replacing path.
+        if self.model_mode != "ar":
+            return False
+        # Never poll a key the recv thread owns: exactly one fetcher per
+        # request, or get_req_chunk double-advances and a payload is skipped
+        # outright (see load_async).
+        if request.request_id in self._async_load_registered:
+            self._inline_recv_skips += 1
+            return False
+        self.request_ids_mapping[request.request_id] = request.external_req_id
+        try:
+            got_inline = bool(self._poll_single_request(request))
+        except Exception as e:
+            got_inline = False
+            logger.warning(
+                "[OmniTransfer] inline receive failed for %s: %s", request.request_id, e,
+            )
+        if not got_inline:
+            self._inline_recv_misses += 1
+            return False
+        # _poll_single_request marks the request finished-load; consume that
+        # marker here so no later pass re-resumes the same payload.
+        finished_load_reqs.discard(request.request_id)
+        self._inline_recv_hits += 1
+        # Keeps the request in `queue` (still RUNNING) unless it carried a
+        # segment opener, which _resume_loaded_request reroutes through
+        # WAITING exactly as the parked path does.
+        self._resume_loaded_request(request, queue, target_status)
+        return True
+
     def _process_chunk_queue_legacy(
         self,
         queue: Any,
@@ -1026,6 +1077,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     continue
                 if self.is_done_receiving_chunks(request.request_id):
                     request.additional_information = None
+                    continue
+                # [P8] see _try_inline_receive: take delivery without paying a
+                # park round-trip when the payload is already in shared memory.
+                if self._try_inline_receive(request, queue, target_status, finished_load_reqs):
                     continue
                 # Requests that waiting for chunk
                 self.load_async(request)
@@ -1195,43 +1250,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 # producer runs 25 tok/s vs the 12.5 rows/s consumed, so it
                 # usually is). A miss costs one failed shm_open and falls
                 # through to exactly the old parked path.
-                if (
-                    _INLINE_RECV
-                    and target_status == RequestStatus.RUNNING
-                    # Scoped to the AR text path, where ONE payload buys ONE
-                    # decode step and the ceiling therefore binds. A non-AR
-                    # consumer (the vocoder) takes a whole 320 ms chunk per
-                    # payload and needs ~3 deliveries/s against ~21 passes/s,
-                    # so the park costs it nothing and there is no reason to
-                    # widen the blast radius to its prompt-replacing path.
-                    and self.model_mode == "ar"
-                    # Never poll a key the recv thread owns: exactly one fetcher
-                    # per request, or get_req_chunk double-advances and a
-                    # payload is skipped (see load_async).
-                    and request.request_id not in self._async_load_registered
-                ):
-                    self.request_ids_mapping[request.request_id] = request.external_req_id
-                    try:
-                        got_inline = bool(self._poll_single_request(request))
-                    except Exception as e:
-                        got_inline = False
-                        logger.warning(
-                            "[OmniTransfer] inline receive failed for %s: %s",
-                            request.request_id, e,
-                        )
-                    if got_inline:
-                        # _poll_single_request marks the request finished-load;
-                        # consume that marker here so no later pass re-resumes.
-                        finished_load_reqs.discard(request.request_id)
-                        self._inline_recv_hits += 1
-                        # Keeps the request in `queue` (still RUNNING) unless it
-                        # carried a segment opener, which _resume_loaded_request
-                        # reroutes through WAITING exactly as the parked path does.
-                        self._resume_loaded_request(request, queue, target_status)
-                        continue
-                    self._inline_recv_misses += 1
-                elif _INLINE_RECV and target_status == RequestStatus.RUNNING:
-                    self._inline_recv_skips += 1
+                if self._try_inline_receive(request, queue, target_status, finished_load_reqs):
+                    continue
                 # Requests that waiting for chunk
                 self.load_async(request)
                 request.status = RequestStatus.WAITING_FOR_CHUNK
