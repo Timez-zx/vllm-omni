@@ -255,7 +255,7 @@ class TemporalPacer:
         # [diagnosis] hold-reason census: which barrier branch dominates
         # storm windows. Logged+reset every ~2500 split calls when
         # VLLM_OMNI_LOG_SCHED_STEPS selects this stage.
-        self._hold_census = {"midjoin": 0, "ahead": 0, "budget": 0, "subslot": 0, "kept": 0}
+        self._hold_census = {"midjoin": 0, "ahead": 0, "budget": 0, "subslot": 0, "kept": 0, "waste": 0}
         self._census_calls = 0
 
         if self.enabled:
@@ -377,8 +377,8 @@ class TemporalPacer:
         if self.log_steps and self._census_calls >= 2500:
             c = self._hold_census
             logger.info(
-                "[pacer-census] stage=%s mono=%.3f kept=%d midjoin=%d ahead=%d budget=%d subslot=%d",
-                self.stage_id, now, c["kept"], c["midjoin"], c["ahead"], c["budget"], c["subslot"])
+                "[pacer-census] stage=%s mono=%.3f kept=%d midjoin=%d ahead=%d budget=%d subslot=%d waste=%d",
+                self.stage_id, now, c["kept"], c["midjoin"], c["ahead"], c["budget"], c["subslot"], c["waste"])
             for k in c:
                 c[k] = 0
             self._census_calls = 0
@@ -405,6 +405,9 @@ class TemporalPacer:
                     if toks[i] < _CODEC_VALID_MAX:
                         add += 1
                 st[1] += add
+                # [diagnosis] invalid-token census: box-level stutter hides
+                # in coarse global accounting.
+                self._hold_census["waste"] += (n - st[0]) - add
             else:
                 st[1] = n
             st[0] = n
