@@ -142,8 +142,39 @@ _LIVE_DEFAULTS = {
     # 96% of all client misses live. Rows after the first EXEMPT flushes of a
     # segment accumulate to TOKENS rows per payload; segment end always
     # flushes. 1 disables (per-token protocol, the control arm).
-    "VLLM_OMNI_TEXT_COALESCE_TOKENS": "8",
+    # The PRIMARY trigger is the tick DEADLINE (TICKS), not the row count:
+    # one flush per TICKS ticks on the shared grid, so text lag is bounded
+    # regardless of the thinker's rate and every session's delivery lands on
+    # the same edge (one pass serves all). TOKENS is then a ceiling on
+    # payload size -- a faster thinker makes bigger batches, not more
+    # deliveries. Budget: stage 1 affords ~1.7 passes/tick with 1 owed to the
+    # frame, so ~0.7/tick is available for signatures. One flush per tick
+    # would spend 1.0/tick: over budget, and ~= the 11/s the per-token
+    # protocol already self-throttles to (measured), i.e. no change at all.
+    # TICKS=4 spends 0.25/tick (3x margin) and equals one audio chunk's
+    # period. TICKS=0 = count-only with the geometric ramp (the arm that
+    # first measured this mechanism); TOKENS=1 = per-token control arm.
+    # VERDICT (measured, u56, paired with burst12): batching alone took client
+    # miss 20.1% -> 1.5%, but ONLY by shortening the text window 3.4x (83
+    # deliveries -> 16); total stall barely moved (1489 -> 1292 ms/turn) and
+    # every remaining miss is in the turn opening. The reason is receiver-side:
+    # a consumer that needs a payload leaves `running` for a pass and advances
+    # exactly one step per park/resume round-trip, so its rate is capped at
+    # pass_rate/2 (~10 frames/s at u56, below the 12.5 contract) and BANKED
+    # rows cannot be drained without another payload event. So the cure is
+    # VLLM_OMNI_INLINE_RECV (below), and with it a per-token payload costs
+    # nothing -- batching is kept OFF by default, as an ablation arm, since it
+    # only adds a cross-segment bank to get wrong.
+    "VLLM_OMNI_TEXT_COALESCE_TICKS": "0",
+    "VLLM_OMNI_TEXT_COALESCE_TOKENS": "1",
     "VLLM_OMNI_TEXT_COALESCE_EXEMPT": "4",
+    # [P8] Take delivery of an upstream payload on the scheduler thread when it
+    # is already in shared memory, instead of parking the consumer for a
+    # round-trip through the recv thread. This is the fix for the ceiling
+    # described above: the talker stays in `running` and keeps its decode slot,
+    # so frame production is limited by the pacer (as designed) rather than by
+    # the text-delivery protocol. 0 = parked-only path (control arm).
+    "VLLM_OMNI_INLINE_RECV": "1",
     # [P5] streaming vocoder conv window: the conv/upsample stack's measured
     # left receptive field is 10 codec frames (autograd probe; the 25-frame
     # left_context is a heuristic sized for the pre-transformer's attention,

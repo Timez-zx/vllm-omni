@@ -43,6 +43,8 @@ _LOG_CHUNK_EMIT = _os.environ.get("VLLM_OMNI_LOG_AUDIO_CHUNKS", "0") not in ("0"
 # [T2T coalesce] see the VLLM_OMNI_TEXT_COALESCE_* entry in _LIVE_DEFAULTS
 # for the sizing argument. Resolved through live_env so the default cannot
 # fork from the other tick-engine knobs.
+import time as _time
+
 from vllm_omni.core.sched.temporal_pacing import live_env as _live_env
 
 try:
@@ -53,17 +55,53 @@ try:
     _T2T_COALESCE_EXEMPT = max(0, int(float(_live_env("VLLM_OMNI_TEXT_COALESCE_EXEMPT") or 0)))
 except ValueError:
     _T2T_COALESCE_EXEMPT = 0
+# Flush period in TICKS. The deadline, not the row count, is the primary
+# trigger: it bounds text lag independently of the thinker's rate (a
+# count-only rule starves the talker exactly when the thinker slows down),
+# and every session quantizes the same host CLOCK_MONOTONIC, so all
+# sessions' deliveries land on the same grid edge and ride one scheduler
+# pass. Sizing: a delivery costs the receiving session ~1 scheduler pass,
+# and stage 1 affords ~1.7 passes per tick with 1 owed to the frame, so the
+# signature budget is ~0.7/tick. One flush per tick would spend 1.0/tick
+# (over budget, and ~= the 11/s the per-token protocol already
+# self-throttles to: no change). 4 ticks spends 0.25/tick -- 3x margin, and
+# the period equals one audio chunk. 0 disables the deadline (count-only).
+try:
+    _T2T_COALESCE_TICKS = max(0, int(float(_live_env("VLLM_OMNI_TEXT_COALESCE_TICKS") or 0)))
+except ValueError:
+    _T2T_COALESCE_TICKS = 0
+try:
+    _T2T_TICK_S = float(_live_env("VLLM_OMNI_TEMPORAL_TICK_MS") or 0) / 1000.0
+except ValueError:
+    _T2T_TICK_S = 0.0
+_T2T_PERIOD_S = _T2T_COALESCE_TICKS * _T2T_TICK_S if _T2T_TICK_S > 0 else 0.0
+
+
+def _t2t_drain(transfer_manager: Any, request_id: str):
+    """Take and clear whatever text rows are buffered; None when empty."""
+    buf = getattr(transfer_manager, "_t2t_text_buf", None)
+    if not buf:
+        return None
+    entry = buf.get(request_id)
+    if entry is None or entry[0] is None:
+        return None
+    emb, hid = entry[0], entry[1]
+    entry[0] = None
+    entry[1] = None
+    entry[2] += 1
+    entry[3] = None
+    return emb, hid
 
 
 def _t2t_coalesce_entry(transfer_manager: Any, request_id: str) -> list:
-    """Per-request text-row accumulator: [emb|None, hid|None, flushes]."""
+    """Per-request text-row accumulator: [emb|None, hid|None, flushes, due]."""
     buf = getattr(transfer_manager, "_t2t_text_buf", None)
     if buf is None:
         buf = {}
         transfer_manager._t2t_text_buf = buf
     entry = buf.get(request_id)
     if entry is None:
-        entry = [None, None, 0]
+        entry = [None, None, 0, None]
         buf[request_id] = entry
     return entry
 
@@ -438,8 +476,8 @@ def _construct_thinker2talker_streaming_input_async_chunk(
             # and must not leak into this one. Also restarts the per-segment
             # exempt counter (the first flushes of EVERY turn ship per-token,
             # TTFA depends on them).
-            if _T2T_COALESCE_TOKENS > 1:
-                _t2t_coalesce_entry(transfer_manager, request_id)[:] = [None, None, 0]
+            if _T2T_COALESCE_TOKENS > 1 or _T2T_PERIOD_S > 0:
+                _t2t_coalesce_entry(transfer_manager, request_id)[:] = [None, None, 0, None]
             prev = transfer_manager._pending_streaming_prefills.get(request_id)
             prompt_rows = int(thinker_emb.shape[0])
             if prev is not None:
@@ -519,26 +557,39 @@ def _construct_thinker2talker_streaming_input_async_chunk(
             # request's FULL output list on every payload, so batching cannot
             # desync it. Buffered rows survive a preemption unsent and flush,
             # once and in order, with the next payload.
-            if _T2T_COALESCE_TOKENS > 1:
+            if _T2T_COALESCE_TOKENS > 1 or _T2T_PERIOD_S > 0:
                 entry = _t2t_coalesce_entry(transfer_manager, request_id)
                 entry[0] = emb_cpu if entry[0] is None else torch.cat((entry[0], emb_cpu), dim=0)
                 entry[1] = hid_cpu if entry[1] is None else torch.cat((entry[1], hid_cpu), dim=0)
-                # Geometric ramp after the exempt window (2, 4, then TOKENS):
-                # a fixed jump straight to TOKENS opens a starvation window at
-                # turn start if the thinker dips below ~TOKENS x 12.5/runway
-                # tok/s; ramping keeps the talker's banked runway ahead of
-                # each batch's fill time at any thinker rate that can sustain
-                # realtime at all.
+                now = _time.monotonic() if _T2T_PERIOD_S > 0 else 0.0
+                if _T2T_PERIOD_S > 0 and entry[3] is None:
+                    # Deadline on the SHARED grid (not now+period), so every
+                    # session's flush lands on the same edge.
+                    entry[3] = (int(now / _T2T_PERIOD_S) + 1) * _T2T_PERIOD_S
                 if entry[2] < _T2T_COALESCE_EXEMPT:
-                    need = 1
+                    # Turn opening: ship per token. TTFA and the talker's
+                    # first frames depend on these; there is no runway yet to
+                    # spend on batching.
+                    ready = True
                 else:
-                    need = min(_T2T_COALESCE_TOKENS, 2 << (entry[2] - _T2T_COALESCE_EXEMPT))
-                if not is_finished and int(entry[0].shape[0]) < need:
+                    # Deadline OR cap, whichever comes first. With the
+                    # deadline armed the cap is a ceiling on payload size (a
+                    # fast thinker makes bigger batches, not more of them);
+                    # with it disabled the cap is the only trigger and the
+                    # geometric ramp protects the same starvation window the
+                    # deadline otherwise bounds.
+                    if _T2T_PERIOD_S > 0:
+                        ready = now >= entry[3] or int(entry[0].shape[0]) >= _T2T_COALESCE_TOKENS
+                    else:
+                        need = min(_T2T_COALESCE_TOKENS, 2 << (entry[2] - _T2T_COALESCE_EXEMPT))
+                        ready = int(entry[0].shape[0]) >= need
+                if not is_finished and not ready:
                     return None
                 emb_cpu, hid_cpu = entry[0], entry[1]
                 entry[0] = None
                 entry[1] = None
                 entry[2] += 1
+                entry[3] = None
             return OmniPayloadStruct(
                 meta=MetaStruct(
                     finished=finished,
@@ -557,7 +608,7 @@ def _construct_thinker2talker_streaming_input_async_chunk(
         # already cleared by the scheduler (this branch): any text rows still
         # buffered must ride out with this terminal payload, or the talker
         # never hears those words.
-        if _T2T_COALESCE_TOKENS > 1:
+        if _T2T_COALESCE_TOKENS > 1 or _T2T_PERIOD_S > 0:
             entry = _t2t_coalesce_entry(transfer_manager, request_id)
             if entry[0] is not None:
                 emb_cpu = torch.cat((entry[0], emb_cpu), dim=0)
@@ -565,6 +616,7 @@ def _construct_thinker2talker_streaming_input_async_chunk(
                 entry[0] = None
                 entry[1] = None
                 entry[2] += 1
+                entry[3] = None
         return OmniPayloadStruct(
             meta=MetaStruct(finished=finished),
             embed=EmbeddingsStruct(decode=emb_cpu),
@@ -713,6 +765,35 @@ def thinker2talker_async_chunk(
     # a frames-on-arrival append can do that, because it is submitted with max_tokens=1 and so
     # stops on the very forward that prefills it. With the feature off, a segment's first
     # forward never stops, so this branch is unreachable and the shipping path is untouched.
+    # [T2T coalesce] BOUNDARY DRAIN. The flush must be a property of the
+    # boundary, not of a builder branch: a segment can end on a save_async
+    # whose payload never reaches the builder at all -- the runner turns an
+    # empty per-request output into None (so `multimodal_output` is not a
+    # Mapping), and the preemption bookmark in save_async deliberately FORCES
+    # multimodal_output=None while still shipping the boundary. Both return
+    # here, above every flush site, and the next segment's opener resets the
+    # buffer: up to TOKENS-1 thinker tokens would be dropped silently and the
+    # talker would never speak those words. Found by adversarial review with a
+    # reproduction, not by measurement -- the loss is invisible in timing
+    # metrics. Ship what is buffered as its own decode payload.
+    if is_finished:
+        _drained = _t2t_drain(transfer_manager, request_id)
+        if _drained is not None:
+            _demb, _dhid = _drained
+            logger.info(
+                "[T2T coalesce] boundary drain: shipping %d buffered text row(s) for req=%s "
+                "on a segment end that carried no usable payload",
+                int(_demb.shape[0]), request_id,
+            )
+            return OmniPayloadStruct(
+                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+                embed=EmbeddingsStruct(decode=_demb),
+                hidden_states=HiddenStatesStruct(output=_dhid),
+                ids=IdsStruct(output=_ensure_list(request.output_token_ids)),
+                speaker=extract_speaker_from_request(request),
+                language=extract_language_from_request(request),
+            )
+
     if is_finished and isinstance(multimodal_output, Mapping):
         _emb = multimodal_output.get("hidden_states", {})
         _layers = _emb.get("layers", {}) if isinstance(_emb, dict) else {}
@@ -750,6 +831,13 @@ def thinker2talker_async_chunk(
         return _snapshot_for_talker(t) if isinstance(t, torch.Tensor) else None
 
     if chunk_id == 0:
+        # [T2T coalesce] chunk 0 is a request's FIRST payload -- including a
+        # request that reuses an external id whose accumulator was stranded by
+        # an earlier session. Reset here as well as on the segment-opener
+        # branch: an inherited flush count would skip the per-token exempt
+        # window that TTFA depends on, and inherited rows would ship ahead of
+        # this request's own first row. (Adversarial review, reproduced.)
+        _t2t_coalesce_entry(transfer_manager, request_id)[:] = [None, None, 0, None]
         all_token_ids = _ensure_list(request.all_token_ids)
         prompt_token_ids = _ensure_list(request.prompt_token_ids)
         payload = OmniPayloadStruct(

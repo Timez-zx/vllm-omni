@@ -2185,5 +2185,26 @@ class OmniGPUModelRunner(GPUModelRunner):
                 merged_info[key] = value
         merged_info.setdefault("meta", {})["num_processed_tokens"] = 0
         merged_info.setdefault("meta", {})["resumable"] = True
+        # The text-consumption CURSOR is rebased to this segment here, so every
+        # piece of state indexed BY that cursor must be dropped in the same
+        # breath -- the dict merge above otherwise carries the previous
+        # segment's cached_decode bank (and its exhaustion flags) into a fresh
+        # index space, where the talker reads the previous turn's rows, or
+        # index padding, as this turn's text conditioning. Silent: it degrades
+        # what the voice says, not any timing metric. (Adversarial review of
+        # the batched-text-payload change, which is what first populated the
+        # bank; harmless to do unconditionally, and correct for any other
+        # producer that banks rows.)
+        # Scoped deliberately: only the cursor-indexed bank and the
+        # exhaustion flag. `decode` and `decode_flag` keep their pre-existing
+        # semantics -- a segment's own cursor offset is self-consistent (the
+        # prefill step rebases it and every decode step advances it by one), so
+        # nothing else here needs to change.
+        _embed = merged_info.get("embed")
+        if isinstance(_embed, dict):
+            _embed.pop("cached_decode", None)
+        _meta = merged_info.get("meta")
+        if isinstance(_meta, dict):
+            _meta.pop("eos_emitted", None)
         self.model_intermediate_buffer[req_id] = merged_info
         setattr(self.requests[req_id], "additional_information_cpu", merged_info)

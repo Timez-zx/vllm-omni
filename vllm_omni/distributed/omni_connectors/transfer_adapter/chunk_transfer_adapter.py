@@ -32,6 +32,11 @@ _LOG_TRANSFER = os.environ.get("VLLM_OMNI_LOG_TRANSFER", "0") not in ("0", "fals
 from vllm_omni.core.sched.temporal_pacing import live_env_on as _live_env_on
 
 _INLINE_SEND = _live_env_on("VLLM_OMNI_TEMPORAL_INLINE_SEND")  # live-vllm: default ON
+# [live-vllm P8] take delivery on the scheduler thread instead of parking the
+# consumer for a round-trip. See the long note at the call site in
+# _process_chunk_queue: the park caps a chunk-fed stage at pass_rate/2 steps,
+# which at u56 is below realtime. 0 = old parked-only path (control arm).
+_INLINE_RECV = _live_env_on("VLLM_OMNI_INLINE_RECV")
 _LOG_CHUNK_ARRIVALS = os.environ.get("VLLM_OMNI_LOG_AUDIO_CHUNKS", "0") not in ("0", "", "false", "False")
 
 
@@ -109,6 +114,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.request_payload = {}
         self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.request_ids_mapping: dict[str, str] = {}
+        # [P8] inline-receive census: hits = deliveries that cost no park,
+        # misses = payload genuinely not there yet (fell back to the parked
+        # path). Logged by the scheduler's step probe.
+        self._inline_recv_hits = 0
+        self._inline_recv_misses = 0
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
@@ -759,6 +769,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.requests_num_chunks_sent.pop(external_req_id, None)
         self.ramp_chunk_count.pop(external_req_id, None)
         self._pending_streaming_prefills.pop(external_req_id, None)
+        # [T2T coalesce] the text-row accumulator is keyed the same way and
+        # holds TENSORS (device-resident when the stages are colocated), so
+        # leaving it behind both leaks GPU memory for the process lifetime and
+        # lets a stranded tail be inherited by the next request that reuses
+        # this external id -- shipping a previous session's rows ahead of the
+        # new turn's own first row. Reported by adversarial review with a
+        # reproduction; the sibling dicts above are all reclaimed here, this
+        # one was simply missed.
+        getattr(self, "_t2t_text_buf", {}).pop(external_req_id, None)
         # Log the request's total before dropping it -- for a long streaming session this is
         # the only place the accumulated cost of the edge is ever visible.
         totals = self._tx_totals.pop(external_req_id, None)
@@ -1128,6 +1147,53 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 if self.is_done_receiving_chunks(request.request_id):
                     request.additional_information = None
                     continue
+                # [live-vllm P8] INLINE RECEIVE. Before parking this request to
+                # await its next payload, try to take delivery right here, on
+                # the scheduler thread.
+                #
+                # The park is the whole disease. A consuming stage that needs a
+                # payload leaves `running` for at least one pass (park), waits
+                # for the recv thread, and is re-admitted by a later pass
+                # (resume) -- and it advances by exactly ONE step per such
+                # round-trip. So its output rate is capped at pass_rate/2,
+                # measured 21 passes/s at u56 => ~10 frames/s, BELOW the 12.5
+                # frames/s realtime contract. While the thinker streams text,
+                # the talker therefore cannot keep up no matter how the
+                # payloads are sized or paced: at 320 ms/chunk contract it
+                # produced 377 ms/chunk, and 96% of all client misses at u56
+                # land in the first quarter of a turn -- exactly the text
+                # window. Sender-side batching only shortens that window (the
+                # 20.1% -> 1.5% measurement); it cannot lift the ceiling,
+                # because banked rows still need a payload event to be
+                # scheduled at all.
+                #
+                # The shm get is a keyed, lock-file-guarded read: safe to call
+                # from this thread while recv_loop works other requests, and
+                # sub-millisecond when the payload is already there (the
+                # producer runs 25 tok/s vs the 12.5 rows/s consumed, so it
+                # usually is). A miss costs one failed shm_open and falls
+                # through to exactly the old parked path.
+                if _INLINE_RECV and target_status == RequestStatus.RUNNING:
+                    self.request_ids_mapping[request.request_id] = request.external_req_id
+                    try:
+                        got_inline = bool(self._poll_single_request(request))
+                    except Exception as e:
+                        got_inline = False
+                        logger.warning(
+                            "[OmniTransfer] inline receive failed for %s: %s",
+                            request.request_id, e,
+                        )
+                    if got_inline:
+                        # _poll_single_request marks the request finished-load;
+                        # consume that marker here so no later pass re-resumes.
+                        finished_load_reqs.discard(request.request_id)
+                        self._inline_recv_hits += 1
+                        # Keeps the request in `queue` (still RUNNING) unless it
+                        # carried a segment opener, which _resume_loaded_request
+                        # reroutes through WAITING exactly as the parked path does.
+                        self._resume_loaded_request(request, queue, target_status)
+                        continue
+                    self._inline_recv_misses += 1
                 # Requests that waiting for chunk
                 self.load_async(request)
                 request.status = RequestStatus.WAITING_FOR_CHUNK
