@@ -1156,6 +1156,23 @@ class Qwen3OmniMoeForConditionalGeneration(
                 continue
             else:
                 raise AssertionError("Expect role id after <|im_start|> (assistant, user, system)")
+        if not talker_input_embeds:
+            # [live-vllm] Wave-onset race: a prefill span carrying NO
+            # assistant span reaches here (empty-payload family) and the
+            # bare torch.cat kills the whole stage-1 engine core -- observed
+            # twice at u56, both at first-compression time, taking all 56
+            # sessions down (diag8/text runs). Same contract as the
+            # pad-to-span clamp: ship ZERO rows with an ERROR line; the
+            # offending segment parks with no output and only its own
+            # session degrades.
+            logger.error(
+                "[talker-prefill] EMPTY talker span list (span_len=%d); "
+                "shipping zero rows instead of crashing the engine core.",
+                int(input_ids.shape[0]) if input_ids is not None else -1,
+            )
+            zero_e = input_embeds.new_zeros((0, input_embeds.shape[-1]))
+            zero_i = input_ids.new_zeros((0,))
+            return zero_i, zero_e, trailing_text_hidden_all
         talker_input_embed = torch.cat([embed.to(input_ids.device) for embed in talker_input_embeds], dim=0)
         talker_input_id = torch.cat([embed.to(input_ids.device) for embed in talker_input_ids], dim=0)
 
