@@ -1381,6 +1381,17 @@ class OmniStreamingVideoHandler:
                             # wrong turn, and conflating them cost a debugging cycle tonight.
                             if st["t_first_text"] is None:
                                 st["t_first_text"] = _time.monotonic()
+                                # [turnprobe] One line per turn, pairing with the
+                                # recv probe in _run_session_turn_body: splits a
+                                # client-measured TTFT into handler time
+                                # (recv -> ADMIT) and engine time (ADMIT ->
+                                # first text). Exists to name the serialization
+                                # point behind the residual 3-11 s outlier
+                                # turns that survived v3-v5.
+                                logger.info(
+                                    "[turnprobe] first-text rid=%s turn=%d",
+                                    ctx.get("rid"), sess.get("turn_idx", -1),
+                                )
                             if delta:
                                 st["text_parts"].append(delta)
                                 await websocket.send_json(
@@ -1651,6 +1662,11 @@ class OmniStreamingVideoHandler:
                 sending the next query, so pipelining would buy nothing here and would
                 complicate the segment bookkeeping.
                 """
+                # [turnprobe] see the first-text probe for why.
+                logger.info(
+                    "[turnprobe] recv rid=%s turn=%d",
+                    (sess.get("active_ctx") or {}).get("rid"), sess.get("turn_idx", -1),
+                )
                 if sess["fatal"]:
                     await self._send_error(websocket, f"Session failed: {sess['fatal']}")
                     return

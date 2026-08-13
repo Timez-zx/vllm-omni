@@ -49,7 +49,8 @@ FRAMES_ROOT = pathlib.Path("/data/zx/stimuli/frames640")
 FRAME_INTERVAL_S = 0.5          # 2 fps, the browser page's rhythm (see --video-interval-ms)
 TURN_TIMEOUT_S = 180.0
 THINK_S = (2.0, 6.0)            # closed-loop pause after each reply (see --think)
-STAGGER_S = (0.0, 8.0)          # spread session starts so turn 1 is not a stampede
+_stag = os.environ.get("MU_STAGGER_S")  # "lo,hi" override for arrival-spread控制实验
+STAGGER_S = tuple(float(x) for x in _stag.split(",")) if _stag else (0.0, 8.0)
 WARMUP_S = 4.0                  # let the frame pump run before the first query
 GIVE_UP_AFTER = 3               # consecutive timeouts before a user stops
 

@@ -1405,6 +1405,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self._replace_streaming_session(session, update)
             return
         super()._update_request_as_session(session, update)
+        # [skipped-waiting requeue] Upstream just flipped the parked session's
+        # status to WAITING -- but when this call came from add_request (a new
+        # segment arriving for a PARKED session), the request object is still
+        # sitting in skipped_waiting among every other session's blocked
+        # parked requests, and the scheduler reaches it there by luck. Probe
+        # measurement: a 15-token segment sat 12 s between admission and
+        # execution while the stage was otherwise fresh -- the entire residual
+        # p99/max outlier family (5-13 s turn starts) of the burst study. The
+        # downstream branch above has always re-enqueued on wake; the stage-0
+        # path was missing the same dance. _enqueue_waiting_request routes by
+        # status, so a genuinely still-blocked request lands back in
+        # skipped_waiting and nothing changes for it. On the
+        # _handle_stopped_request path the session is in neither queue and
+        # this is a no-op (the caller enqueues right after).
+        if session in self.skipped_waiting:
+            self.skipped_waiting.remove_requests((session,))
+            self._enqueue_waiting_request(session)
         # Apply the update's max_tokens. Upstream carries it on every StreamingUpdate and
         # never applies it -- `Request.max_tokens` keeps the FIRST chunk's value for the
         # whole session. The stop check compares per-segment output counts (upstream
