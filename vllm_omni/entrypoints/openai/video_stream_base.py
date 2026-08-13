@@ -74,6 +74,25 @@ assert _PREFILL_ONLY_KEY == _TTS_PREFILL_ONLY_KEY, (
 _DEFAULT_IDLE_TIMEOUT = 60.0
 _DEFAULT_CONFIG_TIMEOUT = 10.0
 _MAX_FRAME_SIZE = 10 * 1024 * 1024  # 10MB per frame
+
+# [Tick engine WP7] Frame-tick mailbox. When enabled, an arriving frame is NOT
+# appended to the engine immediately: it waits in frame_buffer (which already
+# is the mailbox -- refused frames stay there today) and a per-session flush
+# fires at the next edge of the global tick grid. Every session quantizes the
+# same CLOCK_MONOTONIC to the same grid -- the exact scheme the engine-side
+# pacer uses (temporal_pacing.py) -- so the sessions' flushes align WITHOUT
+# any shared registry, and their frame appends reach stage 0 inside one tick
+# window where the vision encoder batches them in one forward
+# (_execute_mm_encoder batches everything co-scheduled in a pass). Greedy
+# arrival phase is random per user, so without this the encoder runs batch=1
+# per frame: 48 users x 480 ms = ~100 scattered encoder calls/s.
+# Gated separately from VLLM_OMNI_TEMPORAL_TICK_MS because the M arm sets the
+# tick env too; this is a T-family treatment and must be opt-in.
+_FRAME_TICK_S: float = 0.0
+if os.environ.get("VLLM_OMNI_TEMPORAL_FRAME_TICK", "0") not in ("0", "", "false", "False"):
+    _FRAME_TICK_S = max(
+        0.0, float(os.environ.get("VLLM_OMNI_TEMPORAL_TICK_MS", "0") or 0.0)
+    ) / 1000.0
 _MAX_BUFFER_FRAMES = 64
 _MAX_AUDIO_BUFFER_BYTES = 4 * 1024 * 1024
 _MAX_MSG_QUEUE = 200
@@ -1428,8 +1447,12 @@ class OmniStreamingVideoHandler:
                         ctx["failed"] = str(e)
                         ctx["ready_evt"].set()
 
-            async def _prefill_frame_on_arrival(frame_b64: str) -> None:
-                """Append one just-arrived frame to the live request so stage 0 prefills it now.
+            async def _prefill_frames_on_arrival(frames: list[str]) -> bool:
+                """Append just-arrived frame(s) to the live request so stage 0 prefills them now.
+
+                Immediate mode passes a single frame; frame-tick mode (WP7) passes
+                everything the mailbox collected this tick as ONE chunk, so the
+                frames' encoder work and KV prefill travel together.
 
                 The append carries no query text, and `max_tokens=1` because the engine needs
                 a nonzero cap to schedule the chunk. Since section 25 the scheduler discards
@@ -1477,7 +1500,7 @@ class OmniStreamingVideoHandler:
                 if sess["queue"].qsize() > 0:
                     return False
                 chunk = await self._build_session_chunk(
-                    config, [frame_b64], bytearray(), "", frame_pil_cache,
+                    config, frames, bytearray(), "", frame_pil_cache,
                     is_first=False,
                 )
                 if chunk is None or not isinstance(chunk, dict):
@@ -1526,18 +1549,18 @@ class OmniStreamingVideoHandler:
                 # boundary lost" on the first turn after any append).
                 ntok = len(chunk.get("prompt_token_ids") or ())
                 sess["arrival_appends"] += 1
-                sess["arrival_frames"] += 1
+                sess["arrival_frames"] += len(frames)
                 sess["arrival_tokens"] += ntok
                 sess["cum_tokens"] = sess.get("cum_tokens", 0) + ntok
                 # Arrival-consumed frames never reach the turn body's new_frames list,
                 # so the transcript would lose exactly the frames this optimisation
                 # touches. Same pending list the turn body feeds, same turn-close drain.
                 if compression_trigger and config.context_compression_carry_frames:
-                    sess.setdefault("pending_frames", []).append(frame_b64)
+                    sess.setdefault("pending_frames", []).extend(frames)
                 logger.info(
-                    "[session] prefill-on-arrival: frame -> %d tokens (appends=%d frames=%d "
-                    "tokens=%d cum=%d)",
-                    ntok, sess["arrival_appends"], sess["arrival_frames"],
+                    "[session] prefill-on-arrival: %d frame(s) -> %d tokens (appends=%d "
+                    "frames=%d tokens=%d cum=%d)",
+                    len(frames), ntok, sess["arrival_appends"], sess["arrival_frames"],
                     sess["arrival_tokens"], sess.get("cum_tokens", 0),
                 )
                 # Frames alone can carry the context across the compression trigger during
@@ -1546,6 +1569,45 @@ class OmniStreamingVideoHandler:
                 if _warmup_due() and _shadow_allowed():
                     _launch_shadow_warmup("arrival")
                 return True
+
+            def _arm_frame_flush() -> None:
+                """[WP7] Schedule ONE mailbox flush at the next global tick edge.
+
+                Every session computes the edge as ceil(now/tick)*tick on the
+                shared CLOCK_MONOTONIC -- the same quantization the engine-side
+                pacer uses -- so flushes align across sessions with no shared
+                registry, and the aligned appends are what let stage 0 batch
+                the frames' encoder work. The flush is delivered through
+                msg_queue (the `_internal.*` precedent) so frame_buffer keeps
+                its single writer: _processor.
+
+                One timer per session at a time; a flush that finds the turn
+                busy simply leaves the frames buffered (same soft-failure
+                contract as the immediate path) and the NEXT frame arrival
+                re-arms -- no periodic retry churn.
+                """
+                if sess.get("frame_flush_armed"):
+                    return
+                sess["frame_flush_armed"] = True
+
+                async def _wait_edge() -> None:
+                    now = _time.monotonic()
+                    delay = math.ceil(now / _FRAME_TICK_S) * _FRAME_TICK_S - now
+                    # Landing exactly on an edge (or sub-ms before it) would
+                    # flush a mailbox the current frame has not reached yet.
+                    if delay < 0.002:
+                        delay += _FRAME_TICK_S
+                    await asyncio.sleep(delay)
+                    try:
+                        msg_queue.put_nowait({"type": "_internal.frame_flush"})
+                    except asyncio.QueueFull:
+                        # The loop is already saturated; the next arrival
+                        # re-arms. Frames stay buffered -- never lost.
+                        sess["frame_flush_armed"] = False
+
+                task = asyncio.create_task(_wait_edge())
+                prewarm_tasks.add(task)
+                task.add_done_callback(prewarm_tasks.discard)
 
             async def _prefill_audio_on_arrival() -> bool:
                 """[Tick engine WP5] prefill buffered mic audio while the user speaks.
@@ -2573,6 +2635,22 @@ class OmniStreamingVideoHandler:
 
                     msg_type = msg.get("type")
 
+                    if msg_type == "_internal.frame_flush":
+                        # [WP7] Tick-edge mailbox flush. Runs inside _processor, so
+                        # frame_buffer cannot change under the await below (this loop
+                        # is its single writer; frames arriving meanwhile sit in
+                        # msg_queue). Prefix deletion therefore removes exactly the
+                        # flushed frames -- same shape as the turn body's drain.
+                        sess["frame_flush_armed"] = False
+                        if (frame_buffer and config.prefill_frames_on_arrival
+                                and config.session_scoped_request):
+                            flush = list(frame_buffer)
+                            if await _prefill_frames_on_arrival(flush):
+                                del frame_buffer[:len(flush)]
+                                for _fb in flush:
+                                    frame_pil_cache.pop(_fb, None)
+                        continue
+
                     if msg_type == "_internal.frame_decode_failed":
                         frame_data = msg.get("b64", "")
                         removed = frame_data in frame_buffer
@@ -2692,8 +2770,12 @@ class OmniStreamingVideoHandler:
                         # Prefill this frame now rather than when the query arrives. Only if it
                         # is actually consumed does it leave frame_buffer -- see the helper: a
                         # refusal leaves the frame for the ordinary query-time path.
+                        # [WP7] Under frame-tick, the frame WAITS in the mailbox instead and
+                        # the flush at the next global tick edge appends everything at once.
                         if config.prefill_frames_on_arrival and config.session_scoped_request:
-                            if await _prefill_frame_on_arrival(frame_data):
+                            if _FRAME_TICK_S > 0:
+                                _arm_frame_flush()
+                            elif await _prefill_frames_on_arrival([frame_data]):
                                 try:
                                     frame_buffer.remove(frame_data)
                                 except ValueError:

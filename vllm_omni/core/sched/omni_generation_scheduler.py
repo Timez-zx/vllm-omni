@@ -121,6 +121,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # OMNI: Track requests that are already finished (e.g., marked by connector)
         # These should be removed from running and not scheduled
         already_finished_reqs: set[Request] = set()
+        # [Temporal batching] how many ready chunks the tick gate held this
+        # pass -- reported in the [SCHED-STEP] line below.
+        gated_this_pass = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
             # OMNI: Skip requests that are not in self.requests
@@ -152,6 +155,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             if self.chunk_tick_gate.enabled and self.chunk_tick_gate.should_hold(
                 request.request_id, scheduled_timestamp
             ):
+                gated_this_pass += 1
                 req_index += 1
                 continue
             num_new_tokens = min(required_tokens, token_budget)
@@ -315,6 +319,22 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # this pass means every pending chunk is gated (or absent) -- the loop
         # may sleep until the gate's next_wake / the chunk-poll cap.
         self.omni_tick_idle = total_num_scheduled_tokens == 0
+
+        # [Temporal pacing] same evidence line the AR stages emit
+        # (omni_ar_scheduler): nreq per non-idle pass is what verifies -- or
+        # refutes -- that the tick gate turns scattered per-arrival vocode
+        # calls into one batched forward. held = chunks the gate parked.
+        if self.chunk_tick_gate.log_steps and total_num_scheduled_tokens:
+            logger.info(
+                "[SCHED-STEP] stage=%s mono=%.6f nreq=%d ntok=%d held=%d run=%d wait=%d",
+                getattr(self.vllm_config.model_config, "stage_id", -1),
+                scheduled_timestamp,
+                len(num_scheduled_tokens),
+                total_num_scheduled_tokens,
+                gated_this_pass,
+                len(self.running),
+                len(self.waiting),
+            )
 
         # Record the request ids scheduled in this step (v0.14.0 behavior).
         self.prev_step_scheduled_req_ids.clear()

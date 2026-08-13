@@ -348,6 +348,10 @@ class ChunkTickGate:
         self.tick_s = max(0.0, tick_ms) / 1000.0
         self.enabled = self.tick_s > 0 and barrier
         self.stage_id = getattr(model_config, "stage_id", -1)
+        # Same env as the AR stages' [SCHED-STEP] line: the generation
+        # scheduler consults this to emit per-pass batch evidence, which is
+        # how tick-aligned vocode batching is verified rather than assumed.
+        self.log_steps = _parse_log_steps(self.stage_id)
         # Earliest pending release; the tick engine loop sleeps until this.
         self.next_wake: float | None = None
         # rid -> [chunks_seen_this_segment, release_t | None]
