@@ -105,6 +105,27 @@ _LIVE_DEFAULTS = {
     # delivery delay -- inside the lead buffer, same argument as the gate's
     # own +<=1 tick. 0/1 disables (plain next-edge release).
     "VLLM_OMNI_TEMPORAL_VOCODE_PHASES": "4",
+    # [P7 phase-locked pipeline] Per-stage phase offsets on the SHARED tick
+    # grid (all processes quantize the same host CLOCK_MONOTONIC, so the
+    # edges coincide numerically across stages). The tick becomes a fixed
+    # program: T+0 thinker decode -> (transfer, phase-locked mailbox) ->
+    # T+PHASE1 talker step (its inputs are READY BY CONSTRUCTION: produced at
+    # T+0, shipped inline) -> T+PHASE2 vocode gate edge (the 4th frame enters
+    # its box in the SAME tick). This removes the straggler CONCEPT rather
+    # than compensating for it: a session's input window closes before its
+    # own departure slot. Measured disease it targets: u56 production-gap
+    # tail (p99 586ms vs 402 at u48) from per-session frames completing at
+    # load-coupled moments.
+    "VLLM_OMNI_TEMPORAL_PHASE0_MS": "0",
+    "VLLM_OMNI_TEMPORAL_PHASE1_MS": "30",
+    "VLLM_OMNI_TEMPORAL_PHASE2_MS": "64",
+    # [P7] time-budgeted slack (freight limiter): a prefill slice may only be
+    # as large as the tick's REMAINING time can absorb at the measured
+    # prefill throughput; right after the stage's phase edge there is a
+    # decode-only zone where freight is barred entirely. 0 disables (fixed
+    # SLACK_TOKENS cap only).
+    "VLLM_OMNI_TEMPORAL_TIME_SLACK": "1",
+    "VLLM_OMNI_TEMPORAL_DECODE_ZONE_MS": "18",
     # [P5] streaming vocoder conv window: the conv/upsample stack's measured
     # left receptive field is 10 codec frames (autograd probe; the 25-frame
     # left_context is a heuristic sized for the pre-transformer's attention,
@@ -209,6 +230,16 @@ class TemporalPacer:
         # efficiency 3.9 vs 6.1). Slots cover the worst-case catchup budget.
         max_units = max(1, int(math.ceil(self.tick_budget * self.catchup))) if self.tick_budget else 1
         self.sub_slot = self.tick_s / max_units if self.tick_s > 0 else 0.0
+        # [P7] Phase offset: this stage's grid edges sit at k*tick + phase.
+        # thinker=PHASE0 (0), talker=PHASE1 (after the thinker step + inline
+        # transfer) -- the pipeline schedule that makes the talker's inputs
+        # ready-by-construction at its own edge.
+        if "talker" in stage:
+            self.phase_s = _env_float("VLLM_OMNI_TEMPORAL_PHASE1_MS",
+                                      float(live_env("VLLM_OMNI_TEMPORAL_PHASE1_MS"))) / 1000.0
+        else:
+            self.phase_s = _env_float("VLLM_OMNI_TEMPORAL_PHASE0_MS",
+                                      float(live_env("VLLM_OMNI_TEMPORAL_PHASE0_MS"))) / 1000.0
         # Barrier state: the boundary that opened the CURRENT tick window, and
         # each request's unit count snapshotted at that boundary.
         self._tick_open: float = 0.0
@@ -266,7 +297,10 @@ class TemporalPacer:
         Requests still inside their per-turn burst bypass everything, so TTFA
         never pays for the barrier.
         """
-        boundary = math.floor(now / self.tick_s) * self.tick_s
+        # [P7] the grid is phase-shifted: edges at k*tick + phase. Same host
+        # CLOCK_MONOTONIC across stage processes, so thinker edges (phase 0)
+        # and talker edges (phase 30ms) interleave into one pipeline.
+        boundary = math.floor((now - self.phase_s) / self.tick_s) * self.tick_s + self.phase_s
         fresh = boundary > self._tick_open
         if fresh:
             self._tick_open = boundary
@@ -416,6 +450,11 @@ class ChunkTickGate:
             self.phase_groups = max(0, int(float(live_env("VLLM_OMNI_TEMPORAL_VOCODE_PHASES") or 0)))
         except ValueError:
             self.phase_groups = 0
+        # [P7] gate edges at k*tick + PHASE2: placed after the talker's step
+        # (PHASE1 + step time) so a chunk completed this tick vocodes THIS
+        # tick instead of waiting for the next plain edge.
+        self.phase_s = _env_float("VLLM_OMNI_TEMPORAL_PHASE2_MS",
+                                  float(live_env("VLLM_OMNI_TEMPORAL_PHASE2_MS"))) / 1000.0
         self._grp: dict[str, int] = {}
         self._next_grp = 0
         if self.enabled and self.phase_groups > 1:
@@ -445,7 +484,8 @@ class ChunkTickGate:
             # chunk cadence preserves group phase afterwards), so it starts
             # at chunk 3: chunk 2 lands while the client buffer is thinnest
             # and keeps today's plain next-edge release.
-            edge = math.ceil(now / self.tick_s)
+            # [P7] edges live on the phase-shifted grid (k*tick + PHASE2).
+            edge = math.ceil((now - self.phase_s) / self.tick_s)
             if self.phase_groups > 1 and st[0] > 2:
                 grp = self._grp.get(request_id)
                 if grp is None:
@@ -453,7 +493,7 @@ class ChunkTickGate:
                     self._next_grp = (self._next_grp + 1) % self.phase_groups
                 while edge % self.phase_groups != grp:
                     edge += 1
-            st[1] = edge * self.tick_s
+            st[1] = edge * self.tick_s + self.phase_s
         if now < st[1]:
             if self.next_wake is None or self.next_wake <= now or st[1] < self.next_wake:
                 self.next_wake = st[1]

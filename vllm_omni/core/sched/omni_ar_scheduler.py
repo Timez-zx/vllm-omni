@@ -73,12 +73,22 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
 from vllm_omni.core.sched.temporal_pacing import SLACK_CLASS_KEY as _SLACK_CLASS_KEY
 from vllm_omni.core.sched.temporal_pacing import TICK_ENGINE_LOOP as _TICK_ENGINE_LOOP
 from vllm_omni.core.sched.temporal_pacing import TICK_REPLAY as _TICK_REPLAY
-from vllm_omni.core.sched.temporal_pacing import TemporalPacer, live_env
+from vllm_omni.core.sched.temporal_pacing import TemporalPacer, live_env, live_env_on
 
 # [live-vllm P2] Per-pass aperiodic-prefill cap (the slack slot); decode
 # heartbeat tokens are budgeted ON TOP of this, so a prefill slice can never
 # stretch a pass past the tick edge. Read once per engine-core process.
 _SLACK_TOKENS = int(float(live_env("VLLM_OMNI_TEMPORAL_SLACK_TOKENS") or 0))
+
+# [live-vllm P7] Freight limiter: size each prefill slice by TIME, not by a
+# fixed token count -- the slice may only be as large as the tick's remaining
+# window absorbs at the MEASURED prefill throughput, and the first
+# DECODE_ZONE ms after the stage's phase edge carry no freight at all. This
+# is what makes "the thinker's step completes before the talker's phase edge"
+# a guarantee instead of a hope (measured: stage-0 pass tail p99 190ms from
+# 6144-token slices riding decode passes).
+_TIME_SLACK = live_env_on("VLLM_OMNI_TEMPORAL_TIME_SLACK")
+_DECODE_ZONE_S = float(live_env("VLLM_OMNI_TEMPORAL_DECODE_ZONE_MS") or 0) / 1000.0
 
 
 def _slack_is_background(request: Any) -> bool:
@@ -560,10 +570,33 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.waiting.remove_requests(bg)
                 _slack_bg_held = bg
                 self._slack_bg_parks = getattr(self, "_slack_bg_parks", 0) + len(bg)
+            _now_mono = _monotonic()
+            # [P7] settle the previous pass's prefill-throughput sample: the
+            # gap to the next schedule() call approximates its execute time.
+            _prev = getattr(self, "_ts_prev", None)
+            if _prev is not None:
+                _dt = _now_mono - _prev[0]
+                if 0 < _dt < 2 * max(self.temporal_pacer.tick_s, 0.04) and _prev[1] > 256:
+                    _sample = _prev[1] / _dt
+                    _old = getattr(self, "_prefill_tps", 100_000.0)
+                    self._prefill_tps = min(500_000.0, max(20_000.0, 0.8 * _old + 0.2 * _sample))
+                self._ts_prev = None
+            _slack_cap = _SLACK_TOKENS
+            if (_TIME_SLACK and self.temporal_pacer.barrier
+                    and self.temporal_pacer.tick_s > 0):
+                _in_win = (_now_mono - self.temporal_pacer.phase_s) % self.temporal_pacer.tick_s
+                if _in_win < _DECODE_ZONE_S:
+                    # decode-only zone right after this stage's phase edge:
+                    # the heartbeat step never queues behind freight.
+                    _slack_cap = 0
+                else:
+                    _remaining = self.temporal_pacer.tick_s - _in_win
+                    _tps = getattr(self, "_prefill_tps", 100_000.0)
+                    _slack_cap = min(_SLACK_TOKENS, int(_tps * _remaining * 0.7))
             _slack_budget_saved = self.max_num_scheduled_tokens
             self.max_num_scheduled_tokens = min(
                 _slack_budget_saved,
-                _SLACK_TOKENS + 2 * len(self.running),
+                _slack_cap + 2 * len(self.running),
             )
 
         try:
@@ -581,6 +614,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 scheduler_output = super().schedule(throttle_prefills)
                 if scheduler_output.total_num_scheduled_tokens:
                     self._replay_misses = getattr(self, "_replay_misses", 0) + 1
+            # [P7] stamp this pass's freight so the NEXT call can settle a
+            # prefill-throughput sample (call gap ~ this pass's execute time).
+            _pf_toks = (scheduler_output.total_num_scheduled_tokens
+                        - len(scheduler_output.num_scheduled_tokens))
+            if _pf_toks > 256:
+                self._ts_prev = (_monotonic(), _pf_toks)
             _hits = getattr(self, "_replay_hits", 0)
             _misses = getattr(self, "_replay_misses", 0)
             if (_hits + _misses) and (_hits + _misses) % 5000 == 0:
