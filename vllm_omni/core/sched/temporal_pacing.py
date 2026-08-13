@@ -252,6 +252,11 @@ class TemporalPacer:
         self.next_wake: float | None = None
         # rid -> [output_len_seen, units_this_turn, anchor_t, holds]
         self._st: dict[str, list] = {}
+        # [diagnosis] hold-reason census: which barrier branch dominates
+        # storm windows. Logged+reset every ~2500 split calls when
+        # VLLM_OMNI_LOG_SCHED_STEPS selects this stage.
+        self._hold_census = {"midjoin": 0, "ahead": 0, "budget": 0, "subslot": 0, "kept": 0}
+        self._census_calls = 0
 
         if self.enabled:
             logger.info(
@@ -320,10 +325,12 @@ class TemporalPacer:
             if base is None:
                 # Joined mid-window: wait for the boundary, where everyone
                 # steps together.
+                self._hold_census["midjoin"] += 1
                 held.append(req)
                 continue
             ahead = (units - self.burst) / self.rate - (now - anchor)
             if ahead > self.lead_s:
+                self._hold_census["ahead"] += 1
                 held.append(req)
                 continue
             # Catch up TOWARD THE LEAD BUFFER, not merely back to zero
@@ -336,17 +343,29 @@ class TemporalPacer:
             budget = self.tick_budget * (self.catchup if ahead < self.lead_s * 0.75 else 1.0)
             used = units - base
             if used >= budget:
+                self._hold_census["budget"] += 1
                 held.append(req)
                 continue
             # Sub-slot barrier: the k-th unit of this window releases at
             # open + k*sub_slot -- catch-up units gather and step together.
             slot_open = self._tick_open + used * self.sub_slot
             if now < slot_open:
+                self._hold_census["subslot"] += 1
                 held.append(req)
                 if slot_open < next_boundary:
                     next_boundary = slot_open  # earliest wake for the micro-sleep
             else:
+                self._hold_census["kept"] += 1
                 kept.append(req)
+        self._census_calls += 1
+        if self.log_steps and self._census_calls >= 2500:
+            c = self._hold_census
+            logger.info(
+                "[pacer-census] stage=%s mono=%.3f kept=%d midjoin=%d ahead=%d budget=%d subslot=%d",
+                self.stage_id, now, c["kept"], c["midjoin"], c["ahead"], c["budget"], c["subslot"])
+            for k in c:
+                c[k] = 0
+            self._census_calls = 0
         return kept, held, (next_boundary if held else None)
 
     def _observe(self, req: Any, now: float) -> tuple[int, float | None]:
