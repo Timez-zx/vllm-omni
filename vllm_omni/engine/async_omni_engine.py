@@ -439,6 +439,28 @@ class AsyncOmniEngine:
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
+
+            # [live-vllm diagnosis] orchestrator-loop lag probe: every audio
+            # chunk's timestamp -- and its delivery -- rides THIS thread's
+            # event loop, which shares the process GIL with the input-
+            # preprocessing threads. If this loop starves during input
+            # bursts, chunks are stamped (and shipped) late while every
+            # engine-side instrument stays green. Same probe as the serving
+            # loop's [loop-lag].
+            async def _orch_lag_probe() -> None:
+                lags: list[float] = []
+                _loop = asyncio.get_running_loop()
+                while True:
+                    _t0 = _loop.time()
+                    await asyncio.sleep(0.1)
+                    lags.append(max(0.0, (_loop.time() - _t0 - 0.1) * 1000.0))
+                    if len(lags) >= 100:
+                        lags.sort()
+                        logger.info("[orch-lag] p50=%.1fms p99=%.1fms max=%.1fms",
+                                    lags[50], lags[99], lags[-1])
+                        lags = []
+
+            asyncio.get_running_loop().create_task(_orch_lag_probe())
             await orchestrator.run()
 
         try:
