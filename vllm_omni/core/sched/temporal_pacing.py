@@ -78,20 +78,61 @@ logger = init_logger(__name__)
 # and produce no audio frame, so they must not advance the frame count.
 _CODEC_VALID_MAX = 2048
 
+# [live-vllm P1] On this branch the tick engine is the ARCHITECTURE, not an
+# option: every temporal gate defaults ON and the request-driven path is the
+# thing you must opt INTO (set the env to 0 explicitly) to build a control
+# arm. Single source of truth for those defaults -- factory.py,
+# chunk_transfer_adapter.py and video_stream_base.py import the helpers so a
+# default can never fork between modules.
+_LIVE_DEFAULTS = {
+    "VLLM_OMNI_TEMPORAL_TICK_MS": "80",
+    "VLLM_OMNI_TEMPORAL_BARRIER": "1",
+    "VLLM_OMNI_TEMPORAL_ENGINE": "1",
+    "VLLM_OMNI_TEMPORAL_REPLAY": "1",
+    "VLLM_OMNI_TEMPORAL_INLINE_SEND": "1",
+    "VLLM_OMNI_TEMPORAL_MAILBOX": "1",
+    "VLLM_OMNI_TEMPORAL_FRAME_TICK": "1",
+    # [P2] per-pass cap on APERIODIC prefill tokens (the slack slot). The
+    # tick's decode heartbeat is exempt (budgeted on top); 0 disables.
+    # Sizing: one pass's prefill slice must finish inside the tick --
+    # 6144 tokens ~ 40-60 ms of stage-0 prefill on this hardware, leaving
+    # the decode step comfortable margin in an 80 ms tick.
+    "VLLM_OMNI_TEMPORAL_SLACK_TOKENS": "6144",
+}
+
+# [P2] Priority-class marker for aperiodic work, riding SamplingParams
+# .extra_args (the established marker channel -- see _PREFILL_ONLY_KEY in
+# video_stream_base). "background" = invisible-latency work (compression
+# shadow seeds): it yields the slack slot to anything a user is waiting on.
+SLACK_CLASS_KEY = "vllm_omni_slack_class"
+
+
+def live_env(name: str) -> str:
+    # Empty string counts as unset, matching _env_float: only an explicit
+    # value (e.g. "0") opts out of a live default.
+    v = os.environ.get(name)
+    if v is None or v == "":
+        return _LIVE_DEFAULTS.get(name, "0")
+    return v
+
+
+def live_env_on(name: str) -> bool:
+    return live_env(name) not in ("0", "", "false", "False")
+
 # [WP1] VLLM_OMNI_TEMPORAL_ENGINE=1 turns the engine-core busy loop into a
 # tick loop: between pacing events it SLEEPS on the input queue (waking
 # instantly for client requests) instead of hot-spinning through empty
 # scheduler passes. Read once per engine-core process.
 TICK_ENGINE_LOOP = (
-    os.environ.get("VLLM_OMNI_TEMPORAL_ENGINE", "0") not in ("0", "", "false", "False")
-    and float(os.environ.get("VLLM_OMNI_TEMPORAL_TICK_MS", "0") or 0) > 0
+    live_env_on("VLLM_OMNI_TEMPORAL_ENGINE")
+    and float(live_env("VLLM_OMNI_TEMPORAL_TICK_MS") or 0) > 0
 )
-TICK_S = float(os.environ.get("VLLM_OMNI_TEMPORAL_TICK_MS", "0") or 0) / 1000.0
+TICK_S = float(live_env("VLLM_OMNI_TEMPORAL_TICK_MS") or 0) / 1000.0
 
 # [WP2] VLLM_OMNI_TEMPORAL_REPLAY=1: pure-decode steps of an unchanged cohort
 # are emitted by the scheduler's cohort-replay fast path instead of the full
 # upstream scheduling pass. See OmniARScheduler._try_replay_schedule.
-TICK_REPLAY = os.environ.get("VLLM_OMNI_TEMPORAL_REPLAY", "0") not in ("0", "", "false", "False")
+TICK_REPLAY = live_env_on("VLLM_OMNI_TEMPORAL_REPLAY")
 
 
 def _env_float(name: str, default: float) -> float:
@@ -119,7 +160,7 @@ class TemporalPacer:
     """
 
     def __init__(self, model_config: Any):
-        tick_ms = _env_float("VLLM_OMNI_TEMPORAL_TICK_MS", 0.0)
+        tick_ms = _env_float("VLLM_OMNI_TEMPORAL_TICK_MS", 80.0)  # live-vllm: default ON
         self.tick_s = max(0.0, tick_ms) / 1000.0
         self.no_quant = os.environ.get("VLLM_OMNI_TEMPORAL_NO_QUANT", "0") not in ("0", "", "false", "False")
         self.lead_s = _env_float("VLLM_OMNI_TEMPORAL_LEAD_MS", 240.0) / 1000.0
@@ -140,7 +181,7 @@ class TemporalPacer:
             self.burst = 0
             self.codec_only = False
 
-        self.barrier = os.environ.get("VLLM_OMNI_TEMPORAL_BARRIER", "0") not in ("0", "", "false", "False")
+        self.barrier = live_env_on("VLLM_OMNI_TEMPORAL_BARRIER")
         self.catchup = max(1.0, _env_float("VLLM_OMNI_TEMPORAL_CATCHUP", 2.0))
         # Per-tick budget in output units (thinker: tokens, talker: frames).
         self.tick_budget = max(1, round(self.rate * self.tick_s)) if self.rate > 0 else 0
@@ -343,8 +384,8 @@ class ChunkTickGate:
     """
 
     def __init__(self, model_config: Any):
-        tick_ms = _env_float("VLLM_OMNI_TEMPORAL_TICK_MS", 0.0)
-        barrier = os.environ.get("VLLM_OMNI_TEMPORAL_BARRIER", "0") not in ("0", "", "false", "False")
+        tick_ms = _env_float("VLLM_OMNI_TEMPORAL_TICK_MS", 80.0)  # live-vllm: default ON
+        barrier = live_env_on("VLLM_OMNI_TEMPORAL_BARRIER")
         self.tick_s = max(0.0, tick_ms) / 1000.0
         self.enabled = self.tick_s > 0 and barrier
         self.stage_id = getattr(model_config, "stage_id", -1)

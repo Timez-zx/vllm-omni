@@ -29,7 +29,9 @@ _LOG_TRANSFER = os.environ.get("VLLM_OMNI_LOG_TRANSFER", "0") not in ("0", "fals
 # [Tick engine WP4-lite] VLLM_OMNI_TEMPORAL_INLINE_SEND=1: chunk sends happen
 # synchronously at the point save_async is called (T+0 of the producing step)
 # instead of via the background save thread. See save_async.
-_INLINE_SEND = os.environ.get("VLLM_OMNI_TEMPORAL_INLINE_SEND", "0") not in ("0", "false", "False", "")
+from vllm_omni.core.sched.temporal_pacing import live_env_on as _live_env_on
+
+_INLINE_SEND = _live_env_on("VLLM_OMNI_TEMPORAL_INLINE_SEND")  # live-vllm: default ON
 
 
 

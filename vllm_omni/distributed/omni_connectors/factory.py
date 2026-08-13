@@ -74,7 +74,8 @@ def _create_shm_connector(config: dict[str, Any]) -> OmniConnectorBase:
     # SharedMemoryConnector -- experiment arms keep ONE shared yaml and
     # differ only by env. The mailbox inherits the legacy path as its
     # universal fallback, so behavior is a superset.
-    if os.environ.get("VLLM_OMNI_TEMPORAL_MAILBOX", "0") not in ("0", "", "false", "False"):
+    from vllm_omni.core.sched.temporal_pacing import live_env_on as _live_env_on
+    if _live_env_on("VLLM_OMNI_TEMPORAL_MAILBOX"):  # live-vllm: default ON
         try:
             from .connectors.tick_mailbox_connector import TickMailboxConnector
 

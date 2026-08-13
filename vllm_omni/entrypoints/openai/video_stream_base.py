@@ -88,10 +88,12 @@ _MAX_FRAME_SIZE = 10 * 1024 * 1024  # 10MB per frame
 # per frame: 48 users x 480 ms = ~100 scattered encoder calls/s.
 # Gated separately from VLLM_OMNI_TEMPORAL_TICK_MS because the M arm sets the
 # tick env too; this is a T-family treatment and must be opt-in.
+from vllm_omni.core.sched.temporal_pacing import live_env, live_env_on as _live_env_on
+
 _FRAME_TICK_S: float = 0.0
-if os.environ.get("VLLM_OMNI_TEMPORAL_FRAME_TICK", "0") not in ("0", "", "false", "False"):
+if _live_env_on("VLLM_OMNI_TEMPORAL_FRAME_TICK"):  # live-vllm: default ON
     _FRAME_TICK_S = max(
-        0.0, float(os.environ.get("VLLM_OMNI_TEMPORAL_TICK_MS", "0") or 0.0)
+        0.0, float(live_env("VLLM_OMNI_TEMPORAL_TICK_MS") or 0.0)
     ) / 1000.0
 _MAX_BUFFER_FRAMES = 64
 _MAX_AUDIO_BUFFER_BYTES = 4 * 1024 * 1024
@@ -1076,11 +1078,17 @@ class OmniStreamingVideoHandler:
                             # output_kind is explicit because a first chunk's params
                             # become the REQUEST's params, and the bare default is the
                             # non-streaming kind.
+                            # [live-vllm P2] The seed prefills in silence -- nobody is
+                            # waiting on it. Mark it "background" so the scheduler's
+                            # express lane lets turn-opens and joins pass it; the marker
+                            # dies with the first real chunk (the swap turn) engine-side.
+                            from vllm_omni.core.sched.temporal_pacing import SLACK_CLASS_KEY
                             yield StreamingInput(
                                 prompt=prompt,
                                 sampling_params=SamplingParams(
                                     max_tokens=max_tokens,
                                     output_kind=RequestOutputKind.DELTA,
+                                    extra_args={SLACK_CLASS_KEY: "background"},
                                 ),
                             )
                             continue

@@ -70,9 +70,21 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
     uses_full_payload_input_coordinator,
 )
+from vllm_omni.core.sched.temporal_pacing import SLACK_CLASS_KEY as _SLACK_CLASS_KEY
 from vllm_omni.core.sched.temporal_pacing import TICK_ENGINE_LOOP as _TICK_ENGINE_LOOP
 from vllm_omni.core.sched.temporal_pacing import TICK_REPLAY as _TICK_REPLAY
-from vllm_omni.core.sched.temporal_pacing import TemporalPacer
+from vllm_omni.core.sched.temporal_pacing import TemporalPacer, live_env
+
+# [live-vllm P2] Per-pass aperiodic-prefill cap (the slack slot); decode
+# heartbeat tokens are budgeted ON TOP of this, so a prefill slice can never
+# stretch a pass past the tick edge. Read once per engine-core process.
+_SLACK_TOKENS = int(float(live_env("VLLM_OMNI_TEMPORAL_SLACK_TOKENS") or 0))
+
+
+def _slack_is_background(request: Any) -> bool:
+    sp = getattr(request, "sampling_params", None)
+    ea = getattr(sp, "extra_args", None) if sp is not None else None
+    return bool(ea) and ea.get(_SLACK_CLASS_KEY) == "background"
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
@@ -529,20 +541,67 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             original_waiting = self.waiting
             self.waiting = create_request_queue(self.policy)
 
+        # [live-vllm P2] Slack slot + express lane. Two rules, both scoped to
+        # this one pass and unwound in the finally:
+        #   (a) pass budget = decode needs (2 tok x running) + slack cap --
+        #       an aperiodic prefill slice can no longer consume the whole
+        #       max_num_batched_tokens and stretch the pass past the tick.
+        #   (b) BACKGROUND waiting work (compression shadow seeds, marked via
+        #       SLACK_CLASS_KEY) is parked whenever any FOREGROUND request is
+        #       waiting: user-visible opens never queue behind invisible
+        #       warm-ups. Parked = same shape as the pacer park (removed for
+        #       one pass, restored before anything can look).
+        _slack_bg_held: list[Request] = []
+        _slack_budget_saved: int | None = None
+        if _SLACK_TOKENS > 0 and self.temporal_pacer.enabled:
+            waiting_now = list(self.waiting)
+            bg = [r for r in waiting_now if _slack_is_background(r)]
+            if bg and len(bg) < len(waiting_now):
+                self.waiting.remove_requests(bg)
+                _slack_bg_held = bg
+                self._slack_bg_parks = getattr(self, "_slack_bg_parks", 0) + len(bg)
+            _slack_budget_saved = self.max_num_scheduled_tokens
+            self.max_num_scheduled_tokens = min(
+                _slack_budget_saved,
+                _SLACK_TOKENS + 2 * len(self.running),
+            )
+
         try:
             # [WP2 cohort replay] a pure-decode step for an unchanged cohort
             # needs none of the full pass's queue scans / budget arithmetic /
             # encoder logic -- emit it directly. Returns None (-> full path)
             # whenever ANY validity gate fails.
             scheduler_output = self._try_replay_schedule()
-            if scheduler_output is None:
+            # [live-vllm P1] replay is the intended STEADY-STATE path, not an
+            # opportunistic fast path -- measure its coverage so "steady state
+            # = replay" is a number, not a hope. Non-idle passes only.
+            if scheduler_output is not None:
+                self._replay_hits = getattr(self, "_replay_hits", 0) + 1
+            else:
                 scheduler_output = super().schedule(throttle_prefills)
+                if scheduler_output.total_num_scheduled_tokens:
+                    self._replay_misses = getattr(self, "_replay_misses", 0) + 1
+            _hits = getattr(self, "_replay_hits", 0)
+            _misses = getattr(self, "_replay_misses", 0)
+            if (_hits + _misses) and (_hits + _misses) % 5000 == 0:
+                logger.info(
+                    "[replay-coverage] stage=%s hits=%d full=%d (%.1f%% of non-idle passes replayed) slack_bg_parks=%d",
+                    self.vllm_config.model_config.stage_id, _hits, _misses,
+                    100.0 * _hits / (_hits + _misses),
+                    getattr(self, "_slack_bg_parks", 0),
+                )
         except AssertionError:
             # Upstream asserts kill the engine-core process. Dump the state before it dies,
             # or the only evidence is a traceback with no request in it.
             self._log_request_table("upstream schedule() raised AssertionError")
             raise
         finally:
+            if _slack_budget_saved is not None:
+                self.max_num_scheduled_tokens = _slack_budget_saved
+            if _slack_bg_held:
+                # Background work re-queues at the front: it keeps its arrival
+                # position for the next pass where no foreground is waiting.
+                self.waiting.prepend_requests(_slack_bg_held)
             if _paced_held:
                 # Back into running before anything else can look: a paced
                 # request is RUNNING in every observable sense, it just sat
@@ -1433,6 +1492,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         update_max_tokens = getattr(update, "max_tokens", None)
         if isinstance(update_max_tokens, int) and update_max_tokens > 0:
             session.max_tokens = update_max_tokens
+
+        # [live-vllm P2] A new streaming chunk means a live user is attached
+        # to this request: whatever priority class the FIRST chunk carried
+        # (a shadow's seed is "background") no longer describes it. Clear the
+        # marker so the express lane can never park a request a user is
+        # actually waiting on -- the swap turn is exactly this transition.
+        _sp = getattr(session, "sampling_params", None)
+        _ea = getattr(_sp, "extra_args", None) if _sp is not None else None
+        if _ea and _SLACK_CLASS_KEY in _ea:
+            _ea.pop(_SLACK_CLASS_KEY, None)
         # Per-UPDATE prefill-only capture (the zero-output append, section 25).
         # Marked segments are discarded at sampling time in update_from_output;
         # the flag is one-shot per segment: set here for the chunk that carried
