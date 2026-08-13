@@ -323,11 +323,19 @@ class TemporalPacer:
                 self._units_at_tick[rid] = units
             base = self._units_at_tick.get(rid)
             if base is None:
-                # Joined mid-window: wait for the boundary, where everyone
-                # steps together.
+                # [live-vllm anti-wave #4] Joined mid-window: REGISTER now and
+                # release on the sub-slot grid, instead of forfeiting the
+                # whole tick. The forfeit rule was the v1-regression guard,
+                # but the census convicted it as the dominant hold under
+                # load (70-130 midjoin-holds/s at u56 = every session fined
+                # ~1 tick every 3-8 ticks): a talker briefly leaves running
+                # for every text-chunk load, and any resume landing after
+                # the window opening paid a full tick. Budget accounting and
+                # sub-slot quantization below still apply, so this is the
+                # 40 ms catch-up bus, not a free run.
                 self._hold_census["midjoin"] += 1
-                held.append(req)
-                continue
+                self._units_at_tick[rid] = units
+                base = units
             ahead = (units - self.burst) / self.rate - (now - anchor)
             if ahead > self.lead_s:
                 self._hold_census["ahead"] += 1
