@@ -309,7 +309,15 @@ class TemporalPacer:
         fresh = boundary > self._tick_open
         if fresh:
             self._tick_open = boundary
-            self._units_at_tick = {}
+            # [live-vllm anti-wave #5] Enroll EVERY tracked session at the
+            # boundary, not just the ones momentarily in `running`: a talker
+            # flaps out of running for every text-chunk load, and a boundary
+            # falling inside that flap used to erase its enrollment -- the
+            # midjoin fine (measured 70-130/s at u56; #4 shrank the fine
+            # from a full tick to a sub-slot, this removes the ticket
+            # entirely). A session parked long (between turns) re-enrolls
+            # with its unit count unchanged, so the budget cap still binds.
+            self._units_at_tick = {rid: st[1] for rid, st in self._st.items()}
         next_boundary = self._tick_open + self.tick_s
         kept: list = []
         held: list = []
