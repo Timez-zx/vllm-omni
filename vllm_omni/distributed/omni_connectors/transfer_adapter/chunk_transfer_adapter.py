@@ -32,6 +32,7 @@ _LOG_TRANSFER = os.environ.get("VLLM_OMNI_LOG_TRANSFER", "0") not in ("0", "fals
 from vllm_omni.core.sched.temporal_pacing import live_env_on as _live_env_on
 
 _INLINE_SEND = _live_env_on("VLLM_OMNI_TEMPORAL_INLINE_SEND")  # live-vllm: default ON
+_LOG_CHUNK_ARRIVALS = os.environ.get("VLLM_OMNI_LOG_AUDIO_CHUNKS", "0") not in ("0", "", "false", "False")
 
 
 
@@ -938,6 +939,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         pass then emits it as NewRequestData with the fresh payload attached.
         """
         req_id = request.request_id
+        # [live-vllm diagnosis] per-chunk ARRIVAL stamp at the consumer:
+        # the talker's text pieces resume here -- the last unstamped
+        # dependency of frame production. Same env as the other chunk stamps.
+        if _LOG_CHUNK_ARRIVALS:
+            logger.info("[TEXT-CHUNK] rid=%s mono=%.6f", req_id, time.monotonic())
         self.requests_with_ready_chunks.add(req_id)
         replaced = req_id in self._segment_replaced_reqs
         self._segment_replaced_reqs.discard(req_id)
