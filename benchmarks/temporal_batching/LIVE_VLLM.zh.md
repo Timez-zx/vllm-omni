@@ -55,4 +55,27 @@ live-vllm:拍执行器为脊柱,补丁转正为器官;决策只在事件发生
 触发 0.75×份额、真实到达。所有已建立的证据线沿用:SCHED-STEP、turnprobe、
 ChunkTickGate 日志、analyze.py 指标全套。
 
-(以下各阶段的实测结果随施工追加。)
+## 4. 施工日志
+
+**P1(2026-08-13)完成**:七开关默认 ON,单一事实源 `temporal_pacing._LIVE_DEFAULTS`
+(factory/adapter/video_stream_base 统一引用,空串=未设置);`run_engine.sh` tick
+默认 80;replay-coverage 计数线(稳态=重放是数字不是希望)。验收:**零 env 默认
+启动 = 完整拍引擎**(ChunkTickGate ON、pacing 全开),u4 GATE PASS,ttfa p50 181ms。
+
+**P2(2026-08-13)完成**:(a) 每 pass 预算 = 解码需求(2tok×running)+
+SLACK_TOKENS(默认 6144)——非周期预填切片不再把 pass 拖过拍沿;(b) background
+等待请求(影子种子,SLACK_CLASS_KEY 标记,swap 真 chunk 到达即摘标)在任何前台
+等待存在时停车一 pass。冒烟(酷刑触发线 1500、u8):33 预热/30 就绪/2 放行
+/2 阻塞兜底,回退链健康,GATE PASS p50 248ms。
+
+**P3(2026-08-13)完成**:准入台账三页——stage0 池份额(0.75×pool/active ≥
+floor 4096)、stage1 池份额(既有)、槽位(active+影子许可+余量2 ≤ max_num_seqs,
+拒绝的正是 early-warm 回归的失败模式)。超载拒绝不排队。容量探顶在 P6。
+
+**P4(2026-08-13)完成**:声码相位轮值组(默认 K=4,round-robin 发相位,
+块 3 起对齐——块 2 在薄缓冲期保持普通拍沿)。单测:放行沿正确落在各自组。
+每拍声码负载 = N/K by construction。
+
+**P5 施工中**:手术选型 = 流化卷积栈(上采样+解码器,FLOPs 大头,×1920 到
+24kHz 采样域),预变换器保持 25+4 帧窗口重算(帧率域,重算近乎免费)——
+消灭 ~86% 冗余,风险减半。等价性离线验证后接线。
