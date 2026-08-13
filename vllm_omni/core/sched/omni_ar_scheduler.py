@@ -274,8 +274,27 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._omits_kv_transfer_cache[rid] = result
         return result
 
+    def _in_decode_zone(self, now: float | None = None) -> bool:
+        """[live-vllm W1/W2] True inside the decode-only window right after
+        this stage's phase edge."""
+        if not (_TIME_SLACK and _DECODE_ZONE_S > 0 and self.temporal_pacer.enabled
+                and self.temporal_pacer.barrier and self.temporal_pacer.tick_s > 0):
+            return False
+        if now is None:
+            now = _monotonic()
+        in_win = (now - self.temporal_pacer.phase_s) % self.temporal_pacer.tick_s
+        return in_win < _DECODE_ZONE_S
+
     def _should_defer_waiting_admission(self) -> bool:
-        return False
+        # [live-vllm W1] Membership events must never break the heartbeat:
+        # inside the decode zone, ALL waiting admissions defer to the slack
+        # window later in the same tick, so the decode pass sees an
+        # unchanged cohort and the replay fast path stays eligible even
+        # while a compression wave is being born. Measured basis: within
+        # the wave window, seconds containing a warmup launch carried 10.7%
+        # slip rate vs 2.5% for event-free seconds -- the tax is admission
+        # work displacing the heartbeat, not compute volume.
+        return bool(self.waiting) and self._in_decode_zone()
 
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
         """
@@ -592,6 +611,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if (_TIME_SLACK and self.temporal_pacer.barrier
                     and self.temporal_pacer.tick_s > 0):
                 _in_win = (_now_mono - self.temporal_pacer.phase_s) % self.temporal_pacer.tick_s
+                # [W2] slack window: drain teardown block-frees parked by
+                # the decode zone (bounded work, pool accounting catches up
+                # within the tick).
+                if _in_win >= _DECODE_ZONE_S:
+                    _dbf = getattr(self, "_deferred_block_frees", None)
+                    while _dbf:
+                        self._free_blocks(_dbf.pop())
                 if _in_win < _DECODE_ZONE_S:
                     # decode-only zone right after this stage's phase edge:
                     # the heartbeat step never queues behind freight.
@@ -658,6 +684,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if deferred_waiting:
                     original_waiting.prepend_requests(deferred_waiting)
                 self.waiting = original_waiting
+                # [W1] wake at the zone end so deferred admissions run in
+                # THIS tick's slack window, not the next grid edge. Set in
+                # the finally because split_running overwrites next_wake
+                # during the pass.
+                if self.waiting and self._in_decode_zone():
+                    _nw_now = _monotonic()
+                    _zone_end = (_nw_now
+                                 - ((_nw_now - self.temporal_pacer.phase_s)
+                                    % self.temporal_pacer.tick_s)
+                                 + _DECODE_ZONE_S)
+                    _nw = self.temporal_pacer.next_wake
+                    if _nw is None or _zone_end < _nw:
+                        self.temporal_pacer.next_wake = _zone_end
             if self.chunk_transfer_adapter:
                 # Add request waiting for chunk to the waiting and running queue
                 self.chunk_transfer_adapter.restore_queues(
@@ -1679,6 +1718,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # 3. Standard Freeing
             delay_free_blocks |= connector_delay_free_blocks
+            # [live-vllm W2] a teardown landing inside the decode zone must
+            # not spend the heartbeat's time walking block tables (measured:
+            # teardown seconds carried 1.8x the slip rate of event-free wave
+            # seconds). Park the request; the slack window drains it within
+            # the same tick.
+            if not delay_free_blocks and self._in_decode_zone():
+                if not hasattr(self, "_deferred_block_frees"):
+                    self._deferred_block_frees = []
+                self._deferred_block_frees.append(request)
+                delay_free_blocks = True
             if not delay_free_blocks:
                 self._free_blocks(request)
 
