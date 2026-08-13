@@ -756,7 +756,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self.temporal_pacer.log_steps and scheduler_output.total_num_scheduled_tokens:
             logger.info(
                 "[SCHED-STEP] stage=%s mono=%.6f nreq=%d ntok=%d held=%d run=%d wait=%d "
-                "irecv=%d/%d",
+                "irecv=%d/%d/%d/%d",
                 self.vllm_config.model_config.stage_id,
                 _monotonic(),
                 len(scheduler_output.num_scheduled_tokens),
@@ -764,14 +764,21 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 len(_paced_held),
                 len(self.running),
                 len(self.waiting),
-                # [P8] cumulative inline-receive hits/misses: a hit is a
-                # delivery that cost the consumer no park. hits/(hits+misses)
-                # near 1 means the park has been removed from the text path;
-                # near 0 means the producer is not actually ahead and the
-                # ceiling analysis needs revisiting.
+                # [P8] cumulative hits/misses/skips/dupes for inline receive.
+                # hit = delivery that cost the consumer no park; miss = payload
+                # genuinely not there yet; skip = something already owned the
+                # fetch or a payload was already in hand; dupe = a second
+                # load_async for a request that already had one queued. hits
+                # near total means the park is off the text path. All four zero
+                # means the code never ran -- which is how the first attempt's
+                # null result was diagnosed, so the distinction is load-bearing.
                 getattr(self.chunk_transfer_adapter, "_inline_recv_hits", 0)
                 if self.chunk_transfer_adapter else 0,
                 getattr(self.chunk_transfer_adapter, "_inline_recv_misses", 0)
+                if self.chunk_transfer_adapter else 0,
+                getattr(self.chunk_transfer_adapter, "_inline_recv_skips", 0)
+                if self.chunk_transfer_adapter else 0,
+                getattr(self.chunk_transfer_adapter, "_async_load_dupes", 0)
                 if self.chunk_transfer_adapter else 0,
             )
 

@@ -120,6 +120,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._inline_recv_hits = 0
         self._inline_recv_misses = 0
         self._inline_recv_skips = 0
+        self._async_load_dupes = 0
         # Requests whose fetch is currently owned by the recv thread; the
         # scheduler's inline poll must not touch these. See load_async.
         self._async_load_registered: set[str] = set()
@@ -236,6 +237,20 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # chunk id outright. Measured consequence (u56, first inline-recv run):
         # skipped segment-opener payloads -> talker prefill with no assistant
         # span -> engine core dead, 43 turns timed out.
+        if request.request_id in self._async_load_registered:
+            # Idempotent: a fetch for this id is ALREADY queued, and its
+            # success sets the ready marker and resumes the request no matter
+            # who asked. Enqueueing a second entry would leave two fetchers
+            # under one registration -- the first success releases the
+            # registration while the second entry lives on, re-opening the
+            # double-advance of get_req_chunk this registry exists to prevent.
+            # Reachable because a streaming update can flip a parked request's
+            # status back to WAITING while its fetch is still queued.
+            # (Adversarial review; the registry was a hint, this makes it a
+            # mutual-exclusion token. Also removes a pre-existing duplicate
+            # park.)
+            self._async_load_dupes += 1
+            return
         self._async_load_registered.add(request.request_id)
         self._pending_load_reqs.append(request)
         with self._recv_cond:
@@ -1040,14 +1055,43 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if request.request_id in self._async_load_registered:
             self._inline_recv_skips += 1
             return False
+        # A payload already fetched but not yet consumed must not be
+        # overwritten: _poll_single_request assigns request.additional_
+        # information unconditionally, so fetching the NEXT chunk on top of an
+        # unconsumed one drops the unconsumed one's rows silently. The ready-set
+        # check at the call site covers the normal case; these cover the states
+        # where a fetch completed but the marker has not been consumed yet.
+        if (
+            request.request_id in self._finished_load_reqs
+            or getattr(request, "additional_information", None) is not None
+        ):
+            self._inline_recv_skips += 1
+            return False
+        # Uncommitted sampled output (async scheduling) means this request's
+        # token accounting is mid-flight; the parked path applies payloads only
+        # to requests that have left the batch, so keep that guarantee here
+        # instead of relying on a per-stage deploy convention.
+        if getattr(request, "num_output_placeholders", 0):
+            self._inline_recv_skips += 1
+            return False
         self.request_ids_mapping[request.request_id] = request.external_req_id
+        connector = getattr(self, "connector", None)
+        had_nb = getattr(connector, "nonblocking_get", None)
         try:
+            # Never block this thread on the producer's write lock: a large
+            # first-of-segment payload can be held for hundreds of ms, and this
+            # is the pass that every other session on the stage is waiting for.
+            if had_nb is not None:
+                connector.nonblocking_get = True
             got_inline = bool(self._poll_single_request(request))
         except Exception as e:
             got_inline = False
             logger.warning(
                 "[OmniTransfer] inline receive failed for %s: %s", request.request_id, e,
             )
+        finally:
+            if had_nb is not None:
+                connector.nonblocking_get = had_nb
         if not got_inline:
             self._inline_recv_misses += 1
             return False

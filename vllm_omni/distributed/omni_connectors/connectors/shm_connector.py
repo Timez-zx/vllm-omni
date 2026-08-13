@@ -28,6 +28,11 @@ class SharedMemoryConnector(OmniConnectorBase):
         self.config = config
         self.stage_id = config.get("stage_id", -1)
         self._pending_keys: set[str] = set()
+        # [P8] Set for the duration of a get that runs on a latency-critical
+        # thread; see _get_data_with_lock. Off by default so the background
+        # fetch loop keeps its blocking (and therefore always-eventually-
+        # succeeding) behaviour.
+        self.nonblocking_get = False
         self._metrics = {
             "puts": 0,
             "gets": 0,
@@ -68,7 +73,22 @@ class SharedMemoryConnector(OmniConnectorBase):
         deserialized = False
         try:
             with open(lock_file, "rb+") as lockf:
-                fcntl.flock(lockf, fcntl.LOCK_EX)
+                if self.nonblocking_get:
+                    # [P8] The lock is held by the WRITER across its whole copy
+                    # (see put), and a first-of-segment payload on the
+                    # thinker->talker edge can be hundreds of MB. A caller that
+                    # runs on an engine-core thread (the inline-receive path)
+                    # must never block there: a blocked scheduler pass stalls
+                    # every OTHER session on the stage, which is the exact
+                    # failure the inline path exists to remove. Treat contention
+                    # as "not ready yet" -- the caller falls back to the
+                    # background fetch, same as any other miss.
+                    try:
+                        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except OSError:
+                        return None
+                else:
+                    fcntl.flock(lockf, fcntl.LOCK_EX)
                 data_bytes = shm_read_bytes(shm_handle)
                 fcntl.flock(lockf, fcntl.LOCK_UN)
             obj = self.deserialize_obj(data_bytes)
