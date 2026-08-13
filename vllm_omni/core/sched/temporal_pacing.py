@@ -98,6 +98,13 @@ _LIVE_DEFAULTS = {
     # 6144 tokens ~ 40-60 ms of stage-0 prefill on this hardware, leaving
     # the decode step comfortable margin in an 80 ms tick.
     "VLLM_OMNI_TEMPORAL_SLACK_TOKENS": "6144",
+    # [P4] vocode phase groups: each session vocodes only on tick edges of
+    # its own group (round-robin assigned), so per-tick vocoder load is
+    # N/K BY CONSTRUCTION instead of on average. A session's chunk cadence
+    # is 1 per 4 ticks (codec_chunk_frames=4), so K=4 adds <=3 ticks of
+    # delivery delay -- inside the lead buffer, same argument as the gate's
+    # own +<=1 tick. 0/1 disables (plain next-edge release).
+    "VLLM_OMNI_TEMPORAL_VOCODE_PHASES": "4",
 }
 
 # [P2] Priority-class marker for aperiodic work, riding SamplingParams
@@ -393,6 +400,18 @@ class ChunkTickGate:
         # scheduler consults this to emit per-pass batch evidence, which is
         # how tick-aligned vocode batching is verified rather than assumed.
         self.log_steps = _parse_log_steps(self.stage_id)
+        # [live-vllm P4] Phase groups: session s releases only on tick edges
+        # where edge_index % K == group(s). Round-robin assignment at first
+        # sight keeps groups exactly level (a hash could clump).
+        try:
+            self.phase_groups = max(0, int(float(live_env("VLLM_OMNI_TEMPORAL_VOCODE_PHASES") or 0)))
+        except ValueError:
+            self.phase_groups = 0
+        self._grp: dict[str, int] = {}
+        self._next_grp = 0
+        if self.enabled and self.phase_groups > 1:
+            logger.info("[ChunkTickGate] stage=%s phase groups: K=%d (per-tick vocode load = N/K by construction)",
+                        self.stage_id, self.phase_groups)
         # Earliest pending release; the tick engine loop sleeps until this.
         self.next_wake: float | None = None
         # rid -> [chunks_seen_this_segment, release_t | None]
@@ -410,7 +429,22 @@ class ChunkTickGate:
             if st[0] <= 1:
                 st[1] = 0.0  # segment's first chunk: TTFA bypass
                 return False
-            st[1] = math.ceil(now / self.tick_s) * self.tick_s
+            # [P4] release on the next edge OF THIS SESSION'S PHASE GROUP,
+            # not just the next edge: per-tick vocode load becomes N/K by
+            # construction. Groups are round-robin at first sight. The
+            # alignment costs up to K-1 ticks ONCE per segment (the 4-tick
+            # chunk cadence preserves group phase afterwards), so it starts
+            # at chunk 3: chunk 2 lands while the client buffer is thinnest
+            # and keeps today's plain next-edge release.
+            edge = math.ceil(now / self.tick_s)
+            if self.phase_groups > 1 and st[0] > 2:
+                grp = self._grp.get(request_id)
+                if grp is None:
+                    grp = self._grp[request_id] = self._next_grp
+                    self._next_grp = (self._next_grp + 1) % self.phase_groups
+                while edge % self.phase_groups != grp:
+                    edge += 1
+            st[1] = edge * self.tick_s
         if now < st[1]:
             if self.next_wake is None or self.next_wake <= now or st[1] < self.next_wake:
                 self.next_wake = st[1]
@@ -427,3 +461,6 @@ class ChunkTickGate:
 
     def on_request_freed(self, request_id: str) -> None:
         self._st.pop(request_id, None)
+        # Phase group is released with the request; the slot recycles to the
+        # round-robin naturally as new sessions arrive.
+        self._grp.pop(request_id, None)
