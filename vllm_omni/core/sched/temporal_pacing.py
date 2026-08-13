@@ -78,6 +78,9 @@ logger = init_logger(__name__)
 # and produce no audio frame, so they must not advance the frame count.
 _CODEC_VALID_MAX = 2048
 
+# resolved after _LIVE_DEFAULTS below; placeholder for import order
+_GATE_EXEMPT_CHUNKS = 1
+
 # [live-vllm P1] On this branch the tick engine is the ARCHITECTURE, not an
 # option: every temporal gate defaults ON and the request-driven path is the
 # thing you must opt INTO (set the env to 0 explicitly) to build a control
@@ -105,6 +108,9 @@ _LIVE_DEFAULTS = {
     # delivery delay -- inside the lead buffer, same argument as the gate's
     # own +<=1 tick. 0/1 disables (plain next-edge release).
     "VLLM_OMNI_TEMPORAL_VOCODE_PHASES": "4",
+    # [anti-shoulder] chunks exempt from the vocode gate at each segment
+    # start: this IS the client's buffer depth in chunks (320 ms each).
+    "VLLM_OMNI_TEMPORAL_GATE_EXEMPT": "3",
     # [P7 phase-locked pipeline] Per-stage phase offsets on the SHARED tick
     # grid (all processes quantize the same host CLOCK_MONOTONIC, so the
     # edges coincide numerically across stages). The tick becomes a fixed
@@ -155,6 +161,12 @@ def live_env(name: str) -> str:
 
 def live_env_on(name: str) -> bool:
     return live_env(name) not in ("0", "", "false", "False")
+
+
+try:
+    _GATE_EXEMPT_CHUNKS = max(1, int(float(live_env("VLLM_OMNI_TEMPORAL_GATE_EXEMPT") or 1)))
+except ValueError:
+    _GATE_EXEMPT_CHUNKS = 1
 
 # [WP1] VLLM_OMNI_TEMPORAL_ENGINE=1 turns the engine-core busy loop into a
 # tick loop: between pacing events it SLEEPS on the input queue (waking
@@ -512,8 +524,17 @@ class ChunkTickGate:
         if st[1] is None:
             # New chunk work just became visible.
             st[0] += 1
-            if st[0] <= 1:
-                st[1] = 0.0  # segment's first chunk: TTFA bypass
+            # [live-vllm anti-shoulder] Exempt the first E chunks per segment
+            # (was 1). The single-chunk exemption silently capped the CLIENT
+            # buffer at ~one chunk (320 ms) forever: the gate meters every
+            # later chunk to playback cadence, so whatever lead the talker
+            # builds NEVER reaches the listener -- measured as lead 240->400
+            # having ZERO effect on misses while a 15% shoulder of +40-160 ms
+            # boxes kept draining the paper-thin buffer. With E=3 the client
+            # opens each segment ~960 ms deep (production covers it via the
+            # per-turn burst + catch-up budget) and the shoulder is absorbed.
+            if st[0] <= _GATE_EXEMPT_CHUNKS:
+                st[1] = 0.0  # TTFA/buffer-building bypass
                 return False
             # [P4] release on the next edge OF THIS SESSION'S PHASE GROUP,
             # not just the next edge: per-tick vocode load becomes N/K by
