@@ -49,6 +49,10 @@ FRAMES_ROOT = pathlib.Path("/data/zx/stimuli/frames640")
 FRAME_INTERVAL_S = 0.5          # 2 fps, the browser page's rhythm (see --video-interval-ms)
 TURN_TIMEOUT_S = 180.0
 THINK_S = (2.0, 6.0)            # closed-loop pause after each reply (see --think)
+# Wait for the reply to finish PLAYING (not merely arriving) before the think
+# pause. See the note at the sleep site: arrival-paced turns under-load any
+# engine that delivers faster than realtime.
+PLAYBACK_PACED = os.environ.get("MU_PLAYBACK_PACED", "1") not in ("0", "", "false", "False")
 _stag = os.environ.get("MU_STAGGER_S")  # "lo,hi" override for arrival-spread控制实验
 STAGGER_S = tuple(float(x) for x in _stag.split(",")) if _stag else (0.0, 8.0)
 WARMUP_S = 4.0                  # let the frame pump run before the first query
@@ -415,6 +419,21 @@ class User:
                     w.setsampwidth(2)
                     w.setframerate(24000)
                     w.writeframes(bytes(cur["pcm"]))
+            # [closed loop, playback-paced] The turn ENDS for the server when
+            # the last audio byte is sent, but a human ends it when the audio
+            # finishes PLAYING. Starting the think-time at arrival lets an
+            # engine that races ahead of realtime shorten its own session
+            # cycle: measured at 64 nominal users, the engine that delivered a
+            # 25 s answer in ~16 s ran at median 28 concurrent turns while the
+            # paced engine ran at 49 -- i.e. the racing engine was quietly
+            # tested at 57%% of the load. Wait out the remaining playback first
+            # so both engines face the same number of simultaneous speakers.
+            # MU_PLAYBACK_PACED=0 restores arrival-paced turns.
+            if PLAYBACK_PACED and cur["t_first_audio"] and audio_s > 0:
+                _play_end = cur["t_first_audio"] + audio_s
+                _left = _play_end - time.monotonic()
+                if _left > 0:
+                    await asyncio.sleep(_left)
             await asyncio.sleep(self.rng.uniform(*self.think_s))
 
     def _mark_skipped(self, start: int | None = None, reason: str = "") -> None:

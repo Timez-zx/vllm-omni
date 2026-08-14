@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from collections.abc import Iterable
 from time import monotonic as _monotonic
@@ -79,6 +80,8 @@ from vllm_omni.core.sched.temporal_pacing import TemporalPacer, live_env, live_e
 # heartbeat tokens are budgeted ON TOP of this, so a prefill slice can never
 # stretch a pass past the tick edge. Read once per engine-core process.
 _SLACK_TOKENS = int(float(live_env("VLLM_OMNI_TEMPORAL_SLACK_TOKENS") or 0))
+# Per-request prefill timeline probe; see the [PF] log site in schedule().
+_LOG_PREFILL = os.environ.get("VLLM_OMNI_LOG_PREFILL", "0") not in ("0", "", "false", "False")
 
 # [live-vllm P7] Freight limiter: size each prefill slice by TIME, not by a
 # fixed token count -- the slice may only be as large as the tick's remaining
@@ -647,6 +650,27 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 scheduler_output = super().schedule(throttle_prefills)
                 if scheduler_output.total_num_scheduled_tokens:
                     self._replay_misses = getattr(self, "_replay_misses", 0) + 1
+            # [prefill timeline] Per-request prefill progress, so the
+            # question->first-token latency can be DECOMPOSED instead of
+            # guessed. Two guesses were already refuted by measurement (frames
+            # accumulating during the previous answer; the slack token
+            # ceiling), and percentiles alone cannot separate "waited to be
+            # admitted" from "prefill took many passes". One line per
+            # prefill-carrying request per pass; VLLM_OMNI_LOG_PREFILL=1.
+            if _LOG_PREFILL and scheduler_output.total_num_scheduled_tokens:
+                _now_pf = _monotonic()
+                for _rid, _nt in scheduler_output.num_scheduled_tokens.items():
+                    if _nt <= 4:
+                        continue          # decode heartbeat, not freight
+                    _rq = self.requests.get(_rid)
+                    if _rq is None:
+                        continue
+                    logger.info(
+                        "[PF] stage=%s rid=%s mono=%.6f sched=%d computed=%d prompt=%d out=%d",
+                        self.vllm_config.model_config.stage_id, _rid, _now_pf, _nt,
+                        int(getattr(_rq, "num_computed_tokens", 0)),
+                        len(_rq.prompt_token_ids or ()), len(_rq.output_token_ids or ()),
+                    )
             # [P7] stamp this pass's freight so the NEXT call can settle a
             # prefill-throughput sample (call gap ~ this pass's execute time).
             _pf_toks = (scheduler_output.total_num_scheduled_tokens
