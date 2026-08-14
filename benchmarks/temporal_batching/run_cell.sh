@@ -100,6 +100,7 @@ CFG="$CFG}"
 
 bash "$HERE/run_engine.sh" stop; sleep 12
 env "${ARM_ENV[@]}" VLLM_OMNI_LOG_AUDIO_CHUNKS=1 VLLM_OMNI_LOG_SCHED_STEPS=1 \
+  ${STEP_GPU:+VLLM_OMNI_LOG_STEP_GPU=1} \
   TB_DEPLOY="$HERE/$DEPLOY" bash "$HERE/run_engine.sh" || { echo "!! boot failed"; exit 1; }
 mkdir -p "$OUT"
 printf '{"name":"%s","users":%d,"arm":"%s","deploy":"%s","turns":%d,"env":"%s","session_cfg":%s}\n' \
@@ -113,8 +114,12 @@ S0=$(grep -o "StageEngineCoreProc_stage0_replica0 pid=[0-9]*" "$ENGINE_LOG" | ta
 # latency event it is supposed to explain, which is the difference between
 # "the GPU is busy 9% of seconds" and "the GPU was busy during THIS spike".
 nvidia-smi --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used \
-  --format=csv,noheader,nounits -l 1 > "$OUT/gpu.csv" 2>/dev/null &
+  --format=csv,noheader,nounits -lms 100 > "$OUT/gpu.csv" 2>/dev/null &
 SMI=$!
+# Per-PROCESS sm%: GPU1 hosts the talker AND the vocoder, and the aggregate
+# number cannot say which of them is holding the card.
+nvidia-smi pmon -s um -d 1 -o DT > "$OUT/gpu_pmon.txt" 2>/dev/null &
+PMON=$!
 
 (cd "$WEB" && env MU_STAGGER_S=0,40 MU_ENGINE_LOG="$ENGINE_LOG" MU_QUESTIONS=long \
   MU_SESSION_CFG_JSON="$CFG" \
@@ -133,7 +138,7 @@ if [ "$PROFILE" = "profile" ]; then
 fi
 
 wait $BENCH
-kill $SMI 2>/dev/null
+kill $SMI $PMON 2>/dev/null
 tail -c +$((LOG_OFF + 1)) "$ENGINE_LOG" > "$OUT/engine_slice.log" 2>/dev/null || true
 bash "$HERE/run_engine.sh" stop
 "$MAGE_PY" "$HERE/analyze.py" "$OUT" --warmup-turns 2 >/dev/null 2>&1 || true

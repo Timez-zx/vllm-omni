@@ -76,6 +76,12 @@ except ValueError:
     _T2T_TICK_S = 0.0
 _T2T_PERIOD_S = _T2T_COALESCE_TICKS * _T2T_TICK_S if _T2T_TICK_S > 0 else 0.0
 
+# Drop payload fields the consumer never reads on the decode path; see the
+# long note at the return site. Default ON -- it is a pure "stop sending unread
+# bytes" change -- with an env to restore the fat payload for A/B.
+_T2T_LEAN_DECODE = _os.environ.get("VLLM_OMNI_T2T_LEAN_DECODE", "1") not in ("0", "", "false", "False")
+
+
 
 def _t2t_drain(transfer_manager: Any, request_id: str):
     """Take and clear whatever text rows are buffered; None when empty."""
@@ -590,6 +596,28 @@ def _construct_thinker2talker_streaming_input_async_chunk(
                 entry[1] = None
                 entry[2] += 1
                 entry[3] = None
+            # [lean decode payload] Ship only what the consumer reads. On this
+            # path -- a plain decode step, no pending prefill to flush -- the
+            # talker reads embed.decode and nothing else: hidden_states.output
+            # is consumed only by talker_preprocess_prefill (qwen3_omni.py:888)
+            # and ids is consumed only there too (ids.all / ids.prompt at
+            # :892-899); ids.output has no reader anywhere on the receiving
+            # side. Both were being sent per token per session anyway: the
+            # hidden row is a fixed 4096 bytes (half the payload) and the id
+            # list grows through the turn, which is what made per-turn transfer
+            # bytes grow quadratically. Measured motivation: the talker's GPU
+            # runs 2.5 ms per 28.7 ms pass (8.5% duty) at 64 users while ~1 ms
+            # per session per pass goes to CPU -- deserialize and payload build
+            # are 30% of that stage's samples, so the cheapest capacity left is
+            # to stop sending unread bytes. VLLM_OMNI_T2T_LEAN_DECODE=0 restores
+            # the fat payload for A/B.
+            if _T2T_LEAN_DECODE:
+                return OmniPayloadStruct(
+                    meta=MetaStruct(finished=finished),
+                    embed=EmbeddingsStruct(decode=emb_cpu),
+                    speaker=speaker,
+                    language=language,
+                )
             return OmniPayloadStruct(
                 meta=MetaStruct(
                     finished=finished,
