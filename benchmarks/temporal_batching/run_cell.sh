@@ -34,7 +34,10 @@ DEPLOY=${4:-deploy_temporal_2gpu_mns80.yaml}
 PROFILE=${5:-}
 OUT=/home/ubuntu/data/results/$NAME
 TURNS=${TURNS:-6}
-TRIG=$(( POOL0 * 3 / 4 / U )); TGT=$(( TRIG / 2 ))
+# MU_TRIG overrides the compression trigger: set it high enough and compression
+# never fires within a run, which isolates "does this arm have a TTFA problem at
+# all" from "does it handle compression badly".
+TRIG=${MU_TRIG:-$(( POOL0 * 3 / 4 / U ))}; TGT=$(( TRIG / 2 ))
 
 A_OFF=(VLLM_OMNI_TEMPORAL_TICK_MS=0 VLLM_OMNI_TEMPORAL_BARRIER=0
        VLLM_OMNI_TEMPORAL_ENGINE=0 VLLM_OMNI_TEMPORAL_INLINE_SEND=0

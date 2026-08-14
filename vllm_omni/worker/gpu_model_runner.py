@@ -49,6 +49,45 @@ else:
 
 logger = init_logger(__name__)
 
+# [encoder share probe] see the call site in execute_model. Events are read one
+# pass late so the probe never synchronizes on the critical path.
+_LOG_ENC = __import__("os").environ.get("VLLM_OMNI_LOG_ENC", "0") not in ("0", "", "false", "False")
+
+
+def _enc_probe_begin(runner):
+    if not _LOG_ENC or not torch.cuda.is_available():
+        return None
+    st = getattr(runner, "_enc_probe_state", None)
+    if st is None:
+        st = {"pending": None}
+        runner._enc_probe_state = st
+    ev = torch.cuda.Event(enable_timing=True)
+    ev.record()
+    return ev
+
+
+def _enc_probe_end(runner, start_ev):
+    st = runner._enc_probe_state
+    end = torch.cuda.Event(enable_timing=True)
+    end.record()
+    prev = st.get("pending")
+    st["pending"] = (start_ev, end)
+    if prev is None:
+        return
+    s, e = prev
+    if not e.query():
+        return
+    try:
+        dur = s.elapsed_time(e)
+    except Exception:
+        return
+    if dur > 0.05:      # skip passes with no encoder work at all
+        import time as _t
+        logger.info("[ENC-GPU] stage=%s mono=%.6f enc_ms=%.3f",
+                    getattr(runner.vllm_config.model_config, "stage_id", "?"),
+                    _t.monotonic(), dur)
+
+
 
 def _filter_mrope_kwargs_for_model(model: object, kwargs: dict[str, Any]) -> dict[str, Any]:
     """Return only M-RoPE kwargs accepted by the model implementation."""
@@ -1715,7 +1754,21 @@ class OmniGPUModelRunner(GPUModelRunner):
                 scheduler_output,
                 encoder_cache=self.encoder_cache,
             ) as ec_connector_output:
+                # [encoder share probe] How much of a pass's GPU time is the
+                # vision/audio encoder, as opposed to the LLM attending over
+                # the embeddings it produces? That ratio decides whether
+                # moving the encoders to their own device is worth the work:
+                # the encoders are stateless (a frame's embedding depends on
+                # that frame alone) and their output is ~800 KB per frame
+                # against ~48 KB per token of KV, so they are the one part of
+                # this pipeline that disaggregates cheaply -- but only if they
+                # actually cost something. Measured with CUDA events read on
+                # the next pass, so no synchronize lands on the critical path.
+                # VLLM_OMNI_LOG_ENC=1.
+                _enc_probe = _enc_probe_begin(self)
                 self._execute_mm_encoder(scheduler_output)
+                if _enc_probe is not None:
+                    _enc_probe_end(self, _enc_probe)
                 mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
 
             # NOTE(woosuk): To unify token ids and soft tokens (vision
