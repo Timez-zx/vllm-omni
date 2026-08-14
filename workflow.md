@@ -444,6 +444,40 @@ its last byte arrives (`MU_PLAYBACK_PACED=1`), or a faster engine gets its next 
 silently runs at lower concurrency — one run measured 28 concurrent sessions against another's 49 with
 both labelled the same N.
 
+### The load generator does not compress its websocket
+
+`mu_bench.py` connects with `compression=None`. The `websockets` library offers permessage-deflate by
+default and the server accepts it, so before this every audio delta was zlib-compressed on the way
+out and inflated on the way in. py-spy on the API server at 200 sessions put **42% of its event loop
+in `permessage_deflate.encode`** — audio PCM, which barely compresses. A/B at 200 sessions, same
+seed, back to back:
+
+| | TTFA p50 | TTFA p99 | deadline miss | API server's busiest thread |
+|---|---|---|---|---|
+| deflate on | 645 ms | 1654 ms | 0.44% | 65% of a core |
+| deflate off | 558 ms | **728 ms** | 0.48% | **34% of a core** |
+
+The three stage processes did not move (99 / 67-68 / 81%), so the change is confined to the API
+server. Two further signatures confirm the mechanism rather than a coincidence: at fixed concurrency
+(190-200 sessions) the growth of question→first-text across a session's turns went from 106→396 ms to
+a flat 69→88 ms, and the control arm reproduced an earlier run to within 6% on p99.
+
+This is a **serial** cost on one event loop shared by every session, which is why it showed up as a
+tail rather than as saturation — the loop averaged 65% of a core while carrying a 1.6 s p99. A high
+tail with a mid-range average CPU is the shape to look for; the first pass at this dismissed the API
+server precisely because 58% "was not saturated".
+
+**The server is deliberately left alone.** A real browser negotiates the extension and should keep
+saving the bandwidth (36% on a real reply, measured). Only the load generator opts out, so the
+capacity number is not spent on compression the engine never asked for. `MU_WS_DEFLATE=1` puts it
+back, which is how the A/B was run.
+
+With it off at 200 sessions the TTFA p50 of 558 ms decomposes as **75 ms** question→thinker's first
+text (the whole web-inbound path plus the thinker), **304 ms** talker turning that text into its first
+codec chunk, **179 ms** code2wav plus orchestration plus delivery. The first chunk is fixed at 4 codec
+frames = 320 ms of speech (`initial_codec_chunk_frames`), so more than half of TTFA is the talker
+filling that first chunk — that, not the web layer, is what a lower TTFA has to attack next.
+
 ---
 
 ## Where it stands

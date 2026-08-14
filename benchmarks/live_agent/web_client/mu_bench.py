@@ -57,6 +57,21 @@ _stag = os.environ.get("MU_STAGGER_S")  # "lo,hi" override for arrival-spread控
 STAGGER_S = tuple(float(x) for x in _stag.split(",")) if _stag else (0.0, 8.0)
 WARMUP_S = 4.0                  # let the frame pump run before the first query
 GIVE_UP_AFTER = 3               # consecutive timeouts before a user stops
+# WebSocket permessage-deflate is OFF here, and only here. The `websockets`
+# library offers the extension by default and the server accepts it, so every
+# audio delta was being zlib-compressed -- 42% of the API server's event loop at
+# 200 sessions, measured with py-spy. A/B at 200 sessions, same seed, back to
+# back: TTFA p99 1654 -> 728 ms, the API server's busiest thread 65% -> 34%, and
+# the per-session growth in question->first-text (106 -> 396 ms across 10 turns
+# at fixed concurrency) went flat (69 -> 88 ms). It is a serial cost on one event
+# loop shared by every session, so it shows up as a tail, not as saturation:
+# the loop averaged only 65% of a core while carrying that whole tail.
+# The SERVER is deliberately left alone -- a real browser negotiates the
+# extension and should keep saving the bandwidth. Turning it off in the load
+# generator stops the benchmark from spending its capacity number on compression
+# that the engine never asked for. MU_WS_DEFLATE=1 puts it back, which is how
+# the A/B above was run.
+WS_DEFLATE = os.environ.get("MU_WS_DEFLATE", "0") not in ("0", "", "false", "False")
 
 # Audio input is streamed in fixed-cadence chunks on the AUDIO GRID (80 ms =
 # 1 codec frame = the model's own 12.5 Hz rhythm). Video takes no clock of its
@@ -243,7 +258,10 @@ class User:
             cfg.update(json.loads(_extra))
 
         try:
-            async with websockets.connect(URL, max_size=None) as ws:
+            async with websockets.connect(
+                URL, max_size=None,
+                compression="deflate" if WS_DEFLATE else None,
+            ) as ws:
                 await ws.send(json.dumps(cfg))
                 reader = asyncio.create_task(self._reader(ws))
                 pump = asyncio.create_task(self._frame_pump(ws))
