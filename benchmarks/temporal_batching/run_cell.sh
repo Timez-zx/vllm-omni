@@ -126,7 +126,7 @@ SMI=$!
 nvidia-smi pmon -s um -d 1 -o DT > "$OUT/gpu_pmon.txt" 2>/dev/null &
 PMON=$!
 
-(cd "$WEB" && env MU_STAGGER_S=0,40 MU_ENGINE_LOG="$ENGINE_LOG" MU_QUESTIONS=long \
+(cd "$WEB" && env MU_STAGGER_S="${MU_STAGGER_S:-0,40}" MU_ENGINE_LOG="$ENGINE_LOG" MU_QUESTIONS=long \
   MU_SESSION_CFG_JSON="$CFG" \
   timeout 3600 "$MAGE_PY" mu_bench.py \
   --users "$U" --content synthetic --turns "$TURNS" \
