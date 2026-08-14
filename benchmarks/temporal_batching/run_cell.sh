@@ -56,9 +56,16 @@ case "$ARM" in
   # deployment would take, not a scheduling organ. Classifying it as a temporal
   # organ kept it off for the A arms while T had it, which tilted the vocoder
   # stage against A by ~2x.
+  # The frame mailbox is NOT here. Criterion for arm membership, sharpened:
+  # a mechanism that REMOVES self-inflicted synchronization (the compression
+  # trigger phase ladder, the warmup calendar) is hygiene any multi-tenant
+  # application owes its users, and belongs to the baseline. A mechanism that
+  # CREATES synchronization -- holding independent arrivals until a shared
+  # clock edge so they batch -- is the periodic idea itself, applied at the
+  # input boundary, and belongs to the periodic arm. The frame mailbox is the
+  # second kind, so it moves to T.
   Astar) ARM_ENV=("${A_OFF[@]}" VLLM_OMNI_INLINE_RECV=0
-                  VLLM_OMNI_STREAM_VOCODER=1
-                  VLLM_OMNI_FRAME_FLUSH_MS=80) ; AP=1 ;;
+                  VLLM_OMNI_STREAM_VOCODER=1) ; AP=1 ;;
   # A* plus the one ENGINE change (inline chunk receive). Separates "does the
   # application work still buy anything once the engine stops parking the
   # consumer" from "does either one alone fix the wall".
@@ -74,8 +81,7 @@ case "$ARM" in
                      VLLM_OMNI_INLINE_RECV_ASYNC=1
                      VLLM_OMNI_STREAM_VOCODER=1
                      VLLM_OMNI_TEMPORAL_INLINE_SEND=1
-                     VLLM_OMNI_TEMPORAL_MAILBOX=1
-                     VLLM_OMNI_FRAME_FLUSH_MS=80) ; AP=1 ;;
+                     VLLM_OMNI_TEMPORAL_MAILBOX=1) ; AP=1 ;;
   T)     ARM_ENV=(VLLM_OMNI_CELL_ARM=T) ; AP=0 ;;
   # T* = the periodic arm with the SAME application-level treatment the A arms
   # get. Without this the comparison is asymmetric in the other direction: the
