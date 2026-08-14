@@ -103,8 +103,13 @@ env "${ARM_ENV[@]}" VLLM_OMNI_LOG_AUDIO_CHUNKS=1 VLLM_OMNI_LOG_SCHED_STEPS=1 \
   ${STEP_GPU:+VLLM_OMNI_LOG_STEP_GPU=1} \
   TB_DEPLOY="$HERE/$DEPLOY" bash "$HERE/run_engine.sh" || { echo "!! boot failed"; exit 1; }
 mkdir -p "$OUT"
-printf '{"name":"%s","users":%d,"arm":"%s","deploy":"%s","turns":%d,"env":"%s","session_cfg":%s}\n' \
-  "$NAME" "$U" "$ARM" "$DEPLOY" "$TURNS" "${ARM_ENV[*]}" "$CFG" > "$OUT/meta.json"
+# Record the arm env AND every VLLM_OMNI_* actually in the environment: a knob
+# passed as a command-line prefix (the usual way an ablation is run) would
+# otherwise exist only in shell history, and "which knobs did that cell have"
+# is the question that has invalidated more cells here than any analysis error.
+INHERITED=$(env | grep -E "^VLLM_OMNI_" | sort | tr '\n' ' ')
+printf '{"name":"%s","users":%d,"arm":"%s","deploy":"%s","turns":%d,"arm_env":"%s","inherited_env":"%s","session_cfg":%s}\n' \
+  "$NAME" "$U" "$ARM" "$DEPLOY" "$TURNS" "${ARM_ENV[*]}" "$INHERITED" "$CFG" > "$OUT/meta.json"
 
 LOG_OFF=$(stat -c%s "$ENGINE_LOG" 2>/dev/null || echo 0)
 S1=$(grep -o "StageEngineCoreProc_stage1_replica0 pid=[0-9]*" "$ENGINE_LOG" | tail -1 | grep -o "[0-9]*$")
