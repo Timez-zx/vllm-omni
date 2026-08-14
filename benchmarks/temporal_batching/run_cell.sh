@@ -51,19 +51,40 @@ case "$ARM" in
   # some T runs did -- that asymmetry is the reason this arm exists). Engine
   # organs stay off, INLINE_RECV stays off: the point is to find A's wall with
   # the application optimized, not to patch the engine.
+  # VLLM_OMNI_STREAM_VOCODER belongs here, not in A_OFF: it is a windowed
+  # convolution whose output is bit-identical, i.e. a kernel optimization any
+  # deployment would take, not a scheduling organ. Classifying it as a temporal
+  # organ kept it off for the A arms while T had it, which tilted the vocoder
+  # stage against A by ~2x.
   Astar) ARM_ENV=("${A_OFF[@]}" VLLM_OMNI_INLINE_RECV=0
+                  VLLM_OMNI_STREAM_VOCODER=1
                   VLLM_OMNI_FRAME_FLUSH_MS=80) ; AP=1 ;;
   # A* plus the one ENGINE change (inline chunk receive). Separates "does the
   # application work still buy anything once the engine stops parking the
   # consumer" from "does either one alone fix the wall".
+  # Everything that is NOT a scheduling decision, on both arms. The test for
+  # membership: would someone running stock vLLM want this on its own merits?
+  # Windowed vocoder (bit-identical output), inline send and the tick mailbox
+  # are transport/kernel optimizations and pass that test; the barrier, pacer,
+  # replay, phase groups and slack slot are the scheduling policy under test and
+  # do not. Getting this wrong is not a wrong conclusion, it is a broken
+  # experiment -- it happened twice (vocoder off for A, inline receive off for
+  # T*) and each time it was worth ~2x on the headline metric.
   AstarFix) ARM_ENV=("${A_OFF[@]}" VLLM_OMNI_INLINE_RECV=1
                      VLLM_OMNI_INLINE_RECV_ASYNC=1
+                     VLLM_OMNI_STREAM_VOCODER=1
+                     VLLM_OMNI_TEMPORAL_INLINE_SEND=1
+                     VLLM_OMNI_TEMPORAL_MAILBOX=1
                      VLLM_OMNI_FRAME_FLUSH_MS=80) ; AP=1 ;;
   T)     ARM_ENV=(VLLM_OMNI_CELL_ARM=T) ; AP=0 ;;
   # T* = the periodic arm with the SAME application-level treatment the A arms
   # get. Without this the comparison is asymmetric in the other direction: the
   # A arms would carry the audio arrival prefill and T would not.
-  Tstar) ARM_ENV=(VLLM_OMNI_CELL_ARM=Tstar) ; AP=1 ;;
+  # INLINE_RECV_ASYNC is required here too: T runs on the overlap deploy, and
+  # without it the placeholder guard disables inline receive entirely (measured:
+  # 0 hits / 31468 skips), i.e. the periodic arm silently pays the very
+  # per-payload tax the comparison is supposed to hold constant.
+  Tstar) ARM_ENV=(VLLM_OMNI_INLINE_RECV_ASYNC=1) ; AP=1 ;;
   *)     echo "unknown arm: $ARM"; exit 2 ;;
 esac
 
@@ -82,7 +103,10 @@ LOG_OFF=$(stat -c%s "$ENGINE_LOG" 2>/dev/null || echo 0)
 S1=$(grep -o "StageEngineCoreProc_stage1_replica0 pid=[0-9]*" "$ENGINE_LOG" | tail -1 | grep -o "[0-9]*$")
 S0=$(grep -o "StageEngineCoreProc_stage0_replica0 pid=[0-9]*" "$ENGINE_LOG" | tail -1 | grep -o "[0-9]*$")
 
-nvidia-smi --query-gpu=index,utilization.gpu,utilization.memory,memory.used \
+# timestamp first: without it a utilization sample cannot be matched to the
+# latency event it is supposed to explain, which is the difference between
+# "the GPU is busy 9% of seconds" and "the GPU was busy during THIS spike".
+nvidia-smi --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used \
   --format=csv,noheader,nounits -l 1 > "$OUT/gpu.csv" 2>/dev/null &
 SMI=$!
 
