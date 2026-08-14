@@ -57,8 +57,13 @@ case "$ARM" in
   # application work still buy anything once the engine stops parking the
   # consumer" from "does either one alone fix the wall".
   AstarFix) ARM_ENV=("${A_OFF[@]}" VLLM_OMNI_INLINE_RECV=1
+                     VLLM_OMNI_INLINE_RECV_ASYNC=1
                      VLLM_OMNI_FRAME_FLUSH_MS=80) ; AP=1 ;;
   T)     ARM_ENV=(VLLM_OMNI_CELL_ARM=T) ; AP=0 ;;
+  # T* = the periodic arm with the SAME application-level treatment the A arms
+  # get. Without this the comparison is asymmetric in the other direction: the
+  # A arms would carry the audio arrival prefill and T would not.
+  Tstar) ARM_ENV=(VLLM_OMNI_CELL_ARM=Tstar) ; AP=1 ;;
   *)     echo "unknown arm: $ARM"; exit 2 ;;
 esac
 

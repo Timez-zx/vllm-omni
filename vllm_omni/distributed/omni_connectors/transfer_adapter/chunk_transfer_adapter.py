@@ -37,6 +37,9 @@ _INLINE_SEND = _live_env_on("VLLM_OMNI_TEMPORAL_INLINE_SEND")  # live-vllm: defa
 # _process_chunk_queue: the park caps a chunk-fed stage at pass_rate/2 steps,
 # which at u56 is below realtime. 0 = old parked-only path (control arm).
 _INLINE_RECV = _live_env_on("VLLM_OMNI_INLINE_RECV")
+# Allow inline receive on a stage running async scheduling (see the guard
+# in _try_inline_receive). Off by default until measured safe under load.
+_INLINE_RECV_ASYNC = os.environ.get("VLLM_OMNI_INLINE_RECV_ASYNC", "0") not in ("0", "", "false", "False")
 _LOG_CHUNK_ARRIVALS = os.environ.get("VLLM_OMNI_LOG_AUDIO_CHUNKS", "0") not in ("0", "", "false", "False")
 
 
@@ -1069,9 +1072,20 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return False
         # Uncommitted sampled output (async scheduling) means this request's
         # token accounting is mid-flight; the parked path applies payloads only
-        # to requests that have left the batch, so keep that guarantee here
-        # instead of relying on a per-stage deploy convention.
-        if getattr(request, "num_output_placeholders", 0):
+        # to requests that have left the batch, so this keeps that guarantee
+        # rather than relying on a per-stage deploy convention.
+        #
+        # MEASURED CONSEQUENCE: under async scheduling a running request ALWAYS
+        # has a placeholder, so this guard fires on every call -- 23553 skips
+        # and 0 hits at 48 users -- making inline receive and CPU/GPU overlap
+        # mutually exclusive, i.e. the two fixes for the same wall cannot be
+        # combined. That is an artefact of the guard, not a property of the
+        # system: inline receive exists precisely so the request does NOT leave
+        # the batch, and leaving the batch is what the -1 sentinel hazard needs.
+        # VLLM_OMNI_INLINE_RECV_ASYNC=1 lifts it so the combination can be
+        # measured; the failure mode it guards against is loud (device-side
+        # assert / shape mismatch), so the experiment is self-checking.
+        if getattr(request, "num_output_placeholders", 0) and not _INLINE_RECV_ASYNC:
             self._inline_recv_skips += 1
             return False
         self.request_ids_mapping[request.request_id] = request.external_req_id
