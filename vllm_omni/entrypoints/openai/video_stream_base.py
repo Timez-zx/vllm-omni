@@ -105,8 +105,25 @@ try:
 except ValueError:
     _COMPRESS_MIN_INTERVAL_S = 2.0
 
+# Frame mailbox flush period. This machinery lives entirely in the API server
+# -- arrivals wait in a mailbox and flush together on a shared CLOCK_MONOTONIC
+# edge, so every session's frames reach the engine inside one window and batch
+# into one encoder call instead of arriving at each client's random phase. It
+# costs the scheduler nothing and any application could implement it, but it
+# was reachable only through VLLM_OMNI_TEMPORAL_TICK_MS -- so an arm that
+# zeroes the pacing organs to get native engine semantics ALSO lost an
+# application-level optimization it should have kept, which makes an
+# application-vs-engine attribution unfair before it starts. VLLM_OMNI_FRAME_
+# FLUSH_MS gives it its own knob; the pacing tick is the fallback so existing
+# configurations behave exactly as before.
 _FRAME_TICK_S: float = 0.0
-if _live_env_on("VLLM_OMNI_TEMPORAL_FRAME_TICK"):  # live-vllm: default ON
+_frame_flush_ms = os.environ.get("VLLM_OMNI_FRAME_FLUSH_MS", "").strip()
+if _frame_flush_ms:
+    try:
+        _FRAME_TICK_S = max(0.0, float(_frame_flush_ms)) / 1000.0
+    except ValueError:
+        _FRAME_TICK_S = 0.0
+elif _live_env_on("VLLM_OMNI_TEMPORAL_FRAME_TICK"):  # live-vllm: default ON
     _FRAME_TICK_S = max(
         0.0, float(live_env("VLLM_OMNI_TEMPORAL_TICK_MS") or 0.0)
     ) / 1000.0

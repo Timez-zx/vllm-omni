@@ -45,8 +45,19 @@ A_OFF=(VLLM_OMNI_TEMPORAL_TICK_MS=0 VLLM_OMNI_TEMPORAL_BARRIER=0
 
 case "$ARM" in
   A)     ARM_ENV=("${A_OFF[@]}" VLLM_OMNI_INLINE_RECV=0) ; AP=0 ;;
+  # A* = A plus application-level work ONLY. The frame mailbox is API-server
+  # code, so it gets its own knob rather than borrowing the pacing tick; the
+  # audio arrival prefill is an entrypoint feature arm A never enabled (and
+  # some T runs did -- that asymmetry is the reason this arm exists). Engine
+  # organs stay off, INLINE_RECV stays off: the point is to find A's wall with
+  # the application optimized, not to patch the engine.
   Astar) ARM_ENV=("${A_OFF[@]}" VLLM_OMNI_INLINE_RECV=0
-                  VLLM_OMNI_TEMPORAL_FRAME_TICK=1 VLLM_OMNI_TEMPORAL_MAILBOX=1) ; AP=1 ;;
+                  VLLM_OMNI_FRAME_FLUSH_MS=80) ; AP=1 ;;
+  # A* plus the one ENGINE change (inline chunk receive). Separates "does the
+  # application work still buy anything once the engine stops parking the
+  # consumer" from "does either one alone fix the wall".
+  AstarFix) ARM_ENV=("${A_OFF[@]}" VLLM_OMNI_INLINE_RECV=1
+                     VLLM_OMNI_FRAME_FLUSH_MS=80) ; AP=1 ;;
   T)     ARM_ENV=(VLLM_OMNI_CELL_ARM=T) ; AP=0 ;;
   *)     echo "unknown arm: $ARM"; exit 2 ;;
 esac

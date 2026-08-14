@@ -1,0 +1,184 @@
+# CEILING-PROBE variant (mns 80 -> up to 72 users + 6 shadows + 2 margin)
+# CAPACITY-TEST variant: max_num_seqs 20 -> 56 on all stages (N up to 48
+# sessions + shadow/roll headroom). Everything else identical to
+# deploy_temporal_2gpu.yaml. Both stress arms (greedy A / tick T) use THIS
+# file so the comparison is config-identical.
+#
+# Qwen3-Omni for the TEMPORAL-PACING multi-user experiment: TWO GPUs,
+# thinker alone on GPU0, speech pair (talker + code2wav) on GPU1, up to
+# N=16 concurrent streaming sessions.
+#
+# Derived from deploy_web_demo.yaml (single-user, single shared GPU). Deltas:
+#   * devices: stage 0 -> "0", stages 1+2 -> "1". `devices` values are
+#     LOGICAL indices into the launcher's CUDA_VISIBLE_DEVICES: with
+#     CUDA_VISIBLE_DEVICES=0,1 the mapping is identity ("1" -> physical 1);
+#     with CUDA_VISIBLE_DEVICES=2,3 the same yaml would land on 2 and 3.
+#     (vllm_omni/entrypoints/stage_utils.py:_map_device_list.)
+#   * max_num_seqs 4 -> 20 on all stages. Sessions are PERSISTENT engine
+#     requests, so stages 0 and 1 both need one slot per user
+#     (deploy_mu_fp8_s32.yaml); 20 = 16 users + shadow warm-up seeds
+#     (_MAX_CONCURRENT_SHADOW_WARMUPS = 2) + margin.
+#   * gpu_memory_utilization retuned for the split (see per-stage notes).
+#     The web-demo 0.74/0.10/0.08 was a one-card compromise; the stock
+#     2xH100 config (vllm_omni/deploy/qwen3_omni_moe.yaml) runs 0.9/0.6/0.1
+#     on this exact split.
+#   * stage 1 drops enforce_eager: eager was purely a memory measure on the
+#     shared card ("if a future run has the card entirely to itself, try
+#     turning this back off first" -- deploy_web_demo.yaml), and CUDA graphs
+#     matter more here: temporal pacing steps all sessions in ONE decode
+#     batch, and the eager talker was measured kernel-active only 29% of
+#     the time at 32 users.
+#
+# Kept from deploy_web_demo.yaml, deliberately:
+#   * stage 1 async_scheduling: false. Temporal pacing PARKS talker requests
+#     and re-admits them next tick -- exactly the park/re-admit path that,
+#     under async scheduling, reads the -1 sentinel from token_ids_cpu and
+#     kills stage 1 in codec_embedding (see the long comment in
+#     deploy_web_demo.yaml). Do not flip this without that fix landing.
+#   * codec_chunk_frames: 4 -- the startup quantum that makes early playback
+#     smooth; 1 codec frame = 1920 samples @ 24 kHz = 80 ms.
+#   * stage 2 stays eager: the vocoder CUDA-graph wrapper mishandles
+#     heterogeneous VIDEO co-batches (deploy_mu_fp8_s128_coloc.yaml).
+#
+# Run with the speech pair colocated (the run_qwen_server.sh default):
+#   CUDA_VISIBLE_DEVICES=0,1 VLLM_OMNI_COLOCATE_STAGES=2:1 \
+#   DEPLOY_CONFIG=.../temporal_batching_2gpu.yaml bash run_qwen_server.sh
+# Colocation places the GUEST (stage 2) inside the HOST's (stage 1) process,
+# so stage 2 runs on whatever CUDA_VISIBLE_DEVICES the host was spawned with;
+# its own `devices` field must MATCH the host's ("1") so both land in the
+# same sequential init group and the guest attaches after the host stashes
+# its addresses (stage_runtime.py:_replica_init_group_key /
+# _attach_colocated_guest). Stage 0 in its own process on GPU0 is fine:
+# 2:1 keeps the thinker->talker edge on the CPU/SharedMemory path, which is
+# device-agnostic.
+#
+# SERVER-SIDE (not this file): set the session config's
+# stage1_kv_pool_tokens to the boot log's stage-1 "GPU KV cache size" token
+# count. Admission refuses a session when 0.75 * pool / active < 2048
+# (_TALKER_ROLL_FLOOR), i.e. N=16 needs pool >= 43,691 tokens -- trivially
+# met here; at ~1M tokens the per-session share (~50k) stays above every
+# realistic roll threshold, so the pool guard never fires before the
+# per-session 65,536 max_model_len wall.
+
+async_chunk: true
+
+# Both edges on SharedMemoryConnector, exactly like the proven
+# deploy_web_demo.yaml. A ColocInProcConnector on the 1->2 edge was tried
+# first and BROKE the pipeline silently: the orchestrator's async-chunk
+# prewarm never admitted the request at stage 2 (ADMIT logs showed stages
+# 0/1 only), so the talker's codec chunks piled up unread and the client got
+# text but never audio. The 1->2 chunks are 1-4 KB -- the shm copy is noise.
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      initial_codec_chunk_frames: 4
+      codec_chunk_frames: 4
+      codec_left_context_frames: 25
+
+stages:
+  - stage_id: 0                      # thinker: vision + audio encoders + LLM
+    max_num_batched_tokens: 16384    # RAISED from 8192 (2026-08-13): the
+                                     # roll-waive fix left an 8-turn prefill-
+                                     # queueing tail (1.8-7.7 s TTFT, all in the
+                                     # compression window) -- swap-turn + seed
+                                     # prefills bind on this budget. Original
+                                     # note: raise toward 32768 (stock) only if
+                                     # prefill throughput binds -- it now does.
+    # GLOBAL FP8 (default since 2026-08-13, user decision): weights are
+    # quantized AT LOAD TIME from the official bf16 checkpoint -- do NOT
+    # point QWEN_MODEL at the community block-FP8 checkpoint, it produced
+    # degenerate text (verbatim loops) on this fork (deploy_mu_fp8_s32.yaml,
+    # 2026-08-02). Measured there: fp8 weights take the thinker 59.4 ->
+    # 31.7 GiB; fp8 KV halves the 96 KB/token cost. Both together grow the
+    # stage-0 pool from 275,008 tokens by roughly 6x -- read the boot log's
+    # "GPU KV cache size" line for the real number, never trust estimates.
+    quantization: fp8
+    kv_cache_dtype: fp8
+    max_num_seqs: 80
+    # Whole 96 GB card to itself now: 0.90 as in the stock 2xH100 config.
+    # Weights are 59.4 GiB bf16; 0.74 gave a 106,880-token pool (96 KB/token
+    # bf16 KV), 0.90 adds ~15 GiB -> expect ~270k tokens. Read the boot log
+    # "GPU KV cache size" line for the real number, never trust the estimate.
+    gpu_memory_utilization: 0.90
+    trust_remote_code: true
+    enable_prefix_caching: true
+    # Temporal pacing paces the THINKER too (same global tick clock as the
+    # talker), so stage 0 hits the same park/re-admit path that is unsafe
+    # under async scheduling (-1 sentinel from token_ids_cpu; see the stage-1
+    # note below). Kept false for ALL experiment arms -- baseline included --
+    # so the comparison is apples-to-apples. Deviation from stock (async on)
+    # is documented in DESIGN.zh.md.
+    async_scheduling: false
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 2048
+
+  - stage_id: 1                      # talker: speech codec token LM
+    max_num_batched_tokens: 8192
+    # GLOBAL FP8 (default since 2026-08-13, user decision): fp8 KV on the
+    # talker has a clean precedent (deploy_mu_sw4k_kvfp8.yaml: 20 -> 10
+    # KB/token, SlidingWindowSpec carries kv_quant_mode). fp8 WEIGHTS on the
+    # talker are NEW here -- every earlier fp8 config kept talker weights
+    # bf16 ("one variable at a time" + the vocoder-feeding stage is quality-
+    # sensitive). On-the-fly quantization from the official checkpoint, same
+    # as stage 0. Gate: any bench with this file must show 0 empty replies
+    # and sane chars/s before results count.
+    quantization: fp8
+    kv_cache_dtype: fp8
+    max_num_seqs: 80
+    # GPU1 is shared only with code2wav now. 0.30 x ~95 GiB = ~28.5 GiB;
+    # minus ~7 GiB fixed (weights + graphs) leaves ~21 GiB of KV at ~20 KB
+    # per token bf16 -> ~1M tokens, per-session share ~50k at N=16. The
+    # single-card 0.10 gave 123,040 tokens (2.35 GiB) and was the measured
+    # wall at 64 users; stock 2xH100 uses 0.6 -- more than needed for 16.
+    gpu_memory_utilization: 0.30
+    trust_remote_code: true
+    enable_prefix_caching: false
+    # MUST stay false while pacing parks/re-admits requests -- see header.
+    async_scheduling: false
+    # Dedicated card: CUDA graphs back on (eager was a shared-card memory
+    # measure). If boot tips over, flip to true FIRST, before touching
+    # fractions -- graph capture is what pushed the shared card to 85 GB.
+    enforce_eager: false
+    devices: "1"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      # [A*] seed dropped: a per-request seed forces vLLM's row-wise sampling
+      # loop instead of one batched sample. It changes reproducibility only,
+      # not the distribution. repetition_penalty KEPT -- it does change the
+      # codec token distribution, so it is not a free win.
+      repetition_penalty: 1.05
+
+  - stage_id: 2                      # code2wav: waveform reconstruction
+    max_num_batched_tokens: 65536
+    max_num_seqs: 80
+    # 0.10 x ~95 GiB = ~9.5 GiB on the now-roomy GPU1 (was 0.08 squeezed
+    # next to the thinker). Stock 2xH100 also uses 0.1 here.
+    gpu_memory_utilization: 0.10
+    # Campaign change (ALL arms, shared config, fair): the vocoder graph
+    # wrapper's known crash is on heterogeneous VIDEO co-batches; this
+    # pipeline's output is audio-only, documented "measured clean for hours".
+    # Graphs collapse the vocoder's launch overhead -- GPU1 headroom.
+    enforce_eager: false
+    trust_remote_code: true
+    enable_prefix_caching: false
+    enable_chunked_prefill: false
+    async_scheduling: false
+    devices: "1"
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      # [A*] seed and repetition_penalty dropped: this stage runs at
+      # temperature 0.0, so the seed can change nothing, and the penalty makes
+      # the sampler build a token-history tensor every pass for a greedy
+      # decode. Output is unchanged.
