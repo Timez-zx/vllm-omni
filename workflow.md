@@ -72,6 +72,7 @@ with different causes, and averaging them together hid the real one for weeks.
 | 25 | stage→card mapping | already thinker GPU0, talker+vocoder GPU1 | unchanged | no NVLink here, so only the text payload crosses cards |
 | **Per-step data movement** ||||
 | 26 | the per-step payload row | pageable `.to(device)`, once per session per step | staged through pinned memory, copy enqueued async | 4 KB at 147 μs → 176 sessions: miss 27.2% → 2.03%, capacity ~168 → ~180 |
+| 27 | the code predictor's 15 AR steps | re-forwards the whole 17-position window every step | fixed-size KV cache: one position per step, attention over 17 masked slots | 35.4 → 8.6 ms per pass; 184 sessions: miss 3.6-6.8% → 0.12%, capacity ~180 → ~200 |
 
 ---
 
@@ -358,6 +359,36 @@ turn-opening path and is left alone, so this change's effect stays attributable.
 
 ---
 
+### 27. The code predictor keeps a fixed-size KV cache
+
+**Stock.** A codec frame is 16 code groups; the first comes from the talker and the code predictor
+produces the other 15 in sequence. Each of those steps re-forwards the **whole** 17-position window
+(`seq_len = max_seq`), so at batch 105 padded to 128 a talker pass does 128 × 17 × 15 = 32,640
+token-forwards. Measured: **35.4 ms of GPU time per pass**, four times the talker's own forward, and
+46.6% of the pass.
+
+**A.** Each step forwards one position and attends over a cache of 17 fixed slots, with the slots
+not yet written hidden by an additive mask. Two properties matter together: the arithmetic drops
+17× **and** every step keeps the same shape, so one compiled function serves all of them. The second
+half is not optional — sizing each step to the prefix it needs (step+1 positions, 40% less
+arithmetic) was measured 8% SLOWER, because it loses the single shape.
+
+**Measured**, 184 audio sessions: code-predictor time **35.4 → ~8.6 ms** per pass and now flat in
+batch (8.4-9.6 ms from batch 3 to 67, i.e. a fixed per-pass cost rather than a per-session one);
+talker pass 76.0 → 34.7 ms; late audio 3.6-6.8% → **0.12%**; stall 90-180 → 1.2 ms/turn; rtf
+1.15 → 2.51; TTFA p50 873 → 504 ms. Max servable **~180 → ~200 sessions**.
+
+**Equivalence** is numerical, not bit-exact: the two paths reduce in different orders, so bf16 cannot
+match bit-for-bit. `benchmarks/` has no test for this; the check was an offline script that builds
+the inner model directly and compares "full window, take row s" against "step per position" at all
+17 positions — relative error 0.7-1.3%, the level a single SDPA call already shows (3.3e-3 = bf16's
+2⁻⁸). End to end: probes clean, deterministic answers identical, and the produced audio's RMS, peak
+and zero-crossing rate all in the normal speech range. `VLLM_OMNI_CP_KV_CACHE=0` restores the
+re-prefill path for comparison; `VLLM_OMNI_CP_KV_VERIFY=1` runs both paths and logs the difference
+(it self-disables under CUDA graph capture, where its device sync is illegal).
+
+---
+
 ## The defaults are this configuration
 
 Until 2026-08-14 every mechanism above defaulted OFF for upstream compatibility, and the measured
@@ -437,6 +468,15 @@ compression waves do not coincide. What remains at 64 is **simultaneity**, not c
 - prefill/decode disaggregation: the state to move is the KV cache, and this host has no NVLink.
 
 ### Where the audio limit is now
+
+**After #27 the limit moved off the talker.** At 200 sessions: late audio 0.55%, stall 7.8 ms/turn,
+TTFA p99 1747 ms, no admission refusals — passing. At 240: late audio still only 1.00%, but TTFA p99
+is 3409 ms (fails) and the thinker's pool guard refuses 33 sessions, because
+`0.75 × 1,132,672 / 240 = 3540` is below the 4096-token admission floor. So the audio workload is now
+bounded by the THINKER — its TTFA tail, and a hard ceiling of about 207 sessions from the stage-0 KV
+pool — not by the speech pair.
+
+The decomposition below is the pre-#27 state, kept because it is what identified the code predictor:
 
 184 sessions, batch 105, a 76.0 ms pass (`VLLM_OMNI_LOG_MTP_GPU=1`):
 

@@ -239,6 +239,51 @@ class CodePredictorAttention(nn.Module):
             sync=True,
         )[0]
 
+    def forward_step(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        slot: torch.Tensor,
+        attn_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """One position, attending over a FIXED-SIZE cache.
+
+        Shapes never change across AR steps: the query is always [B, 1, H] and
+        the cache is always [B, kv_heads, max_seq, head_dim], with `attn_mask`
+        hiding the slots not written yet. That is deliberate -- sizing each step
+        to the prefix it needs was measured SLOWER (35.1 -> 38.1 ms at 184
+        sessions) because it loses the single compiled shape, so the cache keeps
+        one shape and cuts the arithmetic instead.
+        """
+        bsz = hidden_states.shape[0]
+        q = self.q_norm(self.q_proj(hidden_states).view(bsz, 1, self.num_heads, self.head_dim)).transpose(1, 2)
+        k = self.k_norm(self.k_proj(hidden_states).view(bsz, 1, self.num_kv_heads, self.head_dim)).transpose(1, 2)
+        v = self.v_proj(hidden_states).view(bsz, 1, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        q = (q * cos) + (_rotate_half(q) * sin)
+        k = (k * cos) + (_rotate_half(k) * sin)
+
+        # index_copy_ keeps the slot a TENSOR, so the compiled graph does not
+        # specialize on the step number and one compilation serves all steps.
+        k_cache.index_copy_(2, slot, k)
+        v_cache.index_copy_(2, slot, v)
+
+        attn_out = F.scaled_dot_product_attention(
+            q,
+            k_cache,
+            v_cache,
+            attn_mask=attn_mask,
+            scale=self.scaling,
+            enable_gqa=self.is_gqa,
+        )
+        attn_out = attn_out.transpose(1, 2).reshape(bsz, 1, -1)
+        return self.o_proj(attn_out)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -309,6 +354,29 @@ class CodePredictorDecoderLayer(nn.Module):
         self.input_layernorm = _RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = _RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    def forward_step(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        slot: torch.Tensor,
+        attn_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        # Same order and the same norms as forward() below; only the attention
+        # call differs. Any divergence here shows up as a numeric mismatch in
+        # the VLLM_OMNI_CP_KV_VERIFY comparison.
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn.forward_step(
+            hidden_states, position_embeddings, k_cache, v_cache, slot, attn_mask
+        )
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        return residual + hidden_states
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -377,6 +445,29 @@ class CodePredictorBaseModel(nn.Module):
     def get_input_embeddings(self) -> nn.ModuleList:
         return self.codec_embedding
 
+    def forward_step(
+        self,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_caches: list[tuple[torch.Tensor, torch.Tensor]],
+        slot: torch.Tensor,
+        attn_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """One position through the stack, reading/writing a fixed-size cache."""
+        input_dtype = inputs_embeds.dtype
+        use_fp32 = input_dtype == torch.float16 and inputs_embeds.device.type != "cpu"
+        if use_fp32:
+            inputs_embeds = inputs_embeds.float()
+        hidden_states = inputs_embeds
+        with torch.amp.autocast(inputs_embeds.device.type, enabled=use_fp32, dtype=torch.float32):
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+            for layer, (k_cache, v_cache) in zip(self.layers, kv_caches, strict=True):
+                hidden_states = layer.forward_step(
+                    hidden_states, position_embeddings, k_cache, v_cache, slot, attn_mask
+                )
+            hidden_states = self.norm(hidden_states)
+        return hidden_states.to(input_dtype)
+
     def forward(
         self,
         inputs_embeds: torch.Tensor,
@@ -438,12 +529,41 @@ class CodePredictorWrapperConfig:
 # ===================================================================
 
 
-class CodePredictorWrapper(nn.Module):
-    """Optimized code predictor -- re-prefill approach, no KV cache.
+# The AR loop keeps a fixed-size KV cache instead of re-forwarding the whole
+# window at every step. ON by default: at 184 concurrent audio sessions it took
+# this stage's code-predictor time from 35.4 to 8.6 ms per pass and the client's
+# late-audio rate from 3.6-6.8% to 0.12%. VLLM_OMNI_CP_KV_CACHE=0 restores the
+# re-prefill path, which is how the two are compared.
+#
+# NOTE for the other model that shares this wrapper (qwen3_tts): the change is
+# generic -- one position per step, attention over the full fixed cache with the
+# unwritten slots masked -- and equivalence was checked numerically rather than
+# per model (see the equivalence note on forward_step). Set the flag to 0 there
+# if a difference shows up.
+_KV_CACHE_AR = __import__("os").environ.get("VLLM_OMNI_CP_KV_CACHE", "1") not in ("0", "", "false", "False")
+# VLLM_OMNI_CP_KV_VERIFY=1 runs BOTH paths per step and logs the max abs
+# difference of the row the sampler reads. It cannot run under CUDA graph
+# capture (its .item() is a device sync), so it self-disables while capturing.
+_KV_CACHE_VERIFY = __import__("os").environ.get("VLLM_OMNI_CP_KV_VERIFY", "0") not in ("0", "", "false", "False")
+# The step path mutates its cache arguments in place. VLLM_OMNI_CP_KV_NOCOMPILE=1
+# runs it eager, which is how "is a mismatch compile dropping the in-place
+# write?" gets answered instead of guessed.
+_KV_NOCOMPILE = __import__("os").environ.get("VLLM_OMNI_CP_KV_NOCOMPILE", "0") not in ("0", "", "false", "False")
 
-    Each AR step forwards the full growing sequence (len 2 -> num_code_groups+1)
-    through the transformer.  The extra O(T^2) FLOPs are negligible for
-    short sequences, and this avoids all KV-cache management overhead.
+
+class CodePredictorWrapper(nn.Module):
+    """Optimized code predictor.
+
+    Default path: a FIXED-SIZE KV cache. Each AR step forwards ONE position and
+    attends over a cache of num_code_groups+1 slots with the unwritten slots
+    masked, so every step keeps the same shape while doing a single token's
+    arithmetic.
+
+    Fallback (VLLM_OMNI_CP_KV_CACHE=0): re-prefill, where each step forwards the
+    full window (len 2 -> num_code_groups+1). This docstring used to call the
+    extra O(T^2) negligible for short sequences; that holds at batch 1, but at
+    batch 105 and 13 passes per second it was 35.4 ms of GPU time per talker
+    pass -- 46.6% of the pass -- against 8.6 ms for the cached path.
 
     Optimizations:
       1. Per-call embedding buffer -- avoids cross-request aliasing.
@@ -452,6 +572,7 @@ class CodePredictorWrapper(nn.Module):
       4. torch.compile on inner transformer.
       5. Inline sampling (top-k + top-p) -- no custom op overhead.
       6. Optional manual CUDA graph capture per batch-size bucket.
+      7. Fixed-size KV cache for the AR steps (default; see above).
     """
 
     def __init__(
@@ -508,6 +629,15 @@ class CodePredictorWrapper(nn.Module):
         self._lm_heads_list: list[nn.Module] | None = None
         self._codec_embeds_list: list[nn.Module] | None = None
         self._device_graphs: dict[int | tuple[int, int], tuple] = {}  # (graph, static_output) per bucket
+        # Fixed-size AR cache: per (padded batch) list of per-layer (k, v), plus
+        # one additive mask per step. Filled by _build_ar_state at SETUP time
+        # (not lazily -- see the note there) and reused for the process's
+        # lifetime; shapes never change, so neither does the compiled graph.
+        self._ar_kv: dict[int, list[tuple[torch.Tensor, torch.Tensor]]] = {}
+        self._ar_masks: list[torch.Tensor] | None = None
+        self._ar_slots: list[torch.Tensor] | None = None
+        self._ar_pos: list[torch.Tensor] | None = None
+        self._compiled_step_fwd = None
         prefix_graph_cfg = self._stage_connector_extra_config(vllm_config)
         prefix_graphs_requested = self._parse_bool_config(prefix_graph_cfg.get("code_predictor_prefix_graphs"))
         is_npu = current_omni_platform.is_npu()
@@ -689,6 +819,9 @@ class CodePredictorWrapper(nn.Module):
         self._ensure_buffers(device, self._model_dtype, max(self._bucket_sizes))
         proj_buf = self._proj_buf
 
+        if _KV_CACHE_AR:
+            self._build_ar_state(device, self._model_dtype, max_seq)
+
         if self._prefix_graphs_enabled:
             prefix_seq_lens = self._prefix_seq_lens(max_seq)
             needs_full_graph = set(prefix_seq_lens) != set(range(2, max_seq))
@@ -727,6 +860,88 @@ class CodePredictorWrapper(nn.Module):
                 for _ in range(3):
                     self._compiled_model_fwd(proj_buf[:bsz, :max_seq, :], pos_ids)
             logger.info("code_predictor: warmup done for buckets %s", self._bucket_sizes)
+
+    @staticmethod
+    def _verify_pos(step: int, padded_bsz: int, device) -> torch.Tensor:
+        return torch.arange(step + 1, device=device, dtype=torch.long).unsqueeze(0).expand(padded_bsz, -1).contiguous()
+
+    def _build_ar_state(self, device, dtype, max_seq: int) -> None:
+        """Allocate the AR cache for every bucket, at SETUP time.
+
+        Not lazily in forward(): the first call can land inside the outer
+        engine's CUDA graph capture, and allocating during capture fails with
+        cudaErrorStreamCaptureUnsupported. Everything the step path needs --
+        caches, masks, slot and position tensors, and the compiled function --
+        is therefore created here, and forward() only looks it up.
+        """
+        for bsz in self._bucket_sizes:
+            self._ensure_ar_state(bsz, device, dtype, max_seq)
+        # Warm the compiled step path once per bucket so Inductor compiles here
+        # rather than under capture.
+        with torch.no_grad():
+            for bsz in self._bucket_sizes:
+                caches = self._ar_kv[bsz]
+                dummy = torch.zeros((bsz, 1, self.config.hidden_size), device=device, dtype=dtype)
+                for step in range(max_seq):
+                    self._compiled_step_fwd(dummy, self._ar_pos[step], caches, self._ar_slots[step], self._ar_masks[step])
+                for k_cache, v_cache in caches:
+                    k_cache.zero_()
+                    v_cache.zero_()
+        logger.info("code_predictor: AR KV cache + compiled step path ready for buckets %s", self._bucket_sizes)
+
+    def _ensure_ar_state(self, padded_bsz: int, device, dtype, max_seq: int):
+        """Allocate the fixed-size AR cache, masks, slots and position ids once.
+
+        Everything here is shape-constant for the process's life: one cache per
+        padded batch bucket, one additive mask per step (0 up to the written
+        slot, -inf after it), one slot index tensor and one position id tensor
+        per step. Passing the slot as a TENSOR keeps the compiled step graph
+        from specializing on the step number.
+        """
+        if self._ar_masks is None:
+            neg = torch.finfo(dtype).min
+            self._ar_masks = []
+            self._ar_slots = []
+            self._ar_pos = []
+            for step in range(max_seq):
+                m = torch.full((1, 1, 1, max_seq), neg, device=device, dtype=dtype)
+                m[..., : step + 1] = 0
+                self._ar_masks.append(m)
+                self._ar_slots.append(torch.tensor([step], device=device, dtype=torch.long))
+                self._ar_pos.append(torch.full((1, 1), step, device=device, dtype=torch.long))
+        caches = self._ar_kv.get(padded_bsz)
+        if caches is None:
+            cfg = self.config
+            n_kv = cfg.num_key_value_heads
+            hd = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
+            caches = [
+                (
+                    torch.zeros((padded_bsz, n_kv, max_seq, hd), device=device, dtype=dtype),
+                    torch.zeros((padded_bsz, n_kv, max_seq, hd), device=device, dtype=dtype),
+                )
+                for _ in range(cfg.num_hidden_layers)
+            ]
+            self._ar_kv[padded_bsz] = caches
+            logger.info(
+                "code_predictor: AR KV cache allocated for batch %d (%d layers x 2 x %d x %d x %d, %.1f MB)",
+                padded_bsz,
+                cfg.num_hidden_layers,
+                padded_bsz,
+                max_seq,
+                hd,
+                2 * cfg.num_hidden_layers * padded_bsz * n_kv * max_seq * hd * caches[0][0].element_size() / 1e6,
+            )
+        if self._compiled_step_fwd is None:
+            fwd = self.model.forward_step
+            if not _KV_NOCOMPILE:
+                try:
+                    # Same options as the full-window path: shapes are constant,
+                    # so one compilation serves every step and every pass.
+                    fwd = torch.compile(fwd, dynamic=False, options={"epilogue_fusion": False})
+                except Exception as exc:      # pragma: no cover
+                    logger.warning("code_predictor: step path not compiled (%s)", exc)
+            self._compiled_step_fwd = fwd
+        return caches
 
     def _capture_cuda_graphs(self) -> None:
         """Capture a CUDA graph per bucket using vLLM's global graph pool."""
@@ -888,6 +1103,18 @@ class CodePredictorWrapper(nn.Module):
             all_codes = torch.empty(bsz, num_groups, dtype=torch.long, device=device)
             all_codes[:, 0] = layer0_code.reshape(bsz)
 
+        # Fixed-size KV cache path: prefill position 0 so that step 1 finds it
+        # in the cache, then every step forwards exactly one position.
+        ar_caches = self._ar_kv.get(padded_bsz) if _KV_CACHE_AR else None
+        if ar_caches is not None:
+            self._compiled_step_fwd(
+                proj_buf[:padded_bsz, 0:1, :],
+                self._ar_pos[0],
+                ar_caches,
+                self._ar_slots[0],
+                self._ar_masks[0],
+            )
+
         # Autoregressive loop: predict layers 1..G-1
         for step in range(1, num_groups):
             graph_key: int | tuple[int, int] = padded_bsz
@@ -906,16 +1133,37 @@ class CodePredictorWrapper(nn.Module):
                     .contiguous()
                 )
 
-            # Use captured device graph if available, otherwise call compiled fn.
-            device_graph_entry = self._device_graphs.get(graph_key)
-
-            if device_graph_entry is not None:
-                device_graph_entry[0].replay()
-                hidden_out = device_graph_entry[1]
+            if ar_caches is not None:
+                # Cached path: forward ONLY this position, attending over the
+                # fixed-size cache. 1 token per step instead of the whole window.
+                step_row = self._compiled_step_fwd(
+                    proj_buf[:padded_bsz, step : step + 1, :],
+                    self._ar_pos[step],
+                    ar_caches,
+                    self._ar_slots[step],
+                    self._ar_masks[step],
+                )
+                used = step_row[:bsz, 0, :]
+                if _KV_CACHE_VERIFY and not torch.cuda.is_current_stream_capturing():
+                    ref = model_fwd(proj_buf[:padded_bsz, : step + 1, :], self._verify_pos(step, padded_bsz, device))
+                    diff = (ref[:bsz, step, :].float() - used.float()).abs().max().item()
+                    ref_mag = ref[:bsz, step, :].float().abs().max().item()
+                    logger.info(
+                        "[CP-KV-VERIFY] step=%d bsz=%d max_abs_diff=%.3e ref_max_abs=%.3e rel=%.3e",
+                        step, bsz, diff, ref_mag, diff / max(ref_mag, 1e-9),
+                    )
+                logits = lm_heads[step - 1](used)
             else:
-                hidden_out = model_fwd(proj_buf[:padded_bsz, :seq_len, :], pos_ids)
+                # Use captured device graph if available, otherwise call compiled fn.
+                device_graph_entry = self._device_graphs.get(graph_key)
 
-            logits = lm_heads[step - 1](hidden_out[:bsz, step, :])
+                if device_graph_entry is not None:
+                    device_graph_entry[0].replay()
+                    hidden_out = device_graph_entry[1]
+                else:
+                    hidden_out = model_fwd(proj_buf[:padded_bsz, :seq_len, :], pos_ids)
+
+                logits = lm_heads[step - 1](hidden_out[:bsz, step, :])
 
             # Sample next code via Gumbel-max.
             #
