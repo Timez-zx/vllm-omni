@@ -69,6 +69,19 @@ def _create_mooncake_store_connector(config: dict[str, Any]) -> OmniConnectorBas
 
 
 def _create_shm_connector(config: dict[str, Any]) -> OmniConnectorBase:
+    # VLLM_OMNI_MAILBOX=1 substitutes the
+    # persistent two-slot mailbox wherever the deploy yaml says
+    # SharedMemoryConnector -- experiment arms keep ONE shared yaml and
+    # differ only by env. The mailbox inherits the legacy path as its
+    # universal fallback, so behavior is a superset.
+    from vllm_omni.core.sched.runtime_flags import flag_on as _flag_on
+    if _flag_on("VLLM_OMNI_MAILBOX"):
+        try:
+            from .connectors.shm_mailbox_connector import ShmMailboxConnector
+
+            return ShmMailboxConnector(config)
+        except Exception as e:
+            logger.warning(f"ShmMailboxConnector unavailable ({e}); using SharedMemoryConnector")
     try:
         from .connectors.shm_connector import SharedMemoryConnector
     except ImportError:

@@ -34,6 +34,19 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
 
 logger = logging.getLogger(__name__)
 
+# [live-vllm diagnosis] same env as the orchestrator's [AUDIO-CHUNK] stamps:
+# per-chunk emit stamps at the stage-1 send point.
+import os as _os
+
+_LOG_CHUNK_EMIT = _os.environ.get("VLLM_OMNI_LOG_AUDIO_CHUNKS", "0") not in ("0", "", "false", "False")
+
+# Drop payload fields the consumer never reads on the decode path; see the
+# long note at the return site. Default ON -- it is a pure "stop sending unread
+# bytes" change -- with an env to restore the fat payload for A/B.
+_T2T_LEAN_DECODE = _os.environ.get("VLLM_OMNI_T2T_LEAN_DECODE", "1") not in ("0", "", "false", "False")
+
+
+
 # Pooling output layer keys: "0" = word embedding, "24" = accept_hidden_layer
 _EMBED_LAYER_KEY = "0"
 _HIDDEN_LAYER_KEY = "24"
@@ -470,6 +483,28 @@ def _construct_thinker2talker_streaming_input_async_chunk(
                         speaker=speaker,
                         language=language,
                     )
+            # [lean decode payload] Ship only what the consumer reads. On this
+            # path -- a plain decode step, no pending prefill to flush -- the
+            # talker reads embed.decode and nothing else: hidden_states.output
+            # is consumed only by talker_preprocess_prefill (qwen3_omni.py:888)
+            # and ids is consumed only there too (ids.all / ids.prompt at
+            # :892-899); ids.output has no reader anywhere on the receiving
+            # side. Both were being sent per token per session anyway: the
+            # hidden row is a fixed 4096 bytes (half the payload) and the id
+            # list grows through the turn, which is what made per-turn transfer
+            # bytes grow quadratically. Measured motivation: the talker's GPU
+            # runs 2.5 ms per 28.7 ms pass (8.5% duty) at 64 users while ~1 ms
+            # per session per pass goes to CPU -- deserialize and payload build
+            # are 30% of that stage's samples, so the cheapest capacity left is
+            # to stop sending unread bytes. VLLM_OMNI_T2T_LEAN_DECODE=0 restores
+            # the fat payload for A/B.
+            if _T2T_LEAN_DECODE:
+                return OmniPayloadStruct(
+                    meta=MetaStruct(finished=finished),
+                    embed=EmbeddingsStruct(decode=emb_cpu),
+                    speaker=speaker,
+                    language=language,
+                )
             return OmniPayloadStruct(
                 meta=MetaStruct(
                     finished=finished,
@@ -973,6 +1008,17 @@ def talker2code2wav_async_chunk(
     codes = (
         torch.cat(transfer_manager.code_prompt_token_ids[request_id][-end_index:], dim=0).transpose(0, 1).reshape(-1)
     )
+
+    # [live-vllm diagnosis] per-chunk emit stamp at the stage-1 SEND point --
+    # the last unstamped hop of the chunk pipeline (emit -> vocode ->
+    # orchestrator stamp -> client). CLOCK_MONOTONIC is host-wide, so this
+    # aligns with [SCHED-STEP] mono across processes.
+    if _LOG_CHUNK_EMIT:
+        import time as _t
+        logger.info(
+            "[CHUNK-EMIT] rid=%s chunk_id=%d frames=%d mono=%.6f",
+            request_id, chunk_id, context_length, _t.monotonic(),
+        )
 
     return OmniPayloadStruct(
         codes=CodesStruct(audio=codes),

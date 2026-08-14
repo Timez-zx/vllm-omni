@@ -1000,7 +1000,33 @@ class Qwen3OmniMoeForConditionalGeneration(
         update_dict.setdefault("meta", {})["prefill_consumed_text_tokens"] = 1
         self._talker_cache_thinker_decode_embeds(embed, update_dict)
 
-        return req_input_ids[start_index:end_index], req_embeds[start_index:end_index], update_dict
+        out_ids = req_input_ids[start_index:end_index]
+        out_embeds = req_embeds[start_index:end_index]
+        span = end_index - start_index
+        if out_embeds.shape[0] < span:
+            # The consumption cursor (num_processed_tokens) points past the
+            # rows this payload actually carries -- upstream segment-state
+            # desync. Returning short rows here is what killed whole engines:
+            # the worker clamps seg_len to what it got, leaving this request's
+            # slots as torch.empty garbage (device-side asserts for every
+            # batch-mate) or, alone in the batch, a 0-row forward (IndexError
+            # in execute_model). Pad to the scheduled span so shapes stay
+            # aligned; this request's audio for the segment is degraded, the
+            # engine and the other users survive.
+            missing = span - out_embeds.shape[0]
+            logger.error(
+                "[talker-text-only] prefill row shortfall: span [%d,%d) wants %d rows, "
+                "payload has %d total; padding %d zero row(s). Upstream segment-state "
+                "desync -- this segment's audio is degraded but the batch stays aligned.",
+                start_index, end_index, span, req_embeds.shape[0], missing,
+            )
+            pad_embeds = torch.zeros(
+                (missing, req_embeds.shape[-1]), dtype=req_embeds.dtype, device=req_embeds.device
+            )
+            out_embeds = torch.cat((out_embeds, pad_embeds), dim=0)
+            pad_ids = torch.zeros((missing,), dtype=req_input_ids.dtype, device=req_input_ids.device)
+            out_ids = torch.cat((out_ids.reshape(-1), pad_ids), dim=0)
+        return out_ids, out_embeds, update_dict
 
     def _talker_cache_thinker_decode_embeds(
         self,
@@ -1130,6 +1156,34 @@ class Qwen3OmniMoeForConditionalGeneration(
                 continue
             else:
                 raise AssertionError("Expect role id after <|im_start|> (assistant, user, system)")
+        if not talker_input_embeds:
+            # [live-vllm] Wave-onset race: a prefill span carrying NO
+            # assistant span reaches here (empty-payload family) and the
+            # bare torch.cat kills the whole stage-1 engine core -- observed
+            # twice at u56, both at first-compression time, taking all 56
+            # sessions down (diag8/text runs). Same contract as the
+            # pad-to-span clamp: ship ZERO rows with an ERROR line; the
+            # offending segment parks with no output and only its own
+            # session degrades.
+            logger.error(
+                "[talker-prefill] EMPTY talker span list (span_len=%d); "
+                "shipping zero rows instead of crashing the engine core.",
+                int(input_ids.shape[0]) if input_ids is not None else -1,
+            )
+            # `input_embeds` is not in scope here (it belongs to the CALLER,
+            # talker_preprocess_prefill) -- this guard raised NameError the
+            # first time it ever fired, killing the stage-1 core it was written
+            # to protect. Build the zero rows from what this function actually
+            # has: talker text width, on the talker's device, matching the
+            # dtype of the rows the success path returns (bfloat16, see
+            # _get_talker_user_parts).
+            zero_e = torch.zeros(
+                (0, self.config.talker_config.text_config.hidden_size),
+                device=input_ids.device,
+                dtype=torch.bfloat16,
+            )
+            zero_i = input_ids.new_zeros((0,))
+            return zero_i, zero_e, trailing_text_hidden_all
         talker_input_embed = torch.cat([embed.to(input_ids.device) for embed in talker_input_embeds], dim=0)
         talker_input_id = torch.cat([embed.to(input_ids.device) for embed in talker_input_ids], dim=0)
 
@@ -1162,9 +1216,29 @@ class Qwen3OmniMoeForConditionalGeneration(
                 update_dict.setdefault("embed", {})["cached_decode"] = cached_thinker_decode_embeds
 
         elif thinker_decode_embed is not None:
-            thinker_embed = thinker_decode_embed
-            if thinker_embed.device != device:
-                thinker_embed = thinker_embed.to(device)
+            rows = thinker_decode_embed.to(device)
+            if rows.ndim == 1:
+                rows = rows.view(1, -1)
+            # [T2T coalesce] identical to the old branch for a [1,D] payload
+            # (rows[0:1] IS the whole tensor). A batched payload landing with
+            # no live cache consumes row 0 this step and BANKS the rest in
+            # cached_decode, aligned to the cursor's index space: the cache
+            # is padded up to (start_index+1) rows with filler the monotonic
+            # cursor can never re-read, so cached[start_index + i] lands on
+            # payload row i for every following step.
+            thinker_embed = rows[0:1]
+            if rows.shape[0] > 1:
+                base = (
+                    cached_thinker_decode_embeds.to(device=device, dtype=rows.dtype)
+                    if cached_thinker_decode_embeds is not None
+                    else rows[:0]
+                )
+                gap = (start_index + 1) - base.shape[0]
+                if gap > 0:
+                    base = torch.cat([base, rows.new_zeros((gap, rows.shape[-1]))], dim=0)
+                else:
+                    base = base[: start_index + 1]
+                update_dict.setdefault("embed", {})["cached_decode"] = torch.cat([base, rows[1:]], dim=0)
 
         else:
             # When the tokens output by the thinker are exhausted, an EOS token needs to be appended.

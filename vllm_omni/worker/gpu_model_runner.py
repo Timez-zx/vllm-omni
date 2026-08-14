@@ -49,6 +49,45 @@ else:
 
 logger = init_logger(__name__)
 
+# [encoder share probe] see the call site in execute_model. Events are read one
+# pass late so the probe never synchronizes on the critical path.
+_LOG_ENC = __import__("os").environ.get("VLLM_OMNI_LOG_ENC", "0") not in ("0", "", "false", "False")
+
+
+def _enc_probe_begin(runner):
+    if not _LOG_ENC or not torch.cuda.is_available():
+        return None
+    st = getattr(runner, "_enc_probe_state", None)
+    if st is None:
+        st = {"pending": None}
+        runner._enc_probe_state = st
+    ev = torch.cuda.Event(enable_timing=True)
+    ev.record()
+    return ev
+
+
+def _enc_probe_end(runner, start_ev):
+    st = runner._enc_probe_state
+    end = torch.cuda.Event(enable_timing=True)
+    end.record()
+    prev = st.get("pending")
+    st["pending"] = (start_ev, end)
+    if prev is None:
+        return
+    s, e = prev
+    if not e.query():
+        return
+    try:
+        dur = s.elapsed_time(e)
+    except Exception:
+        return
+    if dur > 0.05:      # skip passes with no encoder work at all
+        import time as _t
+        logger.info("[ENC-GPU] stage=%s mono=%.6f enc_ms=%.3f",
+                    getattr(runner.vllm_config.model_config, "stage_id", "?"),
+                    _t.monotonic(), dur)
+
+
 
 def _filter_mrope_kwargs_for_model(model: object, kwargs: dict[str, Any]) -> dict[str, Any]:
     """Return only M-RoPE kwargs accepted by the model implementation."""
@@ -403,6 +442,107 @@ class OmniGPUModelRunner(GPUModelRunner):
             return
 
         self._fixup_precomputed_mrope_decode_positions(scheduler_output)
+
+    def _calc_mrope_positions(self, scheduler_output: "SchedulerOutput"):
+        """Upstream copy with one defensive guard (see below).
+
+        Upstream's prompt-part copy assumes ``req.mrope_positions`` covers the
+        whole prompt. For streaming SESSION requests the chunk adapter / the
+        next_stage_prompt_len resize REPLACE the prompt on a live request, and
+        the runner-side CachedRequestState keeps the OLD (possibly empty)
+        mrope_positions -- under many concurrent turn transitions the copy
+        then hits `[3, 0]` source vs `[3, N]` target and the whole engine-core
+        dies, taking every session with it (observed identically on the
+        greedy baseline and the tick engine at 24-32 users). Until the state
+        refresh is plumbed through the prompt-replacement path, fall back to
+        on-the-fly linear positions for the uncovered span: for the talker's
+        placeholder prompts these match the linear decode positions the
+        session has been running on, and one segment's prefill positions
+        being linear is a bounded audio artifact -- an engine death is not.
+        """
+        from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
+        from vllm.utils import length_from_prompt_token_ids_or_embeds
+
+        mrope_pos_ptr = 0
+        for index, req_id in enumerate(self.input_batch.req_ids):
+            req = self.requests[req_id]
+            assert req.mrope_positions is not None
+
+            num_computed_tokens = self.input_batch.num_computed_tokens_cpu[index]
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            num_prompt_tokens = length_from_prompt_token_ids_or_embeds(req.prompt_token_ids, req.prompt_embeds)
+
+            if num_computed_tokens + num_scheduled_tokens > num_prompt_tokens:
+                prompt_part_len = max(0, num_prompt_tokens - num_computed_tokens)
+                completion_part_len = max(0, num_scheduled_tokens - prompt_part_len)
+            else:
+                prompt_part_len = num_scheduled_tokens
+                completion_part_len = 0
+
+            assert num_scheduled_tokens == prompt_part_len + completion_part_len
+
+            if prompt_part_len > 0:
+                dst_start = mrope_pos_ptr
+                dst_end = mrope_pos_ptr + prompt_part_len
+                src_start = int(num_computed_tokens)
+                src_end = int(num_computed_tokens) + prompt_part_len
+                available = req.mrope_positions.shape[1]
+
+                if src_end <= available:
+                    # Normal path: prompt positions are pre-computed.
+                    self.mrope_positions.cpu[:, dst_start:dst_end] = req.mrope_positions[:, src_start:src_end]
+                else:
+                    # DEFENSIVE PATH: stale/short mrope_positions after a
+                    # live prompt replacement. Copy what exists, fill the
+                    # rest linearly from the position delta.
+                    covered = max(0, available - src_start)
+                    if covered > 0:
+                        self.mrope_positions.cpu[:, dst_start:dst_start + covered] = req.mrope_positions[
+                            :, src_start:src_start + covered
+                        ]
+                    delta = req.mrope_position_delta if req.mrope_position_delta is not None else 0
+                    MRotaryEmbedding.get_next_input_positions_tensor(
+                        out=self.mrope_positions.np,
+                        out_offset=dst_start + covered,
+                        mrope_position_delta=delta,
+                        context_len=src_start + covered,
+                        num_new_tokens=prompt_part_len - covered,
+                    )
+                    # SELF-HEAL: append the generated span to the cached
+                    # request state, so later steps read a consistent buffer
+                    # instead of re-entering this path (and so downstream
+                    # position-dependent behavior -- notably EOS emission --
+                    # sees monotone positions rather than a permanent hole).
+                    try:
+                        fill = torch.from_numpy(
+                            self.mrope_positions.np[:, dst_start + covered : dst_start + prompt_part_len].copy()
+                        ).to(req.mrope_positions.dtype)
+                        req.mrope_positions = torch.cat(
+                            [req.mrope_positions[:, : src_start + covered], fill], dim=1
+                        )
+                        if req.mrope_position_delta is None:
+                            req.mrope_position_delta = delta
+                    except Exception:
+                        logger.debug("mrope self-heal append failed for %s", req_id, exc_info=True)
+                    logger.warning(
+                        "[OmniGPUModelRunner] req %s: mrope_positions covered %d tokens but "
+                        "prompt slice needs [%d:%d); filled %d positions linearly and "
+                        "extended the cached state (stale after live prompt replacement)",
+                        req_id, available, src_start, src_end, prompt_part_len - covered,
+                    )
+                mrope_pos_ptr += prompt_part_len
+
+            if completion_part_len > 0:
+                dst_start = mrope_pos_ptr
+                assert req.mrope_position_delta is not None
+                MRotaryEmbedding.get_next_input_positions_tensor(
+                    out=self.mrope_positions.np,
+                    out_offset=dst_start,
+                    mrope_position_delta=req.mrope_position_delta,
+                    context_len=num_computed_tokens + prompt_part_len,
+                    num_new_tokens=completion_part_len,
+                )
+                mrope_pos_ptr += completion_part_len
 
     def _fixup_precomputed_mrope_decode_positions(self, scheduler_output: "SchedulerOutput") -> None:
         """Overwrite linear decode M-RoPE positions with pre-computed ones.
@@ -1502,6 +1642,37 @@ class OmniGPUModelRunner(GPUModelRunner):
                     decoded_info = deserialize_additional_information(req_infos)
                     if decoded_info:
                         self._update_intermediate_buffer(req_id, decoded_info)
+                        # A new-segment payload on the CACHED path skips the
+                        # per-segment refresh the NewRequestData path performs
+                        # (_update_streaming_input_additional_info). The chunk
+                        # adapter now reroutes segment openers through WAITING,
+                        # so this should be unreachable -- but if any
+                        # interleaving still lands one here, resetting the
+                        # consumption cursor is the difference between one
+                        # degraded reply and the model slicing past the fresh
+                        # prefill rows: empty/garbage embeddings, IndexError or
+                        # device-side asserts, engine death for every user on
+                        # the stage. Openers are recognized by the explicit
+                        # replace marker (MiniCPM-o) or by carrying fresh
+                        # prefill embeddings (Qwen3-Omni ships embed.prefill
+                        # exactly once, on a segment's first chunk).
+                        meta_in = decoded_info.get("meta")
+                        embed_in = decoded_info.get("embed")
+                        is_segment_opener = (
+                            isinstance(meta_in, dict) and meta_in.get("replace_streaming_prompt") is True
+                        ) or (isinstance(embed_in, dict) and embed_in.get("prefill") is not None)
+                        if is_segment_opener:
+                            logger.error(
+                                "[OmniGPUModelRunner] req %s: new-segment payload arrived on the "
+                                "CACHED path (adapter reroute missed); forcing "
+                                "num_processed_tokens=0 to keep the prefill-row cursor sane",
+                                req_id,
+                            )
+                            buf = self.model_intermediate_buffer.get(req_id)
+                            if isinstance(buf, dict):
+                                buf_meta = buf.setdefault("meta", {})
+                                buf_meta["num_processed_tokens"] = 0
+                                buf_meta["resumable"] = True
 
     def _maybe_attach_mimo_audio_req_infos(
         self,
@@ -1583,7 +1754,21 @@ class OmniGPUModelRunner(GPUModelRunner):
                 scheduler_output,
                 encoder_cache=self.encoder_cache,
             ) as ec_connector_output:
+                # [encoder share probe] How much of a pass's GPU time is the
+                # vision/audio encoder, as opposed to the LLM attending over
+                # the embeddings it produces? That ratio decides whether
+                # moving the encoders to their own device is worth the work:
+                # the encoders are stateless (a frame's embedding depends on
+                # that frame alone) and their output is ~800 KB per frame
+                # against ~48 KB per token of KV, so they are the one part of
+                # this pipeline that disaggregates cheaply -- but only if they
+                # actually cost something. Measured with CUDA events read on
+                # the next pass, so no synchronize lands on the critical path.
+                # VLLM_OMNI_LOG_ENC=1.
+                _enc_probe = _enc_probe_begin(self)
                 self._execute_mm_encoder(scheduler_output)
+                if _enc_probe is not None:
+                    _enc_probe_end(self, _enc_probe)
                 mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
 
             # NOTE(woosuk): To unify token ids and soft tokens (vision
@@ -2053,5 +2238,26 @@ class OmniGPUModelRunner(GPUModelRunner):
                 merged_info[key] = value
         merged_info.setdefault("meta", {})["num_processed_tokens"] = 0
         merged_info.setdefault("meta", {})["resumable"] = True
+        # The text-consumption CURSOR is rebased to this segment here, so every
+        # piece of state indexed BY that cursor must be dropped in the same
+        # breath -- the dict merge above otherwise carries the previous
+        # segment's cached_decode bank (and its exhaustion flags) into a fresh
+        # index space, where the talker reads the previous turn's rows, or
+        # index padding, as this turn's text conditioning. Silent: it degrades
+        # what the voice says, not any timing metric. (Adversarial review of
+        # the batched-text-payload change, which is what first populated the
+        # bank; harmless to do unconditionally, and correct for any other
+        # producer that banks rows.)
+        # Scoped deliberately: only the cursor-indexed bank and the
+        # exhaustion flag. `decode` and `decode_flag` keep their pre-existing
+        # semantics -- a segment's own cursor offset is self-consistent (the
+        # prefill step rebases it and every decode step advances it by one), so
+        # nothing else here needs to change.
+        _embed = merged_info.get("embed")
+        if isinstance(_embed, dict):
+            _embed.pop("cached_decode", None)
+        _meta = merged_info.get("meta")
+        if isinstance(_meta, dict):
+            _meta.pop("eos_emitted", None)
         self.model_intermediate_buffer[req_id] = merged_info
         setattr(self.requests[req_id], "additional_information_cpu", merged_info)

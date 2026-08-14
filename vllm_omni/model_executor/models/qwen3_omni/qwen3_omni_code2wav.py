@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 
 import numpy as np
@@ -30,6 +31,21 @@ from vllm.model_executor.models.utils import (  # type: ignore
 from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
 
 logger = init_logger(__name__)
+
+# [live-vllm P5] Conv window margin in codec frames for the windowed streaming
+# decode: 10 = the conv/upsample stack's MEASURED left receptive field
+# (autograd probe: emitted samples of frame q depend on input frames
+# [q-10, q+1]) + 1 frame covering the 555-sample tail refill and the
+# transposed-conv lookahead. The 25-frame left_context the caller ships is
+# sized for the PRE-TRANSFORMER's attention and still applies there.
+_CONV_WINDOW_MARGIN_FRAMES = 11
+try:
+    from vllm_omni.core.sched.runtime_flags import flag_on as _flag_on
+
+    _STREAM_VOCODER = _flag_on("VLLM_OMNI_STREAM_VOCODER")
+except Exception:  # pragma: no cover -- standalone/partial installs
+    _STREAM_VOCODER = os.environ.get("VLLM_OMNI_STREAM_VOCODER", "0") not in (
+        "0", "", "false", "False")
 
 
 class Qwen3OmniMoeCode2Wav(nn.Module):
@@ -187,30 +203,33 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         """
         if codes.shape[1] != self.config.num_quantizers:
             raise ValueError(f"Expected {self.config.num_quantizers} layers of codes, got {codes.shape[1]}")
+        return self._forward_convs(self._forward_features(codes))
 
-        # Stage 1: Code Embedding
-        # Add offset to separate layer vocabularies, then embed and average
+    def _forward_features(self, codes: torch.Tensor) -> torch.Tensor:
+        """Stages 1+2: code embedding + pre-transformer. [B,Q,T] -> [B,T,H].
+
+        Runs at codec-frame rate (12.5 Hz) -- the cheap half. Split out so the
+        streaming path can window the CONV stack without touching attention
+        semantics (the 25-frame left context is sized for attention, and its
+        truncated-window recompute is the quality-approved behavior).
+        """
         hidden = self.code_embedding(codes + self.code_offset).mean(1)
-        # Shape: [batch, seq_len, hidden_size]
+        return self.pre_transformer(inputs_embeds=hidden).last_hidden_state
 
-        # Stage 2: Pre-Transformer (add temporal context)
-        hidden = self.pre_transformer(inputs_embeds=hidden).last_hidden_state
-        # Shape: [batch, seq_len, hidden_size]
+    def _forward_convs(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Stages 3+4: upsampling + decoder + clamp. [B,T,H] -> [B,1,samples].
 
-        # Stage 3: Upsampling
+        Runs at up-to-1920x upsampled resolution -- the FLOPs-dominant half.
+        Output length is T*total_upsample - 555 (the causal stack's structural
+        right trim; see chunked_decode_streaming's tail-refill note).
+        """
         hidden = hidden.permute(0, 2, 1)  # [batch, hidden_size, seq_len]
         for blocks in self.upsample:
             for block in blocks:
                 hidden = block(hidden)
-        # Shape: [batch, hidden_size, seq_len * upsample_factor]
-
-        # Stage 4: Decoder (progressive upsampling to waveform)
         wav = hidden
         for block in self.decoder:
             wav = block(wav)
-        # Shape: [batch, 1, waveform_len]
-
-        # Clamp to valid audio range
         return wav.clamp(min=-1.0, max=1.0)
 
     def chunked_decode(
@@ -296,12 +315,27 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
                 codes. For ``batch_size == 1``, this is a list containing a
                 single tensor with shape ``[1, waveform_len]``.
         """
-        if not (left_context_size and seq_token_counts and len(left_context_size) == len(seq_token_counts)):
+        meta_ok = bool(
+            left_context_size and seq_token_counts
+            and len(left_context_size) == len(seq_token_counts)
+        )
+        if not meta_ok:
             logger.warning_once(
                 "chunked_decode_streaming: missing/invalid left_context_size or seq_token_counts; "
                 "defaulting to left_context_size=zeros(len(codes)). This is expected during cudagraph warmup."
             )
             left_context_size = [0] * codes.shape[0]
+        # [live-vllm P5] windowed streaming decode: same features, conv stack
+        # only over the last (new + margin) frames per row. Precedence vs the
+        # CUDA-graph wrapper: the wrapper only ever CAPTURES batch=1 -- at
+        # B>1 it falls back to the eager full-window forward internally, so
+        # the windowed path strictly wins there (measured 1.85x at B=8). At
+        # B=1 the captured graph keeps its launch-overhead win; leave it.
+        _graphs_active = self._cudagraph_enabled and self._cudagraph_wrapper is not None
+        if (_STREAM_VOCODER and meta_ok
+                and (not _graphs_active or codes.shape[0] > 1)):
+            lens = [n // self.config.num_quantizers for n in seq_token_counts]
+            return self._windowed_streaming_decode(codes, left_context_size, lens)
         # Decode chunk
         wavs = []
         if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
@@ -330,6 +364,52 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
             wav_chunk = batch_wav[idx, :, start : code_seq_len * self.total_upsample]
             wavs.append(wav_chunk)
         return wavs
+
+    def _windowed_streaming_decode(
+        self,
+        codes: torch.Tensor,
+        left_context_size: list[int],
+        code_seq_lens: list[int],
+    ) -> list[torch.Tensor]:
+        """[live-vllm P5] Full-window features, WINDOWED conv stack.
+
+        The pre-transformer (12.5 Hz, cheap) still sees each row's whole
+        left_context+new window -- attention semantics identical to the
+        quality-approved path. The conv/upsample stack (up to 1920x resolution,
+        the FLOPs) then processes only the last ``new + _CONV_WINDOW_MARGIN``
+        frames per row: its measured left receptive field is 10 codec frames,
+        so the emitted samples -- the same global span
+        [left*U - 555, seq*U - 555) the full path emits -- are computed from
+        exactly the same inputs. Steady-state chunks drop from 29 to 15 conv
+        frames (-48% on the dominant half); the conv window is also CONSTANT
+        across rows regardless of left-context, so mixed batches pack tighter
+        than the full path.
+        """
+        U = int(self.total_upsample)
+        feats = self._forward_features(codes)  # [B, maxT, H]
+        win: list[int] = []
+        for lc, sl in zip(left_context_size, code_seq_lens):
+            new = max(0, sl - lc)
+            win.append(min(sl, new + _CONV_WINDOW_MARGIN_FRAMES))
+        max_w = max(win) if win else 0
+        if max_w <= 0:
+            return [feats.new_zeros((1, 0)) for _ in code_seq_lens]
+        sliced = feats.new_zeros((feats.shape[0], max_w, feats.shape[-1]))
+        for i, (sl, w) in enumerate(zip(code_seq_lens, win)):
+            if w > 0:
+                sliced[i, :w] = feats[i, sl - w : sl]
+        wav = self._forward_convs(sliced)  # [B, 1, max_w*U - 555]
+        outs: list[torch.Tensor] = []
+        for i, (lc, sl, w) in enumerate(zip(left_context_size, code_seq_lens, win)):
+            new = max(0, sl - lc)
+            # Row-valid output ends at w*U - 555: the structural trim excises
+            # exactly the right-context-dependent tail, so nothing emitted can
+            # see a shorter row's zero padding. Emit the last new*U samples --
+            # the same tail-refill-shifted span the full path ships.
+            valid = w * U - 555
+            start = max(0, valid - new * U)
+            outs.append(wav[i, :, start:valid])
+        return outs
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights from HuggingFace checkpoint."""

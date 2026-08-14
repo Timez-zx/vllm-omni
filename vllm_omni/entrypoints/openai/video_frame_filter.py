@@ -62,8 +62,16 @@ class FrameSimilarityFilter:
     def should_retain(self, frame_jpeg: bytes) -> bool:
         """Return ``True`` if *frame_jpeg* is sufficiently different from the
         last retained frame and should be kept in the buffer."""
-        current = self._decode_and_resize(frame_jpeg)
+        return self.should_retain_thumb(self._decode_and_resize(frame_jpeg))
 
+    def should_retain_thumb(self, current: np.ndarray) -> bool:
+        """Decision from a PRECOMPUTED thumbnail.
+
+        [live-vllm CPU-plane] The decode+resize is the expensive half and now
+        runs in the media worker pool (media_pipeline); this entry point is
+        the cheap half -- an MSE over a 64x64 array, microseconds -- safe to
+        run inline on the serving event loop.
+        """
         if self._last_retained is None:
             self._last_retained = current
             self._retained_count += 1

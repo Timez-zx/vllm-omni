@@ -26,6 +26,21 @@ logger = get_connector_logger(__name__)
 # so a caller can read them without turning logging on.
 _LOG_TRANSFER = os.environ.get("VLLM_OMNI_LOG_TRANSFER", "0") not in ("0", "false", "False", "")
 
+# Chunk sends happen synchronously at the point save_async is called (T+0 of the
+# producing step) instead of via the background save thread. See save_async.
+from vllm_omni.core.sched.runtime_flags import flag_on as _flag_on
+
+_INLINE_SEND = _flag_on("VLLM_OMNI_INLINE_SEND")
+# [live-vllm P8] take delivery on the scheduler thread instead of parking the
+# consumer for a round-trip. See the long note at the call site in
+# _process_chunk_queue: the park caps a chunk-fed stage at pass_rate/2 steps,
+# which at u56 is below realtime. 0 = old parked-only path (control arm).
+_INLINE_RECV = _flag_on("VLLM_OMNI_INLINE_RECV")
+# Allow inline receive on a stage running async scheduling (see the guard
+# in _try_inline_receive). Off by default until measured safe under load.
+_INLINE_RECV_ASYNC = _flag_on("VLLM_OMNI_INLINE_RECV_ASYNC")
+_LOG_CHUNK_ARRIVALS = os.environ.get("VLLM_OMNI_LOG_AUDIO_CHUNKS", "0") not in ("0", "", "false", "False")
+
 
 
 def _request_is_prefill_only(request: Any) -> bool:
@@ -101,11 +116,44 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.request_payload = {}
         self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.request_ids_mapping: dict[str, str] = {}
+        # [P8] inline-receive census: hits = deliveries that cost no park,
+        # misses = payload genuinely not there yet (fell back to the parked
+        # path). Logged by the scheduler's step probe.
+        self._inline_recv_hits = 0
+        self._inline_recv_misses = 0
+        self._inline_recv_skips = 0
+        self._async_load_dupes = 0
+        # Requests whose fetch is currently owned by the recv thread; the
+        # scheduler's inline poll must not touch these. See load_async.
+        self._async_load_registered: set[str] = set()
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
         self.requests_with_ready_chunks = set()
         self.requests_origin_status = {}
+        # Requests whose most recently loaded chunk OPENED a new segment.
+        # Two producer conventions mark that: an explicit
+        # meta.replace_streaming_prompt (MiniCPM-o), or -- the Qwen3-Omni
+        # append-style convention, which ships no marker -- the first
+        # data-bearing chunk after a segment_finished chunk (tracked via
+        # _expect_segment_opener). Such a request must re-enter scheduling
+        # through the WAITING path so the runner receives it as
+        # NewRequestData and runs its full segment refresh
+        # (_update_streaming_request + _update_streaming_input_additional_info:
+        # prompt/mrope re-init, num_processed_tokens=0). Resuming it as
+        # RUNNING delivers the payload on the cached path, which refreshes
+        # none of that; the stale num_processed_tokens then slices past the
+        # fresh (shorter) prefill rows and the model runs on empty or
+        # uninitialized embeddings. Observed as all three campaign death
+        # modes: IndexError on a 0-row hidden_states, vectorized_gather
+        # device-side asserts from batch-mates, and clamped-prefix audio
+        # corruption with no exception.
+        self._segment_replaced_reqs: set[str] = set()
+        # Receive-side boundary memory: req ids whose last consumed chunk
+        # ended a segment, so the next data-bearing chunk is a segment
+        # opener. Survives boundary-only segments in between (those are
+        # segment_finished with no data and keep the flag set).
+        self._expect_segment_opener: set[str] = set()
         self._active_streams: dict[str, Any] = {}
         # Private hold-queue for non-active running requests. Restored to
         # running_queue inside restore_queues(). Avoids calling
@@ -182,6 +230,30 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if not hasattr(request, "additional_information"):
             request.additional_information = None
         self._cancelled_load_reqs.discard(request.request_id)
+        # [P8] Registered with the recv thread until a fetch SUCCEEDS. recv_loop
+        # re-appends a request whose poll returned False and retries it forever,
+        # while restore_queues hands the same request back to the running queue
+        # every pass -- so without this registry the scheduler's inline poll and
+        # the recv thread poll the SAME request concurrently. Both can succeed
+        # on the same key, each bumping get_req_chunk, which skips the next
+        # chunk id outright. Measured consequence (u56, first inline-recv run):
+        # skipped segment-opener payloads -> talker prefill with no assistant
+        # span -> engine core dead, 43 turns timed out.
+        if request.request_id in self._async_load_registered:
+            # Idempotent: a fetch for this id is ALREADY queued, and its
+            # success sets the ready marker and resumes the request no matter
+            # who asked. Enqueueing a second entry would leave two fetchers
+            # under one registration -- the first success releases the
+            # registration while the second entry lives on, re-opening the
+            # double-advance of get_req_chunk this registry exists to prevent.
+            # Reachable because a streaming update can flip a parked request's
+            # status back to WAITING while its fetch is still queued.
+            # (Adversarial review; the registry was a hint, this makes it a
+            # mutual-exclusion token. Also removes a pre-existing duplicate
+            # park.)
+            self._async_load_dupes += 1
+            return
+        self._async_load_registered.add(request.request_id)
         self._pending_load_reqs.append(request)
         with self._recv_cond:
             self._recv_cond.notify()
@@ -221,7 +293,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 f"request.num_output_placeholders={getattr(request, 'num_output_placeholders', 0)}, "
                 f"previous_chunks_sent={self.requests_num_chunks_sent.get(request.external_req_id, 0)}"
             )
-            return
+            # [Boundary-loss fix, drop point A] a task carrying the SEGMENT
+            # BOUNDARY must never be silently consumed: the flag is emitted
+            # exactly once (talker stop) and nothing downstream re-emits it --
+            # dropping it here leaves the consumer stage waiting forever and
+            # the client's turn hangs to its 240 s watchdog. Ship a
+            # boundary-only chunk (payload stripped) instead of returning.
+            if not (is_finished or is_segment_finished):
+                return
+            multimodal_output = None
 
         self.requests_num_chunks_sent[request.external_req_id] = confirmed_num_computed_tokens
         task = {
@@ -241,6 +321,22 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # captured while the segment's state is live, not re-derived later.
             "prefill_only": _request_is_prefill_only(request),
         }
+        if _INLINE_SEND:
+            # Send at T+0 on the scheduler thread
+            # instead of hopping through the save-thread queue. Removes one
+            # thread wakeup + queue-order head-of-line from the chunk path,
+            # and the enqueue-time snapshot races documented above become
+            # moot (state is live at send time). Cost: payload build + shm
+            # put inline -- sub-ms for decode chunks, ~10 ms once per turn
+            # for the first chunk's prefill embeds, paid from tick slack.
+            try:
+                self._send_single_request(task)
+            except Exception as e:
+                logger.warning(
+                    f"[OmniTransfer] inline send failed for "
+                    f"{getattr(request, 'external_req_id', '?')}: {e}"
+                )
+            return
         self._pending_save_reqs.append(task)
         with self._save_cond:
             self._save_cond.notify()
@@ -297,6 +393,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             if self.model_mode == "ar":
                 request.additional_information = payload_data
                 replace_prompt = meta.get("replace_streaming_prompt") is True
+                # Segment-opener detection for the resume in
+                # _process_chunk_queue (see _segment_replaced_reqs): either
+                # the producer says so explicitly (replace_prompt), or this
+                # is the first data-bearing chunk after a segment_finished
+                # chunk (append-style producers ship no marker).
+                if replace_prompt or (
+                    req_id in self._expect_segment_opener and self._payload_has_data(payload_data)
+                ):
+                    self._segment_replaced_reqs.add(req_id)
+                    self._expect_segment_opener.discard(req_id)
                 if getattr(request, "resumable", False) and (chunk_id > 0 or replace_prompt):
                     # For new streaming input segment, we should update prompt from payload
                     construct_next_stage_streaming_input_prompt(payload_data, request)
@@ -338,6 +444,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     request.resumable = False
                 if payload_segment_finished:
                     self.segment_finished_requests.add(req_id)
+                    # The next data-bearing chunk for this request opens a
+                    # new segment (boundary-only segments in between keep
+                    # this set: they are segment_finished with no data).
+                    self._expect_segment_opener.add(req_id)
             else:
                 if payload_finished:
                     self.upstream_exhausted_requests.add(req_id)
@@ -393,7 +503,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     # first DAC frame arrives.
                     return False
 
-            # Mark as finished for consumption
+            # Mark as finished for consumption. The fetch is done, so whichever
+            # thread ran it releases ownership here: recv_loop only re-appends
+            # on FAILURE, so a success is exactly when the request leaves the
+            # thread's retry set and inline polling becomes safe again.
+            self._async_load_registered.discard(req_id)
             self._finished_load_reqs.add(req_id)
             logger.debug(f"[Stage-{stage_id}] Received one chunk for key {connector_get_key}")
             return True
@@ -550,6 +664,27 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             put_key=connector_put_key,
             data=payload_data,
         )
+        # [Boundary-loss fix, drop point B] a failed put normally just loses
+        # one data chunk (bad but survivable); losing the chunk that carries
+        # finished/is_segment_finished hangs the consumer stage forever, and
+        # nothing re-emits it. Retry flagged chunks, loudly.
+        if not success and (is_finished or is_segment_finished):
+            for _attempt in range(3):
+                time.sleep(0.005 * (_attempt + 1))
+                success, size, metadata = self.connector.put(
+                    from_stage=str(stage_id),
+                    to_stage=str(next_stage_id),
+                    put_key=connector_put_key,
+                    data=payload_data,
+                )
+                if success:
+                    break
+            if not success:
+                logger.error(
+                    "[OmniTransfer] BOUNDARY chunk PUT FAILED after retries: %s "
+                    "(stage %s->%s) -- downstream segment will hang",
+                    connector_put_key, stage_id, next_stage_id,
+                )
         _put_ms = (time.perf_counter() - _t_put0) * 1000.0
 
         if success:
@@ -559,7 +694,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # timing are independent additions on the same success path, so both stay.
             # The timing exists because stage-to-stage transfer cost used to be reported
             # as a hardcoded zero, which made "is the speech stage the bottleneck?"
-            # unanswerable -- see workflow.md section 9.
+            # unanswerable.
             self._record_tx(
                 external_req_id=external_req_id,
                 stage_id=stage_id,
@@ -635,6 +770,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.segment_payload_chunks.pop(request_id, None)
         self._boundary_cap_saved_max_tokens.pop(request_id, None)
         self.requests_with_ready_chunks.discard(request_id)
+        self._segment_replaced_reqs.discard(request_id)
+        self._expect_segment_opener.discard(request_id)
         self.request_ids_mapping.pop(request_id, None)
         self.requests_origin_status.pop(request_id, None)
         self._discard_from_chunk_deque(self.waiting_for_chunk_waiting_requests, request_id)
@@ -643,6 +780,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         self._cancelled_load_reqs.add(request_id)
         self._finished_load_reqs.discard(request_id)
+        # [P8] A cancelled load leaves the recv thread's retry set (recv_loop
+        # drops cancelled ids), so ownership must be released with it or this
+        # request could never be inline-polled again after a reuse.
+        self._async_load_registered.discard(request_id)
 
     @staticmethod
     def _discard_from_chunk_deque(deque_list: deque[Any], request_id: str) -> None:
@@ -667,6 +808,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.requests_num_chunks_sent.pop(external_req_id, None)
         self.ramp_chunk_count.pop(external_req_id, None)
         self._pending_streaming_prefills.pop(external_req_id, None)
+        # [T2T coalesce] the text-row accumulator is keyed the same way and
+        # holds TENSORS (device-resident when the stages are colocated), so
+        # leaving it behind both leaks GPU memory for the process lifetime and
+        # lets a stranded tail be inherited by the next request that reuses
+        # this external id -- shipping a previous session's rows ahead of the
+        # new turn's own first row. Reported by adversarial review with a
+        # reproduction; the sibling dicts above are all reclaimed here, this
+        # one was simply missed.
+        getattr(self, "_t2t_text_buf", {}).pop(external_req_id, None)
         # Log the request's total before dropping it -- for a long streaming session this is
         # the only place the accumulated cost of the edge is ever visible.
         totals = self._tx_totals.pop(external_req_id, None)
@@ -683,6 +833,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:
             cached_ic.pop(external_req_id, None)
+
+        # [Boundary-loss fix, hygiene] unconsumed connector segments used to
+        # outlive the request forever: this adapter never told the connector
+        # to reclaim them, so every aborted/rolled session leaked its unread
+        # /dev/shm segments and one 0-byte lockfile per chunk key (measured:
+        # 475 leaked lockfiles after one day's experiments). Best-effort by
+        # contract -- the connector matches keys by request-id prefix.
+        try:
+            self.connector.cleanup(external_req_id)
+        except Exception:
+            logger.debug("connector cleanup failed for %s", external_req_id, exc_info=True)
 
     def cleanup(
         self,
@@ -821,6 +982,142 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self._held_non_active.append(request)
             index -= 1
 
+    def _resume_loaded_request(self, request: Request, queue: Any, target_status: RequestStatus) -> None:
+        """Restore a request whose async chunk load just completed.
+
+        Normal case: flip back to the status of the queue it parked from.
+
+        Segment-boundary case: if the loaded payload REPLACED the streaming
+        prompt (new segment), a RUNNING resume is forbidden -- it would ship
+        the payload to the runner on the cached path, which performs none of
+        the per-segment state refresh (see _segment_replaced_reqs). Route the
+        request through WAITING instead: pull it off the running queue and
+        park it in waiting_for_chunk_waiting_requests, which restore_queues()
+        re-admits into the waiting queue after this scheduler pass; the next
+        pass then emits it as NewRequestData with the fresh payload attached.
+        """
+        req_id = request.request_id
+        # [live-vllm diagnosis] per-chunk ARRIVAL stamp at the consumer:
+        # the talker's text pieces resume here -- the last unstamped
+        # dependency of frame production. Same env as the other chunk stamps.
+        if _LOG_CHUNK_ARRIVALS:
+            logger.info("[TEXT-CHUNK] stage=%s rid=%s mono=%.6f",
+                        getattr(self.connector, "stage_id", "?"), req_id, time.monotonic())
+        self.requests_with_ready_chunks.add(req_id)
+        replaced = req_id in self._segment_replaced_reqs
+        self._segment_replaced_reqs.discard(req_id)
+        if replaced and target_status == RequestStatus.RUNNING:
+            # Loud on purpose: this is the exact interleaving that used to
+            # kill the engine (stale num_processed_tokens -> empty prefill
+            # rows -> IndexError / device-side assert). A count here is the
+            # proof the guard is earning its keep.
+            logger.warning(
+                "[OmniTransfer] req %s: new-segment payload landed while parked "
+                "from RUNNING; rerouting through WAITING so the runner refreshes "
+                "segment state (NewRequestData path)",
+                req_id,
+            )
+            request.status = RequestStatus.WAITING
+            try:
+                queue.remove(request)
+            except ValueError:
+                pass
+            self.requests_origin_status[req_id] = RequestStatus.WAITING
+            self.waiting_for_chunk_waiting_requests.append(request)
+            return
+        request.status = target_status
+
+    def _try_inline_receive(
+        self,
+        request: Request,
+        queue: Any,
+        target_status: RequestStatus,
+        finished_load_reqs: set[str],
+    ) -> bool:
+        """Take delivery on the scheduler thread. True = request keeps its slot.
+
+        Shared by both queue-processing paths: the active-window variant and
+        the legacy one. The legacy path is what production actually runs
+        (``_active_window`` is 0 unless a stream window is configured), and
+        hosting this only in the other one is why the first attempt measured
+        irecv=0/0 -- the code was never reached at all.
+        """
+        if not _INLINE_RECV or target_status != RequestStatus.RUNNING:
+            return False
+        # Scoped to the AR text path, where ONE payload buys ONE decode step
+        # and the ceiling therefore binds. A non-AR consumer (the vocoder)
+        # takes a whole 320 ms chunk per payload and needs ~3 deliveries/s
+        # against ~21 passes/s, so the park costs it nothing and there is no
+        # reason to widen the blast radius to its prompt-replacing path.
+        if self.model_mode != "ar":
+            return False
+        # Never poll a key the recv thread owns: exactly one fetcher per
+        # request, or get_req_chunk double-advances and a payload is skipped
+        # outright (see load_async).
+        if request.request_id in self._async_load_registered:
+            self._inline_recv_skips += 1
+            return False
+        # A payload already fetched but not yet consumed must not be
+        # overwritten: _poll_single_request assigns request.additional_
+        # information unconditionally, so fetching the NEXT chunk on top of an
+        # unconsumed one drops the unconsumed one's rows silently. The ready-set
+        # check at the call site covers the normal case; these cover the states
+        # where a fetch completed but the marker has not been consumed yet.
+        if (
+            request.request_id in self._finished_load_reqs
+            or getattr(request, "additional_information", None) is not None
+        ):
+            self._inline_recv_skips += 1
+            return False
+        # Uncommitted sampled output (async scheduling) means this request's
+        # token accounting is mid-flight; the parked path applies payloads only
+        # to requests that have left the batch, so this keeps that guarantee
+        # rather than relying on a per-stage deploy convention.
+        #
+        # MEASURED CONSEQUENCE: under async scheduling a running request ALWAYS
+        # has a placeholder, so this guard fires on every call -- 23553 skips
+        # and 0 hits at 48 users -- making inline receive and CPU/GPU overlap
+        # mutually exclusive, i.e. the two fixes for the same wall cannot be
+        # combined. That is an artefact of the guard, not a property of the
+        # system: inline receive exists precisely so the request does NOT leave
+        # the batch, and leaving the batch is what the -1 sentinel hazard needs.
+        # VLLM_OMNI_INLINE_RECV_ASYNC=1 lifts it so the combination can be
+        # measured; the failure mode it guards against is loud (device-side
+        # assert / shape mismatch), so the experiment is self-checking.
+        if getattr(request, "num_output_placeholders", 0) and not _INLINE_RECV_ASYNC:
+            self._inline_recv_skips += 1
+            return False
+        self.request_ids_mapping[request.request_id] = request.external_req_id
+        connector = getattr(self, "connector", None)
+        had_nb = getattr(connector, "nonblocking_get", None)
+        try:
+            # Never block this thread on the producer's write lock: a large
+            # first-of-segment payload can be held for hundreds of ms, and this
+            # is the pass that every other session on the stage is waiting for.
+            if had_nb is not None:
+                connector.nonblocking_get = True
+            got_inline = bool(self._poll_single_request(request))
+        except Exception as e:
+            got_inline = False
+            logger.warning(
+                "[OmniTransfer] inline receive failed for %s: %s", request.request_id, e,
+            )
+        finally:
+            if had_nb is not None:
+                connector.nonblocking_get = had_nb
+        if not got_inline:
+            self._inline_recv_misses += 1
+            return False
+        # _poll_single_request marks the request finished-load; consume that
+        # marker here so no later pass re-resumes the same payload.
+        finished_load_reqs.discard(request.request_id)
+        self._inline_recv_hits += 1
+        # Keeps the request in `queue` (still RUNNING) unless it carried a
+        # segment opener, which _resume_loaded_request reroutes through
+        # WAITING exactly as the parked path does.
+        self._resume_loaded_request(request, queue, target_status)
+        return True
+
     def _process_chunk_queue_legacy(
         self,
         queue: Any,
@@ -838,14 +1135,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 if self.is_done_receiving_chunks(request.request_id):
                     request.additional_information = None
                     continue
+                # [P8] see _try_inline_receive: take delivery without paying a
+                # park round-trip when the payload is already in shared memory.
+                if self._try_inline_receive(request, queue, target_status, finished_load_reqs):
+                    continue
                 # Requests that waiting for chunk
                 self.load_async(request)
                 request.status = RequestStatus.WAITING_FOR_CHUNK
             else:
                 if request.request_id in finished_load_reqs:
-                    request.status = target_status
                     finished_load_reqs.remove(request.request_id)
-                    self.requests_with_ready_chunks.add(request.request_id)
+                    self._resume_loaded_request(request, queue, target_status)
                     continue
             queue.remove(request)
             self.requests_origin_status[request.request_id] = target_status
@@ -981,14 +1281,41 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 if self.is_done_receiving_chunks(request.request_id):
                     request.additional_information = None
                     continue
+                # [live-vllm P8] INLINE RECEIVE. Before parking this request to
+                # await its next payload, try to take delivery right here, on
+                # the scheduler thread.
+                #
+                # The park is the whole disease. A consuming stage that needs a
+                # payload leaves `running` for at least one pass (park), waits
+                # for the recv thread, and is re-admitted by a later pass
+                # (resume) -- and it advances by exactly ONE step per such
+                # round-trip. So its output rate is capped at pass_rate/2,
+                # measured 21 passes/s at u56 => ~10 frames/s, BELOW the 12.5
+                # frames/s realtime contract. While the thinker streams text,
+                # the talker therefore cannot keep up no matter how the
+                # payloads are sized or paced: at 320 ms/chunk contract it
+                # produced 377 ms/chunk, and 96% of all client misses at u56
+                # land in the first quarter of a turn -- exactly the text
+                # window. Sender-side batching only shortens that window (the
+                # 20.1% -> 1.5% measurement); it cannot lift the ceiling,
+                # because banked rows still need a payload event to be
+                # scheduled at all.
+                #
+                # The shm get is a keyed, lock-file-guarded read: safe to call
+                # from this thread while recv_loop works other requests, and
+                # sub-millisecond when the payload is already there (the
+                # producer runs 25 tok/s vs the 12.5 rows/s consumed, so it
+                # usually is). A miss costs one failed shm_open and falls
+                # through to exactly the old parked path.
+                if self._try_inline_receive(request, queue, target_status, finished_load_reqs):
+                    continue
                 # Requests that waiting for chunk
                 self.load_async(request)
                 request.status = RequestStatus.WAITING_FOR_CHUNK
             else:
                 if request.request_id in finished_load_reqs:
-                    request.status = target_status
                     finished_load_reqs.remove(request.request_id)
-                    self.requests_with_ready_chunks.add(request.request_id)
+                    self._resume_loaded_request(request, queue, target_status)
                     continue
             queue.remove(request)
             self.requests_origin_status[request.request_id] = target_status
@@ -1043,5 +1370,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self.upstream_exhausted_requests.discard(req_id)
             self._finished_load_reqs.discard(req_id)
             self._cancelled_load_reqs.add(req_id)
+            self._async_load_registered.discard(req_id)  # [P8] see load_async
 
         return []

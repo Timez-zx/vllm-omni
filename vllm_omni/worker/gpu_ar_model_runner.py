@@ -9,6 +9,8 @@ from __future__ import annotations
 import gc
 import os
 import threading
+import time
+from collections import deque
 from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from copy import copy
@@ -54,6 +56,57 @@ from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentio
 from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
 
 logger = init_logger(__name__)
+
+# [GPU duty probe] How much of the wall clock does this stage's GPU actually
+# spend running kernels? nvidia-smi's utilization.gpu answers "was any kernel
+# resident", averaged over a sampling window it chooses, which cannot resolve
+# an 80 ms tick and cannot separate two stages sharing one card. CUDA events
+# around the forward measure the real span on the stream.
+#
+# The events are read LATE -- a fixed number of steps after they were recorded
+# -- so the probe never calls synchronize() on the critical path and therefore
+# cannot create the idleness it is meant to measure. Enable with
+# VLLM_OMNI_LOG_STEP_GPU=1.
+_LOG_STEP_GPU = os.environ.get("VLLM_OMNI_LOG_STEP_GPU", "0") not in ("0", "", "false", "False")
+_STEP_GPU_LAG = 8          # read an event pair this many steps after recording
+_STEP_GPU_EVERY = 1        # record every Nth step
+
+
+def _step_gpu_probe_begin(runner: Any):
+    if not _LOG_STEP_GPU or not torch.cuda.is_available():
+        return None
+    state = getattr(runner, "_step_gpu_state", None)
+    if state is None:
+        state = {"n": 0, "pending": deque()}
+        runner._step_gpu_state = state
+    state["n"] += 1
+    if state["n"] % _STEP_GPU_EVERY:
+        return None
+    start = torch.cuda.Event(enable_timing=True)
+    start.record()
+    return start
+
+
+def _step_gpu_probe_end(runner: Any, start_event: Any, num_reqs: int, num_tokens: int) -> None:
+    state = runner._step_gpu_state
+    end = torch.cuda.Event(enable_timing=True)
+    end.record()
+    state["pending"].append((start_event, end, time.monotonic(), int(num_reqs), int(num_tokens)))
+    if len(state["pending"]) <= _STEP_GPU_LAG:
+        return
+    s, e, t_mono, nreq, ntok = state["pending"].popleft()
+    if not e.query():          # not finished yet: put it back, never block
+        state["pending"].appendleft((s, e, t_mono, nreq, ntok))
+        return
+    try:
+        dur_ms = s.elapsed_time(e)
+    except Exception:
+        return
+    logger.info(
+        "[STEP-GPU] stage=%s mono=%.6f gpu_ms=%.3f nreq=%d ntok=%d",
+        getattr(runner.vllm_config.model_config, "stage_id", "?"),
+        t_mono, dur_ms, nreq, ntok,
+    )
 
 
 def _to_cpu_contiguous(tensor: torch.Tensor) -> torch.Tensor:
@@ -1354,6 +1407,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     defer_finalize=defer_kv_connector_finalize,
                 ) as kv_connector_output,
             ):
+                _gpu_probe = _step_gpu_probe_begin(self)
                 model_output = self._model_forward(
                     input_ids=input_ids,
                     positions=positions,
@@ -1364,6 +1418,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     logits_index=logits_indices,
                     sampler=self.sampler,
                 )
+                if _gpu_probe is not None:
+                    _step_gpu_probe_end(self, _gpu_probe, num_reqs, num_tokens_padded)
 
                 # [Omni] Map pending ropes metadata to req_ids.
                 flush_pending_metadata = getattr(self.model, "flush_pending_metadata", None)

@@ -32,6 +32,7 @@ import base64
 import hashlib
 import io
 import json
+import math
 import os
 import time as _time
 import uuid
@@ -73,6 +74,23 @@ assert _PREFILL_ONLY_KEY == _TTS_PREFILL_ONLY_KEY, (
 _DEFAULT_IDLE_TIMEOUT = 60.0
 _DEFAULT_CONFIG_TIMEOUT = 10.0
 _MAX_FRAME_SIZE = 10 * 1024 * 1024  # 10MB per frame
+
+from vllm_omni.entrypoints.openai import media_pipeline as _media_pipeline
+
+# [live-vllm CPU-plane] spawn the media workers before the first frame needs
+# them (spawn-context startup is seconds); daemon thread so shutdown is free.
+if _media_pipeline.enabled():
+    import threading as _threading
+
+    _threading.Thread(target=_media_pipeline.prewarm_pool, daemon=True).start()
+
+# [live-vllm anti-wave #2] global min interval between compression warmup
+# launches (seconds); 0 disables the calendar.
+try:
+    _COMPRESS_MIN_INTERVAL_S = float(os.environ.get("VLLM_OMNI_COMPRESS_MIN_INTERVAL_S", "2.0"))
+except ValueError:
+    _COMPRESS_MIN_INTERVAL_S = 2.0
+
 _MAX_BUFFER_FRAMES = 64
 _MAX_AUDIO_BUFFER_BYTES = 4 * 1024 * 1024
 _MAX_MSG_QUEUE = 200
@@ -222,12 +240,17 @@ _COMPRESSION_TRANSCRIPT_KEEP = 96
 # is a few MB per session where unbounded retention would grow forever.
 _FRAME_KEEP_TURNS = 40
 # Process-wide cap on concurrent shadow warm-ups. A warming seed holds up to
-# target_tokens of KV on top of the live requests, and the pool slack at full
-# capacity is thin: 731,904-token pool - 13 users x 49,152 trigger = 92,928, which
-# fits TWO 32k seeds and not three. The permit covers warm-up only (seed submit ->
-# ready); a hook that finds the limit busy skips silently and re-fires at the next
-# hook, because cum_tokens keeps growing until a swap resets it.
-_MAX_CONCURRENT_SHADOW_WARMUPS = 2
+# target_tokens of KV on top of the live requests. The original 2 was sized for
+# the 13-user/49k-trigger regime (731,904-token pool - 13 x 49,152 = 92,928,
+# which fits TWO 32k seeds and not three). Under per-N-scaled triggers
+# (trigger = 0.75 * pool / N, target = trigger / 2) the steady state uses about
+# half the pool and a seed is only ~2-4k tokens, so six warm-ups cost < 8% of
+# the pool -- and 2 was the bottleneck that turned synchronized trigger
+# crossings into blocking-roll waves (39-63% of compressions degraded at u48).
+# The permit covers warm-up only (seed submit -> ready); a hook that finds the
+# limit busy skips silently and re-fires at the next hook, because cum_tokens
+# keeps growing until a swap resets it.
+_MAX_CONCURRENT_SHADOW_WARMUPS = 6
 
 
 def _summarise_audio_payload(audio_data: Any) -> str:
@@ -410,7 +433,38 @@ class VideoStreamTurnTrigger:
     config: "StreamingVideoSessionConfig"
 
 
+def _env_int(name: str) -> int | None:
+    """Deployment facts stated once at launch instead of by every client.
+
+    The KV pool sizes are properties of the machine and the deploy yaml (read
+    them off the boot log's "GPU KV cache size" lines), not of a conversation.
+    Before this, every client had to send them or the pool-aware guards stayed
+    off -- which is how a measured configuration ended up living in a benchmark
+    script instead of in the server.
+    """
+    v = os.environ.get(name, "").strip()
+    try:
+        return int(v) if v else None
+    except ValueError:
+        return None
+
+
 class StreamingVideoSessionConfig(BaseModel):
+    """One conversation's settings, sent as the first WebSocket message.
+
+    On this branch the DEFAULTS ARE THE BASELINE: a client that sends nothing
+    but a system prompt gets the configuration every number in workflow.md was
+    measured with -- one persistent request per session, frames and mic audio
+    prefilled on arrival, frames downscaled and paced, context compression
+    armed off the shared KV pool, talker rolling. Previously
+    these all defaulted OFF (upstream-compatible) and the measured
+    configuration lived in a benchmark script, which meant the server and the
+    thing that was measured were two different systems.
+
+    Deployment facts (the KV pool sizes) come from the environment rather than
+    from the client -- see _env_int above.
+    """
+
     """Configuration sent as the first WebSocket message."""
 
     model: str | None = None
@@ -425,7 +479,7 @@ class StreamingVideoSessionConfig(BaseModel):
         description="Max frames to sample from buffer for the model.",
     )
     max_frames: int = Field(
-        default=50,
+        default=8,
         ge=1,
         le=256,
         description=(
@@ -466,18 +520,18 @@ class StreamingVideoSessionConfig(BaseModel):
         description="EVS similarity threshold (higher = keep more frames).",
     )
     max_frame_width: int | None = Field(
-        default=None,
+        default=640,
         ge=32,
         le=8192,
         description=(
             "Downscale arriving frames to fit within this width, preserving aspect ratio. "
-            "None disables it. A frame becomes (W/32)*(H/32) tokens, so halving each edge "
+            "Defaults to the measured baseline's 640x352; None disables it. A frame becomes (W/32)*(H/32) tokens, so halving each edge "
             "cuts a frame's prompt cost 4x; this is the cheapest lever on per-turn latency "
             "for a video stream. Downscale only -- smaller frames are never upscaled."
         ),
     )
     max_frame_height: int | None = Field(
-        default=None,
+        default=352,
         ge=32,
         le=8192,
         description="Companion to max_frame_width. Both must be set for downscaling to apply.",
@@ -489,7 +543,7 @@ class StreamingVideoSessionConfig(BaseModel):
         description="JPEG quality used when re-encoding a downscaled frame.",
     )
     frame_filter_max_gap: int = Field(
-        default=0,
+        default=4,
         ge=0,
         description=(
             "Retain a frame unconditionally once this many consecutive frames have been "
@@ -523,7 +577,7 @@ class StreamingVideoSessionConfig(BaseModel):
         ),
     )
     session_scoped_request: bool = Field(
-        default=False,
+        default=True,
         description=(
             "Submit the whole session as ONE resumable engine request, feeding each turn as "
             "an incremental update, instead of a fresh request per turn. Each turn then "
@@ -567,7 +621,7 @@ class StreamingVideoSessionConfig(BaseModel):
         ),
     )
     session_roll_at_talker_tokens: int | None = Field(
-        default=None,
+        default=45000,
         description=(
             "ROLL the session when the talker's estimated tokens reach this, instead of ending "
             "it: close the engine request and open a fresh one seeded with the recent text "
@@ -583,7 +637,7 @@ class StreamingVideoSessionConfig(BaseModel):
         ),
     )
     stage1_kv_pool_tokens: int | None = Field(
-        default=None,
+        default=_env_int("VLLM_OMNI_STAGE1_KV_POOL_TOKENS"),
         description=(
             "Size of the SPEECH stage's shared KV pool in tokens (read it off the boot "
             "log's stage-1 'GPU KV cache size' line). When set, the talker roll threshold "
@@ -594,7 +648,40 @@ class StreamingVideoSessionConfig(BaseModel):
             "Same family as the pool-aware compression trigger: the wall is shared, the "
             "guard must divide by the number of tenants. A session whose share would fall "
             "below the roll floor is refused at admission (graceful 'at capacity' instead "
-            "of a preemption storm). None = guard off."
+            "of a preemption storm). None = guard off; the default comes from "
+            "VLLM_OMNI_STAGE1_KV_POOL_TOKENS so the deployment states it once."
+        ),
+    )
+    stage0_kv_pool_tokens: int | None = Field(
+        default=_env_int("VLLM_OMNI_STAGE0_KV_POOL_TOKENS"),
+        description=(
+            "[live-vllm P3] Size of the THINKER stage's shared KV pool in tokens (boot "
+            "log's stage-0 'GPU KV cache size'). Same admission ledger as "
+            "stage1_kv_pool_tokens: a session whose 0.75*pool/active share would fall "
+            "below stage0_admission_floor_tokens is refused gracefully -- the wall is "
+            "shared, so the guard must divide by the number of tenants. None = off; "
+            "the default comes from VLLM_OMNI_STAGE0_KV_POOL_TOKENS. It also sets the "
+            "automatic compression trigger (0.75 * pool / VLLM_OMNI_ADMIT_MAX_SESSIONS)."
+        ),
+    )
+    stage0_admission_floor_tokens: int = Field(
+        default=4096,
+        ge=256,
+        description=(
+            "[live-vllm P3] Minimum viable per-session thinker-context share. Below "
+            "this, compression triggers at 0.75*share leave less than ~2 turns of "
+            "context plus a seed -- the session would thrash, degrading everyone."
+        ),
+    )
+    engine_max_seqs: int | None = Field(
+        default=None,
+        description=(
+            "[live-vllm P3] The engine's max_num_seqs (deploy yaml). Sessions are "
+            "persistent engine requests and compression shadows transiently hold one "
+            "slot each, so the slot ledger is: active + shadow permits + margin(2) "
+            "<= max_num_seqs. Refusal at admission beats the alternative -- measured "
+            "as the early-warm regression: 32 live + 32 parked shadows > 56 slots "
+            "slowed the whole fleet. None = off."
         ),
     )
     session_roll_settle_s: float = Field(
@@ -649,11 +736,15 @@ class StreamingVideoSessionConfig(BaseModel):
             "so no turn pays the cold prefill. A shadow needs a max_num_seqs slot on every "
             "stage while the old request still holds its own, so deployments must leave "
             "headroom (max_num_seqs >= sessions + 1) or warm-ups starve silently and every "
-            "compression falls back to the blocking roll."
+            "compression falls back to the blocking roll.\n\n"
+            "None = derive it: 0.75 * stage0_kv_pool_tokens / VLLM_OMNI_ADMIT_MAX_SESSIONS "
+            "when both are known (the shared pool is the wall a multi-session deployment "
+            "hits first), otherwise 75% of stage-0 max_model_len, which only guards the "
+            "single-session lifetime. The resolved value is in the [session] log line."
         ),
     )
-    context_compression_target_tokens: int = Field(
-        default=16384,
+    context_compression_target_tokens: int | None = Field(
+        default=None,
         ge=256,
         description=(
             "Token budget for the ROLLING WINDOW carried across a compression (Gemini "
@@ -682,7 +773,7 @@ class StreamingVideoSessionConfig(BaseModel):
         ),
     )
     context_compression_carry_frames: bool = Field(
-        default=True,
+        default=False,
         description=(
             "Carry recent frames inside the compression seed (the rolling window above). "
             "False restores the old text-only carry: seeds shrink from ~32k to a few "
@@ -702,7 +793,7 @@ class StreamingVideoSessionConfig(BaseModel):
         ),
     )
     prefill_frames_on_arrival: bool = Field(
-        default=False,
+        default=True,
         description=(
             "Turn each retained frame into tokens WHEN IT ARRIVES instead of when the query "
             "is submitted, so the vision encoder and the thinker's prefill for it run while "
@@ -722,6 +813,28 @@ class StreamingVideoSessionConfig(BaseModel):
             "Needs session_scoped_request; without a live request there is nothing to append to."
         ),
     )
+    prefill_audio_on_arrival: bool = Field(
+        default=True,
+        description=(
+            "Prefill the mic audio INCREMENTALLY while the user is "
+            "still speaking, in whole-second chunks, instead of paying the whole "
+            "utterance's audio prefill at query time. Reuses the prefill-only append "
+            "path (see prefill_frames_on_arrival). Qwen3-Omni's audio encoder is "
+            "chunk-structured (1 s conv chunks, 8 s attention blocks), so 8 s-aligned "
+            "splits are bit-faithful to whole-utterance encoding; sub-8 s chunks keep "
+            "the conv/positional grid exact but shrink the attention context to the "
+            "chunk -- a measured-quality trade, keep audio_prefill_chunk_s=8 unless "
+            "TTFA at long utterances matters more. Needs session_scoped_request."
+        ),
+    )
+    audio_prefill_chunk_s: float = Field(
+        default=1.0,
+        description="Whole-second chunk size for prefill_audio_on_arrival; 8 = encoder-faithful, 1 = latency-optimal.",
+    )
+    audio_prefill_reserve_s: float = Field(
+        default=1.0,
+        description="Residual seconds always left in the buffer for the turn-time tail splice.",
+    )
 
 
 class OmniStreamingVideoHandler:
@@ -730,6 +843,11 @@ class OmniStreamingVideoHandler:
     Subclasses implement :class:`VideoStreamPipelineHooks` to customize turn
     triggering, prompt construction, and history updates.
     """
+
+    # [live-vllm anti-wave] process-wide compression choreography state:
+    # the deterministic trigger-phase ladder and the global launch calendar.
+    _trigger_phase_counter: int = 0
+    _last_warmup_launch: float = 0.0
 
     def should_trigger_turn(self, trigger: VideoStreamTurnTrigger) -> bool:
         """Auto-trigger after ``video.frame`` when True (default: never)."""
@@ -792,11 +910,40 @@ class OmniStreamingVideoHandler:
 
     async def handle_session(self, websocket: WebSocket) -> None:
         """Count the session in, run it, count it out -- whatever happens."""
+        self._ensure_loop_lag_probe()
         self._active_sessions += 1
         try:
             await self._handle_session_inner(websocket)
         finally:
             self._active_sessions -= 1
+
+    def _ensure_loop_lag_probe(self) -> None:
+        """[live-vllm V3] One per process: measure the serving loop's wakeup
+        drift. This is the VALIDITY GATE for capacity results -- a ceiling
+        cell may be attributed to GPU/design only while [loop-lag] stays
+        healthy; otherwise the wall being measured is this process's CPU
+        plane (the u56 lesson: GPUs at 40%, misses at 14%, all serving-side).
+        """
+        if getattr(self, "_loop_lag_task", None) is not None:
+            return
+
+        async def _probe() -> None:
+            lags: list[float] = []
+            loop = asyncio.get_running_loop()
+            while True:
+                t0 = loop.time()
+                await asyncio.sleep(0.1)
+                lags.append(max(0.0, (loop.time() - t0 - 0.1) * 1000.0))
+                if len(lags) >= 100:  # one line per ~10 s
+                    lags.sort()
+                    logger.info(
+                        "[loop-lag] p50=%.1fms p99=%.1fms max=%.1fms (n=%d, sessions=%d)",
+                        lags[50], lags[99], lags[-1], len(lags),
+                        self._active_sessions,
+                    )
+                    lags = []
+
+        self._loop_lag_task = asyncio.get_running_loop().create_task(_probe())
 
     async def _handle_session_inner(self, websocket: WebSocket) -> None:
         """Main session loop for a single WebSocket connection."""
@@ -839,6 +986,56 @@ class OmniStreamingVideoHandler:
                         "session without preempting existing ones")
                     return
 
+            # [live-vllm P3] Stage-0 twin of the guard above: same shared-wall
+            # arithmetic, thinker pool edition.
+            if config.stage0_kv_pool_tokens and config.session_scoped_request:
+                _share0 = int(0.75 * config.stage0_kv_pool_tokens
+                              / max(1, self._active_sessions))
+                if _share0 < config.stage0_admission_floor_tokens:
+                    logger.warning(
+                        "[session] REFUSED at admission: stage-0 pool share %d < floor %d "
+                        "(pool=%d, active=%d)", _share0,
+                        config.stage0_admission_floor_tokens,
+                        config.stage0_kv_pool_tokens, self._active_sessions)
+                    await self._send_error(
+                        websocket,
+                        "at capacity: the thinker's KV pool cannot hold another "
+                        "session at a viable context share")
+                    return
+
+            # [live-vllm P3] Slot ledger: persistent requests + transient
+            # shadow slots + roll margin must fit max_num_seqs. The early-warm
+            # regression is the measured failure mode this refuses.
+            if config.engine_max_seqs and config.session_scoped_request:
+                _need = self._active_sessions + _MAX_CONCURRENT_SHADOW_WARMUPS + 2
+                if _need > config.engine_max_seqs:
+                    logger.warning(
+                        "[session] REFUSED at admission: slot ledger %d (active=%d + "
+                        "shadows=%d + margin 2) > max_num_seqs=%d",
+                        _need, self._active_sessions,
+                        _MAX_CONCURRENT_SHADOW_WARMUPS, config.engine_max_seqs)
+                    await self._send_error(
+                        websocket,
+                        "at capacity: engine slots exhausted (sessions are persistent "
+                        "requests; shadows and rolls need headroom)")
+                    return
+
+            # Hard session cap. A session is a standing periodic obligation
+            # (12.5 codec frames/s for as long as it is connected), so once the
+            # engine cannot serve N of them on time, admitting N+1 degrades all
+            # N. VLLM_OMNI_ADMIT_MAX_SESSIONS is that measured N; overload is
+            # REFUSED at the door rather than queued.
+            _cap = int(os.environ.get("VLLM_OMNI_ADMIT_MAX_SESSIONS", "0") or 0)
+            if _cap > 0 and self._active_sessions > _cap:
+                logger.warning(
+                    "[session] REFUSED at admission: tick-capacity cap %d reached "
+                    "(active=%d)", _cap, self._active_sessions)
+                await self._send_error(
+                    websocket,
+                    f"at capacity: this instance is provisioned for {_cap} "
+                    "concurrent realtime sessions")
+                return
+
             # Resolve the compression trigger once per session. None anchors to the
             # MODEL: 75% of stage-0 max_model_len -- the single-user default only guards
             # the lifetime wall. The blocking-roll backstop must sit BELOW that wall:
@@ -850,19 +1047,72 @@ class OmniStreamingVideoHandler:
                 _mml = int(getattr(_mc, "max_model_len", 0) or 0)
             except Exception:
                 _mml = 0
-            if config.context_compression_trigger_tokens is None:
-                compression_trigger = int(0.75 * _mml) if _mml else 0
-            else:
+            # Auto trigger, in order of preference:
+            #   1. the SHARED pool divided by the number of tenants the
+            #      deployment is sized for -- 0.75 * stage0_pool / admit_cap.
+            #      The wall a multi-session deployment hits first is the shared
+            #      thinker pool, not any one session's max_model_len: 64
+            #      sessions at 75% of a 65,536 model limit want 3.1M tokens out
+            #      of a 1.13M pool. Same arithmetic as the admission ledgers
+            #      above, and it is what the measured cells set by hand.
+            #   2. 75% of stage-0 max_model_len, which only guards the
+            #      single-session lifetime wall.
+            _cap_sessions = int(os.environ.get("VLLM_OMNI_ADMIT_MAX_SESSIONS", "0") or 0)
+            if config.context_compression_trigger_tokens is not None:
                 compression_trigger = max(0, config.context_compression_trigger_tokens)
+            elif config.stage0_kv_pool_tokens and _cap_sessions > 0:
+                compression_trigger = int(0.75 * config.stage0_kv_pool_tokens
+                                          / _cap_sessions)
+                if _mml:
+                    compression_trigger = min(compression_trigger, int(0.75 * _mml))
+            else:
+                compression_trigger = int(0.75 * _mml) if _mml else 0
+            if compression_trigger:
+                # De-synchronize the cohort. Sessions that start together and grow
+                # at the same rate cross the SAME trigger in the SAME turn, and the
+                # simultaneous swap-turn + seed prefills queue on stage-0's
+                # per-step token budget -- measured as the entire residual TTFA
+                # tail after the roll-waive fix (8/128 turns at 1.8-7.7 s, all in
+                # the compression window, all thinker-first-token). A per-session
+                # factor in [0.80, 1.00) spreads the crossings over ~2 turns of
+                # growth. DOWNWARD only, so the wave-peak budget that makes
+                # waiving pool-safe (hard 1.5t + seed 0.5t = 2t <= pool/N when
+                # trigger = share/2) still holds for every session.
+                # [live-vllm anti-wave #1] DETERMINISTIC phase spread over
+                # [0.55, 1.00): admission ordinal i takes 0.55 + 0.45*(i%16)/16.
+                # The +/-20% random jitter above was measured insufficient at
+                # u56: growth-rate homogeneity re-bunched 108 first
+                # compressions into a ~90 s window (t+120..210) whose density
+                # (1.2 events/s) produced the reproducible 11-15% slip storm
+                # (workflow.md, "nobody compresses at the same moment").
+                # A 45% deterministic ladder
+                # spreads first crossings ~3.5x wider; DOWNWARD only, so the
+                # waive pool-budget argument still holds for every session.
+                _slot = OmniStreamingVideoHandler._trigger_phase_counter % 16
+                OmniStreamingVideoHandler._trigger_phase_counter += 1
+                _jit = 0.55 + 0.45 * (_slot / 16.0)
+                compression_trigger = max(256, int(compression_trigger * _jit))
+            # Target left unset = HALF the resolved trigger, which is the
+            # configuration every measurement in this study ran: the carried
+            # window leaves about two turns of growth before the next crossing.
+            # A fixed default cannot do that -- it has no idea what the trigger
+            # resolved to, and a target above the trigger never converges.
+            compression_target = (
+                config.context_compression_target_tokens
+                if config.context_compression_target_tokens is not None
+                else max(1024, compression_trigger // 2) if compression_trigger else 16384
+            )
             compression_hard = 0
             if compression_trigger:
                 compression_hard = int(1.5 * compression_trigger)
                 if _mml:
                     compression_hard = min(compression_hard, int(0.92 * _mml))
                 logger.info(
-                    "[session] context compression armed: trigger=%d hard_roll=%d "
-                    "(max_model_len=%d, explicit=%s)",
-                    compression_trigger, compression_hard, _mml,
+                    "[session] context compression armed: trigger=%d target=%d "
+                    "hard_roll=%d (max_model_len=%d, stage0_pool=%s, cap=%d, "
+                    "explicit_trigger=%s)",
+                    compression_trigger, compression_target, compression_hard, _mml,
+                    config.stage0_kv_pool_tokens, _cap_sessions,
                     config.context_compression_trigger_tokens is not None,
                 )
 
@@ -1323,6 +1573,17 @@ class OmniStreamingVideoHandler:
                             # wrong turn, and conflating them cost a debugging cycle tonight.
                             if st["t_first_text"] is None:
                                 st["t_first_text"] = _time.monotonic()
+                                # [turnprobe] One line per turn, pairing with the
+                                # recv probe in _run_session_turn_body: splits a
+                                # client-measured TTFT into handler time
+                                # (recv -> ADMIT) and engine time (ADMIT ->
+                                # first text). Exists to name the serialization
+                                # point behind the residual 3-11 s outlier
+                                # turns that survived v3-v5.
+                                logger.info(
+                                    "[turnprobe] first-text rid=%s turn=%d",
+                                    ctx.get("rid"), sess.get("turn_idx", -1),
+                                )
                             if delta:
                                 st["text_parts"].append(delta)
                                 await websocket.send_json(
@@ -1359,8 +1620,9 @@ class OmniStreamingVideoHandler:
                         ctx["failed"] = str(e)
                         ctx["ready_evt"].set()
 
-            async def _prefill_frame_on_arrival(frame_b64: str) -> None:
-                """Append one just-arrived frame to the live request so stage 0 prefills it now.
+            async def _prefill_frames_on_arrival(frames: list[str]) -> bool:
+                """Append just-arrived frame(s) to the live request so stage 0 prefills them now.
+
 
                 The append carries no query text, and `max_tokens=1` because the engine needs
                 a nonzero cap to schedule the chunk. Since section 25 the scheduler discards
@@ -1408,7 +1670,7 @@ class OmniStreamingVideoHandler:
                 if sess["queue"].qsize() > 0:
                     return False
                 chunk = await self._build_session_chunk(
-                    config, [frame_b64], bytearray(), "", frame_pil_cache,
+                    config, frames, bytearray(), "", frame_pil_cache,
                     is_first=False,
                 )
                 if chunk is None or not isinstance(chunk, dict):
@@ -1457,23 +1719,96 @@ class OmniStreamingVideoHandler:
                 # boundary lost" on the first turn after any append).
                 ntok = len(chunk.get("prompt_token_ids") or ())
                 sess["arrival_appends"] += 1
-                sess["arrival_frames"] += 1
+                sess["arrival_frames"] += len(frames)
                 sess["arrival_tokens"] += ntok
                 sess["cum_tokens"] = sess.get("cum_tokens", 0) + ntok
                 # Arrival-consumed frames never reach the turn body's new_frames list,
                 # so the transcript would lose exactly the frames this optimisation
                 # touches. Same pending list the turn body feeds, same turn-close drain.
                 if compression_trigger and config.context_compression_carry_frames:
-                    sess.setdefault("pending_frames", []).append(frame_b64)
+                    sess.setdefault("pending_frames", []).extend(frames)
                 logger.info(
-                    "[session] prefill-on-arrival: frame -> %d tokens (appends=%d frames=%d "
-                    "tokens=%d cum=%d)",
-                    ntok, sess["arrival_appends"], sess["arrival_frames"],
+                    "[session] prefill-on-arrival: %d frame(s) -> %d tokens (appends=%d "
+                    "frames=%d tokens=%d cum=%d)",
+                    len(frames), ntok, sess["arrival_appends"], sess["arrival_frames"],
                     sess["arrival_tokens"], sess.get("cum_tokens", 0),
                 )
                 # Frames alone can carry the context across the compression trigger during
                 # a long silence; without this hook the warm-up would only start at the
                 # next turn and the swap would slip one turn further.
+                if _warmup_due() and _shadow_allowed():
+                    _launch_shadow_warmup("arrival")
+                return True
+
+            async def _prefill_audio_on_arrival() -> bool:
+                """Prefill buffered mic audio while the user speaks.
+
+                A whole-second-aligned prefix of audio_buffer becomes a
+                prefill-only append (same engine path as frames-on-arrival:
+                zero-output park, nothing reaches the talker). Consumption is
+                in multiples of audio_prefill_chunk_s so every piece -- and
+                the residual tail spliced at turn time -- stays on the audio
+                encoder's 1 s conv grid; 8 s chunks additionally respect its
+                8 s attention blocks (bit-faithful split). Failure is soft:
+                the audio stays buffered and the turn-time path takes it all.
+                """
+                if (not sess["first_sent"] or sess.get("turn_busy")
+                        or sess.get("query_claimed") or sess["fatal"]):
+                    return False
+                if sess.get("shadow") is not None:
+                    return False
+                if "audio" not in (config.modalities or []):
+                    return False
+                if sess["queue"].qsize() > 0:
+                    return False
+                bytes_per_s = 32000  # PCM16 mono 16 kHz
+                chunk_s = max(1, int(config.audio_prefill_chunk_s or 8))
+                reserve_s = max(0, int(math.ceil(config.audio_prefill_reserve_s or 0)))
+                usable_s = len(audio_buffer) // bytes_per_s - reserve_s
+                consume_s = (usable_s // chunk_s) * chunk_s
+                if consume_s <= 0:
+                    return False
+                k = consume_s * bytes_per_s
+                prefix = bytes(audio_buffer[:k])
+                chunk = await self._build_session_chunk(
+                    config, [], bytearray(prefix), "", frame_pil_cache,
+                    is_first=False,
+                )
+                if chunk is None or not isinstance(chunk, dict):
+                    return False
+                if not _strip_chatml_scaffolding(chunk):
+                    logger.warning(
+                        "[session] audio prefill-on-arrival: could not reduce the delta "
+                        "to its audio tokens; skipping (audio stays buffered)")
+                    return False
+                from vllm_omni.engine import (
+                    AdditionalInformationEntry,
+                    AdditionalInformationPayload,
+                )
+
+                entries = {}
+                existing = chunk.get("additional_information")
+                if isinstance(getattr(existing, "entries", None), dict):
+                    entries.update(existing.entries)
+                entries[_PREFILL_ONLY_KEY] = AdditionalInformationEntry(list_data=["1"])
+                chunk["additional_information"] = AdditionalInformationPayload(entries=entries)
+                try:
+                    sess["queue"].put_nowait((chunk, 1))
+                except asyncio.QueueFull:
+                    return False
+                # Only now is the prefix truly out of our hands: consume it so
+                # the turn-time chunk carries just the residual tail.
+                del audio_buffer[:k]
+                ntok = len(chunk.get("prompt_token_ids") or ())
+                sess["arrival_appends"] += 1
+                sess["arrival_tokens"] += ntok
+                sess["cum_tokens"] = sess.get("cum_tokens", 0) + ntok
+                logger.info(
+                    "[session] audio prefill-on-arrival: %ds -> %d tokens "
+                    "(appends=%d tokens=%d cum=%d)",
+                    consume_s, ntok, sess["arrival_appends"],
+                    sess["arrival_tokens"], sess.get("cum_tokens", 0),
+                )
                 if _warmup_due() and _shadow_allowed():
                     _launch_shadow_warmup("arrival")
                 return True
@@ -1520,6 +1855,11 @@ class OmniStreamingVideoHandler:
                 sending the next query, so pipelining would buy nothing here and would
                 complicate the segment bookkeeping.
                 """
+                # [turnprobe] see the first-text probe for why.
+                logger.info(
+                    "[turnprobe] recv rid=%s turn=%d",
+                    (sess.get("active_ctx") or {}).get("rid"), sess.get("turn_idx", -1),
+                )
                 if sess["fatal"]:
                     await self._send_error(websocket, f"Session failed: {sess['fatal']}")
                     return
@@ -1550,12 +1890,35 @@ class OmniStreamingVideoHandler:
                         and not shadow["ctx"].get("failed")):
                     carry = await _swap_to_shadow()
                 elif _must_roll_now():
-                    await _roll_session()
-                    if sess["fatal"]:
-                        await self._send_error(
-                            websocket, f"Session failed: {sess['fatal']}"
+                    if _can_defer_roll():
+                        # [roll-waive] Housekeeping never blocks the user. A
+                        # compression-cap roll with no ready shadow is simply
+                        # WAIVED: the turn is served on the live request (a
+                        # thick context is slow-ish, not wrong) and the swap
+                        # happens whenever a shadow lands, via the ready-shadow
+                        # branch above. Deferring the blocking roll to the
+                        # turn-end silence was tried first and made the wave
+                        # WORSE (p99 64.5 s -> 99.9 s): the roll itself takes
+                        # tens of seconds under a synchronized wave, think time
+                        # is 2-6 s, so the NEXT turn inherited the remainder --
+                        # and turn-end deferral stampeded 32 permit-less
+                        # rebuilds at once. The only blocking roll left is the
+                        # emergency ceiling in _can_defer_roll.
+                        if _shadow_allowed():
+                            _launch_shadow_warmup("hard-cap-waive")
+                        logger.info(
+                            "[session] roll waived: turn=%d served on live "
+                            "request (cum=%d >= hard=%d); waiting for a shadow",
+                            sess["turn_idx"], sess.get("cum_tokens", 0),
+                            compression_hard,
                         )
-                        return
+                    else:
+                        await _roll_session()
+                        if sess["fatal"]:
+                            await self._send_error(
+                                websocket, f"Session failed: {sess['fatal']}"
+                            )
+                            return
                 elif _warmup_due() and _shadow_allowed():
                     _launch_shadow_warmup("turn start")
 
@@ -1731,11 +2094,43 @@ class OmniStreamingVideoHandler:
 
             def _warmup_due() -> bool:
                 """Should a shadow start warming? Thresholds sit BELOW the walls so the
-                shadow is normally ready before any wall forces a blocking roll."""
+                shadow is normally ready before any wall forces a blocking roll.
+
+                Warming earlier than the trigger was tried (0.6x, swap gated
+                at the trigger) and REGRESSED the whole distribution (p50
+                2.8 s, 107/128 slow turns): a parked-ready shadow holds an
+                engine slot, and 32 sessions' long-lived shadows + 32 live
+                requests exceeded max_num_seqs=56 -- short-lived shadows were
+                themselves the slot-pressure valve. With text-only seeds
+                (~200 tokens) an early warm buys nothing anyway."""
                 if compression_trigger and sess.get("cum_tokens", 0) >= compression_trigger:
                     return True
                 roll_at = _talker_roll_at()
                 return bool(roll_at and sess.get("talker_tokens", 0) >= 0.85 * roll_at)
+
+            def _can_defer_roll() -> bool:
+                """May a hard-cap roll be waived for this turn?
+
+                Waivable only when the pressure is the COMPRESSION cap: that
+                cap is a scheduling convenience (1.5x trigger), not a wall.
+                The emergency ceiling (2x trigger, capped at half the model
+                context) bounds how far a session can ride the live request
+                while its shadow warms; with working warm-ups the overshoot is
+                about one turn, and only a session whose shadows keep failing
+                ever reaches the ceiling and pays the old blocking roll. The
+                TALKER wall keeps its blocking semantics -- it does not fail
+                cleanly (preemption storms on the shared stage-1 pool), so a
+                turn must never be served past it.
+                """
+                roll_at = _talker_roll_at()
+                if roll_at and sess.get("talker_tokens", 0) >= roll_at:
+                    return False
+                emergency = 0
+                if compression_trigger:
+                    emergency = 2 * compression_trigger
+                    if _mml:
+                        emergency = min(emergency, int(0.5 * _mml))
+                return bool(emergency and sess.get("cum_tokens", 0) < emergency)
 
             def _must_roll_now() -> bool:
                 """A wall that cannot wait for a shadow. The talker trigger keeps its
@@ -1762,11 +2157,24 @@ class OmniStreamingVideoHandler:
                     return False
                 if not config.session_scoped_request:
                     return False
+                # [live-vllm anti-wave #2] Global compression calendar: at
+                # most one warmup LAUNCH per interval across all sessions.
+                # The u56 storm was 1.2 launches/s for 90 s; steady-state
+                # demand is ~0.25/s (56 sessions / ~230 s per cycle), so a
+                # 2 s min-interval (0.5/s) caps the wave at storm-free
+                # density while never backlogging the steady state. A denied
+                # session simply retries at its next arrival/turn event --
+                # the waive machinery already makes riding past the trigger
+                # safe to 2x.
+                if (_time.monotonic() - OmniStreamingVideoHandler._last_warmup_launch
+                        < _COMPRESS_MIN_INTERVAL_S):
+                    return False
                 # Cooldown after a failed warm-up, so a broken shadow path degrades to
                 # the blocking roll instead of spinning warm-up attempts.
                 return (_time.monotonic() - sess.get("shadow_failed_at", 0.0)) > 60.0
 
             def _launch_shadow_warmup(where: str) -> None:
+                OmniStreamingVideoHandler._last_warmup_launch = _time.monotonic()
                 t = asyncio.create_task(_start_shadow_warmup(where))
                 prewarm_tasks.add(t)
                 t.add_done_callback(prewarm_tasks.discard)
@@ -1813,7 +2221,7 @@ class OmniStreamingVideoHandler:
                 same budget until it too runs out; chars/3 is only the first guess,
                 the built chunk's real token count is checked afterwards and the seed
                 rebuilt smaller if the guess was badly off."""
-                budget = config.context_compression_target_tokens
+                budget = compression_target
                 frames_allowed = bool(config.context_compression_carry_frames)
                 out: list[dict[str, Any]] = []
                 total = 0
@@ -1918,7 +2326,7 @@ class OmniStreamingVideoHandler:
                     if not isinstance(chunk, dict):
                         raise RuntimeError("seed chunk did not build")
                     ntok = len(chunk.get("prompt_token_ids") or ())
-                    while (ntok > config.context_compression_target_tokens * 1.3
+                    while (ntok > compression_target * 1.3
                            and len(seed_msgs) > 2):
                         seed_msgs = seed_msgs[2:]
                         chunk = await self._build_session_chunk(
@@ -2411,7 +2819,28 @@ class OmniStreamingVideoHandler:
                         # decode upstream already judged worth offloading. Awaiting cannot
                         # reorder frames -- this loop reads one message at a time, so the next
                         # frame is not picked up until this one has been buffered.
-                        if config.max_frame_width and config.max_frame_height:
+                        # [live-vllm CPU-plane] One decode per frame, in a worker
+                        # PROCESS (outside this loop's GIL): downscale + filter
+                        # thumbnail + PIL-cache RGB come back together. The
+                        # legacy path decoded the same frame up to 3x, with the
+                        # filter's decode INLINE on this loop -- measured as the
+                        # chunk-delivery tail at u56 (gap p99 569ms, GPUs 40%).
+                        _mp_res = None
+                        if _media_pipeline.enabled():
+                            try:
+                                _mp_res = await _media_pipeline.process_frame(
+                                    raw_bytes,
+                                    config.max_frame_width or 0,
+                                    config.max_frame_height or 0,
+                                    config.frame_jpeg_quality,
+                                )
+                            except Exception:
+                                await self._send_error(websocket, "Invalid image data")
+                                continue
+                            if _mp_res.shrunk_jpeg is not None:
+                                raw_bytes = _mp_res.shrunk_jpeg
+                                frame_data = base64.b64encode(raw_bytes).decode("ascii")
+                        elif config.max_frame_width and config.max_frame_height:
                             try:
                                 shrunk = await asyncio.to_thread(
                                     _downscale_frame_bytes,
@@ -2449,7 +2878,15 @@ class OmniStreamingVideoHandler:
                                     continue
                                 if config.frame_filter_max_gap and frames_since_retained >= config.frame_filter_max_gap:
                                     frame_filter.force_next_retain()
-                                if not frame_filter.should_retain(raw_bytes):
+                                # [CPU-plane] with the media pool, the filter's
+                                # expensive half (decode) already ran in the
+                                # worker; only the microsecond compare runs here.
+                                _retain = (
+                                    frame_filter.should_retain_thumb(_mp_res.thumb)
+                                    if _mp_res is not None
+                                    else frame_filter.should_retain(raw_bytes)
+                                )
+                                if not _retain:
                                     await self._send_frame_ack(
                                         websocket,
                                         msg,
@@ -2491,7 +2928,7 @@ class OmniStreamingVideoHandler:
                         # is actually consumed does it leave frame_buffer -- see the helper: a
                         # refusal leaves the frame for the ordinary query-time path.
                         if config.prefill_frames_on_arrival and config.session_scoped_request:
-                            if await _prefill_frame_on_arrival(frame_data):
+                            if await _prefill_frames_on_arrival([frame_data]):
                                 try:
                                     frame_buffer.remove(frame_data)
                                 except ValueError:
@@ -2506,7 +2943,14 @@ class OmniStreamingVideoHandler:
                         )
                         # Prewarm: decode PIL off the event loop so query-time chat_template
                         # can skip base64+Image.open. uuid=md5 lets mm_cache dedupe identical frames.
-                        if frame_data not in frame_pil_cache:
+                        # [CPU-plane] With the media pool the decode already happened in the
+                        # worker: rebuild the PIL via frombytes (a memcpy) and skip the task.
+                        if _mp_res is not None and frame_data not in frame_pil_cache:
+                            frame_pil_cache[frame_data] = (
+                                Image.frombytes("RGB", _mp_res.size, _mp_res.rgb),
+                                _mp_res.md5,
+                            )
+                        elif frame_data not in frame_pil_cache:
                             mm_uuid = hashlib.md5(raw_bytes, usedforsecurity=False).hexdigest()
 
                             async def _prewarm(b64: str, b: bytes, u: str) -> None:
@@ -2550,6 +2994,15 @@ class OmniStreamingVideoHandler:
                             audio_buffer.clear()
                             continue
                         audio_buffer.extend(pcm_bytes)
+                        # Opportunistic incremental prefill of
+                        # the buffered speech; soft-fails and leaves the buffer.
+                        if (config.prefill_audio_on_arrival
+                                and config.session_scoped_request):
+                            try:
+                                await _prefill_audio_on_arrival()
+                            except Exception:
+                                logger.debug("audio prefill-on-arrival failed",
+                                             exc_info=True)
 
                     elif msg_type == "video.query":
                         query_text = msg.get("text", "")

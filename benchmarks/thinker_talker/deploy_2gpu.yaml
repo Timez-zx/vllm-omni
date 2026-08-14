@@ -1,0 +1,130 @@
+# Qwen3-Omni thinker+talker+code2wav on TWO cards, sized for many concurrent
+# streaming sessions (up to ~64 measured). See workflow.md for what the
+# application on top of this does.
+#
+#   GPU 0   stage 0  thinker      (vision + audio encoders + the LLM)
+#   GPU 1   stage 1  talker       (speech codec token LM)
+#   GPU 1   stage 2  code2wav     (waveform reconstruction)
+#
+# `devices` values are LOGICAL indices into the launcher's
+# CUDA_VISIBLE_DEVICES: with CUDA_VISIBLE_DEVICES=0,1 the mapping is identity
+# ("1" -> physical 1); with CUDA_VISIBLE_DEVICES=2,3 this same file lands on
+# 2 and 3 (vllm_omni/entrypoints/stage_utils.py:_map_device_list).
+#
+# Stages 1 and 2 share GPU1 but run as SEPARATE PROCESSES. They used to be one
+# process (VLLM_OMNI_COLOCATE_STAGES=2:1) and at 64 sessions they blocked each
+# other on the Python GIL: the talker spent most of its 28.5 ms pass waiting
+# and the vocoder most of its 71 ms. Splitting them took GPU1 from 50% to 96%
+# kernels-resident, the talker pass from 28.5 to 14.7 ms, and the client's
+# deadline misses from 5.88%/307 ms to 0.41%/17 ms. The cost is one real IPC
+# hop for codec frames.
+#
+# SERVER-SIDE (not this file): the session config's stage1_kv_pool_tokens must
+# match the boot log's stage-1 "GPU KV cache size" token count. Admission
+# refuses a session when 0.75 * pool / active < 2048 (_TALKER_ROLL_FLOOR).
+
+async_chunk: true
+
+# Both edges on SharedMemoryConnector. A ColocInProcConnector on the 1->2 edge
+# was tried and broke the pipeline silently: the orchestrator's async-chunk
+# prewarm never admitted the request at stage 2, so codec chunks piled up
+# unread and the client got text but never audio. The 1->2 chunks are 1-4 KB,
+# so the shm copy is noise. With VLLM_OMNI_MAILBOX=1 (the default) the factory
+# substitutes ShmMailboxConnector here -- a persistent two-slot segment per
+# edge-session instead of a create/flock/unlink cycle per chunk, falling back
+# to this connector for anything oversized or unacked.
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      initial_codec_chunk_frames: 4
+      codec_chunk_frames: 4
+      codec_left_context_frames: 25
+
+stages:
+  - stage_id: 0                      # thinker: vision + audio encoders + LLM
+    # RAISED from 8192: swap-turn and shadow-seed prefills bind on this budget,
+    # and at 8192 the compression window carried a 1.8-7.7 s TTFT tail.
+    max_num_batched_tokens: 16384
+    # FP8 weights are quantized AT LOAD TIME from the official bf16 checkpoint
+    # -- do NOT point QWEN_MODEL at a community block-FP8 checkpoint, that
+    # produced degenerate text (verbatim loops) on this fork. Measured: fp8
+    # weights take the thinker 59.4 -> 31.7 GiB, and fp8 KV halves the
+    # 96 KB/token cost. Read the boot log's "GPU KV cache size" line for the
+    # real pool size; never trust an estimate.
+    quantization: fp8
+    kv_cache_dtype: fp8
+    # One slot per session, because a session IS one persistent streaming
+    # request, plus headroom for compression shadow seeds and rolls.
+    max_num_seqs: 80
+    gpu_memory_utilization: 0.90
+    trust_remote_code: true
+    enable_prefix_caching: true
+    # Kept false: the thinker's chunk-fed park/re-admit path reads the -1
+    # sentinel out of token_ids_cpu under async scheduling and kills the stage
+    # in codec_embedding. Stage 1 can run async because inline chunk receive
+    # covers its park path (VLLM_OMNI_INLINE_RECV_ASYNC=1); stage 0's arrival
+    # appends do not go through that path.
+    async_scheduling: false
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 2048
+
+  - stage_id: 1                      # talker: speech codec token LM
+    max_num_batched_tokens: 8192
+    quantization: fp8
+    kv_cache_dtype: fp8
+    max_num_seqs: 80
+    # GPU1 is shared only with code2wav. 0.30 x ~95 GiB = ~28.5 GiB; minus
+    # ~7 GiB fixed (weights + graphs) leaves ~21 GiB of KV, ~1M tokens at
+    # ~10 KB/token fp8. The single-card 0.10 gave 123,040 tokens and was the
+    # measured wall at 64 users.
+    gpu_memory_utilization: 0.30
+    trust_remote_code: true
+    enable_prefix_caching: false
+    # vLLM's stock CPU/GPU overlap. Safe here only together with inline chunk
+    # receive: without it the placeholder guard disables inline receive
+    # entirely (measured: 0 hits / 31468 skips) and the stage pays a park per
+    # payload again.
+    async_scheduling: true
+    # Dedicated card: CUDA graphs on. eager was a shared-card memory measure
+    # and left the talker kernel-active only 29% of the time at 32 users.
+    enforce_eager: false
+    devices: "1"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      # No per-request seed: it forces vLLM's row-wise sampling loop instead
+      # of one batched sample, and changes reproducibility only, not the
+      # distribution. repetition_penalty is KEPT -- it does change the codec
+      # token distribution, so dropping it is not a free win.
+      repetition_penalty: 1.05
+
+  - stage_id: 2                      # code2wav: waveform reconstruction
+    max_num_batched_tokens: 65536
+    max_num_seqs: 80
+    gpu_memory_utilization: 0.10
+    # The vocoder graph wrapper's known crash is on heterogeneous VIDEO
+    # co-batches; this pipeline's stage-2 input is audio-only and has been
+    # measured clean for hours. Graphs collapse the vocoder's launch overhead,
+    # which is GPU1 headroom.
+    enforce_eager: false
+    trust_remote_code: true
+    enable_prefix_caching: false
+    enable_chunked_prefill: false
+    async_scheduling: false
+    devices: "1"
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      # No seed (temperature 0.0, so it can change nothing) and no
+      # repetition_penalty (it made the sampler build a token-history tensor
+      # every pass for a greedy decode). Output is unchanged.

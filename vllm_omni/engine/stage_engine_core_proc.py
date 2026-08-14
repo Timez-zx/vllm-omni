@@ -8,8 +8,11 @@ busy loop in a subprocess, communicating with StageEngineCoreClient via ZMQ.
 from __future__ import annotations
 
 import contextlib
+import math
 import os
+import queue as _queue
 import signal
+import time as _time
 from typing import Any
 
 import vllm.v1.engine.core as _vllm_engine_core_module
@@ -63,7 +66,6 @@ class StageEngineCoreProc(EngineCoreProc):
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
         return scheduler_request, current_wave
 
-    @staticmethod
     def run_stage_core(
         *args: Any,
         dp_rank: int = 0,

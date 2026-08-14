@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from collections.abc import Iterable
+from time import monotonic as _monotonic
 from time import time
 from typing import Any
 
@@ -68,6 +70,19 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
     uses_full_payload_input_coordinator,
 )
+# Per-request prefill timeline probe; see the [PF] log site in schedule().
+_LOG_PREFILL = os.environ.get("VLLM_OMNI_LOG_PREFILL", "0") not in ("0", "", "false", "False")
+# One [SCHED-STEP] line per non-idle pass: batch size, token count and queue
+# depths. The pass INTERVAL derived from these stamps is the quantity that
+# decides whether every session gets served often enough for realtime audio.
+_LOG_SCHED_STEPS = os.environ.get("VLLM_OMNI_LOG_SCHED_STEPS", "0") not in ("0", "", "false", "False")
+
+# [diagnosis] VLLM_OMNI_LOG_SEG_CYCLES=1: one line per streaming-segment
+# lifecycle event (park = segment done and the NEXT one has not arrived;
+# cont = next segment was already queued, no park; wake = update arrived for
+# a parked session). The instrument that convicts or acquits the park/wake
+# duty-cycle hypothesis for the u56 production slips.
+_LOG_SEG_CYCLES = os.environ.get("VLLM_OMNI_LOG_SEG_CYCLES", "0") not in ("0", "", "false", "False")
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
@@ -443,6 +458,26 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 len(self.running),
             )
 
+        # Encoder-cache deadlock breaker. Upstream frees a request's passed
+        # encoder inputs only in update_from_output -- i.e. only for requests
+        # that STEPPED. Under a collective multimodal arrival wave (24 users x
+        # ~10 video frames x ~222 embeds > the 62,720-embed cache) every
+        # request ends up truncated at its next frame (num_new_tokens=0, cache
+        # full), so nobody steps, so nobody frees the frames they already
+        # computed, so the cache stays full: a self-sustaining stall that only
+        # a client-timeout abort used to break (measured: all 24 sessions
+        # frozen for ~170-180 s in the u24-mixed and u32-short cells, all
+        # arms). Sweeping the frees at schedule() time instead of step time
+        # removes the step->free dependency and with it the deadlock: a
+        # request's already-passed frames release as soon as the scheduler
+        # runs, whether or not the request itself can move. The condition
+        # inside _free_encoder_inputs (positions fully computed and past
+        # placeholders) is what makes this safe to call at any moment; cost is
+        # O(tracked x cached-ids) over small sets.
+        for _req in self.requests.values():
+            if _req.has_encoder_inputs:
+                self._free_encoder_inputs(_req)
+
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
         # async abort (e.g. client disconnect during TTS streaming) to leave
@@ -488,6 +523,27 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         try:
             scheduler_output = super().schedule(throttle_prefills)
+            # [prefill timeline] Per-request prefill progress, so the
+            # question->first-token latency can be DECOMPOSED instead of
+            # guessed. Two guesses were already refuted by measurement (frames
+            # accumulating during the previous answer; the slack token
+            # ceiling), and percentiles alone cannot separate "waited to be
+            # admitted" from "prefill took many passes". One line per
+            # prefill-carrying request per pass; VLLM_OMNI_LOG_PREFILL=1.
+            if _LOG_PREFILL and scheduler_output.total_num_scheduled_tokens:
+                _now_pf = _monotonic()
+                for _rid, _nt in scheduler_output.num_scheduled_tokens.items():
+                    if _nt <= 4:
+                        continue          # decode heartbeat, not freight
+                    _rq = self.requests.get(_rid)
+                    if _rq is None:
+                        continue
+                    logger.info(
+                        "[PF] stage=%s rid=%s mono=%.6f sched=%d computed=%d prompt=%d out=%d",
+                        self.vllm_config.model_config.stage_id, _rid, _now_pf, _nt,
+                        int(getattr(_rq, "num_computed_tokens", 0)),
+                        len(_rq.prompt_token_ids or ()), len(_rq.output_token_ids or ()),
+                    )
         except AssertionError:
             # Upstream asserts kill the engine-core process. Dump the state before it dies,
             # or the only evidence is a traceback with no request in it.
@@ -550,6 +606,36 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             finished_reqs = {}
 
         self._check_for_wedged_requests(scheduler_output)
+
+        # One line per NON-IDLE pass. Idle passes are skipped so nothing is
+        # logged between turns.
+        if _LOG_SCHED_STEPS and scheduler_output.total_num_scheduled_tokens:
+            logger.info(
+                "[SCHED-STEP] stage=%s mono=%.6f nreq=%d ntok=%d run=%d wait=%d "
+                "irecv=%d/%d/%d/%d",
+                self.vllm_config.model_config.stage_id,
+                _monotonic(),
+                len(scheduler_output.num_scheduled_tokens),
+                scheduler_output.total_num_scheduled_tokens,
+                len(self.running),
+                len(self.waiting),
+                # [P8] cumulative hits/misses/skips/dupes for inline receive.
+                # hit = delivery that cost the consumer no park; miss = payload
+                # genuinely not there yet; skip = something already owned the
+                # fetch or a payload was already in hand; dupe = a second
+                # load_async for a request that already had one queued. hits
+                # near total means the park is off the text path. All four zero
+                # means the code never ran -- which is how the first attempt's
+                # null result was diagnosed, so the distinction is load-bearing.
+                getattr(self.chunk_transfer_adapter, "_inline_recv_hits", 0)
+                if self.chunk_transfer_adapter else 0,
+                getattr(self.chunk_transfer_adapter, "_inline_recv_misses", 0)
+                if self.chunk_transfer_adapter else 0,
+                getattr(self.chunk_transfer_adapter, "_inline_recv_skips", 0)
+                if self.chunk_transfer_adapter else 0,
+                getattr(self.chunk_transfer_adapter, "_async_load_dupes", 0)
+                if self.chunk_transfer_adapter else 0,
+            )
 
         # Wrap in omni scheduler output to carry transfer metadata.
         return self._wrap_omni_scheduler_output(
@@ -1152,6 +1238,18 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self._free_input_coordinator_request(request.request_id)
         return finished
 
+    def _handle_stopped_request(self, request: Request) -> bool:
+        had_queued = bool(getattr(request, "streaming_queue", None))
+        finished = super()._handle_stopped_request(request)
+        if _LOG_SEG_CYCLES and not finished:
+            logger.info(
+                "[SEG-CYCLE] stage=%s rid=%s ev=%s mono=%.6f out=%d",
+                self.vllm_config.model_config.stage_id, request.request_id,
+                "cont" if had_queued else "park", _monotonic(),
+                len(request.output_token_ids),
+            )
+        return finished
+
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
         """
         Override: Only extend prompt at stage 0, and replace
@@ -1205,6 +1303,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self._replace_streaming_session(session, update)
             return
         super()._update_request_as_session(session, update)
+        # [skipped-waiting requeue] Upstream just flipped the parked session's
+        # status to WAITING -- but when this call came from add_request (a new
+        # segment arriving for a PARKED session), the request object is still
+        # sitting in skipped_waiting among every other session's blocked
+        # parked requests, and the scheduler reaches it there by luck. Probe
+        # measurement: a 15-token segment sat 12 s between admission and
+        # execution while the stage was otherwise fresh -- the entire residual
+        # p99/max outlier family (5-13 s turn starts) of the burst study. The
+        # downstream branch above has always re-enqueued on wake; the stage-0
+        # path was missing the same dance. _enqueue_waiting_request routes by
+        # status, so a genuinely still-blocked request lands back in
+        # skipped_waiting and nothing changes for it. On the
+        # _handle_stopped_request path the session is in neither queue and
+        # this is a no-op (the caller enqueues right after).
+        if session in self.skipped_waiting:
+            self.skipped_waiting.remove_requests((session,))
+            self._enqueue_waiting_request(session)
         # Apply the update's max_tokens. Upstream carries it on every StreamingUpdate and
         # never applies it -- `Request.max_tokens` keeps the FIRST chunk's value for the
         # whole session. The stop check compares per-segment output counts (upstream
@@ -1216,6 +1331,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         update_max_tokens = getattr(update, "max_tokens", None)
         if isinstance(update_max_tokens, int) and update_max_tokens > 0:
             session.max_tokens = update_max_tokens
+
+        if _LOG_SEG_CYCLES:
+            logger.info(
+                "[SEG-CYCLE] stage=%s rid=%s ev=wake mono=%.6f new_toks=%d",
+                self.vllm_config.model_config.stage_id, req_id, _monotonic(),
+                len(update.prompt_token_ids),
+            )
         # Per-UPDATE prefill-only capture (the zero-output append, section 25).
         # Marked segments are discarded at sampling time in update_from_output;
         # the flag is one-shot per segment: set here for the chunk that carried

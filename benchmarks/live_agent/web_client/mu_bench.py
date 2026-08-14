@@ -36,7 +36,7 @@ import sys
 import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from probe import session_config  # noqa: E402
+from probe import session_config, synth_frame_jpeg, synth_speechlike_pcm  # noqa: E402
 
 # The engine's CURRENT log file. Boots write wherever the launch redirected
 # them, so the default here can silently go stale (probes then count an empty
@@ -46,12 +46,23 @@ LOG = pathlib.Path(os.environ.get("MU_ENGINE_LOG", "/data/zx/results/qwen_live.l
 URL = "ws://127.0.0.1:8091/v1/video/chat/stream"
 FRAMES_ROOT = pathlib.Path("/data/zx/stimuli/frames640")
 
-FRAME_INTERVAL_S = 0.5          # 2 fps, the browser page's rhythm
+FRAME_INTERVAL_S = 0.5          # 2 fps, the browser page's rhythm (see --video-interval-ms)
 TURN_TIMEOUT_S = 180.0
-THINK_S = (2.0, 6.0)            # closed-loop pause after each reply
-STAGGER_S = (0.0, 8.0)          # spread session starts so turn 1 is not a stampede
+THINK_S = (2.0, 6.0)            # closed-loop pause after each reply (see --think)
+# Wait for the reply to finish PLAYING (not merely arriving) before the think
+# pause. See the note at the sleep site: arrival-paced turns under-load any
+# engine that delivers faster than realtime.
+PLAYBACK_PACED = os.environ.get("MU_PLAYBACK_PACED", "1") not in ("0", "", "false", "False")
+_stag = os.environ.get("MU_STAGGER_S")  # "lo,hi" override for arrival-spread控制实验
+STAGGER_S = tuple(float(x) for x in _stag.split(",")) if _stag else (0.0, 8.0)
 WARMUP_S = 4.0                  # let the frame pump run before the first query
 GIVE_UP_AFTER = 3               # consecutive timeouts before a user stops
+
+# Audio input is streamed in fixed-cadence chunks on the AUDIO GRID (80 ms =
+# 1 codec frame = the model's own 12.5 Hz rhythm). Video takes no clock of its
+# own: its interval should be an integer multiple of the audio cadence
+# (e.g. 480 = 6x80), set via --video-interval-ms.
+AUDIO_CADENCE_MS = 80
 
 SYSTEM_PROMPT = ("You are a voice assistant. "
                  "Answer each question out loud in one short sentence.")
@@ -102,6 +113,31 @@ QUESTIONS = [
     "What do you wear on your feet?",
 ]
 
+# MU_QUESTIONS=long: answers of ~4 sentences (~15-25 s of speech) instead of
+# one short sentence. Triples the sustained talker/code2wav duty per session,
+# which is the knob that separates "idle box, everything is easy" from a load
+# where mid-turn scheduling collisions can actually happen.
+# MU_QUESTIONS=mixed: alternate short and long -- the realistic conversation
+# shape (quick factual turns interleaved with long descriptive ones).
+_SHORT_QUESTIONS = QUESTIONS
+if os.environ.get("MU_QUESTIONS") in ("long", "mixed"):
+    QUESTIONS = [
+        "Describe what a sunrise over the ocean looks like, in about four sentences.",
+        "Explain how bread is made, in about four sentences.",
+        "Describe a walk through a quiet forest, in about four sentences.",
+        "Explain why the sky is blue, in about four sentences.",
+        "Describe what a busy train station feels like, in about four sentences.",
+        "Explain how bees make honey, in about four sentences.",
+        "Describe a thunderstorm from indoors, in about four sentences.",
+        "Explain how a bicycle stays upright, in about four sentences.",
+        "Describe a small mountain village in winter, in about four sentences.",
+        "Explain how rain forms, in about four sentences.",
+        "Describe the smell and sounds of a bakery in the morning, in about four sentences.",
+        "Explain what makes autumn leaves change color, in about four sentences.",
+    ]
+if os.environ.get("MU_QUESTIONS") == "mixed":
+    QUESTIONS = [q for pair in zip(_SHORT_QUESTIONS, QUESTIONS) for q in pair]
+
 # The engine-side probes worth counting over each cell's log slice. All of
 # them are presence checks -- a healthy run has nonzero segment stops and
 # zero everything in "bad".
@@ -133,6 +169,12 @@ def load_frames(content: str) -> list[str]:
         # (standing in for ASR'd speech); the model still answers with speech,
         # so the whole output pipeline is loaded -- only the visual input is gone.
         return []
+    if content == "synthetic":
+        # Locally generated frames -- no stimuli directory needed. Per-USER
+        # variation happens in User.__init__ (labels carry the user name), so
+        # prefix caching cannot collapse the cohort; this shared pool is only
+        # the fallback for code paths that read frames before users exist.
+        return [base64.b64encode(synth_frame_jpeg(f"shared {i}")).decode() for i in range(16)]
     d = FRAMES_ROOT / content
     files = sorted(d.glob("*.jpg"))
     assert files, f"no frames under {d}"
@@ -149,10 +191,27 @@ def pctl(xs: list[float], q: float) -> float | None:
 class User:
     """One simulated browser: a connection, a frame pump, and a turn loop."""
 
-    def __init__(self, uid: int, rep: int, frames: list[str], turns: int, seed: int):
+    def __init__(self, uid: int, rep: int, frames: list[str], turns: int, seed: int,
+                 opts: argparse.Namespace | None = None):
         self.uid = uid
         self.rep = rep
         self.name = f"r{rep}u{uid}"
+        self.opts = opts
+        self.video_interval_s = (opts.video_interval_ms / 1000.0) if opts else FRAME_INTERVAL_S
+        # Dynamic video cadence: a real camera client raises frame rate while
+        # the user speaks / the reply plays (the model may want to see) and
+        # drops it while idle. When set, the pump uses this interval from
+        # speech start until response done, and video_interval_s otherwise.
+        _act = getattr(opts, "video_interval_active_ms", None) if opts else None
+        self.video_interval_active_s = (_act / 1000.0) if _act else None
+        self.turn_active = False
+        self.audio_input_s = opts.audio_input_s if opts else 0.0
+        self.think_s = opts.think_range if opts else THINK_S
+        if opts is not None and opts.content == "synthetic":
+            # Per-user frames: the label carries the user name, so no two
+            # users' frames byte-match and prefix caching cannot collapse them.
+            frames = [base64.b64encode(synth_frame_jpeg(f"{self.name} {i}")).decode()
+                      for i in range(16)]
         self.frames = frames
         self.turns = turns
         self.rng = random.Random(seed * 10_000 + rep * 100 + uid)
@@ -210,7 +269,10 @@ class User:
             }))
             self.frame_pos = (self.frame_pos + 1) % len(self.frames)
             seq += 1
-            await asyncio.sleep(FRAME_INTERVAL_S)
+            interval = self.video_interval_s
+            if self.video_interval_active_s is not None and self.turn_active:
+                interval = self.video_interval_active_s
+            await asyncio.sleep(interval)
 
     async def _reader(self, ws) -> None:
         async for raw in ws:
@@ -252,6 +314,10 @@ class User:
                     cur["t_first_audio"] = t_now
                 data = base64.b64decode(msg["data"])
                 samples = (len(data) - 44) // 2
+                # Full per-delta timeline (arrival stamp, samples): the raw
+                # material for inter-chunk jitter, per-chunk playback deadlines
+                # and tick-alignment checks. ~30 pairs per 10 s reply -- cheap.
+                cur["deltas"].append((t_now, samples))
                 if SAVE_WAV_DIR:
                     cur["pcm"] += data[44:]
                 # starvation: a player that started at the first delta has
@@ -265,15 +331,35 @@ class User:
                 cur["t_done"] = t_now
                 self.done_evt.set()
 
+    async def _stream_audio_input(self, ws) -> None:
+        """Stream synthetic speech at the AUDIO GRID cadence (80 ms chunks).
+
+        Real-time pacing, not a blob: the point of the temporal-batching
+        experiment is that inputs ARRIVE on the grid, so every condition sees
+        the same arrival process. 80 ms at 16 kHz = 1280 samples = 2560 bytes.
+        """
+        chunk_samples = int(16000 * AUDIO_CADENCE_MS / 1000)
+        pcm = synth_speechlike_pcm(self.audio_input_s)
+        step = chunk_samples * 2
+        for off in range(0, len(pcm), step):
+            await ws.send(json.dumps({
+                "type": "audio.chunk",
+                "data": base64.b64encode(pcm[off:off + step]).decode(),
+            }))
+            await asyncio.sleep(AUDIO_CADENCE_MS / 1000)
+
     async def _turn_loop(self, ws) -> None:
         consecutive_timeouts = 0
         for i in range(self.turns):
             q = QUESTIONS[(self.q_offset + i) % len(QUESTIONS)]
+            self.turn_active = True
+            if self.audio_input_s > 0:
+                await self._stream_audio_input(ws)
             self.cur = {
                 "t_first_text": None, "t_first_audio": None, "t_done": None,
                 "text_stream": "", "text_at_first_sound": "",
                 "audio_samples": 0, "n_deltas": 0, "max_starve_s": 0.0,
-                "pcm": bytearray(),
+                "deltas": [], "pcm": bytearray(),
             }
             self.done_evt.clear()
             t_q = time.monotonic()
@@ -281,6 +367,7 @@ class User:
             try:
                 await asyncio.wait_for(self.done_evt.wait(), timeout=TURN_TIMEOUT_S)
             except asyncio.TimeoutError:
+                self.turn_active = False
                 consecutive_timeouts += 1
                 self.records.append({
                     "user": self.name, "turn": i + 1, "q": q, "status": "timeout",
@@ -296,6 +383,7 @@ class User:
                     return
                 continue
             consecutive_timeouts = 0
+            self.turn_active = False
             cur, self.cur = self.cur, None
             ttfa = (cur["t_first_audio"] - t_q) * 1000 if cur["t_first_audio"] else None
             ttft = (cur["t_first_text"] - t_q) * 1000 if cur["t_first_text"] else None
@@ -315,6 +403,8 @@ class User:
                 "audio_s": audio_s,
                 "rtf_deliver": (audio_s / deliver_s) if deliver_s and deliver_s > 0 else None,
                 "max_starve_ms": cur["max_starve_s"] * 1000,
+                # [seconds since t_q, samples] per audio delta, in arrival order.
+                "deltas": [[round(t - t_q, 4), s] for t, s in cur["deltas"]],
                 "n_deltas": cur["n_deltas"],
                 "chars_stream": len(cur["text_stream"]),
                 "chars_at_first_sound": len(cur["text_at_first_sound"]),
@@ -328,7 +418,22 @@ class User:
                     w.setsampwidth(2)
                     w.setframerate(24000)
                     w.writeframes(bytes(cur["pcm"]))
-            await asyncio.sleep(self.rng.uniform(*THINK_S))
+            # [closed loop, playback-paced] The turn ENDS for the server when
+            # the last audio byte is sent, but a human ends it when the audio
+            # finishes PLAYING. Starting the think-time at arrival lets an
+            # engine that races ahead of realtime shorten its own session
+            # cycle: measured at 64 nominal users, the engine that delivered a
+            # 25 s answer in ~16 s ran at median 28 concurrent turns while the
+            # paced engine ran at 49 -- i.e. the racing engine was quietly
+            # tested at 57%% of the load. Wait out the remaining playback first
+            # so both engines face the same number of simultaneous speakers.
+            # MU_PLAYBACK_PACED=0 restores arrival-paced turns.
+            if PLAYBACK_PACED and cur["t_first_audio"] and audio_s > 0:
+                _play_end = cur["t_first_audio"] + audio_s
+                _left = _play_end - time.monotonic()
+                if _left > 0:
+                    await asyncio.sleep(_left)
+            await asyncio.sleep(self.rng.uniform(*self.think_s))
 
     def _mark_skipped(self, start: int | None = None, reason: str = "") -> None:
         done = {r["turn"] for r in self.records}
@@ -382,12 +487,28 @@ async def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--users", type=int, required=True)
     ap.add_argument("--content", required=True,
-                    choices=["none", "screencast", "talkinghead", "handheld_walk_talk"])
+                    choices=["none", "synthetic", "screencast", "talkinghead", "handheld_walk_talk"])
     ap.add_argument("--turns", type=int, default=30)
     ap.add_argument("--repeat-sessions", type=int, default=1)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--out", required=True)
+    # Video rides the audio grid at an integer multiple of 80 ms; audio input
+    # streams at 80 ms per chunk.
+    ap.add_argument("--video-interval-active-ms", type=int, default=None,
+                    help="when set, frame interval while a turn is active (speech start -> "
+                         "response done); --video-interval-ms then applies only to idle/think time")
+    ap.add_argument("--video-interval-ms", type=int, default=int(FRAME_INTERVAL_S * 1000),
+                    help="frame pump interval; use a multiple of 80 (e.g. 480)")
+    ap.add_argument("--audio-input-s", type=float, default=0.0,
+                    help="stream this many seconds of synthetic speech before each query, "
+                         "paced at 80 ms/chunk (0 = text-only queries, the old behavior)")
+    ap.add_argument("--think", default=None, metavar="LO,HI",
+                    help=f"think-time range in seconds (default {THINK_S[0]},{THINK_S[1]})")
     args = ap.parse_args()
+    args.think_range = tuple(float(x) for x in args.think.split(",")) if args.think else THINK_S
+    if args.video_interval_ms % AUDIO_CADENCE_MS:
+        print(f"warning: --video-interval-ms {args.video_interval_ms} is not a multiple "
+              f"of the {AUDIO_CADENCE_MS} ms audio grid", file=sys.stderr)
 
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -397,7 +518,7 @@ async def main() -> int:
 
     all_users: list[User] = []
     for rep in range(args.repeat_sessions):
-        cohort = [User(uid, rep, frames, args.turns, args.seed)
+        cohort = [User(uid, rep, frames, args.turns, args.seed, opts=args)
                   for uid in range(args.users)]
         await asyncio.gather(*(u.run() for u in cohort))
         all_users.extend(cohort)
@@ -416,6 +537,8 @@ async def main() -> int:
 
     meta = {"users": args.users, "content": args.content, "turns_per_user": args.turns,
             "repeat_sessions": args.repeat_sessions, "seed": args.seed,
+            "video_interval_ms": args.video_interval_ms, "audio_input_s": args.audio_input_s,
+            "think_s": list(args.think_range),
             "wall_s": time.monotonic() - t_start}
     summary = summarize(records, all_users, meta, log_slice)
     (out / "summary.json").write_text(json.dumps(summary, indent=1))
