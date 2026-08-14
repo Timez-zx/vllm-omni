@@ -8,8 +8,8 @@
 #   bash run_page_server.sh          # foreground; Ctrl-C to stop
 set -uo pipefail
 
-FORK=/home/zx/voice-agent/vllm-omni
-PY=/home/zx/miniconda3/envs/omni-minicpm/bin/python
+FORK=${FORK:-/home/ubuntu/data/vllm-omni}
+PY=${PY:-/home/ubuntu/miniconda3/envs/omni/bin/python}
 PORT="${1:-7870}"
 BACKEND="${2:-ws://127.0.0.1:8091}"
 

@@ -315,8 +315,6 @@
       // Turn each retained frame into tokens as it ARRIVES, so its prefill happens while
       // you are still speaking instead of after you stop. Session mode already only ever
       // submits new frames; this changes when that work runs, not how much of it there is.
-      // Turn each retained frame into tokens as it ARRIVES. Session mode already submits
-      // only new frames, so this moves WHEN that work happens, not how much there is.
       // Measured, 6 turns per arm, 6 s of streaming before each query:
       //   OFF  median 355.4 ms   range 344.2-379.3  (spread 35.1)
       //   ON   median 345.5 ms   range 343.0-348.6  (spread  5.6)
@@ -324,13 +322,12 @@
       // critical path). The SPREAD is the real result: 6x tighter, because frame prefill is
       // no longer racing the query. An earlier measurement claimed -73%; that was audio
       // landing against the wrong turn, and it went away when the marker was fixed.
-      // OFF: it CRASHES THE ENGINE in real browser use. A stage-1 CUDA device-side assert
-      // (torch.AcceleratorError / cudaErrorAssert) killed the engine core about 10 s into a
-      // hand-driven session. My own A/B survived because it retains ~1-3 frames per turn;
-      // the browser streams continuously, so appends accumulate -- and each append adds a
-      // spurious `<|im_start|>assistant` header plus its one sampled token to the thinker's
-      // context, which is the leading suspect for desynchronising the talker's span
-      // accounting. A latency win is not worth a dead engine.
+      // HISTORY, kept because the failure mode is worth knowing: with this on, a
+      // hand-driven browser session used to kill the stage-1 engine core about 10 s
+      // in (CUDA device-side assert). The cause was the prefill-only marker not
+      // reaching the engine, so every append added a spurious `<|im_start|>assistant`
+      // header and its sampled token to the thinker's context and desynchronised the
+      // talker's span accounting. Root-caused and fixed 2026-08-01; on since.
       prefill_frames_on_arrival: true,
       session_roll_at_talker_tokens: 45000,
       session_roll_history_turns: 8,
