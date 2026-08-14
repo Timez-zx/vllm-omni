@@ -89,6 +89,49 @@ def _enc_probe_end(runner, start_ev):
 
 
 
+# [MTP share probe] The talker's code-predictor forward runs inside _preprocess,
+# i.e. OUTSIDE the [STEP-GPU] event window that measures _model_forward. Its GPU
+# time therefore lands in the "stream busy but not the model" bucket, which at
+# 176 audio sessions is 28 of the 36.5 ms of stream work per pass -- the largest
+# unattributed block left after the pinned-staging fix. This pair isolates it.
+# Events are read several passes late so the probe never synchronizes.
+_LOG_MTP_GPU = __import__("os").environ.get("VLLM_OMNI_LOG_MTP_GPU", "0") not in ("0", "", "false", "False")
+
+
+def _mtp_probe_begin(runner):
+    if not _LOG_MTP_GPU or not torch.cuda.is_available():
+        return None
+    ev = torch.cuda.Event(enable_timing=True)
+    ev.record()
+    return ev
+
+
+def _mtp_probe_end(runner, start_ev, batch: int):
+    if start_ev is None:
+        return
+    from collections import deque
+    import time as _t
+    end = torch.cuda.Event(enable_timing=True)
+    end.record()
+    q = getattr(runner, "_mtp_probe_q", None)
+    if q is None:
+        q = deque()
+        runner._mtp_probe_q = q
+    q.append((start_ev, end, _t.monotonic(), int(batch)))
+    if len(q) <= 8:
+        return
+    s, e, t_mono, n = q.popleft()
+    if not e.query():
+        q.appendleft((s, e, t_mono, n))
+        return
+    try:
+        dur = s.elapsed_time(e)
+    except Exception:
+        return
+    logger.info("[MTP-GPU] stage=%s mono=%.6f mtp_ms=%.3f batch=%d",
+                getattr(runner.vllm_config.model_config, "stage_id", "?"), t_mono, dur, n)
+
+
 def _filter_mrope_kwargs_for_model(model: object, kwargs: dict[str, Any]) -> dict[str, Any]:
     """Return only M-RoPE kwargs accepted by the model implementation."""
     method = getattr(model, "get_mrope_input_positions")
@@ -2005,7 +2048,9 @@ class OmniGPUModelRunner(GPUModelRunner):
 
             # run talker mtp decode
             if self.has_talker_mtp:
+                _mtp_ev = _mtp_probe_begin(self)
                 self._talker_mtp_forward(decode_req_ids, inputs_embeds, decode_start_offsets)
+                _mtp_probe_end(self, _mtp_ev, len(decode_req_ids))
 
         return (
             input_ids,

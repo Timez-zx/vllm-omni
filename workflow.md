@@ -70,6 +70,8 @@ with different causes, and averaging them together hid the real one for weeks.
 | 23 | vocoder chunk | 25 codec frames per call (2 s of audio) | **4** frames (320 ms) | the granularity playback smoothness is made of |
 | 24 | sizing (`qwen3_omni_moe.yaml` → `deploy_2gpu.yaml`) | 64 seqs · 0.9/0.6/0.1 · 32768/32768/65536 batched · no prefix caching | **80** seqs · 0.90/**0.30**/0.10 · **16384/8192**/65536 · prefix caching **on** for the thinker | stage-1 pool ~1M tokens, ~50k per session |
 | 25 | stage→card mapping | already thinker GPU0, talker+vocoder GPU1 | unchanged | no NVLink here, so only the text payload crosses cards |
+| **Per-step data movement** ||||
+| 26 | the per-step payload row | pageable `.to(device)`, once per session per step | staged through pinned memory, copy enqueued async | 4 KB at 147 μs → 176 sessions: miss 27.2% → 2.03%, capacity ~168 → ~180 |
 
 ---
 
@@ -316,6 +318,46 @@ GPU1 and already runs CUDA graphs on all three stages. The deltas are these:
 
 ---
 
+### 26. The per-step payload row goes through pinned memory
+
+**Stock.** The decode payload arrives as a CPU tensor built with `torch.frombuffer` over the
+shared-memory segment — pageable memory. `.to(device)` on pageable memory is a *synchronous* copy:
+it stages through a driver buffer and orders itself against the stream, so the calling thread
+blocks. The talker owes every session a step every 80 ms, so this is paid once per session per step
+on the scheduler thread.
+
+**Measured before the change**, 176 audio sessions: **147 μs per session per pass** for a 4 KB row —
+28 MB/s against a PCIe path that does 20 GB/s, so essentially all per-call overhead and stream
+waiting, none of it transfer. It was the largest single item on the stage's critical thread (32.7% of
+its py-spy samples).
+
+**A.** Stage the row through the caching host allocator's pinned memory and enqueue an async H2D.
+The allocator is what makes buffer reuse safe: it does not hand a pinned block back until the copies
+recorded against it have completed, so sharing buffers across sessions and passes cannot race.
+Consumer ordering is the stream's — every later op is enqueued behind the copy.
+
+**Effect** (audio-only, mixed reply lengths, 10 turns per session, first two dropped):
+
+| load | deadline miss | stall/turn | verdict |
+|---|---|---|---|
+| 168 sessions | 2.92 / 4.67% → **1.75%** | 65 / 87 → 31 ms | passed, now with headroom |
+| 176 sessions | 27.2% → **2.03%** | 338 → 45 ms | **failed → passed** |
+| 200 sessions | 80.9% → 50.3% | 4052 → 2376 ms | still fails |
+
+Max servable **~168 → ~180 sessions**. Three instruments agree on the attribution: the marginal cost
+per session per pass went 745 → 612 μs (the −133 matches the copy's own 147 μs), the line left the
+critical thread's top eight, and the thread's busy share fell 58% → 44% while the pass shortened
+81.4 → 68.4 ms at the same load.
+
+The session-count gain (+7%) is smaller than the per-pass gain (−16%) because the pass/fail metric is
+the deadline-miss **tail**, and the delivery-gap p99 improved less than the median: async copies
+enqueue rather than serialize, trading some per-delivery determinism for throughput.
+
+Only the **decode** intake changed. The prefill intake does the same pageable copies on the
+turn-opening path and is left alone, so this change's effect stays attributable.
+
+---
+
 ## The defaults are this configuration
 
 Until 2026-08-14 every mechanism above defaulted OFF for upstream compatibility, and the measured
@@ -394,6 +436,35 @@ compression waves do not coincide. What remains at 64 is **simultaneity**, not c
   p50 on the 15% of passes that carry it), which cannot pay for a PCIe hop;
 - prefill/decode disaggregation: the state to move is the KV cache, and this host has no NVLink.
 
+### Where the audio limit is now
+
+184 sessions, batch 105, a 76.0 ms pass (`VLLM_OMNI_LOG_MTP_GPU=1`):
+
+| part | per pass | share | per session |
+|---|---:|---:|---:|
+| **code predictor forward (GPU)** | **35.41 ms** | **46.6%** | **339 μs** |
+| talker model forward (GPU) | 8.81 ms | 11.6% | 84 μs |
+| critical thread (CPU) | 33.99 ms | 44.7% | 325 μs |
+| sum | 78.2 ms | vs a measured 76.0 ms pass — 3% apart, so nothing large is unaccounted | |
+
+The limit is now **GPU**, and it is the **code predictor**, not the talker: a 5-layer, hidden-1024
+model costing 4× the talker's own forward per session. Three reasons, from the config and the code:
+
+- `num_code_groups=16`, so **15 sequential AR steps per codec frame** — structural;
+- **no KV cache**: each step re-forwards the whole growing sequence (length 2→17), which is 15,960
+  token-forwards per pass where a cache needs 1,680 — **9.5× redundant**. The wrapper's docstring
+  calls the extra O(T²) negligible for short sequences; that holds at batch 1, not at batch 105 and
+  13 passes/s;
+- `use_cuda_graphs=current_omni_platform.is_npu()`, i.e. **eager on CUDA**: 2176 GFLOP in 35.4 ms is
+  61.5 TFLOPS, roughly 20% of this card.
+
+Ruled out with evidence: the per-row fallback that runs one code-predictor forward per session
+requires a request seed, and this deploy sets none.
+
+So about nine tenths of that GPU time is work that does not have to happen: with a cache (the
+sequence is 2→17 and the batch is known, so it is a fixed-shape buffer, ~44 MB) and graphs, the same
+arithmetic should land near 4-8 ms instead of 35.
+
 **Open:** the 352 ms thinker phase of TTFA is not decomposed — that needs a request-id ↔ turn mapping
 the logs do not carry — and the TTFA p99 tail is not fully attributed: compression is the suspect and
 the isolating run, same load with compression disabled, has not been completed.
@@ -412,6 +483,6 @@ the isolating run, same load with compression disabled, has not been completed.
 | engine-side flags | `vllm_omni/core/sched/runtime_flags.py` |
 | lean decode payload, talker text-only | `vllm_omni/model_executor/stage_input_processors/qwen3_omni.py` |
 | windowed vocoder | `vllm_omni/model_executor/models/qwen3_omni/qwen3_omni_code2wav.py` |
-| probes (`[SCHED-STEP]`, `[STEP-GPU]`, `[ENC-GPU]`, `[PF]`, `[SEG-CYCLE]`) | `omni_ar_scheduler.py`, `gpu_model_runner.py`, `gpu_ar_model_runner.py` |
+| probes (`[SCHED-STEP]`, `[STEP-GPU]`, `[MTP-GPU]`, `[ENC-GPU]`, `[PF]`, `[SEG-CYCLE]`) | `omni_ar_scheduler.py`, `gpu_model_runner.py`, `gpu_ar_model_runner.py` |
 | deployment, runner, metrics | `benchmarks/thinker_talker/` |
 | client and multi-user driver | `benchmarks/live_agent/web_client/` |
