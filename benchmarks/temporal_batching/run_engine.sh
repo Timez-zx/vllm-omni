@@ -2,7 +2,19 @@
 # Engine launcher for the temporal-batching experiment (see DESIGN.zh.md).
 #
 #   GPU 0  thinker (whole card)
-#   GPU 1  talker + code2wav (colocated, VLLM_OMNI_COLOCATE_STAGES=2:1)
+#   GPU 1  talker + code2wav (SEPARATE PROCESSES on the same card)
+#
+# code2wav used to run as a THREAD inside the talker process
+# (VLLM_OMNI_COLOCATE_STAGES=2:1). Measured at 64 sessions: the two stages
+# block each other on the GIL -- the talker spent most of its 28.5 ms pass
+# waiting and the vocoder most of its 71 ms. Splitting them:
+#   GPU1 kernels-resident   50% -> 96%      talker pass 28.5 -> 14.7 ms
+#   client miss/stall       5.88%/307ms -> 0.41%/17ms   TTFA p50 1287 -> 693
+# i.e. 64 users goes from failing the SLO to passing it. The cost is one real
+# IPC hop for codec frames, which shows up as a worse TTFA TAIL at moderate
+# load (u56: p99 1800 -> 2577 ms) while the median improves (698 -> 563).
+# Default is now split; set VLLM_OMNI_COLOCATE_STAGES=2:1 to get the old
+# thread-in-process arrangement back.
 #
 # Both GPUs must be free: the SoulX avatar server (GPU0) and any web-demo
 # engine (GPU1) have to be stopped first -- this script checks and refuses,
@@ -82,7 +94,7 @@ HF_HOME=/home/ubuntu/data/hf-omni \
 CUDA_HOME="$SHIM" \
 PATH="$SHIM/bin:$PATH" \
 CUDA_VISIBLE_DEVICES=0,1 \
-VLLM_OMNI_COLOCATE_STAGES="${VLLM_OMNI_COLOCATE_STAGES-2:1}" \
+VLLM_OMNI_COLOCATE_STAGES="${VLLM_OMNI_COLOCATE_STAGES-}" \
 VLLM_OMNI_TALKER_TEXT_ONLY="${VLLM_OMNI_TALKER_TEXT_ONLY:-1}" \
 VLLM_OMNI_TEMPORAL_TICK_MS="$TICK" \
 VLLM_OMNI_TEMPORAL_LEAD_MS="${VLLM_OMNI_TEMPORAL_LEAD_MS:-240}" \
