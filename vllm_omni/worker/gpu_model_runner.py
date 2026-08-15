@@ -132,6 +132,70 @@ def _mtp_probe_end(runner, start_ev, batch: int):
                 getattr(runner.vllm_config.model_config, "stage_id", "?"), t_mono, dur, n)
 
 
+# [span probe] Answers ONE question that no instrument used so far could:
+# during a region, is the thread WORKING or WAITING?
+#
+# CUDA synchronization spins by default, so a thread parked on the GPU burns
+# CPU exactly like a thread executing Python. /proc says 78% either way and a
+# sampling profiler shows a stack either way. That ambiguity is why chasing
+# per-line shares moved the cost around three times without removing it: a line
+# only "costs" what happens to be outstanding when it synchronizes.
+#
+# The pair below times the SAME region twice: once on the wall clock (CPU view)
+# and once on the CUDA timeline (GPU view, measured between two events on this
+# stage's own stream).
+#
+#   wall ~= gpu   the region is paced by the GPU. Because the events are ordered
+#                 on this stream, work queued ahead by ANOTHER process on the
+#                 same card counts here too, so this also answers "is code2wav
+#                 crowding the talker off GPU1".
+#   wall >> gpu   the GPU timeline barely advanced: real CPU work.
+#
+# Events are read 8 passes late, so the probe itself never synchronizes -- the
+# same trick as [MTP-GPU] above, and for the same reason: a probe that syncs
+# manufactures the very stall it is trying to measure.
+_LOG_SPAN = __import__("os").environ.get("VLLM_OMNI_LOG_SPAN", "0") not in ("0", "", "false", "False")
+
+
+def _span_begin():
+    if not _LOG_SPAN or not torch.cuda.is_available():
+        return None
+    import time as _t
+
+    ev = torch.cuda.Event(enable_timing=True)
+    ev.record()
+    return (ev, _t.monotonic())
+
+
+def _span_end(runner, begin, tag: str, batch: int):
+    if begin is None:
+        return
+    from collections import deque
+    import time as _t
+
+    start_ev, t0 = begin
+    end = torch.cuda.Event(enable_timing=True)
+    end.record()
+    wall_ms = (_t.monotonic() - t0) * 1000.0
+    q = getattr(runner, "_span_q", None)
+    if q is None:
+        q = deque()
+        runner._span_q = q
+    q.append((start_ev, end, t0, wall_ms, tag, int(batch)))
+    if len(q) <= 8:
+        return
+    s, e, t_mono, wall, tg, n = q.popleft()
+    if not e.query():
+        q.appendleft((s, e, t_mono, wall, tg, n))
+        return
+    try:
+        gpu = s.elapsed_time(e)
+    except Exception:
+        return
+    logger.info("[SPAN] stage=%s tag=%s mono=%.6f wall_ms=%.3f gpu_ms=%.3f batch=%d",
+                getattr(runner.vllm_config.model_config, "stage_id", "?"), tg, t_mono, wall, gpu, n)
+
+
 def _filter_mrope_kwargs_for_model(model: object, kwargs: dict[str, Any]) -> dict[str, Any]:
     """Return only M-RoPE kwargs accepted by the model implementation."""
     method = getattr(model, "get_mrope_input_positions")

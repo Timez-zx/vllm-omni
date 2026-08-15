@@ -97,6 +97,11 @@ _MAX_MSG_QUEUE = 200
 _CODEC_FRAME_SAMPLES = 1920  # CausalConv leading-edge artifact length
 _BAD_FRAME = object()
 
+# [path] recv->提交 这条路径上每个 await 点的时间戳。循环延迟和慢回调都看不见
+# "协程在 await 上等"，只能逐点打戳。VLLM_OMNI_LOG_PATH=1。
+_PATHPROBE = os.environ.get("VLLM_OMNI_LOG_PATH", "0") not in ("0", "", "false", "False")
+
+
 
 def _decode_frame_bytes(raw_bytes: bytes) -> Any:
     return Image.open(io.BytesIO(raw_bytes)).convert("RGB")
@@ -231,6 +236,16 @@ _SEED_TOKENS_PER_FRAME = 250
 # at 64 sessions on a 116,384-token pool, every talker request was preempted
 # exactly once and the recompute storm pushed p99 to 57 s.
 _TALKER_ROLL_FLOOR = 2048
+# How much of a shared KV pool the tenants are allowed to divide between them.
+# The remainder is not waste: a compressing session transiently holds up to
+# 1.5x its trigger (the blocking-roll backstop) plus a ~0.5x shadow seed, i.e.
+# about one full share on top of the sessions that are NOT compressing, and the
+# concurrent-warm-up permit lets several do that at once. Raise it and that
+# transient starts landing in a pool that has no room for it, which is a
+# preemption storm rather than a graceful refusal. Lower it and capacity is
+# given away. Overridable so the headroom can be measured instead of argued
+# about; the default is the value every cell in workflow.md was measured at.
+_POOL_SHARE = float(os.environ.get("VLLM_OMNI_POOL_SHARE", "0.75"))
 # Transcript retention when compression carries frames. The blocking-roll default
 # (2 * session_roll_history_turns = 16 entries) binds far below a 32k rolling window
 # (~25 turns of frames+text), so compression raises the floor to 48 turns of entries...
@@ -973,7 +988,7 @@ class OmniStreamingVideoHandler:
             # refused here, gracefully, instead. self._active_sessions already
             # counts this session.
             if config.stage1_kv_pool_tokens and config.session_scoped_request:
-                _share = int(0.75 * config.stage1_kv_pool_tokens
+                _share = int(_POOL_SHARE * config.stage1_kv_pool_tokens
                              / max(1, self._active_sessions))
                 if _share < _TALKER_ROLL_FLOOR:
                     logger.warning(
@@ -989,7 +1004,7 @@ class OmniStreamingVideoHandler:
             # [live-vllm P3] Stage-0 twin of the guard above: same shared-wall
             # arithmetic, thinker pool edition.
             if config.stage0_kv_pool_tokens and config.session_scoped_request:
-                _share0 = int(0.75 * config.stage0_kv_pool_tokens
+                _share0 = int(_POOL_SHARE * config.stage0_kv_pool_tokens
                               / max(1, self._active_sessions))
                 if _share0 < config.stage0_admission_floor_tokens:
                     logger.warning(
@@ -1061,7 +1076,7 @@ class OmniStreamingVideoHandler:
             if config.context_compression_trigger_tokens is not None:
                 compression_trigger = max(0, config.context_compression_trigger_tokens)
             elif config.stage0_kv_pool_tokens and _cap_sessions > 0:
-                compression_trigger = int(0.75 * config.stage0_kv_pool_tokens
+                compression_trigger = int(_POOL_SHARE * config.stage0_kv_pool_tokens
                                           / _cap_sessions)
                 if _mml:
                     compression_trigger = min(compression_trigger, int(0.75 * _mml))
@@ -1220,8 +1235,20 @@ class OmniStreamingVideoHandler:
 
                 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
+                _yield_ret = [0.0]
                 while True:
+                    if _PATHPROBE and _yield_ret[0]:
+                        # [path] 上一次 yield 返回 = vLLM 回来要下一个 chunk。
+                        # 这一段是背压：生成器停在 yield 上，等引擎消化完上一个。
+                        logger.info("[path] gen-resume rid=%s gap_ms=%.1f mono=%.6f",
+                                    ctx.get("rid"),
+                                    (_time.monotonic() - _yield_ret[0]) * 1e3,
+                                    _time.monotonic())
                     item = await ctx["queue"].get()
+                    if _PATHPROBE:
+                        logger.info("[path] gen-got rid=%s mono=%.6f",
+                                    ctx.get("rid"), _time.monotonic())
+                        _yield_ret[0] = _time.monotonic()
                     if item is None:
                         return
                     # A prefill-only append rides through as (prompt, max_tokens). Without a
@@ -1581,8 +1608,9 @@ class OmniStreamingVideoHandler:
                                 # point behind the residual 3-11 s outlier
                                 # turns that survived v3-v5.
                                 logger.info(
-                                    "[turnprobe] first-text rid=%s turn=%d",
+                                    "[turnprobe] first-text rid=%s turn=%d mono=%.6f",
                                     ctx.get("rid"), sess.get("turn_idx", -1),
+                                    _time.monotonic(),
                                 )
                             if delta:
                                 st["text_parts"].append(delta)
@@ -1841,6 +1869,10 @@ class OmniStreamingVideoHandler:
                     sess["fatal"] = "overlapping turn"
                     await self._send_error(websocket, "Overlapping turn")
                     return
+                if _PATHPROBE:
+                    logger.info("[path] enter rid=%s turn=%d mono=%.6f",
+                                (sess.get("active_ctx") or {}).get("rid"),
+                                sess.get("turn_idx", -1), _time.monotonic())
                 sess["turn_busy"] = True
                 try:
                     sess["query_claimed"] = False
@@ -1857,8 +1889,9 @@ class OmniStreamingVideoHandler:
                 """
                 # [turnprobe] see the first-text probe for why.
                 logger.info(
-                    "[turnprobe] recv rid=%s turn=%d",
+                    "[turnprobe] recv rid=%s turn=%d mono=%.6f",
                     (sess.get("active_ctx") or {}).get("rid"), sess.get("turn_idx", -1),
+                    _time.monotonic(),
                 )
                 if sess["fatal"]:
                     await self._send_error(websocket, f"Session failed: {sess['fatal']}")
@@ -1922,6 +1955,10 @@ class OmniStreamingVideoHandler:
                 elif _warmup_due() and _shadow_allowed():
                     _launch_shadow_warmup("turn start")
 
+                if _PATHPROBE:
+                    logger.info("[path] ladder-done rid=%s turn=%d mono=%.6f",
+                                (sess.get("active_ctx") or {}).get("rid"),
+                                sess.get("turn_idx", -1), _time.monotonic())
                 new_frames = list(frame_buffer)
                 n_buffered = len(new_frames)
                 # Freshness (digit-clock study): without this, the frames adjacent to
@@ -1944,6 +1981,10 @@ class OmniStreamingVideoHandler:
                     is_first=not sess["first_sent"],
                     seed_history=seed if seed is not None else carry,
                 )
+                if _PATHPROBE:
+                    logger.info("[path] chunk-built rid=%s turn=%d mono=%.6f",
+                                (sess.get("active_ctx") or {}).get("rid"),
+                                sess.get("turn_idx", -1), _time.monotonic())
                 audio_buffer.clear()
                 if chunk is None:
                     # Nothing to submit: keep the frames for the next turn rather than
@@ -2053,7 +2094,18 @@ class OmniStreamingVideoHandler:
                 # branch is doing the attributing (949 unowned drops, 0/1280 turns in
                 # the first thinker-only run, with the old audio-gated push).
                 sess["audio_seg_fifo"].append("turn")
+                if _PATHPROBE:
+                    # [path] 队列深度。这个队列 maxsize=4，而到达路径（视频帧）也往
+                    # 里塞，所以一轮的查询 chunk 可能排在若干个帧 chunk 后面。
+                    logger.info("[path] pre-put rid=%s turn=%d qsize=%d mono=%.6f",
+                                (sess.get("active_ctx") or {}).get("rid"),
+                                sess.get("turn_idx", -1), sess["queue"].qsize(),
+                                _time.monotonic())
                 await sess["queue"].put(chunk)
+                if _PATHPROBE:
+                    logger.info("[path] post-put rid=%s turn=%d mono=%.6f",
+                                (sess.get("active_ctx") or {}).get("rid"),
+                                sess.get("turn_idx", -1), _time.monotonic())
                 # Bounded wait. A lost segment boundary must surface as an error rather
                 # than a hang: the first bring-up attempt used an unusable boundary signal
                 # and the symptom was the client sitting in its own timeout with no server

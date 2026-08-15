@@ -50,7 +50,7 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
 )
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
-from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner, _span_begin, _span_end
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
@@ -1343,6 +1343,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 for_cudagraph_capture=runner_assisted_full_attn_capture,
             )
 
+            _span = _span_begin()
             (
                 input_ids,
                 inputs_embeds,
@@ -1351,6 +1352,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 model_kwargs,
                 ec_connector_output,
             ) = self._preprocess(scheduler_output, num_tokens_padded, intermediate_tensors)
+            _span_end(self, _span, "preprocess", num_reqs)
 
         # Let the model adjust inputs before forward (e.g. restore input_ids
         # for multimodal position detection, fix decode position offsets).

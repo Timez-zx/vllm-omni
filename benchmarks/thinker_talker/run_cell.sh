@@ -2,6 +2,22 @@
 # One measurement cell: N sessions x TURNS turns, with the evidence needed to
 # interpret it attached.
 #
+# NOT the script the capacity numbers in workflow.md came from. Its defaults
+# differ in three ways that change the result, so running it as-is will not
+# reproduce them:
+#
+#   * it hardcodes the AV workload (--content synthetic --video-interval-ms 480)
+#     and has no audio-only mode;
+#   * MU_QUESTIONS=long, where the capacity cells used `mixed` -- reply length
+#     is then fixed rather than alternating, which moves the TTFA distribution;
+#   * no VLLM_OMNI_POOL_SHARE and no deploy default of deploy_2gpu_seq256.yaml,
+#     so admission refuses sessions past ~200.
+#
+# Left as it is on purpose: earlier results were produced with these defaults
+# and changing them would silently break their correspondence. For a capacity
+# cell follow "The full setup behind one capacity cell" in workflow.md, which
+# spells out the exact env and arguments.
+#
 #   run_cell.sh NAME USERS [DEPLOY] [profile]
 #
 # Writes /home/ubuntu/data/results/NAME/

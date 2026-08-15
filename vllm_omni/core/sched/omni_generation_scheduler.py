@@ -45,6 +45,9 @@ logger = init_logger(__name__)
 # pass INTERVAL is the quantity that decides whether each session can be served
 # often enough for realtime audio. VLLM_OMNI_LOG_SCHED_STEPS=1.
 _LOG_SCHED_STEPS = os.environ.get("VLLM_OMNI_LOG_SCHED_STEPS", "0") not in ("0", "", "false", "False")
+# Per-request version of the above, for attributing one slow turn.
+# VLLM_OMNI_LOG_REQ_STEPS=1.
+_LOG_REQ_STEPS = os.environ.get("VLLM_OMNI_LOG_REQ_STEPS", "0") not in ("0", "", "false", "False")
 
 
 class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
@@ -307,6 +310,23 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 0,
                 len(self.running),
                 len(self.waiting),
+            )
+
+        # [REQ-STEP] The same pass, but named per request. SCHED-STEP is an
+        # aggregate: it can say "this pass carried 3345 tokens" but not which
+        # session's turn those belonged to, so a slow first-token cannot be
+        # attributed to waiting, to its own prefill, or to somebody else's.
+        # Pairs with the API server's [turnprobe] recv/first-text lines, which
+        # carry the same request id and a monotonic stamp. Only requests that
+        # actually got tokens appear; a request in `running` with nothing to do
+        # is absent, which is itself the signal for "waiting on input".
+        # Off by default -- one line per pass, ~9k lines per AV cell.
+        if _LOG_REQ_STEPS and total_num_scheduled_tokens:
+            logger.info(
+                "[REQ-STEP] stage=%s mono=%.6f reqs=%s",
+                getattr(self.vllm_config.model_config, "stage_id", -1),
+                scheduled_timestamp,
+                ",".join(f"{r}:{n}" for r, n in num_scheduled_tokens.items()),
             )
 
         # Record the request ids scheduled in this step (v0.14.0 behavior).

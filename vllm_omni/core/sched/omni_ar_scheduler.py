@@ -76,6 +76,9 @@ _LOG_PREFILL = os.environ.get("VLLM_OMNI_LOG_PREFILL", "0") not in ("0", "", "fa
 # depths. The pass INTERVAL derived from these stamps is the quantity that
 # decides whether every session gets served often enough for realtime audio.
 _LOG_SCHED_STEPS = os.environ.get("VLLM_OMNI_LOG_SCHED_STEPS", "0") not in ("0", "", "false", "False")
+# Per-request version of the above, for attributing one slow turn.
+# VLLM_OMNI_LOG_REQ_STEPS=1.
+_LOG_REQ_STEPS = os.environ.get("VLLM_OMNI_LOG_REQ_STEPS", "0") not in ("0", "", "false", "False")
 
 # [diagnosis] VLLM_OMNI_LOG_SEG_CYCLES=1: one line per streaming-segment
 # lifecycle event (park = segment done and the NEXT one has not arrived;
@@ -341,13 +344,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         """
         logger.info(
             "[OmniARScheduler] stage %s ADMIT req=%s resumable=%s prompt_tokens=%s "
-            "abort_immediately=%s (tracked before this: %d)",
+            "abort_immediately=%s (tracked before this: %d) mono=%.6f",
             self.vllm_config.model_config.stage_id,
             getattr(request, "request_id", "?"),
             getattr(request, "resumable", None),
             getattr(request, "num_prompt_tokens", "?"),
             getattr(request, "abort_immediately", None),
             len(self.requests),
+            _monotonic(),
         )
         super().add_request(request)
 
@@ -635,6 +639,24 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if self.chunk_transfer_adapter else 0,
                 getattr(self.chunk_transfer_adapter, "_async_load_dupes", 0)
                 if self.chunk_transfer_adapter else 0,
+            )
+
+        # [REQ-STEP] The same pass, named per request. SCHED-STEP is an
+        # aggregate: it can say "this pass carried 3345 tokens" but not whose
+        # turn they were, so a slow first token cannot be attributed to
+        # waiting, to its own prefill, or to somebody else's. Pairs with the
+        # API server's [turnprobe] recv/first-text lines, which carry the same
+        # request id and a monotonic stamp. Only requests that actually got
+        # tokens appear -- a request present in `running` with nothing to do is
+        # absent, which is itself the signal for "waiting on input".
+        # Off by default: one line per pass, ~9k lines per AV cell per stage.
+        if _LOG_REQ_STEPS and scheduler_output.total_num_scheduled_tokens:
+            logger.info(
+                "[REQ-STEP] stage=%s mono=%.6f reqs=%s",
+                self.vllm_config.model_config.stage_id,
+                _monotonic(),
+                ",".join(f"{r}:{n}" for r, n
+                         in scheduler_output.num_scheduled_tokens.items()),
             )
 
         # Wrap in omni scheduler output to carry transfer metadata.
