@@ -30,10 +30,16 @@ timestamps, the first two turns of each session dropped as warm-up:
   is not charged again to every chunk behind it.
 - **stall ms per turn** — the silence the listener actually heard, per turn.
 
-**Pass = miss < 1% and stall < 50 ms/turn.** Chunks arriving early are free: generating ahead of
-playback is allowed and the client buffers it; only a gap that outruns the buffer counts. Time to
-first audio is reported but is *not* the judge — "starts late" and "stutters" are different failures
-with different causes, and averaging them together hid the real one for weeks.
+Chunks arriving early are free: generating ahead of playback is allowed and the client buffers it;
+only a gap that outruns the buffer counts. "Starts late" and "stutters" are always reported
+separately — different failures with different causes, and averaging them together hid the real one
+for weeks.
+
+**The verdict is the two criteria in "Pass criteria" below (TTFA p99 < 1000 ms, stutter p99 < 50 ms),
+not the older pair above.** Those two are kept as diagnostics only: "deadline miss %" is binary
+(1 ms late and 3 s late count the same) and its denominator moves with chunk size, which makes it
+unfit as a criterion — measured, 77% of the 0.6% late chunks at 200 sessions were shorter than
+50 ms and inaudible.
 
 ---
 
@@ -788,6 +794,132 @@ One measurement note: **profiling this offline requires gradients disabled.** Th
 gated on `not torch.is_grad_enabled()`, so with grad on the Triton kernel is never reached, and
 autograd additionally retains every intermediate at 1920× upsampled resolution, which exhausts the
 card. Production runs under `inference_mode`; offline measurement has to match.
+
+### Audio+video: capacity 32, and the wall is vLLM's engine loop
+
+**Conclusion: AV's first-audio latency is set by the engine, not by application code, and no
+configuration fixes it.**
+
+Stage 0's engine loop admits new requests only between steps; a multimodal prefill step runs
+175–324 ms; a request that arrives while a big step is in flight waits for that step to finish
+before it is admitted at all.
+
+Capacity (criteria: TTFA p99 < 1000 ms, stutter silence p99 < 50 ms):
+
+| workload | capacity | evidence |
+|---|---:|---|
+| audio only | **230** | 200/210/220/230 pass, 240 fails |
+| **AV (480 ms frames)** | **32** | all three seeds pass (976/926/930); 36/40/44/48 fail |
+
+**Stutter is never the limit**: 0 ms at 32–64 sessions, non-zero only at 80. First audio is what
+binds, throughout.
+
+#### Evidence
+
+**1. Slow turns carry the same work as fast ones** (two seeds, 852 turns attributed individually)
+
+| | seed 7 fast/slow | seed 11 fast/slow |
+|---|---|---|
+| tokens the turn received | **697 / 712** | **698 / 719** |
+
+Slow turns (first audio > 500 ms) are 19% of all turns. **They are not doing more work; the problem
+is not theirs.**
+
+**2. What they wait for is the in-flight step finishing, not a queue**
+
+| | got chunk → admitted | got → in-flight step ends | **step end → admitted** | tokens in that step |
+|---|---:|---:|---:|---:|
+| fast | 18.8 ms | 12.9 ms | **−0.6 ms** | **20** |
+| slow | 177.7 ms | 130.6 ms | **−1.5 ms** | **2443** |
+
+**"step end → admitted" is zero** — admission happens the instant the step ends. Correlation 0.769
+(seed 7) / 0.694 (seed 11). The only difference between fast and slow is whether the step they
+landed behind carried 20 tokens or 2443 — a factor of 120.
+
+**3. The step blocking them is 99.5% prefill**
+
+| the 62 steps that blocked a slow turn | p50 |
+|---|---:|
+| total tokens | 2443 |
+| of which decode (= requests in the batch) | **14** |
+| of which prefill | **2431** |
+
+**This is prefill blocking prefill, not prefill blocking decode.** The blocked request also wants to
+start its own prefill. So PD disaggregation does not help here — it cuts between prefill and decode,
+and both sides of this one are prefill.
+
+**4. The application layer accounts for 6%**
+
+| segment | slow-turn median | belongs to |
+|---|---:|---|
+| query received → handler entered | 0 ms | — |
+| compress/roll ladder | 0.3 ms | app |
+| build chunk | 34 ms | app |
+| into queue → generator picked it up | 0.1 ms | app |
+| **picked up → admitted** | **178 ms** | **engine** |
+| **admitted → first text token** | **331 ms** | **engine** |
+
+**5. The one latency knob fails in both directions**
+
+`max_num_batched_tokens` is the only latency-related parameter the engine has:
+
+| mbt | max tokens in a step | step interval p99 | TTFA p99 |
+|---:|---:|---:|---:|
+| 16384 (baseline) | 8502 | 315 ms | **1231** |
+| 2048 | 2048 | 208 ms | 1342 |
+| 1024 | 1024 | 158 ms | 1611 |
+| 512 | 512 | **98 ms** | **1977** |
+
+**Smaller: the blocking really does drop to a third, and TTFA degrades monotonically by 60%** (four
+points monotonic, two seeds). The budget is shared by every request in the step, so tokens granted
+per request per step fell from 202 to 97 and a turn's own prefill needed twice the steps — while the
+average step got *longer*, 25.7 → 34.1 ms, because past ~100 tokens an MoE step already touches
+100% of the experts, so each extra slice re-reads the same 29 GB of expert weights.
+
+**Larger: no effect.** 16384 was never reached (max observed 8502).
+
+#### Why neither direction works
+
+Measured GPU time per step, fitted on the ≥400-token buckets:
+
+```
+per step ≈ 15.3 ms + 42.2 µs × tokens in that step
+```
+
+A fixed term and a linear term both present, so:
+
+| | 2825 tokens in one step | split into 6 × 470 |
+|---|---:|---:|
+| per step | 134 ms | 35 ms |
+| total | **134 ms** | **211 ms** |
+
+**Big batch: the step is long, so later arrivals wait a whole step.
+Small batch: total time rises 1.6×, throughput drops, and requests back up.**
+
+Either way the newly arrived input does not get prefilled in time. The 1.6× the fit predicts matches
+the measured TTFA p99 of 1231 → 1977 (1.6×).
+
+**A fixed per-step cost makes slicing lose; a linear term makes bigness slow.** There is no value in
+between that is both short and efficient — which is why this is not a tuning problem.
+
+#### Ruled out (each with a control measurement)
+
+Scheduler queueing (scheduled within 2 ms of admission), `max_num_seqs` (cutting it to 64 moved TTFA
+3%, inside the noise), KV pool and memory, the compression trigger (five values, none better than
+the automatic one), the frame pre-decode cache (miss count correlates **negatively** with latency,
+−0.52), the API server's event loop (zero slow callbacks, loop lag p99 10 ms), input preprocessing
+(`process_inputs` never exceeded 20 ms), the session queue (depth constantly 0), and generator
+back-pressure (parked on `yield` p99 25 ms).
+
+#### This is an engine limitation
+
+vLLM is a throughput engine and contains no real-time mechanism: it cannot bound a step's
+**duration** (only its token count, and token count is not duration — encoder work is not counted at
+all), cannot preempt a running step, has no deadline-aware scheduling, and admits new requests on
+the same thread and the same loop iteration that runs the model.
+
+Audio-only does well because its steps happen to be small (609 tokens at most), not because the
+engine does anything for real time.
 
 ---
 
