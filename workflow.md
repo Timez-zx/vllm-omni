@@ -543,6 +543,63 @@ arithmetic should land near 4-8 ms instead of 35.
 the logs do not carry — and the TTFA p99 tail is not fully attributed: compression is the suspect and
 the isolating run, same load with compression disabled, has not been completed.
 
+### Above that, the wall at 300 sessions is GPU1
+
+With websocket compression off, 200 sessions have room to spare: TTFA p99 **728 ms** (criterion 2000)
+and 0.48% late audio (criterion 5%). 300 sessions collapse: rtf **0.83** (a second of speech takes
+1.19 s to produce), 78.6% late, 3128 ms of stall per turn, 25 clients dropped. Aggregate throughput
+rises only from 82 to 94 audio-seconds per wall-second.
+
+**Not admission.** With `stage0_admission_floor_tokens` at 2048 and the pool-share factor at 0.8, all
+300 sessions are admitted. A session's measured thinker context is about 1000 tokens, and 200 of them
+use **18%** of the stage-0 pool — the 4096-token floor is 4× the real usage.
+
+**Not memory.** GPU0's 88 GiB is reserved once at boot by `gpu_memory_utilization` and does not track
+session count; GPU1 uses 47 of 95 GiB.
+
+**GPU1's compute.** The talker's pass time grows linearly with concurrency (fit over 91 batch points):
+
+```
+pass = 6.1 ms + 529 us x concurrently speaking sessions
+```
+
+A pass advances every session in the batch by one codec frame = 80 ms of speech, so a pass must
+finish inside 80 ms: a ceiling near **139 simultaneous speakers**. At 300 sessions the peak is 176
+(a 104 ms pass, slower than real time); at 200 sessions it is 74.
+
+Those 529 us are spent WAITING on the GPU, not on CPU work. Timing the same region inside
+`_preprocess` twice — once on the wall clock, once on the CUDA timeline, with the events read 8
+passes late so the probe never synchronizes (the probe is local, not committed):
+
+| concurrency | wall | CUDA timeline |
+|---|---:|---:|
+| 61–110 | 8.99 ms | 31.45 ms |
+| 151–190 | 29.98 ms | 51.39 ms |
+
+The GPU timeline spans LONGER than the wall clock, which can only mean the CPU queues work faster
+than the GPU retires it.
+
+**The biggest consumer of GPU1 is code2wav, not the talker.** Per-process occupancy (`pmon`, 300
+sessions): code2wav **54%**, talker **28%**. Moving code2wav to GPU0 so the talker owns GPU1 drops
+that same region's GPU timeline from 31.45 to **16.04 ms** at matched concurrency (61–110), of which
+the MTP forward itself is 9.55 ms — the half that disappears is the time code2wav was holding the
+card.
+
+Moving it is **not** a fix, though: GPU0 goes to 94% and GPU1 idles at 38%, and late audio rises from
+62.3% to 89.2%. Either placement saturates one card first (68%/88% against 94%/38%). (That run has a
+confound — the thinker's `gpu_memory_utilization` was cut from 0.90 to 0.78 to make room. The GPU
+timeline measurement is unaffected: matched concurrency, same stream.)
+
+**The next thing to look at is code2wav** — the largest consumer on the GPU, and never profiled;
+every profile so far pointed at stage 1.
+
+One measurement note, recorded so it is not repeated: **high CPU utilization does not mean the thread
+is working.** CUDA synchronization spins by default, so "main thread at 78% CPU" and "the stack is
+parked on this line" read identically whether the thread computes or waits, and a sampling profiler
+sees the line that QUEUED the GPU work while the wait lands on the next synchronizing call.
+Optimizing the talker's CPU path line by line against that reading took three rounds and returned
+4–5%; all of it was reverted. Separating "computing" from "waiting" requires paired CPU/GPU timing.
+
 ---
 
 ## Where the code is
