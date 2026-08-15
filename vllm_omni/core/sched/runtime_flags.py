@@ -18,6 +18,9 @@ corresponding ablation arm is built.
                                  per chunk
     VLLM_OMNI_STREAM_VOCODER     windowed convolution in code2wav: emitted
                                  samples are bit-identical, ~48% less work
+    VLLM_OMNI_FUSED_SNAKE        run code2wav's Snake activations through the
+                                 fused Triton kernel instead of transformers'
+                                 five-kernel elementwise chain
     VLLM_OMNI_T2T_LEAN_DECODE    ship only the fields the talker reads on a
                                  decode payload
 """
@@ -31,6 +34,7 @@ _DEFAULTS = {
     "VLLM_OMNI_INLINE_SEND": "1",
     "VLLM_OMNI_MAILBOX": "1",
     "VLLM_OMNI_STREAM_VOCODER": "1",
+    "VLLM_OMNI_FUSED_SNAKE": "1",
     "VLLM_OMNI_T2T_LEAN_DECODE": "1",
 }
 

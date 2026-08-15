@@ -591,7 +591,7 @@ confound — the thinker's `gpu_memory_utilization` was cut from 0.90 to 0.78 to
 timeline measurement is unaffected: matched concurrency, same stream.)
 
 **The next thing to look at is code2wav** — the largest consumer on the GPU, and never profiled;
-every profile so far pointed at stage 1.
+every profile so far pointed at stage 1. (Profiled; see the section below.)
 
 One measurement note, recorded so it is not repeated: **high CPU utilization does not mean the thread
 is working.** CUDA synchronization spins by default, so "main thread at 78% CPU" and "the stack is
@@ -599,6 +599,82 @@ parked on this line" read identically whether the thread computes or waits, and 
 sees the line that QUEUED the GPU work while the wait lands on the next synchronizing call.
 Optimizing the talker's CPU path line by line against that reading took three rounds and returned
 4–5%; all of it was reverted. Separating "computing" from "waiting" requires paired CPU/GPU timing.
+
+### code2wav: the cause of the stutter, and a third of it removed
+
+**It is the cause.** Short-circuiting the vocoder's compute entirely
+(`VLLM_OMNI_CW_BYPASS=1`, which ships silence of exactly the length the real decode would have
+produced, so chunk count, chunk duration and arrival timing are unchanged and only the samples are
+garbage), at 300 sessions:
+
+| | baseline | code2wav bypassed |
+|---|---:|---:|
+| late chunks | 75.4% | **4.27%** |
+| stall per turn | 2826 ms | **93.6 ms** |
+| rtf | 0.84 (behind) | **1.22 (ahead)** |
+
+Both runs admitted 275 sessions and measured 2200 turns; one variable apart.
+
+**Its cost is a straight line.** Measured offline with both cards idle, real weights, bf16, and the
+production shape (25 frames of left context + 4 new): past batch 8 every additional
+simultaneously-speaking session costs a flat **+1.4 ms of GPU**, and a bigger batch amortizes
+nothing. That is **4.24 ms of GPU per second of speech**, so a dedicated card sustains **236
+simultaneous streams**.
+
+**The time is not in the convolutions, it is in memory traffic.** It reaches **14%** of this card's
+measured bf16 peak (57 of 411 TFLOP/s). The cause is the Snake activation `x + (1/β)·sin²(αx)`:
+transformers evaluates it as five separate kernels (mul, sin, square, mul, add), each reading and
+writing the whole tensor. The decoder's last stage carries `[B, 96, 28800]` — 177 MB at batch 32 —
+so five steps are eleven passes over HBM where a fused kernel needs two. The activation does 2.5
+flops per byte moved on a card whose break-even is ~200, so it is purely bandwidth-bound: cutting
+traffic is the only lever, and extra arithmetic is nearly free.
+
+**The fused kernel already existed in this repo, unconnected.** `SnakeBeta` in
+`common/snake_activation.py` carries a Triton implementation that reads once, writes once, and keeps
+the intermediates in fp32 registers. Qwen3-Omni's code2wav has 29 Snake activations, of which **28**
+come from transformers' `Qwen3OmniMoeCode2WavDecoderBlock` and only the last one was the fused
+module. They are swapped at build time; parameter names and shapes are identical, so weight loading
+is untouched, and the boot line "Precomputed exp caches for N SnakeBeta activations" goes from 1 to
+29, which is the check that it took effect.
+
+**Offline this saturates the available win.** At batch 80 a call goes **108.7 → 72.0 ms**; deleting
+the activation outright costs **71.99 ms**, so the fused version is as fast as not doing the work at
+all and there is nothing left on this axis. Card capacity goes **236 → 356 streams**.
+
+**Accuracy improves rather than degrades.** Against the same model in fp32, the transformers path
+scores 32.36 dB SNR and the fused path **32.73 dB** — the five-kernel chain rounds to bf16 at every
+intermediate, the fused one rounds once on store. Note also that bf16 itself is only ~32 dB against
+fp32 through this decoder, so the difference between the two bf16 paths is bf16's own noise, not an
+artifact of fusing.
+
+**At 300 sessions:**
+
+| | baseline | fused Snake | bypassed (ceiling) |
+|---|---:|---:|---:|
+| late chunks | 75.4% | **40.4%** | 4.27% |
+| stall per turn | 2826 ms | **1077 ms** | 93.6 ms |
+| rtf | 0.84 | **1.01** | 1.22 |
+| TTFA p99 | 4628 ms | 3886 ms | 3253 ms |
+| code2wav's share of GPU1 | 52.8% | **39.0%** | 10.5% |
+
+That is half the achievable gain: (75.4 − 40.4) / (75.4 − 4.27) = 49%. The freed card went to the
+talker (34.5% → 39.5%).
+
+**300 sessions still fail, and not because of code2wav.** Read the ceiling column: even with the
+vocoder's compute deleted, TTFA p99 is **3253 ms** against a 2000 ms criterion. First audio happens
+before any audio is being generated, so GPU1's compute cannot reach it. **Further code2wav work can
+only improve the stutter, never the TTFA tail.**
+
+**Two levers remain**, both stutter-side only: raising `codec_chunk_frames` from 4 to 8 turns the
+convolution window from "15 frames to emit 4" into "19 frames to emit 8", 1.58× less work, config
+only, and the first chunk is a separate knob so TTFA is unaffected; below that, per-layer streaming
+convolution state would take the window from 15 frames to 4, 3.75× less, but requires per-session
+state for ~30 conv layers and reworking both the batching and the CUDA-graph path.
+
+One measurement note: **profiling this offline requires gradients disabled.** The fused path is
+gated on `not torch.is_grad_enabled()`, so with grad on the Triton kernel is never reached, and
+autograd additionally retains every intermediate at 1920× upsampled resolution, which exhausts the
+card. Production runs under `inference_mode`; offline measurement has to match.
 
 ---
 

@@ -4,6 +4,7 @@
 """Inference-only Qwen3-Omni-Moe unified model (thinker + talker + code2wav)."""
 
 import asyncio
+import os
 import time as _time
 from collections.abc import AsyncGenerator, Iterable
 from functools import cached_property
@@ -53,6 +54,16 @@ from vllm_omni.platforms import current_omni_platform
 # Heartbeat interval for the talker-text-only length report. Matches the omni scheduler's
 # heartbeat: often enough to prove the check is running, rare enough not to be noise.
 _TALKER_TEXT_ONLY_LOG_EVERY_S = 10.0
+
+# DIAGNOSTIC ONLY, default off. Skips the vocoder's compute and ships silence of
+# exactly the length the real decode would have produced, so chunk count, chunk
+# duration and arrival timing all stay valid -- only the samples are garbage.
+# This is the ablation that separates "code2wav's compute is the constraint"
+# from "GPU1 is short regardless": measured offline, one decode costs ~1.4 ms of
+# GPU per session per 320 ms chunk, i.e. a dedicated card sustains ~226
+# simultaneously-speaking streams. Turning this on removes that demand entirely
+# and is the upper bound on what optimizing the vocoder can ever buy.
+_CW_BYPASS = os.environ.get("VLLM_OMNI_CW_BYPASS", "0") not in ("0", "", "false", "False")
 
 # Special token IDs for Qwen3 Omni MoE
 # Reference: https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/main/tokenizer_config.json
@@ -692,6 +703,8 @@ class Qwen3OmniMoeForConditionalGeneration(
             talker_codes = talker_codes.expand(1, 16, -1)
 
         if self.vllm_config.model_config.async_chunk:
+            if _CW_BYPASS:
+                return self._bypass_audio(talker_codes, left_context_size, seq_token_counts)
             # Only use left_context_size from additional information
             audio_tensors = self.code2wav.chunked_decode_streaming(
                 talker_codes,
@@ -708,6 +721,33 @@ class Qwen3OmniMoeForConditionalGeneration(
             )
 
         return audio_tensors
+
+    def _bypass_audio(
+        self,
+        talker_codes: torch.Tensor,
+        left_context_size: list[int] | None,
+        seq_token_counts: list[int] | None,
+    ) -> list[torch.Tensor]:
+        """Silence of exactly the length chunked_decode_streaming would emit.
+
+        The windowed path emits ``new * total_upsample`` samples per row, where
+        ``new = seq_len - left_context``; match that, so everything downstream
+        (chunk bytes, playback duration, the client's deadline model) is
+        unchanged and only the vocoder's GPU work disappears.
+        """
+        u = int(self.code2wav.total_upsample)
+        q = self.code2wav_config.num_quantizers
+        batch = talker_codes.shape[0]
+        if seq_token_counts is not None:
+            lens = [n // q for n in seq_token_counts]
+        else:
+            lens = [talker_codes.shape[-1]] * batch
+        lcs = left_context_size if left_context_size else [0] * batch
+        dtype = next(self.code2wav.parameters()).dtype
+        return [
+            talker_codes.new_zeros((1, max(0, lens[i] - lcs[i]) * u), dtype=dtype)
+            for i in range(batch)
+        ]
 
     # ==================== Thinker-Talker Projection ====================
 
