@@ -422,6 +422,73 @@ bash run_engine.sh stop
 (完全无缝),而 TTFA p99 已经 1570 ms。**容量由第一声决定,所以下一个优化目标是 GPU0 上的 thinker,
 不是 GPU1。**
 
+### 一次容量测量的完整 setup
+
+判据那一节的所有数字都出自下面这套。**任何一项不同,数字就不可比。**
+
+**用到的文件**
+
+| 文件 | 用途 |
+|---|---|
+| `benchmarks/thinker_talker/deploy_2gpu_seq256.yaml` | 三个 stage 的部署。**所有容量数字都用它**,和 `deploy_2gpu.yaml` 只差 `max_num_seqs` 80→256 |
+| `benchmarks/live_agent/web_client/mu_bench.py` | 压测客户端(N 个模拟浏览器) |
+| `benchmarks/thinker_talker/run_engine.sh` | 起引擎 |
+| `benchmarks/thinker_talker/analyze.py` | 出两个判据和 PASS/FAIL |
+
+`deploy_2gpu.yaml` 的 `max_num_seqs: 80` 是给约 64 会话配的;一个会话就是一个常驻请求,
+所以 200 会话时 80 个槽位会直接拒掉其余的。256 是天花板不是调参:48 个 AV 会话上把它
+降回 64,TTFA p99 只动了 3%(1269 vs 1231),在 8–17% 的运行间噪声里。
+
+**引擎侧环境变量**
+
+```bash
+TT_DEPLOY=benchmarks/thinker_talker/deploy_2gpu_seq256.yaml
+VLLM_OMNI_ADMIT_MAX_SESSIONS=<用户数>   # 准入上限；也按反比决定压缩触发点
+VLLM_OMNI_POOL_SHARE=0.8                # 池子份额，默认 0.75
+VLLM_OMNI_CP_KV_CACHE=1                 # 码本预测器用固定大小 KV
+VLLM_OMNI_LOG_SCHED_STEPS=1             # 每个调度步一行
+VLLM_OMNI_LOG_STEP_GPU=1                # 每步的 GPU 执行时间
+VLLM_OMNI_LOG_AUDIO_CHUNKS=1
+bash benchmarks/thinker_talker/run_engine.sh
+```
+
+**客户端**
+
+```bash
+cd benchmarks/live_agent/web_client
+MU_STAGGER_S=0,40 \                      # 300 会话的音频测量用 0,60
+MU_QUESTIONS=mixed \                     # 长短问题交替，答案长度不是定值
+MU_SESSION_CFG_JSON='{"stage0_admission_floor_tokens": 2048}' \
+MU_ENGINE_LOG=/home/ubuntu/data/logs/thinker_talker_engine.log \
+python mu_bench.py --users <N> \
+  --content none \                       # 音频负载
+  --turns 10 --audio-input-s 3 --think 2,6 --seed 7 --out <目录>
+```
+
+AV 负载把 `--content none` 换成 `--content synthetic --video-interval-ms 480`。
+`stage0_admission_floor_tokens` 必须显式给 2048:默认的 4096 是实测每会话上下文
+(约 1000 token)的 4 倍,200 会话时会拒掉一部分。
+
+**分析**
+
+```bash
+python benchmarks/thinker_talker/analyze.py <目录> --warmup-turns 2
+```
+
+前两轮丢掉(预热),`analyze.py` 直接打印两个判据和 PASS/FAIL。
+
+**每个容量数字对应的 setup**
+
+| 数字 | 负载 | 帧间隔 | 种子 | 说明 |
+|---|---|---|---|---|
+| 音频容量 230 | `--content none` | — | 7 | 200/210/220/230 过,240 不过 |
+| AV 容量 32 | `synthetic` | 480 ms | 7 / 11 / 23 | 三个种子全过;36/40/44/48 不过 |
+| 帧率—容量曲线 | `synthetic` | 240–5000 ms | 7 / 11 | 每点 2–3 个种子 |
+
+**运行间噪声**:同配置换种子,TTFA p99 波动 **8–17%**(32 会话 5.3%,40 会话 17.5%,
+后者足以翻转 PASS/FAIL)。**所以任何小于 20% 的改善都不能从单次运行下结论**,
+拐点附近的每个点都跑了至少两个种子。
+
 ### 压测客户端不压缩 websocket
 
 `mu_bench.py` 用 `compression=None` 连接。`websockets` 库默认会协商 permessage-deflate,服务端也接受,

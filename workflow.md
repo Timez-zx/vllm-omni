@@ -487,6 +487,75 @@ flips none of the verdicts below.
 sessions the stutter p99 is still 0 ms — seamless — while TTFA p99 is already 1570 ms. **Capacity is
 set by first audio, so the next target is the thinker on GPU0, not GPU1.**
 
+### The full setup behind one capacity cell
+
+Every number in "Pass criteria" came from exactly this. **Change any one item and the numbers
+are no longer comparable.**
+
+**Files**
+
+| file | role |
+|---|---|
+| `benchmarks/thinker_talker/deploy_2gpu_seq256.yaml` | the three-stage deployment. **Every capacity number used this one**; it differs from `deploy_2gpu.yaml` only in `max_num_seqs` 80 → 256 |
+| `benchmarks/live_agent/web_client/mu_bench.py` | the load generator (N simulated browsers) |
+| `benchmarks/thinker_talker/run_engine.sh` | boots the engine |
+| `benchmarks/thinker_talker/analyze.py` | prints the two criteria and PASS/FAIL |
+
+`deploy_2gpu.yaml`'s `max_num_seqs: 80` is sized for ~64 sessions; a session IS one persistent
+request, so at 200 sessions 80 slots refuse the rest. 256 is a ceiling, not a tuning knob:
+dropping it back to 64 at 48 AV sessions moved TTFA p99 by 3% (1269 vs 1231), inside the 8–17%
+run-to-run noise.
+
+**Engine side**
+
+```bash
+TT_DEPLOY=benchmarks/thinker_talker/deploy_2gpu_seq256.yaml
+VLLM_OMNI_ADMIT_MAX_SESSIONS=<users>    # admission cap; also sets the compression trigger (inversely)
+VLLM_OMNI_POOL_SHARE=0.8                # pool share, default 0.75
+VLLM_OMNI_CP_KV_CACHE=1                 # fixed-size KV for the code predictor
+VLLM_OMNI_LOG_SCHED_STEPS=1             # one line per scheduler pass
+VLLM_OMNI_LOG_STEP_GPU=1                # GPU execution time per pass
+VLLM_OMNI_LOG_AUDIO_CHUNKS=1
+bash benchmarks/thinker_talker/run_engine.sh
+```
+
+**Client**
+
+```bash
+cd benchmarks/live_agent/web_client
+MU_STAGGER_S=0,40 \                      # 0,60 for the 300-session audio cells
+MU_QUESTIONS=mixed \                     # short and long question sets alternate, so reply length is not fixed
+MU_SESSION_CFG_JSON='{"stage0_admission_floor_tokens": 2048}' \
+MU_ENGINE_LOG=/home/ubuntu/data/logs/thinker_talker_engine.log \
+python mu_bench.py --users <N> \
+  --content none \                       # audio workload
+  --turns 10 --audio-input-s 3 --think 2,6 --seed 7 --out <dir>
+```
+
+For the AV workload replace `--content none` with `--content synthetic --video-interval-ms 480`.
+`stage0_admission_floor_tokens` must be set to 2048 explicitly: the 4096 default is 4× the
+measured per-session context (~1000 tokens) and refuses sessions past ~200.
+
+**Analysis**
+
+```bash
+python benchmarks/thinker_talker/analyze.py <dir> --warmup-turns 2
+```
+
+The first two turns are dropped as warmup; `analyze.py` prints both criteria and the verdict.
+
+**Which setup produced which number**
+
+| number | workload | frame interval | seeds | note |
+|---|---|---|---|---|
+| audio capacity 230 | `--content none` | — | 7 | 200/210/220/230 pass, 240 fails |
+| AV capacity 32 | `synthetic` | 480 ms | 7 / 11 / 23 | all three seeds pass; 36/40/44/48 fail |
+| frame-rate curve | `synthetic` | 240–5000 ms | 7 / 11 | 2–3 seeds per point |
+
+**Run-to-run noise**: same configuration, different seed, moves TTFA p99 by **8–17%** (5.3% at 32
+sessions, 17.5% at 40, where it flips the verdict). **No improvement under 20% can be claimed from
+a single run**, which is why every point near a knee was run with at least two seeds.
+
 ### The load generator does not compress its websocket
 
 `mu_bench.py` connects with `compression=None`. The `websockets` library offers permessage-deflate by
