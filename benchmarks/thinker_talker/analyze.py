@@ -6,13 +6,23 @@
 Each RUN_DIR is one (condition, N) cell written by mu_bench.py --out. Prints
 one table row per dir and writes metrics.json into each.
 
+A run passes on exactly two numbers:
+
+    ttfa_p99_ms  < 1000    first audio, measured from the end of user speech
+    stall_p99_ms <   50    silence at a chunk seam, no client-side prebuffer
+
+Everything else printed is diagnostic. The old criterion was the fraction of
+chunks that arrived late; it was dropped because lateness is binary there (1 ms
+and 3 s count the same) and its denominator moves with chunk size. Measured: of
+the 0.6% late chunks at 200 sessions, 77% were shorter than 50 ms and inaudible.
+
 The playback model (per turn): the client starts playing at the first delta's
 arrival. Chunk i is NEEDED the moment the previous chunks' audio runs out; a
-chunk arriving later than that is a DEADLINE MISS and the gap is a STALL the
-listener hears. Chunks arriving early are buffered (no penalty) -- so greedy
-generation is not penalized for bursting ahead; it is only penalized when a
-mid-turn gap outruns the buffer it built. That keeps the comparison honest in
-both directions.
+chunk arriving later than that leaves the speaker silent for `t - cursor`, which
+is what the listener hears. Chunks arriving early are buffered (no penalty) --
+so greedy generation is not penalized for bursting ahead; it is only penalized
+when a mid-turn gap outruns the buffer it built. Every seam contributes one
+number (0 when it is not late), and the p99 is taken over all of them.
 """
 from __future__ import annotations
 
@@ -25,6 +35,15 @@ import sys
 
 SR = 24000.0
 
+# The pass criteria. 1000 ms: gaps past ~700 ms are heard as hesitation
+# (Kendrick & Torreira 2015) and 1 s is the limit for uninterrupted flow of
+# thought (Miller 1968); the looser of the two is taken. Note the budget is
+# meant to include endpointing, which t_q does not -- a real product spends
+# another 200-700 ms there. 50 ms: a stop closure in natural speech is already
+# 50-100 ms of near-silence, so a shorter seam is masked by the speech itself.
+TTFA_P99_MS = 1000.0
+STALL_P99_MS = 50.0
+
 
 def pctl(xs: list[float], q: float) -> float | None:
     if not xs:
@@ -36,12 +55,13 @@ def pctl(xs: list[float], q: float) -> float | None:
 def playback(deltas: list[list[float]]) -> dict:
     """Deadline misses + stall seconds for one turn's [t_rel, samples] list."""
     if len(deltas) < 2:
-        return {"misses": 0, "chunks": len(deltas), "stall_s": 0.0, "gaps": [], "excess": []}
+        return {"misses": 0, "chunks": len(deltas), "stall_s": 0.0,
+                "gaps": [], "excess": [], "stalls": []}
     misses = 0
     stall = 0.0
     # cursor = wall time at which playback of everything delivered so far ends
     cursor = deltas[0][0] + deltas[0][1] / SR
-    gaps, excess = [], []
+    gaps, excess, stalls = [], [], []
     for i in range(1, len(deltas)):
         t, samples = deltas[i]
         prev_t, prev_samples = deltas[i - 1]
@@ -50,10 +70,13 @@ def playback(deltas: list[list[float]]) -> dict:
         if t > cursor + 1e-4:            # arrived after the audio ran out
             misses += 1
             stall += t - cursor
+            stalls.append(t - cursor)     # seconds of silence at this seam
             cursor = t                    # re-anchor: playback resumes now
+        else:
+            stalls.append(0.0)            # seamless seam; still one sample
         cursor += samples / SR
     return {"misses": misses, "chunks": len(deltas), "stall_s": stall,
-            "gaps": gaps, "excess": excess}
+            "gaps": gaps, "excess": excess, "stalls": stalls}
 
 
 def analyze_dir(d: pathlib.Path, warmup_turns: int) -> dict | None:
@@ -70,6 +93,7 @@ def analyze_dir(d: pathlib.Path, warmup_turns: int) -> dict | None:
     ttfa = [t["ttfa_ms"] for t in ok if t.get("ttfa_ms") is not None]
     all_gaps: list[float] = []
     all_excess: list[float] = []
+    all_stalls: list[float] = []
     miss_chunks = 0
     total_chunks = 0
     stall_s = 0.0
@@ -84,6 +108,7 @@ def analyze_dir(d: pathlib.Path, warmup_turns: int) -> dict | None:
         stall_turns += 1 if pb["misses"] else 0
         all_gaps.extend(pb["gaps"])
         all_excess.extend(pb["excess"])
+        all_stalls.extend(pb["stalls"])
 
     # Aggregate throughput over the measured window: audio seconds delivered
     # per wall second, using the span from first query to last done.
@@ -93,16 +118,24 @@ def analyze_dir(d: pathlib.Path, warmup_turns: int) -> dict | None:
 
     gp50 = pctl(all_gaps, 0.5)
     gp99 = pctl(all_gaps, 0.99)
+    ttfa_p99 = pctl(ttfa, 0.99)
+    stall_p99 = (pctl(all_stalls, 0.99) or 0.0) * 1000 if all_stalls else None
     m = {
         "dir": str(d),
         "n_ok": len(ok),
         "n_timeout": sum(1 for t in turns if t.get("status") == "timeout"),
         "n_users": len({t["user"] for t in turns}),
+        # THE TWO CRITERIA
+        "ttfa_p99_ms": ttfa_p99,
+        "stall_p99_ms": stall_p99,
+        "pass": (ttfa_p99 is not None and ttfa_p99 < TTFA_P99_MS
+                 and stall_p99 is not None and stall_p99 < STALL_P99_MS),
         # latency
         "ttfa_p50_ms": pctl(ttfa, 0.5),
         "ttfa_p95_ms": pctl(ttfa, 0.95),
-        "ttfa_p99_ms": pctl(ttfa, 0.99),
         # predictability
+        "stall_p50_ms": (pctl(all_stalls, 0.5) or 0.0) * 1000 if all_stalls else None,
+        "stall_p999_ms": (pctl(all_stalls, 0.999) or 0.0) * 1000 if all_stalls else None,
         "gap_p50_ms": gp50 * 1000 if gp50 else None,
         "gap_p95_ms": (pctl(all_gaps, 0.95) or 0) * 1000 if all_gaps else None,
         "gap_p99_ms": gp99 * 1000 if gp99 else None,
@@ -125,10 +158,11 @@ def analyze_dir(d: pathlib.Path, warmup_turns: int) -> dict | None:
 
 
 COLS = [
-    ("dir", 34), ("n_ok", 5),
-    ("ttfa_p50_ms", 9), ("ttfa_p99_ms", 9),
-    ("gap_p50_ms", 8), ("gap_p99_ms", 8), ("gap_p99_over_p50", 8),
-    ("deadline_miss_pct", 7), ("stall_ms_per_turn", 9),
+    ("dir", 30), ("n_ok", 5),
+    # the two criteria, then the verdict
+    ("ttfa_p99_ms", 11), ("stall_p99_ms", 12), ("pass", 5),
+    # diagnostics
+    ("ttfa_p50_ms", 9), ("stall_ms_per_turn", 9), ("deadline_miss_pct", 7),
     ("throughput_audio_s_per_wall_s", 8), ("rtf_deliver_p50", 7),
 ]
 
@@ -136,6 +170,8 @@ COLS = [
 def fmt(v, w):
     if v is None:
         return "-".rjust(w)
+    if isinstance(v, bool):
+        return ("PASS" if v else "FAIL").rjust(w)
     if isinstance(v, float):
         return f"{v:.1f}".rjust(w) if abs(v) >= 10 else f"{v:.2f}".rjust(w)
     return str(v)[-w:].rjust(w)

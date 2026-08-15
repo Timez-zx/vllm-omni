@@ -444,6 +444,49 @@ its last byte arrives (`MU_PLAYBACK_PACED=1`), or a faster engine gets its next 
 silently runs at lower concurrency — one run measured 28 concurrent sessions against another's 49 with
 both labelled the same N.
 
+### Pass criteria
+
+```
+first audio   TTFA p99 < 1000 ms      measured from the end of user speech
+stutter       seam silence p99 < 50 ms   played on arrival, no client prebuffer
+```
+
+**How the stutter number is built.** Simulate playback: when the previous chunk finishes and the next
+one has not arrived, the speaker is silent — record how long. Every seam contributes one number (0
+when it is not late) and the p99 is taken over all turns. The input is `deltas` in `turns.jsonl`
+(each chunk's arrival time and sample count).
+
+Not "fraction of late chunks": lateness there is binary — 1 ms and 3 s count the same — and the
+denominator moves with chunk size. Measured: of the 0.6% late chunks at 200 sessions, **77% were
+shorter than 50 ms and inaudible**.
+
+**Where 1000 ms comes from.** Gaps past ~700 ms are heard as hesitation
+([Kendrick & Torreira 2015](https://doi.org/10.1080/0163853X.2014.955997)); 1 s is the limit for
+uninterrupted flow of thought ([Miller 1968](https://doi.org/10.1145/1476589.1476628)). The modal
+gap between turns in human conversation is near 0
+([Stivers et al. 2009](https://doi.org/10.1073/pnas.0903616106)). The looser of the two is taken.
+
+That budget is meant to **include endpointing** (deciding the user has stopped), which `t_q` does
+not — a real product spends another 200–700 ms there. A full-duplex architecture is what saves it.
+
+**Where 50 ms comes from.** A stop closure (p/t/k) in natural speech is already 50–100 ms of
+near-silence, so a shorter seam is masked by the speech itself; VoIP loss concealment is likewise
+transparent under 30 ms and clearly audible past 80 ms. Moving the threshold anywhere in 30–80 ms
+flips none of the verdicts below.
+
+**Capacity curve** (current HEAD, `deploy_2gpu_seq256.yaml`, audio load, 10 turns less 2 warmup):
+
+| requested | admitted | TTFA p50 | TTFA p99 | stutter p99 | rtf |
+|---:|---:|---:|---:|---:|---:|
+| 200 | 187 | 369 ms | **578 ms PASS** | **0 ms PASS** | 3.27 |
+| 240 | 223 | 542 ms | 1570 ms FAIL | **0 ms PASS** | 1.90 |
+| 280 | 258 | 970 ms | 2344 ms FAIL | 146 ms FAIL | 1.11 |
+| 300 | 275 | 2005 ms | 3886 ms FAIL | 199 ms FAIL | 1.01 |
+
+**First audio breaks first, between 200 and 240; the stutter knee is between 240 and 280.** At 240
+sessions the stutter p99 is still 0 ms — seamless — while TTFA p99 is already 1570 ms. **Capacity is
+set by first audio, so the next target is the thinker on GPU0, not GPU1.**
+
 ### The load generator does not compress its websocket
 
 `mu_bench.py` connects with `compression=None`. The `websockets` library offers permessage-deflate by
@@ -545,8 +588,9 @@ the isolating run, same load with compression disabled, has not been completed.
 
 ### Above that, the wall at 300 sessions is GPU1
 
-With websocket compression off, 200 sessions have room to spare: TTFA p99 **728 ms** (criterion 2000)
-and 0.48% late audio (criterion 5%). 300 sessions collapse: rtf **0.83** (a second of speech takes
+With websocket compression off, 200 sessions have room to spare: TTFA p99 **728 ms** and 0.48% late
+audio. (Both are the old metrics; the criteria were later replaced by TTFA p99 < 1000 ms and stutter
+p99 < 50 ms — see "Pass criteria" above.) 300 sessions collapse: rtf **0.83** (a second of speech takes
 1.19 s to produce), 78.6% late, 3128 ms of stall per turn, 25 clients dropped. Aggregate throughput
 rises only from 82 to 94 audio-seconds per wall-second.
 
@@ -661,7 +705,7 @@ That is half the achievable gain: (75.4 − 40.4) / (75.4 − 4.27) = 49%. The f
 talker (34.5% → 39.5%).
 
 **300 sessions still fail, and not because of code2wav.** Read the ceiling column: even with the
-vocoder's compute deleted, TTFA p99 is **3253 ms** against a 2000 ms criterion. First audio happens
+vocoder's compute deleted, TTFA p99 is **3253 ms** against a 1000 ms criterion. First audio happens
 before any audio is being generated, so GPU1's compute cannot reach it. **Further code2wav work can
 only improve the stutter, never the TTFA tail.**
 
