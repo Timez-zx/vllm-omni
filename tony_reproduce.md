@@ -260,51 +260,104 @@ are not.
 
 ### Full population
 
-| cell | n | queue_ms | prefill_ms | decode_ms | window_ms | gpu_util% |
-|---|---:|---:|---:|---:|---:|---:|
-| u16 seed11 | 152 | 33.3 | 72.2  | 6.3 | 111.8 | 70.2 |
-| u16 seed23 | 153 | 32.1 | 75.4  | 5.7 | 113.1 | 71.7 |
-| u16 seed7  | 154 | 39.3 | 74.3  | 5.8 | 119.5 | 67.1 |
-| u24 seed11 | 213 | 42.9 | 90.2  | 7.9 | 141.0 | 69.6 |
-| u24 seed23 | 203 | 41.2 | 90.5  | 7.1 | 138.8 | 70.3 |
-| u24 seed7  | 213 | 50.1 | 87.5  | 8.3 | 145.9 | 65.6 |
-| u32 seed11 | 265 | 48.0 | 93.7  | 8.1 | 149.8 | 68.0 |
-| u32 seed23 | 258 | 49.9 | 100.2 | 7.4 | 157.5 | 68.3 |
-| u32 seed7  | 254 | 53.5 | 106.4 | 8.7 | 168.6 | 68.3 |
-| u40 seed11 | 316 | 60.7 | 121.2 | 8.3 | 190.2 | 68.1 |
-| u40 seed23 | 305 | 59.9 | 105.9 | 9.0 | 174.9 | 65.7 |
-| u40 seed7  | 301 | 58.6 | 104.3 | 9.3 | 172.2 | 66.0 |
+| cell | n | queue_ms | prefill_ms | decode_ms | window_ms |
+|---|---:|---:|---:|---:|---:|
+| u16 seed11 | 152 | 33.3 | 72.2  | 6.3 | 111.8 |
+| u16 seed23 | 153 | 32.1 | 75.4  | 5.7 | 113.1 |
+| u16 seed7  | 154 | 39.3 | 74.3  | 5.8 | 119.5 |
+| u24 seed11 | 213 | 42.9 | 90.2  | 7.9 | 141.0 |
+| u24 seed23 | 203 | 41.2 | 90.5  | 7.1 | 138.8 |
+| u24 seed7  | 213 | 50.1 | 87.5  | 8.3 | 145.9 |
+| u32 seed11 | 265 | 48.0 | 93.7  | 8.1 | 149.8 |
+| u32 seed23 | 258 | 49.9 | 100.2 | 7.4 | 157.5 |
+| u32 seed7  | 254 | 53.5 | 106.4 | 8.7 | 168.6 |
+| u40 seed11 | 316 | 60.7 | 121.2 | 8.3 | 190.2 |
+| u40 seed23 | 305 | 59.9 | 105.9 | 9.0 | 174.9 |
+| u40 seed7  | 301 | 58.6 | 104.3 | 9.3 | 172.2 |
 
 ### P95 tail only (worst 5% by TTFA, threshold computed per-cell)
 
-| cell | n | queue_ms | prefill_ms | decode_ms | window_ms | gpu_util% |
-|---|---:|---:|---:|---:|---:|---:|
-| u16 seed11 | 8  | 71.9  | 155.3 | 6.0 | 233.2 | 69.2 |
-| u16 seed23 | 8  | 48.0  | 161.6 | 4.8 | 214.4 | 77.6 |
-| u16 seed7  | 8  | 73.8  | 185.6 | 4.0 | 263.4 | 72.0 |
-| u24 seed11 | 11 | 80.2  | 310.2 | 1.9 | 392.3 | 79.6 |
-| u24 seed23 | 11 | 101.1 | 232.2 | 8.4 | 341.8 | 70.4 |
-| u24 seed7  | 11 | 104.7 | 233.2 | 2.5 | 340.4 | 69.2 |
-| u32 seed11 | 14 | 117.8 | 309.9 | 2.5 | 430.3 | 72.6 |
-| u32 seed23 | 13 | 113.7 | 266.4 | 1.8 | 381.9 | 70.2 |
-| u32 seed7  | 13 | 122.8 | 348.7 | 3.4 | 475.0 | 74.1 |
-| u40 seed11 | 16 | 157.4 | 361.0 | 6.7 | 525.2 | 70.0 |
-| u40 seed23 | 16 | 144.1 | 327.8 | 7.2 | 479.2 | 69.9 |
-| u40 seed7  | 16 | 136.8 | 315.0 | 7.2 | 459.1 | 70.2 |
+| cell | n | queue_ms | prefill_ms | decode_ms | window_ms |
+|---|---:|---:|---:|---:|---:|
+| u16 seed11 | 8  | 71.9  | 155.3 | 6.0 | 233.2 |
+| u16 seed23 | 8  | 48.0  | 161.6 | 4.8 | 214.4 |
+| u16 seed7  | 8  | 73.8  | 185.6 | 4.0 | 263.4 |
+| u24 seed11 | 11 | 80.2  | 310.2 | 1.9 | 392.3 |
+| u24 seed23 | 11 | 101.1 | 232.2 | 8.4 | 341.8 |
+| u24 seed7  | 11 | 104.7 | 233.2 | 2.5 | 340.4 |
+| u32 seed11 | 14 | 117.8 | 309.9 | 2.5 | 430.3 |
+| u32 seed23 | 13 | 113.7 | 266.4 | 1.8 | 381.9 |
+| u32 seed7  | 13 | 122.8 | 348.7 | 3.4 | 475.0 |
+| u40 seed11 | 16 | 157.4 | 361.0 | 6.7 | 525.2 |
+| u40 seed23 | 16 | 144.1 | 327.8 | 7.2 | 479.2 |
+| u40 seed7  | 16 | 136.8 | 315.0 | 7.2 | 459.1 |
 
-**Analysis.** `gpu_util%` (the queue-vs-busy ratio) is remarkably flat across every load and
-every population slice — 65.6-71.7% for the full population, 69.2-79.6% for the P95 tail, no
-downward trend as load rises. This is the sharpest single finding of the whole reproduction: the
-tail is not caused by queueing becoming a *larger fraction* of the wait. Both `queue_ms` and
-`prefill_ms` grow together, by roughly the same multiple, from average case to P95 tail (queue
-~1.5-2.5x, prefill ~2-3x) at every load point — a P99/P95 turn isn't "mostly waiting," it's
-riding the same ~70/30 compute/queue split as an average turn, just at 2-3x the absolute size,
-because it landed behind a bigger prefill chunk, not because the system got proportionally worse
-at admitting requests. `decode_ms` stays under 10ms everywhere, confirming (via yet another
-independent path) that decode was never a real contributor to this window. This directly
-supports the doc's "no configuration fixes it" framing — the wall is a fixed proportional
-relationship between queueing and prefill compute, not a growing inefficiency that a scheduling
-tweak could plausibly correct.
+**Analysis.** `decode_ms` stays under 10ms everywhere, both full population and P95 tail,
+confirming (via yet another independent path) that decode was never a real contributor to this
+window — `prefill_ms` is what grows, in both the average case and the tail. `queue_ms` and
+`prefill_ms` grow together from average case to P95 tail (queue ~1.5-2.5x, prefill ~2-3x) at
+every load point, so the tail isn't disproportionately more *queued* — it's riding a bigger
+version of the same composition, because it landed behind a larger prefill chunk. (An earlier
+draft of this table also reported a `gpu_util%` = `(prefill_ms+decode_ms)/window_ms` column here
+and called it flat across load — that ratio is a real number, but it is **not** GPU hardware
+utilization: it's this request's own busy-fraction of its own wait window, and since many
+requests' windows overlap in real time, averaging it across requests double-counts the same
+GPU-busy milliseconds once per concurrently-waiting request. The corrected, hardware-true version
+of GPU utilization is in the next section.)
+
+---
+
+## Additional finding: true GPU utilization (time-based, hardware-wide)
+
+Computed correctly this time: **once per cell, over wall-clock time**, not averaged across
+per-request windows. For every `[STEP-GPU]` entry on a given stage, sum `gpu_ms`; divide by the
+cell's total wall-clock span. This counts every busy millisecond exactly once, regardless of how
+many requests were concurrently waiting through it — the property an aggregate hardware
+utilization number actually needs.
+
+```
+utilization% = 100 × (Σ gpu_ms across all steps) / (span of the cell, in ms)
+```
+
+`stage=0` = GPU0 (thinker), `stage=1` = GPU1 (talker). Code2wav is not a scheduled
+autoregressive step and has no `[STEP-GPU]` entries at all, so the GPU1 numbers below are a
+**lower bound** on true GPU1 occupancy (talker + code2wav together), not the full picture.
+
+| cell | span_s | GPU0 busy_s | **GPU0 util%** | GPU1 busy_s | **GPU1 util%** |
+|---|---:|---:|---:|---:|---:|
+| u16 seed7  | 263.3 | 72.2  | **27.4** | 24.4 | **9.3**  |
+| u16 seed11 | 272.5 | 73.3  | **26.9** | 24.9 | **9.1**  |
+| u16 seed23 | 273.0 | 72.8  | **26.7** | 24.3 | **8.9**  |
+| u24 seed7  | 263.2 | 97.5  | **37.0** | 30.9 | **11.8** |
+| u24 seed11 | 290.0 | 97.3  | **33.6** | 30.8 | **10.6** |
+| u24 seed23 | 284.0 | 92.2  | **32.5** | 30.8 | **10.8** |
+| u32 seed7  | 267.1 | 113.9 | **42.6** | 37.0 | **13.9** |
+| u32 seed11 | 308.8 | 112.4 | **36.4** | 36.2 | **11.7** |
+| u32 seed23 | 294.5 | 116.1 | **39.4** | 36.8 | **12.5** |
+| u40 seed7  | 274.5 | 126.5 | **46.1** | 39.5 | **14.4** |
+| u40 seed11 | 277.5 | 126.9 | **45.7** | 40.5 | **14.6** |
+| u40 seed23 | 275.9 | 125.9 | **45.6** | 40.1 | **14.5** |
+
+**Time-series, u=40 (all three seeds, phase-aligned to each run's own start)**: [published
+chart](https://claude.ai/code/artifact/2e0666c6-ef27-48f8-9be4-c82dcf64bc2a). Bucketed into 5s
+windows, it shows the same phase structure on every seed — a ramp-up (0-40s, matching the
+client's 40-second connection stagger), a steady state (~40-210s) holding GPU0 in the 45-67%
+band and GPU1 in the 14-20% band, and a ramp-down as sessions finish their 10 turns.
+
+**Analysis.** This is a materially different, and more useful, picture than the flawed
+per-request metric gave. Two real findings: (1) **true utilization climbs monotonically with
+load** — GPU0 26.7% → 46.1% from u16 to u40, GPU1 8.9% → 14.6% — a genuine trend the old metric's
+double-counting bias had flattened out. (2) **Even at u=40, sitting right at the capacity wall,
+GPU0 is idle more than half the time (54%) and GPU1 more than 85% of the time.** That is the
+opposite signature of hardware saturation — a genuinely compute-bound system would show
+utilization climbing toward 90-100% as the wall approaches. Instead this confirms the doc's
+"the wall is vLLM's engine loop, not the hardware" framing more sharply than the per-request
+metric could: there is substantial spare GPU capacity sitting idle at the exact load where the
+system starts failing its TTFA criterion. The failure is entirely about *when* work gets
+scheduled, not whether the hardware can keep up with the volume. GPU0 also runs at roughly 3x
+GPU1's utilization throughout — architecturally expected (the thinker's multimodal prefill+decode
+is heavier per step than the talker's codec-token generation), though GPU1's true number is
+understated here since code2wav's own compute isn't captured by this log source at all.
 
 ---
 
@@ -320,9 +373,10 @@ tweak could plausibly correct.
 | #4: application layer is negligible | ✅ | net_ms 0.18-0.61% of total; app-layer sub-segments not directly measurable, engine segments (picked up→admitted, admitted→first text) directly measured and dominate as in the doc |
 | #5: mbt knob fails both directions | ❌ not tested | requires new engine boots, out of scope here |
 
-The core mechanism reproduces cleanly and, in several places (evidence #1, #3, and the flat
-`gpu_util%` finding in the stage-0 window composition section), reproduces *more strongly* than
-the doc's own single-sample evidence could show. The one genuine divergence is the sharpness of
-the capacity wall itself — on this hardware it is a zone (32-40), not a single passing/failing
-boundary — which is itself consistent with, not contradictory to, the doc's own stated 17.5%
-run-to-run noise finding at exactly that load.
+The core mechanism reproduces cleanly and, in several places (evidence #1, #3, and the true
+GPU-utilization finding — climbing with load but still well under 50% even at the wall, the
+opposite signature of a hardware-bound system), reproduces *more strongly* than the doc's own
+single-sample evidence could show. The one genuine divergence is the sharpness of the capacity
+wall itself — on this hardware it is a zone (32-40), not a single passing/failing boundary —
+which is itself consistent with, not contradictory to, the doc's own stated 17.5% run-to-run
+noise finding at exactly that load.
