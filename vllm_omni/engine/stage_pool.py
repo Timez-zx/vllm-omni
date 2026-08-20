@@ -939,8 +939,12 @@ class StagePool:
                 # cadence, one line per audio chunk per request.
                 if _LOG_AUDIO_CHUNKS:
                     logger.info(
-                        "[AUDIO-CHUNK] stage=%s req=%s ts=%.6f frames=%d sr=%d",
-                        self.stage_id, rid, output_ts, audio_frames,
+                        "[AUDIO-CHUNK] stage=%s req=%s ts=%.6f mono=%.6f frames=%d sr=%d",
+                        self.stage_id,
+                        rid,
+                        output_ts,
+                        _time.monotonic(),
+                        audio_frames,
                         audio_sample_rate or 0,
                     )
             if self._audio_sample_rate_by_request.get(rid, 0) <= 0 and audio_sample_rate > 0:
