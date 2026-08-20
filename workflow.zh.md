@@ -100,7 +100,7 @@ talker 每步把一行 CPU payload 搬到 GPU。由普通 host memory 的同步 
 
 ### 历史容量结论
 
-以下数字只适用于提交 `f91091a6` 附近、`deploy_2gpu_seq256.yaml`、2× RTX PRO 6000、旧版 `analyze.py` 的 0 ms 预缓冲口径：
+以下数字来自提交 `f91091a6` 附近的已归档两卡实验，使用旧版 0 ms 预缓冲口径；对应旧 runner、配置和 analyzer 已从当前工作树删除：
 
 | Workload | 最大已测通过容量 | 首个失败点 | 主要限制 |
 |---|---:|---:|---|
@@ -132,38 +132,42 @@ AV 慢请求自己的输入 token 与快请求接近；差别是它到达时撞�
 
 此前 stateless handler 固定使用 `message_history[-2:]`，只包含上一轮，不是完整历史。现在 `history_max_turns` 定义为：`null` 全历史、`0` 无历史、正整数为最近 N 轮；默认仍为兼容性的 1 轮。
 
-### Workload 修正
+### 唯一容量 workload
 
-`mu_bench.py` 模拟闭环用户：等待回复实际播放完成，再思考 2–6 秒后开始下一轮，避免生成更快的系统被悄悄降低实际并发。
+容量测试只保留一种目标场景：持续 AV session。每个用户使用一条长期 WebSocket，行为与浏览器一致：
 
-同时增加：
+- 视频在整个 session 内每 500 ms 上传一帧；
+- 麦克风在用户聆听、思考和说话期间每 200 ms 上传 PCM；
+- assistant 第一段音频到达后暂停麦克风，等实际播放结束，再保留 300 ms echo guard；
+- 每轮使用真实 16 kHz mono PCM16 语音；同一 session 固定 speaker，录音不循环；
+- 语音末尾追加 700 ms endpoint silence，然后发送空文本 `video.query`，问题语义只来自音频；
+- 回复实际播放完后再进入 think time；think time 为确定性长尾分布，中位数约 3 秒，范围 1–12 秒；
+- 使用固定视频序列，但每个用户从不同 offset 开始。
 
-- 每用户、每轮不同的 synthetic audio，并记录 SHA256；
-- 确定且可审计的视频起始 offset；
-- 按 WAV header 解析采样率和样本数，不再假设固定 44-byte header；
-- 记录每个 audio delta 的到达时间和样本数；
-- 以默认 60 ms prebuffer 重放 1× 播放时间线，计算卡顿次数、总时长和最大值；
-- 记录 protocol mismatch、重复输入、source commit、dirty 状态和 deploy YAML SHA256。
+三种 session 策略使用同一个由 seed 生成的 `workload_plan.json`。计划、语音 corpus、视频帧集、source commit 和 deploy YAML 都写入哈希，确保策略之间只改变 session/KV policy。
 
-新增 CPU 行为测试覆盖 session identity、历史选择、workload 唯一性和 playback timeline；相关测试 38 项通过。
+客户端按 60 ms prebuffer 重放音频。容量通过条件为：预热轮之后全部 turn 完成、TTFA p99 < 1 s、每轮最大卡顿 p99 < 50 ms、无 protocol mismatch、client error 和 bad engine probe。
+
+旧的按视频内容拆分 matrix、audio-only p99 ladder 和 synthetic AV cell runner 已删除；`probe.py` 中的 synthetic media 只用于协议 smoke test，不参与容量结论。
+
+CPU 测试覆盖真实 WAV manifest、speaker/turn 计划、媒体 cadence、session identity 和 playback timeline。
 
 ### 当前缺口
 
-- `run_session_baselines.sh` 已保证三种策略使用同一个 matrix，但默认是 1/2/4/8/16 用户、30 轮、视频+文本问题、`audio_input_s=0`；正式容量测试前仍需补齐带音频输入的高并发阶梯。
-- 旧 `analyze.py` 从第一块立即播放，即 0 ms prebuffer；新 `mu_bench.py` 默认 60 ms prebuffer，并汇总 per-turn 最大卡顿的 p95。正式比较前必须统一预缓冲和 percentile。
-- 本阶段只有 CPU 测试，没有新的 GPU 容量结果。
+- 正式运行必须提供有足够 speaker/turn 的真实语音 manifest 和一个固定的真实视频帧序列。
+- 新 workload 尚未产生 GPU 容量结果；旧 0 ms prebuffer 和其他 workload 的数字只保留为历史诊断，不能与新结果直接比较。
 
 ## 当前标准实验流程
 
 1. 固定 source commit、deploy YAML 和硬件；结果必须记录 commit、dirty 状态和 YAML SHA256。
-2. 固定用户数、轮数、音频时长、视频内容与 cadence、问题集、think time、stagger 和 seed。
+2. 固定用户数、轮数、语音 corpus 与 turn plan、视频序列与 cadence、think time、stagger 和 seed。
 3. 每个 cell 重启 engine，避免残留 KV、request 或故障污染下一组。
 4. 三种 session baseline 只改变 session policy。
 5. 拐点附近至少使用多个 seed；历史运行间波动为 8–17%，单次小于 20% 的变化不直接宣称有效。
 6. 同时报 TTFA、播放卡顿、RTF、timeout、实际接入数、身份错误、GPU 指标和 engine probes。
 7. 先用日志证明 workload 与开关确实生效，再讨论容量。
 
-产出新的容量结论前，先固定当前分支的一份部署配置和 workload，并统一 0/60 ms prebuffer 与 p95/p99 口径。
+新的正式容量结论只使用 `origin_deploy_3gpu.yaml`、本节定义的 workload、60 ms prebuffer 和 p99 口径；历史结果不并入容量曲线。
 
 ## 关键代码
 
@@ -173,10 +177,12 @@ AV 慢请求自己的输入 token 与快请求接近；差别是它到达时撞�
 | Stateless 历史拼接 | `vllm_omni/entrypoints/openai/serving_video_stream.py` |
 | Session/turn/segment identity | `vllm_omni/entrypoints/openai/video_stream_state.py` |
 | 多用户 workload | `benchmarks/live_agent/web_client/mu_bench.py` |
+| AV workload 计划与媒体加载 | `benchmarks/live_agent/web_client/continuous_av_workload.py` |
+| AV 容量阶梯 | `benchmarks/live_agent/web_client/run_av_session_ladder.sh` |
 | 三种 session baseline | `benchmarks/live_agent/web_client/run_session_baselines.sh` |
 | 播放时间线 | `benchmarks/live_agent/playback_metrics.py` |
-| 旧版 SLO 分析 | `benchmarks/thinker_talker/analyze.py` |
-| 两卡历史容量部署 | `benchmarks/thinker_talker/deploy_2gpu_seq256.yaml` |
+| 正式三卡部署 | `benchmarks/thinker_talker/origin_deploy_3gpu.yaml` |
+| 运行机制验证 | `benchmarks/live_agent/analysis/verify_run.py` |
 | Scheduler/connector 开关 | `vllm_omni/core/sched/runtime_flags.py` |
 | Chunk transport | `vllm_omni/distributed/omni_connectors/transfer_adapter/chunk_transfer_adapter.py` |
 | Code predictor KV | `vllm_omni/model_executor/models/common/qwen3_code_predictor.py` |

@@ -10,14 +10,13 @@ checked statically:
   logs but the user reads as "the model ignored me");
 * a wrong audio container or sample rate (noise, not an exception).
 
-    PYTHONPATH=/home/zx/voice-agent/vllm-omni python selftest.py
+    python selftest.py
 """
 
 from __future__ import annotations
 
 import base64
 import io
-import json
 import pathlib
 import re
 import sys
@@ -68,21 +67,35 @@ def main() -> int:
     sent.pop("type", None)
     known = set(StreamingVideoSessionConfig.model_fields)
     unknown = sorted(set(sent) - known)
-    check("every key the page sends exists on the server model", not unknown,
-          f"unknown: {unknown}" if unknown else f"{len(sent)} keys, all known")
+    check(
+        "every key the page sends exists on the server model",
+        not unknown,
+        f"unknown: {unknown}" if unknown else f"{len(sent)} keys, all known",
+    )
 
     wanted = {
-        "session_scoped_request", "session_roll_at_talker_tokens", "session_roll_history_turns",
-        "max_frame_width", "max_frame_height", "enable_frame_filter", "frame_filter_min_gap",
-        "frame_filter_max_gap", "use_audio_in_video", "system_prompt", "modalities",
+        "session_scoped_request",
+        "session_roll_at_talker_tokens",
+        "session_roll_history_turns",
+        "max_frame_width",
+        "max_frame_height",
+        "enable_frame_filter",
+        "frame_filter_min_gap",
+        "frame_filter_max_gap",
+        "use_audio_in_video",
+        "system_prompt",
+        "modalities",
     }
     missing = sorted(wanted - set(sent))
-    check("the optimisations we care about are actually requested", not missing,
-          f"not sent: {missing}" if missing else f"all {len(wanted)} present")
+    check(
+        "the optimisations we care about are actually requested",
+        not missing,
+        f"not sent: {missing}" if missing else f"all {len(wanted)} present",
+    )
 
     # ---- 2. message types must be ones the server accepts ----
     print("\n2. message types against the server's dispatch")
-    base_src = (pathlib.Path(StreamingVideoSessionConfig.__module__.replace(".", "/") + ".py"))
+    base_src = pathlib.Path(StreamingVideoSessionConfig.__module__.replace(".", "/") + ".py")
     server_src = (pathlib.Path(__file__).resolve().parents[3] / base_src).read_text(encoding="utf-8")
     accepted = set(re.findall(r'msg_type == "([a-z._]+)"', server_src))
     accepted.add("session.config")  # handled in _receive_config, not the dispatch chain
@@ -92,23 +105,29 @@ def main() -> int:
     # you to ignore the test.
     client_sends = set(re.findall(r"socket\.send\(JSON\.stringify\(\{\s*type:\s*'([a-z._]+)'", app_js))
     if "type: 'session.config'" in app_js:
-        client_sends.add("session.config")   # built by buildSessionConfig, sent on open
+        client_sends.add("session.config")  # built by buildSessionConfig, sent on open
     bad = sorted(client_sends - accepted)
-    check("every type the page sends is dispatched by the server", not bad,
-          f"not accepted: {bad}" if bad else f"sends {sorted(client_sends)}")
+    check(
+        "every type the page sends is dispatched by the server",
+        not bad,
+        f"not accepted: {bad}" if bad else f"sends {sorted(client_sends)}",
+    )
 
     # Only what the server really sends. Its module docstring also lists the
     # CLIENT->server messages, and counting those as "emitted" made this test
     # demand the page handle session.config, which it sends rather than receives.
-    body = server_src.split('\"\"\"', 2)[-1]
+    body = server_src.split('"""', 2)[-1]
     emitted = set(re.findall(r'send_json\(\s*\{\s*"type":\s*"([a-z._]+)"', body))
     emitted |= set(re.findall(r'"type":\s*"(response\.[a-z._]+|session\.[a-z._]+)"', body))
     handled = set(re.findall(r"case '([a-z._]+)':", app_js))
     # response.* and session.* are the ones a user would notice going unhandled.
     notable = {e for e in emitted if e.startswith(("response.", "session."))}
     unhandled = sorted(notable - handled)
-    check("the page handles every response./session. event the server emits",
-          not unhandled, f"unhandled: {unhandled}" if unhandled else f"{len(notable)} events")
+    check(
+        "the page handles every response./session. event the server emits",
+        not unhandled,
+        f"unhandled: {unhandled}" if unhandled else f"{len(notable)} events",
+    )
 
     # probe.py claims to send "deliberately the same values app.js sends, so this probe and
     # the page exercise one configuration rather than two". That claim drifted the moment a
@@ -118,26 +137,35 @@ def main() -> int:
     probe_keys = set(re.findall(r'^\s*"([a-z_]+)":', probe_src, re.M)) & known
     page_only = sorted(set(sent) - probe_keys)
     probe_only = sorted(probe_keys - set(sent))
-    check("probe.py and the page send the same session config",
-          not page_only and not probe_only,
-          f"page-only {page_only}, probe-only {probe_only}" if (page_only or probe_only)
-          else f"{len(probe_keys)} keys in both")
+    check(
+        "probe.py and the page send the same session config",
+        not page_only and not probe_only,
+        f"page-only {page_only}, probe-only {probe_only}"
+        if (page_only or probe_only)
+        else f"{len(probe_keys)} keys in both",
+    )
 
     # ---- 3. the audio contract, both directions ----
     print("\n3. audio contract")
-    check("uplink is raw PCM16 at 16 kHz", "INPUT_RATE = 16000" in app_js
-          and "type: 'audio.chunk'" in app_js, "audio.chunk carries base64 PCM16")
+    check(
+        "uplink is raw PCM16 at 16 kHz",
+        "INPUT_RATE = 16000" in app_js and "type: 'audio.chunk'" in app_js,
+        "audio.chunk carries base64 PCM16",
+    )
+
+    import numpy as np
 
     from vllm_omni.entrypoints.openai.video_stream_base import OmniStreamingVideoHandler as H
-    import numpy as np
 
     tone = (0.2 * np.sin(2 * np.pi * 440 * np.arange(12000) / 24000)).astype(np.float32)
     wav_bytes = base64.b64decode(H._encode_audio_wav_b64(tone))
     with wave.open(io.BytesIO(wav_bytes), "rb") as w:
         rate, width, ch, n = w.getframerate(), w.getsampwidth(), w.getnchannels(), w.getnframes()
     check("downlink is a parsable WAV", True, f"{rate} Hz, {ch}ch, {width * 8}-bit, {n} frames")
-    check("the page parses the WAV header rather than assuming 44 bytes",
-          "decodeWav" in app_js and "'data'" in app_js and "'fmt '" in app_js)
+    check(
+        "the page parses the WAV header rather than assuming 44 bytes",
+        "decodeWav" in app_js and "'data'" in app_js and "'fmt '" in app_js,
+    )
     check("16-bit is what the page supports", width == 2, f"server emits {width * 8}-bit")
 
     # The whole reply has to survive, not just its first granule. Streaming requests are
@@ -148,7 +176,7 @@ def main() -> int:
     # Both delta modes had the bug, which is why an A/B between them showed no difference.
     import torch
 
-    granules = [7125, 48000, 48000, 32640]     # measured shape of one 151-char reply
+    granules = [7125, 48000, 48000, 32640]  # measured shape of one 151-char reply
     for mode in ("fast", "slow"):
         drained, emitted = 0, 0
         for n_samples in granules:
@@ -158,29 +186,40 @@ def main() -> int:
                     emitted += w.getnframes()
         # One codec frame comes off the first granule as a CausalConv artifact.
         expected = sum(granules) - 1920
-        check(f"delta mode {mode} delivers the whole reply", emitted == expected,
-              f"{emitted}/{expected} samples ({emitted / 24000:.2f}s of "
-              f"{sum(granules) / 24000:.2f}s produced)")
+        check(
+            f"delta mode {mode} delivers the whole reply",
+            emitted == expected,
+            f"{emitted}/{expected} samples ({emitted / 24000:.2f}s of {sum(granules) / 24000:.2f}s produced)",
+        )
 
     # ---- 4. the turn trigger must exist, because the server never fires one ----
     print("\n4. the turn trigger")
-    handler_src = (pathlib.Path(__file__).resolve().parents[3]
-                   / "vllm_omni/entrypoints/openai/serving_video_stream.py").read_text(encoding="utf-8")
-    m = re.search(r"def should_trigger_turn\(self[^)]*\)[^:]*:\s*\n\s*(?:\"\"\".*?\"\"\"\s*\n\s*)?return (\w+)",
-                  handler_src, re.S)
+    handler_src = (
+        pathlib.Path(__file__).resolve().parents[3] / "vllm_omni/entrypoints/openai/serving_video_stream.py"
+    ).read_text(encoding="utf-8")
+    m = re.search(
+        r"def should_trigger_turn\(self[^)]*\)[^:]*:\s*\n\s*(?:\"\"\".*?\"\"\"\s*\n\s*)?return (\w+)", handler_src, re.S
+    )
     server_never_triggers = bool(m) and m.group(1) == "False"
-    check("the server still never auto-starts a turn", server_never_triggers,
-          "should_trigger_turn returns False -- so the client MUST send video.query")
+    check(
+        "the server still never auto-starts a turn",
+        server_never_triggers,
+        "should_trigger_turn returns False -- so the client MUST send video.query",
+    )
     check("the page sends video.query", "type: 'video.query'" in app_js)
-    check("the page offers both auto-silence and push-to-talk",
-          "updateSilenceDetector" in app_js and "push to talk released" in app_js)
+    check(
+        "the page offers both auto-silence and push-to-talk",
+        "updateSilenceDetector" in app_js and "push to talk released" in app_js,
+    )
 
     # ---- 5. the page must not lie about who decides ----
     print("\n5. honesty of the UI")
     index_html = (APP / "index.html").read_text(encoding="utf-8")
-    check("the page tells the user turn-taking is client-side",
-          "no listen/speak decision of its own" in index_html,
-          "otherwise this gets confused with the natively duplex model")
+    check(
+        "the page tells the user turn-taking is client-side",
+        "no listen/speak decision of its own" in index_html,
+        "otherwise this gets confused with the natively duplex model",
+    )
 
     print()
     if FAILURES:

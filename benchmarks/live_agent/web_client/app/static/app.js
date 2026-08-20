@@ -82,7 +82,7 @@
   // 4 ms stall. Inaudible, but it is the reason not to shave this further. To widen it,
   // raise `initial_codec_chunk_frames` server-side rather than this.
   const PLAYBACK_PREBUFFER_MS = { fast: 60, smooth: 1400 };
-  const ECHO_GUARD_MS = 300;         // keep uploading this long after playback
+  const ECHO_GUARD_MS = 300;         // keep mic paused this long after playback
 
   // Silence detection, used only when the trigger mode is 'auto'. These are
   // deliberately conservative: a false trigger interrupts the user mid-sentence,
@@ -476,10 +476,8 @@
 
   function microphoneUploadEnabled() {
     if (muted) return false;
-    // Keep uploading during and just after playback so the stream is genuinely
-    // continuous -- audio arriving mid-turn is buffered by the server for the
-    // NEXT turn, so nothing is lost. The guard only suppresses the window where
-    // the speakers would feed the model its own voice.
+    // Match the current half-duplex product behavior: pause mic upload while the
+    // assistant is playing and for a short echo guard after the last audio.
     if (assistantSpeaking) return false;
     if (performance.now() - lastAudioAt < ECHO_GUARD_MS) return false;
     return true;

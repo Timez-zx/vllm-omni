@@ -198,7 +198,7 @@ def try_recv_via_connector(
 #   * MiniCPM-o 4.5, an independently designed model in the same thinker/talker family, hands
 #     its speech decoder only the GENERATED text tokens (<= 20 vectors per tick) and no visual
 #     positions at all. The architecture does not require them.
-#   * Measured here (run_talker_textonly_ab.sh, 5 turns/arm, 2026-07-31): the talker's
+#   * In the recorded five-turn control/treatment run: the talker's
 #     per-turn rows fall 817 -> 33, a 24.8x cut, and EVERY turn still produced audio on both
 #     arms. Length contract held exactly -- built == requested on all six prefills, zero
 #     mismatch warnings. Earlier, a 45x cut of the same conditioning by a different mechanism

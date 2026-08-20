@@ -7,7 +7,7 @@ as a stall. This drives one turn, records the arrival time and duration of every
 `response.audio.delta`, then replays the client's own buffering rule against those
 timestamps to find where the player would run dry -- and for how long.
 
-    PYTHONPATH=/home/zx/voice-agent/vllm-omni python audio_timeline.py --direct
+    python audio_timeline.py --direct
 
 The model: playback starts once PREBUFFER_MS of audio is queued, then consumes audio at
 exactly 1x. A stall happens whenever the queue empties before the next delta lands. That
@@ -29,7 +29,7 @@ import wave
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 from probe import session_config, synth_frame_jpeg, synth_speechlike_pcm  # noqa: E402
 
-DEFAULT_PREBUFFER_MS = 60.0     # keep in step with app.js PLAYBACK_PREBUFFER_MS
+DEFAULT_PREBUFFER_MS = 60.0  # keep in step with app.js PLAYBACK_PREBUFFER_MS
 
 
 def wav_seconds(raw: bytes) -> float:
@@ -39,6 +39,7 @@ def wav_seconds(raw: bytes) -> float:
 
 def wav_samples(raw: bytes) -> list[int]:
     import struct
+
     with wave.open(io.BytesIO(raw), "rb") as w:
         data = w.readframes(w.getnframes())
     return list(struct.unpack(f"<{len(data) // 2}h", data))
@@ -58,21 +59,25 @@ def seam_report(chunks: list[list[int]]) -> str:
     """
     within = []
     for c in chunks:
-        step = max(1, len(c) // 2000)          # sample the interior, do not walk 300k
+        step = max(1, len(c) // 2000)  # sample the interior, do not walk 300k
         within.extend(abs(c[i + 1] - c[i]) for i in range(0, len(c) - 1, step))
-    across = [abs(chunks[i + 1][0] - chunks[i][-1]) for i in range(len(chunks) - 1)
-              if chunks[i] and chunks[i + 1]]
+    across = [abs(chunks[i + 1][0] - chunks[i][-1]) for i in range(len(chunks) - 1) if chunks[i] and chunks[i + 1]]
     if not within or not across:
         return "  seams: not enough data"
     within.sort()
-    q = lambda p: within[min(len(within) - 1, int(len(within) * p))]
+
+    def q(p: float) -> int:
+        return within[min(len(within) - 1, int(len(within) * p))]
+
     worse = sum(1 for a in across if a > q(0.999))
-    return (f"  seams: {len(across)} join(s); worst jump {max(across)}, "
-            f"median {sorted(across)[len(across) // 2]}\n"
-            f"         within-chunk jumps: p50 {q(0.5)}, p99 {q(0.99)}, p99.9 {q(0.999)}, "
-            f"max {within[-1]}\n"
-            f"         {worse}/{len(across)} join(s) exceed the within-chunk p99.9 "
-            f"-> {'AUDIBLE CLICKS LIKELY' if worse else 'no seam stands out'}")
+    return (
+        f"  seams: {len(across)} join(s); worst jump {max(across)}, "
+        f"median {sorted(across)[len(across) // 2]}\n"
+        f"         within-chunk jumps: p50 {q(0.5)}, p99 {q(0.99)}, p99.9 {q(0.999)}, "
+        f"max {within[-1]}\n"
+        f"         {worse}/{len(across)} join(s) exceed the within-chunk p99.9 "
+        f"-> {'AUDIBLE CLICKS LIKELY' if worse else 'no seam stands out'}"
+    )
 
 
 def simulate(deltas: list[tuple[float, float]], prebuffer_s: float) -> dict:
@@ -109,14 +114,16 @@ def simulate(deltas: list[tuple[float, float]], prebuffer_s: float) -> dict:
 async def run(args) -> int:
     import websockets
 
-    url = args.url or ("ws://127.0.0.1:8091/v1/video/chat/stream" if args.direct
-                       else "ws://127.0.0.1:7870/ws")
+    url = args.url or ("ws://127.0.0.1:8091/v1/video/chat/stream" if args.direct else "ws://127.0.0.1:7870/ws")
     print(f"connecting to {url}")
     async with websockets.connect(url, max_size=None, ping_interval=20) as ws:
-        await ws.send(json.dumps(session_config(
-            "You are a friendly voice assistant in a live video call. "
-            "Always answer with both text and speech."
-        )))
+        await ws.send(
+            json.dumps(
+                session_config(
+                    "You are a friendly voice assistant in a live video call. Always answer with both text and speech."
+                )
+            )
+        )
         state: dict = {"deltas": [], "pcm": [], "text": "", "t0": None, "done": False}
 
         async def reader() -> None:
@@ -128,9 +135,7 @@ async def run(args) -> int:
                 t = msg.get("type")
                 if t == "response.audio.delta":
                     raw_wav = base64.b64decode(msg.get("data", ""))
-                    state["deltas"].append(
-                        (time.monotonic() - state["t0"], wav_seconds(raw_wav))
-                    )
+                    state["deltas"].append((time.monotonic() - state["t0"], wav_seconds(raw_wav)))
                     state["pcm"].append(wav_samples(raw_wav))
                 elif t == "response.text.delta":
                     state["text"] += msg.get("delta", "")
@@ -143,10 +148,10 @@ async def run(args) -> int:
         task = asyncio.create_task(reader())
 
         for _ in range(4):
-            await ws.send(json.dumps({"type": "video.frame",
-                                      "data": base64.b64encode(synth_frame_jpeg("t")).decode()}))
-            await ws.send(json.dumps({"type": "audio.chunk",
-                                      "data": base64.b64encode(synth_speechlike_pcm(0.5)).decode()}))
+            await ws.send(json.dumps({"type": "video.frame", "data": base64.b64encode(synth_frame_jpeg("t")).decode()}))
+            await ws.send(
+                json.dumps({"type": "audio.chunk", "data": base64.b64encode(synth_speechlike_pcm(0.5)).decode()})
+            )
             await asyncio.sleep(0.1)
 
         # Several turns, because the arrival schedule of turn 2 is not something turn 1
@@ -165,8 +170,9 @@ async def run(args) -> int:
             turns.append((state["deltas"][:], state["text"], state["pcm"][:]))
             # Speak again between turns, the way a live client would.
             for _ in range(3):
-                await ws.send(json.dumps({"type": "audio.chunk",
-                                          "data": base64.b64encode(synth_speechlike_pcm(0.5)).decode()}))
+                await ws.send(
+                    json.dumps({"type": "audio.chunk", "data": base64.b64encode(synth_speechlike_pcm(0.5)).decode()})
+                )
                 await asyncio.sleep(0.05)
         await ws.send(json.dumps({"type": "video.done"}))
         task.cancel()
@@ -195,8 +201,10 @@ def report(deltas, args) -> None:
         print(f"{i:>5} {t:>8.3f}s {dur:>8.3f} {t - prev:>14.3f}s")
         prev = t
     total_audio = sum(d for _, d in deltas)
-    print(f"\ntotal audio {total_audio:.2f}s delivered over {deltas[-1][0]:.2f}s wall "
-          f"(rtf {deltas[-1][0] / total_audio:.2f})")
+    print(
+        f"\ntotal audio {total_audio:.2f}s delivered over {deltas[-1][0]:.2f}s wall "
+        f"(rtf {deltas[-1][0] / total_audio:.2f})"
+    )
 
     sim = simulate(deltas, args.prebuffer_ms / 1000.0)
     print(f"\nplayback simulation at prebuffer={args.prebuffer_ms:.0f}ms:")
@@ -218,13 +226,13 @@ def report(deltas, args) -> None:
         if s["start"] is None:
             print(f"  {ms:>5}ms  never starts on the threshold alone")
             continue
-        print(f"  {ms:>5}ms  start {s['start']:.3f}s  "
-              f"{len(s['stalls'])} stall(s), {s['stall_total'] * 1000:.0f}ms silent")
+        print(
+            f"  {ms:>5}ms  start {s['start']:.3f}s  {len(s['stalls'])} stall(s), {s['stall_total'] * 1000:.0f}ms silent"
+        )
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--url", default=None)
     p.add_argument("--direct", action="store_true", help="bypass the page-server proxy")
     p.add_argument("--query", default="Please count slowly from one to fifteen.")

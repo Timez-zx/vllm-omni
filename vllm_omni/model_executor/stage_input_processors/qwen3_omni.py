@@ -641,7 +641,7 @@ def thinker2talker_async_chunk(
     #    forward's batch. An append parks the talker, so it leaves the batch and is re-admitted
     #    on an output row -- readable only from CPU, and reads -1. codec_embedding has 3072
     #    rows, so `indexSelectSmallIndex: srcIndex < srcSelectDimSize`, stage 1 dead. FIXED by
-    #    `async_scheduling: false` on stage 1 in deploy_web_demo.yaml, not here.
+    #    `async_scheduling: false` on stage 1 in the deploy YAML, not here.
     #
     # 2. A prefill tensor labelled as a decode payload -- what this branch prevents. An append
     #    stops on the very forward that prefills it, and omni_ar_scheduler.py clears

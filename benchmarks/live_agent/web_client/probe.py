@@ -10,8 +10,8 @@ media so no device or permission is involved:
 
     session.config -> audio.chunk* + video.frame* -> video.query -> audio back
 
-    PYTHONPATH=/home/zx/voice-agent/vllm-omni python probe.py            # via the page server
-    PYTHONPATH=/home/zx/voice-agent/vllm-omni python probe.py --direct   # straight to the engine
+    python probe.py            # via the page server
+    python probe.py --direct   # straight to the engine
 """
 
 from __future__ import annotations
@@ -45,10 +45,7 @@ def synth_speechlike_pcm(seconds: float, *, variant: int = 0) -> bytes:
     for i in range(n):
         t = i / RATE
         env = 0.35 * (1.0 + math.sin(2 * math.pi * 3.0 * t + phase)) / 2.0
-        sample = env * (
-            0.6 * math.sin(2 * math.pi * low_hz * t)
-            + 0.4 * math.sin(2 * math.pi * high_hz * t + phase)
-        )
+        sample = env * (0.6 * math.sin(2 * math.pi * low_hz * t) + 0.4 * math.sin(2 * math.pi * high_hz * t + phase))
         out += struct.pack("<h", max(-32768, min(32767, int(sample * 32767))))
     return bytes(out)
 
@@ -104,18 +101,24 @@ async def run(args) -> int:
     try:
         ws = await asyncio.wait_for(websockets.connect(url, max_size=None), timeout=15)
     except Exception as exc:
-        print(f"\n!! cannot connect: {exc}\n"
-              f"   engine health:  curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:8091/health\n"
-              f"   page server:    curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:7870/healthz\n",
-              file=sys.stderr)
+        print(
+            f"\n!! cannot connect: {exc}\n"
+            f"   engine health:  curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:8091/health\n"
+            f"   page server:    curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:7870/healthz\n",
+            file=sys.stderr,
+        )
         return 2
 
     turns_ok = 0
     async with ws:
-        await ws.send(json.dumps(session_config(
-            "You are a friendly voice assistant in a live video call. Reply out loud in one or two "
-            "short sentences. Always answer with both text and speech."
-        )))
+        await ws.send(
+            json.dumps(
+                session_config(
+                    "You are a friendly voice assistant in a live video call. Reply out loud in one or two "
+                    "short sentences. Always answer with both text and speech."
+                )
+            )
+        )
 
         state = {"text": "", "wavs": [], "t_query": None, "first_audio_ms": None, "done": False}
 
@@ -153,17 +156,25 @@ async def run(args) -> int:
             next_frame_at = 0.0
             elapsed = 0.0
             for off in range(0, len(pcm), chunk):
-                await ws.send(json.dumps({
-                    "type": "audio.chunk",
-                    "data": base64.b64encode(pcm[off:off + chunk]).decode(),
-                }))
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "audio.chunk",
+                            "data": base64.b64encode(pcm[off : off + chunk]).decode(),
+                        }
+                    )
+                )
                 elapsed += 0.1
                 if elapsed >= next_frame_at:
                     next_frame_at = elapsed + 0.5
-                    await ws.send(json.dumps({
-                        "type": "video.frame",
-                        "data": base64.b64encode(synth_frame_jpeg(str(turn))).decode(),
-                    }))
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "video.frame",
+                                "data": base64.b64encode(synth_frame_jpeg(str(turn))).decode(),
+                            }
+                        )
+                    )
                     frames += 1
                 await asyncio.sleep(0.1)
 
@@ -186,10 +197,12 @@ async def run(args) -> int:
             secs = samples / rate if rate else 0.0
             ok = samples > 0
             turns_ok += 1 if ok else 0
-            print(f"turn {turn}: frames={frames} chunks={len(state['wavs'])} "
-                  f"audio={secs:.2f}s@{rate or '?'}Hz "
-                  f"first_audio={state['first_audio_ms'] and round(state['first_audio_ms']) or '-'}ms "
-                  f"{'OK' if ok else 'NO AUDIO'}")
+            print(
+                f"turn {turn}: frames={frames} chunks={len(state['wavs'])} "
+                f"audio={secs:.2f}s@{rate or '?'}Hz "
+                f"first_audio={state['first_audio_ms'] and round(state['first_audio_ms']) or '-'}ms "
+                f"{'OK' if ok else 'NO AUDIO'}"
+            )
             if state["text"]:
                 print(f"         text: {state['text'][:110]}")
 
@@ -204,16 +217,14 @@ async def run(args) -> int:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--url", default=None)
-    p.add_argument("--direct", action="store_true",
-                   help="bypass the page server and talk to the engine")
+    p.add_argument("--direct", action="store_true", help="bypass the page server and talk to the engine")
     p.add_argument("--turns", type=int, default=2)
     p.add_argument("--speak-s", type=float, default=2.0)
     p.add_argument("--query", default="", help="empty means the question is in the audio")
     p.add_argument("--timeout-s", type=float, default=120.0)
     args = p.parse_args()
     if args.url is None:
-        args.url = ("ws://127.0.0.1:8091/v1/video/chat/stream" if args.direct
-                    else "ws://127.0.0.1:7870/ws")
+        args.url = "ws://127.0.0.1:8091/v1/video/chat/stream" if args.direct else "ws://127.0.0.1:7870/ws"
     try:
         return asyncio.run(run(args))
     except KeyboardInterrupt:

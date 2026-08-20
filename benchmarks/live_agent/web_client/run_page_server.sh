@@ -1,25 +1,14 @@
 #!/usr/bin/env bash
-# Serve the live-session page and proxy its websocket to the engine.
-#
-# A script for the same reason run_qwen_server.sh is one: inline backgrounding
-# has lost the working directory and the redirect in this project, and the
-# symptom looks like the server failing rather than the launcher failing.
-#
-#   bash run_page_server.sh          # foreground; Ctrl-C to stop
+# Serve the browser and proxy its WebSocket to the Qwen engine.
 set -uo pipefail
 
-FORK=${FORK:-/home/ubuntu/data/vllm-omni}
-PY=${PY:-/home/ubuntu/miniconda3/envs/omni/bin/python}
-PORT="${1:-7870}"
-BACKEND="${2:-ws://127.0.0.1:8091}"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../../.." && pwd)
+PYTHON_BIN=${MU_PYTHON:-python3}
+PORT=${MU_PAGE_PORT:-${1:-7870}}
+BACKEND=${MU_BACKEND_URL:-${2:-ws://127.0.0.1:8091}}
 
-echo "page      http://127.0.0.1:${PORT}/"
-echo "engine    ${BACKEND}/v1/video/chat/stream"
-echo
-echo "On your Mac:  ssh -N -L ${PORT}:127.0.0.1:${PORT} <server>"
-echo "Then open:    http://localhost:${PORT}/"
-echo
-
-cd "$FORK"
-PYTHONPATH="$FORK" exec "$PY" benchmarks/live_agent/web_client/server.py \
+echo "page:   http://127.0.0.1:$PORT/"
+echo "engine: $BACKEND/v1/video/chat/stream"
+PYTHONPATH="$REPO_ROOT" exec "$PYTHON_BIN" "$SCRIPT_DIR/server.py" \
   --port "$PORT" --ws-backend "$BACKEND"

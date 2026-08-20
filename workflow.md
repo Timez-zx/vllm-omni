@@ -100,7 +100,7 @@ This improved mid-response playback but did not solve TTFA. Even bypassing code2
 
 ### Historical capacity result
 
-The following results apply only to the code near `f91091a6`, `deploy_2gpu_seq256.yaml`, 2× RTX PRO 6000, and the old `analyze.py` convention with zero playback prebuffer:
+The following numbers come from the archived two-GPU experiment near `f91091a6` and use its legacy zero-prebuffer convention. Its old runner, deploy files, and analyzer have been removed from the current tree:
 
 | Workload | Largest passing point | First failing point | Limiting behavior |
 |---|---:|---:|---|
@@ -132,38 +132,42 @@ Commit: `b726effe`. This phase changes no scheduler, KV manager, or model execut
 
 The stateless handler previously used `message_history[-2:]`, which retained only the previous turn rather than full history. `history_max_turns` now means: `null` for all history, `0` for none, and a positive integer for the most recent N turns. The compatibility default remains one turn.
 
-### Workload corrections
+### The single capacity workload
 
-`mu_bench.py` now models closed-loop users: it waits until the response would finish playing, then waits another random 2–6 seconds before starting the next turn. A faster-delivering engine therefore cannot reduce its own effective concurrency by starting the next turn early.
+Capacity testing keeps one target scenario: a continuous AV session. Each user owns one long-lived WebSocket and mirrors the browser:
 
-The benchmark also adds:
+- video sends one frame every 500 ms for the full session;
+- microphone PCM is sent every 200 ms while the user listens, thinks, or speaks;
+- microphone upload pauses at first assistant audio, resumes after actual playback, and observes a 300 ms echo guard;
+- every turn uses a real 16 kHz mono PCM16 recording; one session keeps one speaker and never loops a recording;
+- 700 ms endpoint silence follows the utterance, then an empty `video.query` is sent, so semantics come only from audio;
+- the next think period starts after playback; think time is a deterministic long-tailed distribution with median near 3 s and bounds of 1–12 s;
+- all users share one fixed video sequence but start at different offsets.
 
-- distinct synthetic audio for every user and turn, with SHA256 fingerprints;
-- deterministic, auditable video start offsets;
-- WAV-header parsing for sample rate and frame count instead of assuming a 44-byte header;
-- arrival timestamps and sample counts for every audio delta;
-- 1× playback replay with a default 60 ms prebuffer, producing stall count, total, and maximum;
-- protocol mismatches, duplicate inputs, source commit/dirty state, and deploy-YAML SHA256.
+All three session policies consume the same seed-derived `workload_plan.json`. The plan, audio corpus, frame set, source commit, and deploy YAML are hashed so only the session/KV policy changes between arms.
 
-CPU behavior tests cover session identity, history selection, workload uniqueness, and playback timelines; 38 relevant tests pass.
+The client replays output with a 60 ms prebuffer. A capacity cell passes only when every post-warmup turn completes, TTFA p99 < 1 s, per-turn maximum stall p99 < 50 ms, and there are no protocol mismatches, client errors, or bad engine probes.
+
+The per-content matrix, audio-only p99 ladder, and synthetic AV cell runner have been removed. Synthetic media in `probe.py` remains only for protocol smoke tests and cannot support a capacity claim.
+
+CPU tests cover real-WAV manifests, speaker/turn plans, media cadence, session identity, and playback timelines.
 
 ### Remaining gaps
 
-- `run_session_baselines.sh` applies the same matrix to all three policies, but its default is 1/2/4/8/16 users, 30 turns, video plus text queries, and `audio_input_s=0`. A high-concurrency ladder with audio input is still required for a capacity result.
-- The old `analyze.py` starts playback immediately at the first chunk, while the new `mu_bench.py` defaults to a 60 ms prebuffer and summarizes the p95 of per-turn maximum stall. Buffering and percentile conventions must be unified before formal comparison.
-- This phase has CPU tests but no new GPU capacity result.
+- A formal run requires a real speech manifest with enough speakers and turns, plus one fixed real-video frame sequence.
+- The new workload has no GPU capacity result yet. Historical zero-prebuffer or other-workload numbers are diagnostic only and are not comparable with new results.
 
 ## Current experiment procedure
 
 1. Pin the source commit, deploy YAML, and hardware; record commit, dirty state, and YAML SHA256.
-2. Fix user count, turns, audio duration, video content and cadence, question set, think time, stagger, and seed.
+2. Fix user count, turns, speech corpus and turn plan, video sequence and cadence, think time, stagger, and seed.
 3. Restart the engine for every cell so KV, requests, or failures cannot leak into the next result.
 4. Change only the session policy across the three baselines.
 5. Use multiple seeds near the knee. Historical run-to-run variation is 8–17%, so a one-run change below 20% is not a result.
 6. Report TTFA, playback stalls, RTF, timeouts, admitted users, identity errors, GPU metrics, and engine probes together.
 7. Verify from logs that the workload and mechanism actually ran before interpreting capacity.
 
-Before publishing a new capacity result, pin one current-branch deployment and workload and unify the 0/60 ms prebuffer and p95/p99 conventions.
+New formal capacity claims use only `origin_deploy_3gpu.yaml`, this workload, a 60 ms prebuffer, and p99; historical results do not enter the capacity curve.
 
 ## Key code
 
@@ -173,10 +177,12 @@ Before publishing a new capacity result, pin one current-branch deployment and w
 | Stateless history construction | `vllm_omni/entrypoints/openai/serving_video_stream.py` |
 | Session/turn/segment identity | `vllm_omni/entrypoints/openai/video_stream_state.py` |
 | Multi-user workload | `benchmarks/live_agent/web_client/mu_bench.py` |
+| AV workload planning and media loading | `benchmarks/live_agent/web_client/continuous_av_workload.py` |
+| AV capacity ladder | `benchmarks/live_agent/web_client/run_av_session_ladder.sh` |
 | Three session baselines | `benchmarks/live_agent/web_client/run_session_baselines.sh` |
 | Playback timeline | `benchmarks/live_agent/playback_metrics.py` |
-| Legacy SLO analysis | `benchmarks/thinker_talker/analyze.py` |
-| Historical two-GPU capacity deployment | `benchmarks/thinker_talker/deploy_2gpu_seq256.yaml` |
+| Canonical three-GPU deployment | `benchmarks/thinker_talker/origin_deploy_3gpu.yaml` |
+| Run-mechanism verification | `benchmarks/live_agent/analysis/verify_run.py` |
 | Scheduler and connector flags | `vllm_omni/core/sched/runtime_flags.py` |
 | Chunk transport | `vllm_omni/distributed/omni_connectors/transfer_adapter/chunk_transfer_adapter.py` |
 | Code predictor KV | `vllm_omni/model_executor/models/common/qwen3_code_predictor.py` |

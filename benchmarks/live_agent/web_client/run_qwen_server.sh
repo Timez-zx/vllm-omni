@@ -1,101 +1,118 @@
 #!/usr/bin/env bash
-# Bring up Qwen3-Omni for the browser live session, with the merged optimisations.
-#
-# A script rather than an inline command on purpose: backgrounding a long
-# `cd X && ENV=1 setsid ... &` chain has repeatedly lost either the working
-# directory or the redirect in this project, and the symptom (an empty log, or a
-# stale one) looks like the server failing rather than the launcher failing.
-#
-#   bash run_qwen_server.sh            # start, wait for health, report
-#
-# Nothing may be inserted between the env assignments and the command: a comment
-# after a backslash continuation comments out the rest of the line, PYTHONPATH
-# silently stops being exported, and the server comes up on site-packages with
-# none of our changes.
+# Start the canonical three-GPU Qwen3-Omni engine and wait for health.
 set -uo pipefail
 
-FORK=/home/zx/voice-agent/vllm-omni
-PY=/home/zx/miniconda3/envs/omni-minicpm/bin/vllm-omni
-LOG="${QWEN_LOG:-/data/zx/results/qwen_live.log}"
-PORT=8091
-# DEFAULT MODE (2026-08-08): two processes -- the speech pair (talker +
-# code2wav) colocated in one process, the thinker in its own. This is the
-# split the evidence picked: the pair's fine-grained per-chunk handoff wants
-# one process (in-proc references, kernel overlap where speech starved), the
-# thinker's heavy Python bookkeeping wants its own GIL. It also set the
-# extreme-load record (128-user rtf 1.13). Override with
-#   VLLM_OMNI_COLOCATE_STAGES=""        # three separate processes
-#   VLLM_OMNI_COLOCATE_STAGES="2:1,0:1" # tri-colocation (research platform)
-# The async deploy config routes both edges through ColocInProcConnector,
-# which delegates to SharedMemory automatically for cross-process edges, so
-# ONE yaml serves every mode.
-export VLLM_OMNI_COLOCATE_STAGES="${VLLM_OMNI_COLOCATE_STAGES-2:1}"
-# DEFAULT DEPLOY (2026-08-08, workflow section 22): talker runs a 4k sliding
-# attention window + FP8 KV, shares 0.72/0.10/0.08 -- per-user talker
-# residency capped at ~window, audio capacity no longer pool-bound. The
-# previous default (full-attention talker) is deploy_mu_fp8_s128_async.yaml.
-DEPLOY="${DEPLOY_CONFIG:-$FORK/benchmarks/live_agent/web_client/deploy_mu_sw4k_kvfp8.yaml}"
-# QWEN_MODEL swaps the checkpoint without touching this file -- used for the
-# FP8 experiment: marksverdhei/Qwen3-Omni-30B-A3B-FP8 is a block-FP8 E4M3
-# quant of the SAME Instruct base (thinker+talker FP8; encoders, code2wav,
-# embeddings, norms, MoE gates kept bf16).
-MODEL="${QWEN_MODEL:-Qwen/Qwen3-Omni-30B-A3B-Instruct}"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../../.." && pwd)
+RESULTS_DIR=${RESULTS_DIR:-/tmp/vllm-omni-results}
+LOG=${QWEN_LOG:-$RESULTS_DIR/qwen_live.log}
+PORT=${MU_PORT:-8091}
+DEPLOY=${DEPLOY_CONFIG:-$REPO_ROOT/benchmarks/thinker_talker/origin_deploy_3gpu.yaml}
+MODEL=${QWEN_MODEL:-Qwen/Qwen3-Omni-30B-A3B-Instruct}
+VLLM_OMNI_BIN=${VLLM_OMNI_BIN:-$(command -v vllm-omni || true)}
+GPU_IDS=${MU_GPU_IDS:-0,1,2}
+MIN_FREE_MIB=${MU_MIN_FREE_MIB:-60000}
 
-[ -f "$DEPLOY" ] || { echo "!! deploy config missing: $DEPLOY"; exit 1; }
+[ -n "$VLLM_OMNI_BIN" ] && [ -x "$VLLM_OMNI_BIN" ] || {
+  echo "set VLLM_OMNI_BIN to the vllm-omni executable" >&2
+  exit 2
+}
+[ -f "$DEPLOY" ] || {
+  echo "deploy config missing: $DEPLOY" >&2
+  exit 2
+}
+deploy_name=${DEPLOY##*/}
+[ "$deploy_name" = "origin_deploy_3gpu.yaml" ] || {
+  echo "formal runs are pinned to origin_deploy_3gpu.yaml: $DEPLOY" >&2
+  exit 2
+}
+[ -z "${VLLM_OMNI_COLOCATE_STAGES:-}" ] || {
+  echo "origin_deploy_3gpu.yaml requires three separate stage processes; unset VLLM_OMNI_COLOCATE_STAGES" >&2
+  exit 2
+}
 
-free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits)
-if [ "$free" -lt 80000 ]; then
-  echo "!! only ${free} MiB free -- Qwen3-Omni needs ~80 GB. Someone else may be on the card."
-  nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader
-  exit 1
-fi
 
-echo "== which vllm_omni will load =="
-PYTHONPATH="$FORK" $(dirname "$PY")/python -c "
-import vllm_omni, os
-p = os.path.dirname(vllm_omni.__file__)
-print('  ', p)
-assert '/voice-agent/vllm-omni/' in p, 'NOT the fork -- aborting'
-from vllm_omni.entrypoints.openai.video_stream_base import StreamingVideoSessionConfig as C
-need = {'session_scoped_request','session_roll_at_talker_tokens','max_frame_width','frame_filter_min_gap'}
-assert need <= set(C.model_fields), 'merged optimisations missing from the config model'
-from vllm_omni.distributed.omni_connectors.adapter import TALKER_TEXT_ONLY
-print('   optimisations present; talker text-only =', TALKER_TEXT_ONLY)
-" 2>&1 | grep -vE "NVFP4|RuntimeWarning|^This typically|^Using fallback|from .version|_version'|patch.py" || exit 1
+for variable in \
+  VLLM_OMNI_INLINE_RECV VLLM_OMNI_INLINE_RECV_ASYNC VLLM_OMNI_INLINE_SEND \
+  VLLM_OMNI_MAILBOX VLLM_OMNI_STREAM_VOCODER VLLM_OMNI_FUSED_SNAKE \
+  VLLM_OMNI_T2T_LEAN_DECODE VLLM_OMNI_TALKER_TEXT_ONLY; do
+  if [ -n "${!variable+x}" ]; then
+    echo "unset $variable for the canonical baseline" >&2
+    exit 2
+  fi
+done
 
-# Keep the PREVIOUS log instead of truncating it. A crash is investigated after the fact,
-# by which time the natural next move is to restart -- and truncating here destroyed the only
-# copy of a stage-1 CUDA device-side assert that had just killed the engine. One generation
-# back is enough and costs nothing.
+IFS=',' read -r -a gpu_ids <<< "$GPU_IDS"
+[ "${#gpu_ids[@]}" -eq 3 ] || {
+  echo "MU_GPU_IDS must contain exactly three GPU ids: $GPU_IDS" >&2
+  exit 2
+}
+for gpu in "${gpu_ids[@]}"; do
+  free=$(nvidia-smi --id="$gpu" --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null)
+  [ -n "$free" ] || {
+    echo "cannot query GPU $gpu" >&2
+    exit 2
+  }
+  if [ "$free" -lt "$MIN_FREE_MIB" ]; then
+    echo "GPU $gpu has only ${free} MiB free; need at least ${MIN_FREE_MIB} MiB" >&2
+    exit 2
+  fi
+done
+
+PYTHON_BIN=$(dirname -- "$VLLM_OMNI_BIN")/python
+REPO_ROOT_ENV="$REPO_ROOT" PYTHONPATH="$REPO_ROOT" "$PYTHON_BIN" -c '
+import os
+from pathlib import Path
+import vllm_omni
+from vllm_omni.entrypoints.openai.video_stream_base import StreamingVideoSessionConfig
+
+repo = Path(os.environ["REPO_ROOT_ENV"]).resolve()
+loaded = Path(vllm_omni.__file__).resolve()
+assert repo in loaded.parents, f"loaded {loaded}, expected checkout under {repo}"
+required = {
+    "session_scoped_request",
+    "session_roll_at_talker_tokens",
+    "max_frame_width",
+    "frame_filter_min_gap",
+}
+assert required <= set(StreamingVideoSessionConfig.model_fields)
+print(f"vllm_omni: {loaded}")
+' || exit 1
+
+mkdir -p "$(dirname -- "$LOG")"
 [ -s "$LOG" ] && mv -f "$LOG" "$LOG.prev"
 : > "$LOG"
-# TALKER_TEXT_ONLY is passed through so the A/B can be run without editing this
-# file: VLLM_OMNI_TALKER_TEXT_ONLY=0 bash run_qwen_server.sh gives the control arm.
-HF_HOME=/data/zx/hf CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$FORK" \
+
+extra_args=()
+if [ -n "${QWEN_EXTRA_ARGS:-}" ]; then
+  read -r -a extra_args <<< "$QWEN_EXTRA_ARGS"
+fi
+
+CUDA_VISIBLE_DEVICES="$GPU_IDS" PYTHONPATH="$REPO_ROOT" \
 VLLM_OMNI_TALKER_TEXT_ONLY="${VLLM_OMNI_TALKER_TEXT_ONLY:-1}" \
 VLLM_OMNI_LOG_SESSION_OUTPUTS=1 \
-setsid "$PY" serve "$MODEL" \
+setsid "$VLLM_OMNI_BIN" serve "$MODEL" \
   --omni --deploy-config "$DEPLOY" \
   --trust-remote-code --host 127.0.0.1 --port "$PORT" \
-  --init-timeout 3000 --stage-init-timeout 1500 ${QWEN_EXTRA_ARGS:-} >> "$LOG" 2>&1 &
+  --init-timeout 3000 --stage-init-timeout 1500 \
+  "${extra_args[@]}" >> "$LOG" 2>&1 &
 
-echo "== waiting for health (about 2-3 minutes) =="
+echo "waiting for engine health on port $PORT"
 for i in $(seq 1 200); do
-  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:${PORT}/health" 2>/dev/null)
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null)
   if [ "$code" = "200" ]; then
-    echo "READY after ~$((i*5))s"
-    nvidia-smi --query-gpu=memory.used --format=csv,noheader
+    echo "engine ready after about $((i * 5)) s"
+    nvidia-smi --id="$GPU_IDS" --query-gpu=index,memory.used --format=csv,noheader
     exit 0
   fi
-  # Report the deepest exception rather than the first line that contains the
-  # word "error", which is usually a benign warning.
   if grep -qE "Engine core initialization failed|not enough GPU memory|ModuleNotFoundError|FileNotFoundError" "$LOG" 2>/dev/null; then
-    echo "!! STARTUP FAILED"
-    sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -E "^\S*\s*(\w+Error|\w+Exception):" | tail -4 | cut -c1-200
+    echo "engine startup failed; see $LOG" >&2
+    tail -20 "$LOG" >&2
     exit 1
   fi
   sleep 5
 done
-echo "!! TIMEOUT after 1000s"
-sed 's/\x1b\[[0-9;]*m//g' "$LOG" | tail -6 | cut -c1-170
+
+echo "engine health timeout; see $LOG" >&2
+tail -20 "$LOG" >&2
 exit 2

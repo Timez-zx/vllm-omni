@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Where does the p99 TTFA increase come from as audio-only users scale?
+"""Where does p99 TTFA increase as continuous-AV sessions scale?
 
-Input: cell directories from run_p99_ladder.sh (turns.jsonl per cell, with the
+Input: cell directories from run_av_session_ladder.sh (turns.jsonl per cell, with the
 absolute per-turn stamps t_q/t_ft/t_fa/t_done that mu_bench.py records).
 
 Four decompositions, each aimed at one hypothesis:
@@ -26,8 +26,9 @@ Four decompositions, each aimed at one hypothesis:
   4. HYGIENE -- timeouts, session rolls, bad probes per cell (from
      summary.json), so a pathological cell cannot masquerade as a scaling law.
 
-    p99_attribution.py --cells '/data/zx/results/p99aud_none_u*'
+    p99_attribution.py --cells '/tmp/vllm-omni-results/avsession_*_u*'
 """
+
 from __future__ import annotations
 
 import argparse
@@ -58,8 +59,7 @@ def load_cell(d: pathlib.Path) -> dict:
                 recs.append(json.loads(line))
     summary = json.loads((d / "summary.json").read_text()) if (d / "summary.json").exists() else {}
     m = re.search(r"_u(\d+)$", d.name)
-    return {"dir": d, "users": int(m.group(1)) if m else summary.get("users", 0),
-            "recs": recs, "summary": summary}
+    return {"dir": d, "users": int(m.group(1)) if m else summary.get("users", 0), "recs": recs, "summary": summary}
 
 
 def arrival_state(recs: list[dict]) -> None:
@@ -83,17 +83,23 @@ def arrival_state(recs: list[dict]) -> None:
 
 
 def cell_report(cell: dict) -> dict:
-    ok = [r for r in cell["recs"] if r.get("status") == "ok"
-          and r.get("ttfa_ms") is not None and r.get("ttft_ms") is not None]
+    ok = [
+        r
+        for r in cell["recs"]
+        if r.get("status") == "ok" and r.get("ttfa_ms") is not None and r.get("ttft_ms") is not None
+    ]
     for r in ok:
         r["speech_ms"] = r["ttfa_ms"] - r["ttft_ms"]
     ttfa = [r["ttfa_ms"] for r in ok]
     out = {
-        "users": cell["users"], "n_ok": len(ok),
+        "users": cell["users"],
+        "n_ok": len(ok),
         "n_timeout": cell["summary"].get("n_timeout"),
         "rolls": cell["summary"].get("session_rolls"),
-        "ttfa_p50": pct(ttfa, 50), "ttfa_p95": pct(ttfa, 95),
-        "ttfa_p99": pct(ttfa, 99), "ttfa_max": max(ttfa) if ttfa else float("nan"),
+        "ttfa_p50": pct(ttfa, 50),
+        "ttfa_p95": pct(ttfa, 95),
+        "ttfa_p99": pct(ttfa, 99),
+        "ttfa_max": max(ttfa) if ttfa else float("nan"),
         "ttft_p50": pct([r["ttft_ms"] for r in ok], 50),
         "ttft_p99": pct([r["ttft_ms"] for r in ok], 99),
         "speech_p50": pct([r["speech_ms"] for r in ok], 50),
@@ -111,7 +117,8 @@ def cell_report(cell: dict) -> dict:
         exc_thk = st.mean([r["ttft_ms"] - med_ttft for r in tail])
         exc_spc = st.mean([r["speech_ms"] - med_speech for r in tail])
         out[f"tail_{tail_name}"] = {
-            "n": len(tail), "excess_ms": round(exc_tot, 1),
+            "n": len(tail),
+            "excess_ms": round(exc_tot, 1),
             "thinker_share": round(exc_thk / exc_tot, 3) if exc_tot else None,
             "speech_share": round(exc_spc / exc_tot, 3) if exc_tot else None,
         }
@@ -122,15 +129,15 @@ def cell_report(cell: dict) -> dict:
     for r in ok:
         by_wait.setdefault(r["n_wait"], []).append(r["ttfa_ms"])
     out["ttfa_by_n_wait"] = {
-        k: {"n": len(v), "p50": round(pct(v, 50), 1), "p99": round(pct(v, 99), 1)}
-        for k, v in sorted(by_wait.items())}
+        k: {"n": len(v), "p50": round(pct(v, 50), 1), "p99": round(pct(v, 99), 1)} for k, v in sorted(by_wait.items())
+    }
     by_stream: dict[int, list[float]] = {}
     for r in ok:
         if r["n_wait"] == 0:  # isolate the streaming effect from the queueing one
             by_stream.setdefault(min(r["n_stream"], 8), []).append(r["ttfa_ms"])
     out["ttfa_by_n_stream_at_wait0"] = {
-        k: {"n": len(v), "p50": round(pct(v, 50), 1), "p99": round(pct(v, 99), 1)}
-        for k, v in sorted(by_stream.items())}
+        k: {"n": len(v), "p50": round(pct(v, 50), 1), "p99": round(pct(v, 99), 1)} for k, v in sorted(by_stream.items())
+    }
     tail95 = [r for r in ok if r["ttfa_ms"] >= out["ttfa_p95"]]
     out["n_wait_mean_all"] = round(st.mean([r["n_wait"] for r in ok]), 2) if ok else None
     out["n_wait_mean_tail95"] = round(st.mean([r["n_wait"] for r in tail95]), 2) if tail95 else None
@@ -144,13 +151,25 @@ def cell_report(cell: dict) -> dict:
         buckets.setdefault(b, []).append(r["ttfa_ms"])
     out["ttfa_by_turn_bucket"] = {
         k: {"n": len(v), "p50": round(pct(v, 50), 1), "p99": round(pct(v, 99), 1)}
-        for k, v in sorted(buckets.items(), key=lambda kv: int(kv[0].split("-")[0]))}
+        for k, v in sorted(buckets.items(), key=lambda kv: int(kv[0].split("-")[0]))
+    }
 
     # 4. hygiene
     probes = cell["summary"].get("engine_probes", {})
-    out["bad_probes"] = {k: v for k, v in probes.items() if v and k in
-                         ("unowned_audio", "torch_cat_error", "counter_leak_clamped",
-                          "zero_output_wedge", "negative_slice", "preempted_reqs")}
+    out["bad_probes"] = {
+        k: v
+        for k, v in probes.items()
+        if v
+        and k
+        in (
+            "unowned_audio",
+            "torch_cat_error",
+            "counter_leak_clamped",
+            "zero_output_wedge",
+            "negative_slice",
+            "preempted_reqs",
+        )
+    }
     return out
 
 
@@ -160,26 +179,34 @@ def main() -> int:
     ap.add_argument("--json-out", default=None)
     args = ap.parse_args()
 
-    cells = [load_cell(pathlib.Path(p)) for p in sorted(glob.glob(args.cells))
-             if (pathlib.Path(p) / "turns.jsonl").exists()]
+    cells = [
+        load_cell(pathlib.Path(p)) for p in sorted(glob.glob(args.cells)) if (pathlib.Path(p) / "turns.jsonl").exists()
+    ]
     cells.sort(key=lambda c: c["users"])
     reports = [cell_report(c) for c in cells]
 
-    hdr = (f"{'users':>5} {'n':>4} {'p50':>6} {'p95':>7} {'p99':>7} "
-           f"{'thk p50/p99':>12} {'spc p50/p99':>12} "
-           f"{'tail95 thk/spc':>14} {'wait all/tail':>13} {'to':>3} {'roll':>4}")
+    hdr = (
+        f"{'users':>5} {'n':>4} {'p50':>6} {'p95':>7} {'p99':>7} "
+        f"{'thk p50/p99':>12} {'spc p50/p99':>12} "
+        f"{'tail95 thk/spc':>14} {'wait all/tail':>13} {'to':>3} {'roll':>4}"
+    )
     print(hdr)
     for r in reports:
         t95 = r.get("tail_p95", {})
-        share = (f"{t95.get('thinker_share', float('nan')):.2f}/"
-                 f"{t95.get('speech_share', float('nan')):.2f}") if t95 else "-"
-        print(f"{r['users']:>5} {r['n_ok']:>4} {r['ttfa_p50']:>6.0f} {r['ttfa_p95']:>7.0f} "
-              f"{r['ttfa_p99']:>7.0f} "
-              f"{r['ttft_p50']:>5.0f}/{r['ttft_p99']:>5.0f} "
-              f"{r['speech_p50']:>5.0f}/{r['speech_p99']:>5.0f} "
-              f"{share:>14} "
-              f"{r['n_wait_mean_all']:>5.2f}/{r['n_wait_mean_tail95']:>5.2f} "
-              f"{r['n_timeout'] or 0:>3} {r['rolls'] or 0:>4}")
+        share = (
+            (f"{t95.get('thinker_share', float('nan')):.2f}/{t95.get('speech_share', float('nan')):.2f}")
+            if t95
+            else "-"
+        )
+        print(
+            f"{r['users']:>5} {r['n_ok']:>4} {r['ttfa_p50']:>6.0f} {r['ttfa_p95']:>7.0f} "
+            f"{r['ttfa_p99']:>7.0f} "
+            f"{r['ttft_p50']:>5.0f}/{r['ttft_p99']:>5.0f} "
+            f"{r['speech_p50']:>5.0f}/{r['speech_p99']:>5.0f} "
+            f"{share:>14} "
+            f"{r['n_wait_mean_all']:>5.2f}/{r['n_wait_mean_tail95']:>5.2f} "
+            f"{r['n_timeout'] or 0:>3} {r['rolls'] or 0:>4}"
+        )
         if r["bad_probes"]:
             print(f"      !! bad probes: {r['bad_probes']}")
 
@@ -191,4 +218,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     import sys
+
     sys.exit(main())
