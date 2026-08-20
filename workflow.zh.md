@@ -146,16 +146,25 @@ AV 慢请求自己的输入 token 与快请求接近；差别是它到达时撞�
 
 三种 session 策略使用同一个由 seed 生成的 `workload_plan.json`。计划、语音 corpus、视频帧集、source commit 和 deploy YAML 都写入哈希，确保策略之间只改变 session/KV policy。
 
-客户端按 60 ms prebuffer 重放音频。容量通过条件为：预热轮之后全部 turn 完成、TTFA p99 < 1 s、每轮最大卡顿 p99 < 50 ms、无 protocol mismatch、client error 和 bad engine probe。
+客户端使用 1.4 s smooth-buffer 阈值；当前 4-frame 首块只有约 217 ms 音频，因此通常在第二块到达时开始播放，而不是固定等待 1.4 s。容量通过条件为：预热轮之后全部 turn 完成、可听播放启动 p99 < 1 s、播放卡顿 p99 < 50 ms，且无 protocol、client 或 fatal engine error。Service TTFA 单独用于 stage attribution。
 
 旧的按视频内容拆分 matrix、audio-only p99 ladder 和 synthetic AV cell runner 已删除；`probe.py` 中的 synthetic media 只用于协议 smoke test，不参与容量结论。
 
 CPU 测试覆盖真实 WAV manifest、speaker/turn 计划、媒体 cadence、session identity 和 playback timeline。
 
-### 当前缺口
+### 当前结果与 root cause
 
-- 正式运行必须提供有足够 speaker/turn 的真实语音 manifest 和一个固定的真实视频帧序列。
-- 新 workload 尚未产生 GPU 容量结果；旧 0 ms prebuffer 和其他 workload 的数字只保留为历史诊断，不能与新结果直接比较。
+`seed=17`、30 轮/用户的 canonical 运行在 8 用户通过：224/224，service TTFA p50/p99 为 265/541 ms，可听播放启动 p99 为 972 ms，stall p99 为 0。16 用户完成 448/448，但 TTFA 为 456/1178 ms、播放启动 p99 为 2062 ms，因此容量边界在 8–16 用户之间，未继续 32。
+
+同 workload 的 chunk-level 对照得到：
+
+- 第一块到第二块固定需要 25–26 个 Talker request step；
+- 16 用户时第二块 gap p50/p99 为 460/1482 ms，超过正常 step 成本的等待为 124/865 ms；
+- 90% 的 Talker 长间隔内，Thinker 正在执行同一个 request；Thinker→Talker inline receive hit rate 只有 42.9%；
+- Code2Wav emit→waveform p99 为 41 ms，不是 tail 来源；
+- 只把视频从 arrival prefill 改为 query-time prefill 后，16 用户 TTFA p99 降至 694 ms，第二块 gap p99 降至 611 ms，inline receive hit rate升至 72.8%；再关闭 audio arrival prefill 只带来小幅变化。
+
+结论：持续视频 arrival prefill 与 Thinker 的回复 decode 共享同一 stage-0 调度，拖慢增量 text/hidden-state 供给；Talker 因等待上游 chunk 断续运行，其固定 25-step 串行窗口放大抖动。Code2Wav 和应用层播放不是主因，也没有证据表明三张 GPU 同时算力饱和。后续 engine 优化应优先研究 stage-0 prefill/decode QoS、deadline/priority scheduling 和跨阶段 backpressure。
 
 ## 当前标准实验流程
 
@@ -167,7 +176,7 @@ CPU 测试覆盖真实 WAV manifest、speaker/turn 计划、媒体 cadence、ses
 6. 同时报 TTFA、播放卡顿、RTF、timeout、实际接入数、身份错误、GPU 指标和 engine probes。
 7. 先用日志证明 workload 与开关确实生效，再讨论容量。
 
-新的正式容量结论只使用 `origin_deploy_3gpu.yaml`、本节定义的 workload、60 ms prebuffer 和 p99 口径；历史结果不并入容量曲线。
+新的正式容量结论只使用 `origin_deploy_3gpu.yaml`、本节定义的 workload、1.4 s smooth-buffer 和 p99 口径；历史结果不并入容量曲线。
 
 ## 关键代码
 
@@ -183,6 +192,7 @@ CPU 测试覆盖真实 WAV manifest、speaker/turn 计划、媒体 cadence、ses
 | 播放时间线 | `benchmarks/live_agent/playback_metrics.py` |
 | 正式三卡部署 | `benchmarks/thinker_talker/origin_deploy_3gpu.yaml` |
 | 运行机制验证 | `benchmarks/live_agent/analysis/verify_run.py` |
+| 音频 chunk root-cause 分析 | `benchmarks/live_agent/analysis/audio_chunk_rca.py` |
 | Scheduler/connector 开关 | `vllm_omni/core/sched/runtime_flags.py` |
 | Chunk transport | `vllm_omni/distributed/omni_connectors/transfer_adapter/chunk_transfer_adapter.py` |
 | Code predictor KV | `vllm_omni/model_executor/models/common/qwen3_code_predictor.py` |

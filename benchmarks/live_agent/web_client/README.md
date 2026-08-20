@@ -121,3 +121,17 @@ python benchmarks/live_agent/analysis/verify_run.py RESULT_DIR
 
 `probe.py` uses synthetic media only to validate the protocol. Capacity claims
 must come from `mu_bench.py` with the real manifest and frame sequence.
+
+For chunk-level root-cause runs, start the engine with
+`VLLM_OMNI_LOG_SCHED_STEPS=1`, `VLLM_OMNI_LOG_REQ_STEPS=1`, and
+`VLLM_OMNI_LOG_AUDIO_CHUNKS=1`, then compare cells with:
+
+```bash
+python benchmarks/live_agent/analysis/audio_chunk_rca.py \
+  --cell baseline=/path/to/baseline_cell \
+  --cell ablation=/path/to/ablation_cell \
+  --json-out /path/to/root_cause.json
+```
+
+The report separates the fixed Talker AR steps, upstream-chunk waiting, and
+Code2Wav latency between the first and second audible chunks.

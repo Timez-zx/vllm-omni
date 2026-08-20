@@ -146,16 +146,25 @@ Capacity testing keeps one target scenario: a continuous AV session. Each user o
 
 All three session policies consume the same seed-derived `workload_plan.json`. The plan, audio corpus, frame set, source commit, and deploy YAML are hashed so only the session/KV policy changes between arms.
 
-The client replays output with a 60 ms prebuffer. A capacity cell passes only when every post-warmup turn completes, TTFA p99 < 1 s, per-turn maximum stall p99 < 50 ms, and there are no protocol mismatches, client errors, or bad engine probes.
+The client uses a 1.4 s smooth-buffer threshold. The current four-frame initial chunk contains only about 217 ms of audio, so playback normally starts when the second chunk arrives rather than after a fixed 1.4 s delay. A cell passes only when every post-warmup turn completes, audible playback-start p99 < 1 s, playback-stall p99 < 50 ms, and there are no protocol, client, or fatal engine errors. Service TTFA is reported separately for stage attribution.
 
 The per-content matrix, audio-only p99 ladder, and synthetic AV cell runner have been removed. Synthetic media in `probe.py` remains only for protocol smoke tests and cannot support a capacity claim.
 
 CPU tests cover real-WAV manifests, speaker/turn plans, media cadence, session identity, and playback timelines.
 
-### Remaining gaps
+### Current result and root cause
 
-- A formal run requires a real speech manifest with enough speakers and turns, plus one fixed real-video frame sequence.
-- The new workload has no GPU capacity result yet. Historical zero-prebuffer or other-workload numbers are diagnostic only and are not comparable with new results.
+The canonical `seed=17`, 30-turn run passes at eight users: 224/224 turns, service TTFA p50/p99 265/541 ms, audible playback-start p99 972 ms, and stall p99 0. Sixteen users complete all 448 turns, but TTFA rises to 456/1178 ms and playback-start p99 to 2062 ms. The boundary is therefore between 8 and 16 users; the ladder correctly did not continue to 32.
+
+Chunk-level runs on the same workload show:
+
+- the first-to-second chunk window always contains 25–26 Talker request steps;
+- at 16 users, second-chunk gap p50/p99 is 460/1482 ms and wait beyond normal step cost is 124/865 ms;
+- 90% of long Talker gaps overlap Thinker work for the same request, while the Thinker-to-Talker inline-receive hit rate is only 42.9%;
+- Code2Wav emit-to-waveform p99 is 41 ms and is not the tail source;
+- moving only video from arrival prefill to query-time prefill reduces 16-user TTFA p99 to 694 ms, second-chunk gap p99 to 611 ms, and raises inline-receive hit rate to 72.8%; disabling audio arrival prefill as well changes little.
+
+The root cause is stage-0 contention: continuous video arrival prefill shares the Thinker scheduler with response decode and delays incremental text/hidden-state delivery. Talker repeatedly waits for upstream chunks, and its fixed 25-step serial window amplifies the jitter. Code2Wav and browser playback are not causal, and the three GPUs are not simultaneously compute-saturated. The next engine work should target stage-0 prefill/decode QoS, deadline or priority scheduling, and cross-stage backpressure.
 
 ## Current experiment procedure
 
@@ -167,7 +176,7 @@ CPU tests cover real-WAV manifests, speaker/turn plans, media cadence, session i
 6. Report TTFA, playback stalls, RTF, timeouts, admitted users, identity errors, GPU metrics, and engine probes together.
 7. Verify from logs that the workload and mechanism actually ran before interpreting capacity.
 
-New formal capacity claims use only `origin_deploy_3gpu.yaml`, this workload, a 60 ms prebuffer, and p99; historical results do not enter the capacity curve.
+New formal capacity claims use only `origin_deploy_3gpu.yaml`, this workload, the 1.4 s smooth buffer, and p99; historical results do not enter the capacity curve.
 
 ## Key code
 
@@ -183,6 +192,7 @@ New formal capacity claims use only `origin_deploy_3gpu.yaml`, this workload, a 
 | Playback timeline | `benchmarks/live_agent/playback_metrics.py` |
 | Canonical three-GPU deployment | `benchmarks/thinker_talker/origin_deploy_3gpu.yaml` |
 | Run-mechanism verification | `benchmarks/live_agent/analysis/verify_run.py` |
+| Audio-chunk root-cause analysis | `benchmarks/live_agent/analysis/audio_chunk_rca.py` |
 | Scheduler and connector flags | `vllm_omni/core/sched/runtime_flags.py` |
 | Chunk transport | `vllm_omni/distributed/omni_connectors/transfer_adapter/chunk_transfer_adapter.py` |
 | Code predictor KV | `vllm_omni/model_executor/models/common/qwen3_code_predictor.py` |
