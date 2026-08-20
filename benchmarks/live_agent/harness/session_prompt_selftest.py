@@ -29,11 +29,13 @@ from __future__ import annotations
 
 import collections.abc
 import os
+import pathlib
 import sys
 
 # Import the FORK rather than whatever is installed in site-packages, so this can be
 # run before (or without) an editable install.
-sys.path.insert(0, "/home/zx/voice-agent/vllm-omni")
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REPO_ROOT))
 
 FAILS: list[str] = []
 
@@ -65,8 +67,8 @@ def main() -> int:
 
     print("\n2. the fork imports and carries the session-mode pieces")
     import vllm_omni.entrypoints.openai.video_stream_base as B
-    check("loaded from the fork, not site-packages", "/voice-agent/vllm-omni/" in B.__file__,
-          B.__file__)
+    loaded_from_repo = pathlib.Path(B.__file__).resolve().is_relative_to(REPO_ROOT)
+    check("loaded from this checkout, not site-packages", loaded_from_repo, B.__file__)
     check("session_scoped_request is a config field",
           "session_scoped_request" in B.StreamingVideoSessionConfig.model_fields)
     check("it defaults to OFF",
@@ -77,8 +79,11 @@ def main() -> int:
     check("frame downscaler present", hasattr(B, "_downscale_frame_bytes"))
     for fld in ("max_frame_width", "max_frame_height", "frame_filter_min_gap", "frame_filter_max_gap"):
         check(f"config field {fld}", fld in B.StreamingVideoSessionConfig.model_fields)
-    from vllm_omni.entrypoints.openai.video_frame_filter import FrameSimilarityFilter as _F
-    check("FrameSimilarityFilter.force_next_retain present", hasattr(_F, "force_next_retain"))
+    from vllm_omni.entrypoints.openai.video_frame_filter import (
+        FrameSimilarityFilter as _FrameSimilarityFilter,
+    )
+    check("FrameSimilarityFilter.force_next_retain present",
+          hasattr(_FrameSimilarityFilter, "force_next_retain"))
 
     print("\n3. the two prefix token ids are really <|im_end|> and newline")
     try:
@@ -151,8 +156,8 @@ def main() -> int:
     class PR:
         __slots__ = ("offset", "length")
 
-        def __init__(self, o, l):
-            self.offset, self.length = o, l
+        def __init__(self, offset, length):
+            self.offset, self.length = offset, length
 
     ep2 = {"mm_placeholders": {"audio": [PR(10, 40)]}}
     B._shift_mm_placeholders(ep2, 2)

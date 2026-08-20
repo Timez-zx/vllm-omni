@@ -84,7 +84,7 @@ run_cell() {  # $1 content, $2 users
   nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used \
     --format=csv,noheader -l 2 > "$out/gpu.csv" 2>/dev/null &
   local sampler=$!
-  timeout 7200 "$PYBIN" "$WC/mu_bench.py" \
+  MU_DEPLOY_CONFIG="$MU_DEPLOY" timeout 7200 "$PYBIN" "$WC/mu_bench.py" \
     --users "$u" --content "$content" --turns "$TURNS" \
     --repeat-sessions "$reps" --out "$out" 2>&1 | tee "$out/driver.log"
   local rc=${PIPESTATUS[0]}

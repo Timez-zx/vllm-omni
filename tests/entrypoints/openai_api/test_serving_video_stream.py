@@ -755,3 +755,27 @@ def test_build_messages_keeps_recent_history_text_only():
     assert messages[1] == {"role": "assistant", "content": "recent answer"}
     assert messages[2] == user_message
     assert user_message["content"][-1] == {"type": "text", "text": "current question"}
+
+
+def test_build_messages_can_replay_complete_history():
+    handler = QwenOmniStreamingVideoHandler(chat_service=object())
+    history = [
+        {"role": "user", "content": "question one"},
+        {"role": "assistant", "content": "answer one"},
+        {"role": "user", "content": "question two"},
+        {"role": "assistant", "content": "answer two"},
+    ]
+
+    messages, user_message = handler._build_messages(
+        StreamingVideoSessionConfig(
+            model="test", num_frames=1, history_max_turns=None
+        ),
+        [],
+        bytearray(),
+        history,
+        "current question",
+        {},
+    )
+
+    assert messages[:-1] == history
+    assert messages[-1] == user_message

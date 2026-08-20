@@ -24,18 +24,25 @@ The one-user cell should be run with --repeat-sessions 2: two sequential
 30-turn sessions rather than one 60-turn session, so its turn indices match
 the multi-user cells and turn index cannot be read as concurrency.
 """
+
 import argparse
 import asyncio
-import os
 import base64
+import hashlib
+import io
 import json
+import os
 import pathlib
 import random
 import re
+import subprocess
 import sys
 import time
+import wave
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+from playback_metrics import simulate_playback  # noqa: E402
 from probe import session_config, synth_frame_jpeg, synth_speechlike_pcm  # noqa: E402
 
 # The engine's CURRENT log file. Boots write wherever the launch redirected
@@ -46,17 +53,17 @@ LOG = pathlib.Path(os.environ.get("MU_ENGINE_LOG", "/data/zx/results/qwen_live.l
 URL = "ws://127.0.0.1:8091/v1/video/chat/stream"
 FRAMES_ROOT = pathlib.Path("/data/zx/stimuli/frames640")
 
-FRAME_INTERVAL_S = 0.5          # 2 fps, the browser page's rhythm (see --video-interval-ms)
+FRAME_INTERVAL_S = 0.5  # 2 fps, the browser page's rhythm (see --video-interval-ms)
 TURN_TIMEOUT_S = 180.0
-THINK_S = (2.0, 6.0)            # closed-loop pause after each reply (see --think)
+THINK_S = (2.0, 6.0)  # closed-loop pause after each reply (see --think)
 # Wait for the reply to finish PLAYING (not merely arriving) before the think
 # pause. See the note at the sleep site: arrival-paced turns under-load any
 # engine that delivers faster than realtime.
 PLAYBACK_PACED = os.environ.get("MU_PLAYBACK_PACED", "1") not in ("0", "", "false", "False")
 _stag = os.environ.get("MU_STAGGER_S")  # "lo,hi" override for arrival-spread控制实验
 STAGGER_S = tuple(float(x) for x in _stag.split(",")) if _stag else (0.0, 8.0)
-WARMUP_S = 4.0                  # let the frame pump run before the first query
-GIVE_UP_AFTER = 3               # consecutive timeouts before a user stops
+WARMUP_S = 4.0  # let the frame pump run before the first query
+GIVE_UP_AFTER = 3  # consecutive timeouts before a user stops
 # WebSocket permessage-deflate is OFF here, and only here. The `websockets`
 # library offers the extension by default and the server accepts it, so every
 # audio delta was being zlib-compressed -- 42% of the API server's event loop at
@@ -73,14 +80,14 @@ GIVE_UP_AFTER = 3               # consecutive timeouts before a user stops
 # the A/B above was run.
 WS_DEFLATE = os.environ.get("MU_WS_DEFLATE", "0") not in ("0", "", "false", "False")
 
+PLAYBACK_PREBUFFER_S = float(os.environ.get("MU_PLAYBACK_PREBUFFER_MS", "60")) / 1000.0
 # Audio input is streamed in fixed-cadence chunks on the AUDIO GRID (80 ms =
 # 1 codec frame = the model's own 12.5 Hz rhythm). Video takes no clock of its
 # own: its interval should be an integer multiple of the audio cadence
 # (e.g. 480 = 6x80), set via --video-interval-ms.
 AUDIO_CADENCE_MS = 80
 
-SYSTEM_PROMPT = ("You are a voice assistant. "
-                 "Answer each question out loud in one short sentence.")
+SYSTEM_PROMPT = "You are a voice assistant. Answer each question out loud in one short sentence."
 
 # Optional listening artifacts: dump each ok turn's audio as
 # <dir>/<user>_tNN.wav (24 kHz mono PCM). Env-driven like MU_SESSION_CFG_JSON
@@ -206,8 +213,9 @@ def pctl(xs: list[float], q: float) -> float | None:
 class User:
     """One simulated browser: a connection, a frame pump, and a turn loop."""
 
-    def __init__(self, uid: int, rep: int, frames: list[str], turns: int, seed: int,
-                 opts: argparse.Namespace | None = None):
+    def __init__(
+        self, uid: int, rep: int, frames: list[str], turns: int, seed: int, opts: argparse.Namespace | None = None
+    ):
         self.uid = uid
         self.rep = rep
         self.name = f"r{rep}u{uid}"
@@ -225,26 +233,32 @@ class User:
         if opts is not None and opts.content == "synthetic":
             # Per-user frames: the label carries the user name, so no two
             # users' frames byte-match and prefix caching cannot collapse them.
-            frames = [base64.b64encode(synth_frame_jpeg(f"{self.name} {i}")).decode()
-                      for i in range(16)]
+            frames = [base64.b64encode(synth_frame_jpeg(f"{self.name} {i}")).decode() for i in range(16)]
         self.frames = frames
         self.turns = turns
         self.rng = random.Random(seed * 10_000 + rep * 100 + uid)
-        self.frame_pos = self.rng.randrange(len(frames)) if frames else 0
+        cohort_index = rep * (opts.users if opts else 1) + uid
+        self.frame_pos = cohort_index % len(frames) if frames else 0
         self.q_offset = (uid * 7 + rep * 3) % len(QUESTIONS)
         self.records: list[dict] = []
+        self.protocol_mismatches = 0
+        self.session_incarnation: str | None = None
+        self.session_epoch: int | None = None
+        self.frame_start_offset = self.frame_pos
         self.acks_accepted = 0
         self.acks_filtered = 0
         self.rolls = 0
         self.stray_audio = 0
         self.errors: list[str] = []
         self.cur: dict | None = None
+        self.expect_session_identity = True
         self.done_evt = asyncio.Event()
 
     async def run(self) -> None:
         import websockets
 
         cfg = session_config(SYSTEM_PROMPT)
+        cfg["session_id"] = self.name
         cfg["frame_filter_min_gap"] = 0
         cfg["frame_filter_max_gap"] = 4
         cfg["prefill_frames_on_arrival"] = True
@@ -257,9 +271,11 @@ class User:
         if _extra:
             cfg.update(json.loads(_extra))
 
+        self.expect_session_identity = bool(cfg.get("session_scoped_request", True))
         try:
             async with websockets.connect(
-                URL, max_size=None,
+                URL,
+                max_size=None,
                 compression="deflate" if WS_DEFLATE else None,
             ) as ws:
                 await ws.send(json.dumps(cfg))
@@ -280,11 +296,15 @@ class User:
             return
         seq = 0
         while True:
-            await ws.send(json.dumps({
-                "type": "video.frame",
-                "data": self.frames[self.frame_pos],
-                "frame_id": f"{self.name}-f{seq}",
-            }))
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "video.frame",
+                        "data": self.frames[self.frame_pos],
+                        "frame_id": f"{self.name}-f{seq}",
+                    }
+                )
+            )
             self.frame_pos = (self.frame_pos + 1) % len(self.frames)
             seq += 1
             interval = self.video_interval_s
@@ -294,62 +314,107 @@ class User:
 
     async def _reader(self, ws) -> None:
         async for raw in ws:
-            t_now = time.monotonic()          # stamp BEFORE any decoding
+            t_now = time.monotonic()  # stamp before decoding
             try:
                 msg = json.loads(raw)
             except Exception:
                 continue
-            t = msg.get("type")
-            if t == "video.frame.ack":
+            event_type = msg.get("type")
+
+            if event_type == "session.created":
+                if msg.get("session_id") != self.name:
+                    self.protocol_mismatches += 1
+                    self.errors.append("session.created id mismatch")
+                    continue
+                self.session_incarnation = msg.get("incarnation")
+                self.session_epoch = msg.get("epoch")
+                continue
+            if event_type in ("session.rolled", "session.compressed"):
+                if msg.get("incarnation") != self.session_incarnation:
+                    self.protocol_mismatches += 1
+                    self.errors.append(f"{event_type} incarnation mismatch")
+                    continue
+                self.session_epoch = msg.get("epoch")
+                self.rolls += int(event_type == "session.rolled")
+                continue
+            if event_type == "video.frame.ack":
                 if msg.get("accepted"):
                     self.acks_accepted += 1
                 else:
                     self.acks_filtered += 1
                 continue
-            if t == "session.rolled":
-                self.rolls += 1
-                continue
-            if t == "error":
+            if event_type == "error":
                 self.errors.append(str(msg.get("message"))[:200])
                 continue
+
             cur = self.cur
             if cur is None:
-                if t == "response.audio.delta":
+                if event_type == "response.audio.delta":
                     self.stray_audio += 1
                 continue
-            if t == "response.text.delta":
+            if event_type.startswith("response.") and self.expect_session_identity:
+                response_identity = (
+                    msg.get("session_id"),
+                    msg.get("incarnation"),
+                    msg.get("turn_id"),
+                )
+                expected_identity = (
+                    self.name,
+                    self.session_incarnation,
+                    cur["expected_turn_id"],
+                )
+                if response_identity != expected_identity:
+                    self.protocol_mismatches += 1
+                    self.errors.append(
+                        f"{event_type} identity mismatch: got={response_identity} expected={expected_identity}"
+                    )
+                    continue
+                if cur.get("segment_id") is None:
+                    cur["segment_id"] = msg.get("segment_id")
+                    cur["epoch"] = msg.get("epoch")
+                elif msg.get("segment_id") != cur["segment_id"]:
+                    self.protocol_mismatches += 1
+                    self.errors.append(f"{event_type} segment changed mid-turn")
+                    continue
+                if msg.get("epoch") != cur["epoch"]:
+                    self.protocol_mismatches += 1
+                    self.errors.append(f"{event_type} epoch changed mid-turn")
+                    continue
+
+            if event_type == "response.text.delta":
                 if cur["t_first_text"] is None:
                     cur["t_first_text"] = t_now
                 cur["text_stream"] += msg.get("delta") or ""
-            elif t == "response.text.done":
+            elif event_type == "response.text.done":
                 cur["text_at_first_sound"] = msg.get("text") or ""
                 if TEXT_ONLY:
-                    # Text-only turns have no audio.done; this close IS the end.
                     cur["t_done"] = t_now
                     self.done_evt.set()
-            elif t == "response.audio.delta":
+            elif event_type == "response.audio.delta":
                 if cur["t_first_audio"] is None:
                     cur["t_first_audio"] = t_now
                 data = base64.b64decode(msg["data"])
-                samples = (len(data) - 44) // 2
-                # Full per-delta timeline (arrival stamp, samples): the raw
-                # material for inter-chunk jitter, per-chunk playback deadlines
-                # and tick-alignment checks. ~30 pairs per 10 s reply -- cheap.
+                try:
+                    with wave.open(io.BytesIO(data), "rb") as wav:
+                        samples = wav.getnframes()
+                        sample_rate = wav.getframerate()
+                        pcm = wav.readframes(samples)
+                except Exception as exc:
+                    self.errors.append(f"invalid audio delta: {exc!r}"[:200])
+                    continue
+                if sample_rate != 24000:
+                    self.errors.append(f"unexpected output sample rate: {sample_rate}")
+                    continue
                 cur["deltas"].append((t_now, samples))
                 if SAVE_WAV_DIR:
-                    cur["pcm"] += data[44:]
-                # starvation: a player that started at the first delta has
-                # consumed (t_now - t_first) seconds; was that much delivered?
-                played = t_now - cur["t_first_audio"]
-                avail = cur["audio_samples"] / 24000.0
-                cur["max_starve_s"] = max(cur["max_starve_s"], played - avail)
+                    cur["pcm"] += pcm
                 cur["audio_samples"] += samples
                 cur["n_deltas"] += 1
-            elif t == "response.audio.done":
+            elif event_type == "response.audio.done":
                 cur["t_done"] = t_now
                 self.done_evt.set()
 
-    async def _stream_audio_input(self, ws) -> None:
+    async def _stream_audio_input(self, ws, turn_index: int) -> str:
         """Stream synthetic speech at the AUDIO GRID cadence (80 ms chunks).
 
         Real-time pacing, not a blob: the point of the temporal-batching
@@ -357,27 +422,44 @@ class User:
         the same arrival process. 80 ms at 16 kHz = 1280 samples = 2560 bytes.
         """
         chunk_samples = int(16000 * AUDIO_CADENCE_MS / 1000)
-        pcm = synth_speechlike_pcm(self.audio_input_s)
+        variant = self.rep * self.turns * 10_000 + self.uid * self.turns + turn_index
+        pcm = synth_speechlike_pcm(self.audio_input_s, variant=variant)
+        fingerprint = hashlib.sha256(pcm).hexdigest()
         step = chunk_samples * 2
         for off in range(0, len(pcm), step):
-            await ws.send(json.dumps({
-                "type": "audio.chunk",
-                "data": base64.b64encode(pcm[off:off + step]).decode(),
-            }))
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "audio.chunk",
+                        "data": base64.b64encode(pcm[off : off + step]).decode(),
+                    }
+                )
+            )
             await asyncio.sleep(AUDIO_CADENCE_MS / 1000)
+        return fingerprint
 
     async def _turn_loop(self, ws) -> None:
         consecutive_timeouts = 0
         for i in range(self.turns):
             q = QUESTIONS[(self.q_offset + i) % len(QUESTIONS)]
             self.turn_active = True
+            input_audio_sha256 = None
             if self.audio_input_s > 0:
-                await self._stream_audio_input(ws)
+                input_audio_sha256 = await self._stream_audio_input(ws, i)
             self.cur = {
-                "t_first_text": None, "t_first_audio": None, "t_done": None,
-                "text_stream": "", "text_at_first_sound": "",
-                "audio_samples": 0, "n_deltas": 0, "max_starve_s": 0.0,
-                "deltas": [], "pcm": bytearray(),
+                "t_first_text": None,
+                "t_first_audio": None,
+                "t_done": None,
+                "text_stream": "",
+                "text_at_first_sound": "",
+                "audio_samples": 0,
+                "n_deltas": 0,
+                "deltas": [],
+                "pcm": bytearray(),
+                "expected_turn_id": i,
+                "segment_id": None,
+                "epoch": None,
+                "input_audio_sha256": input_audio_sha256,
             }
             self.done_evt.clear()
             t_q = time.monotonic()
@@ -387,14 +469,28 @@ class User:
             except asyncio.TimeoutError:
                 self.turn_active = False
                 consecutive_timeouts += 1
-                self.records.append({
-                    "user": self.name, "turn": i + 1, "q": q, "status": "timeout",
-                    "t_q": t_q, "t_ft": self.cur["t_first_text"],
-                    "t_fa": self.cur["t_first_audio"], "t_done": None,
-                    "ttfa_ms": None, "ttft_ms": None, "wall_s": None,
-                    "audio_s": self.cur["audio_samples"] / 24000.0,
-                    "chars_stream": len(self.cur["text_stream"]),
-                })
+                self.records.append(
+                    {
+                        "user": self.name,
+                        "turn": i + 1,
+                        "q": q,
+                        "status": "timeout",
+                        "t_q": t_q,
+                        "t_ft": self.cur["t_first_text"],
+                        "t_fa": self.cur["t_first_audio"],
+                        "t_done": None,
+                        "ttfa_ms": None,
+                        "ttft_ms": None,
+                        "wall_s": None,
+                        "audio_s": self.cur["audio_samples"] / 24000.0,
+                        "session_id": self.name,
+                        "incarnation": self.session_incarnation,
+                        "epoch": self.cur.get("epoch"),
+                        "segment_id": self.cur.get("segment_id"),
+                        "input_audio_sha256": self.cur.get("input_audio_sha256"),
+                        "chars_stream": len(self.cur["text_stream"]),
+                    }
+                )
                 self.cur = None
                 if consecutive_timeouts >= GIVE_UP_AFTER:
                     self._mark_skipped(start=i + 1, reason="gave_up")
@@ -408,28 +504,52 @@ class User:
             wall = cur["t_done"] - t_q
             audio_s = cur["audio_samples"] / 24000.0
             deliver_s = (cur["t_done"] - cur["t_first_audio"]) if cur["t_first_audio"] else None
-            self.records.append({
-                "user": self.name, "turn": i + 1, "q": q, "status": "ok",
-                # Absolute monotonic stamps (one clock: all users share this
-                # process). They let the analysis reconstruct, for any turn,
-                # how many OTHER turns were mid-TTFA or mid-delivery when this
-                # one arrived -- the split between "queued behind others" and
-                # "everything got slower" that percentiles alone cannot give.
-                "t_q": t_q, "t_ft": cur["t_first_text"],
-                "t_fa": cur["t_first_audio"], "t_done": cur["t_done"],
-                "ttfa_ms": ttfa, "ttft_ms": ttft, "wall_s": wall,
-                "audio_s": audio_s,
-                "rtf_deliver": (audio_s / deliver_s) if deliver_s and deliver_s > 0 else None,
-                "max_starve_ms": cur["max_starve_s"] * 1000,
-                # [seconds since t_q, samples] per audio delta, in arrival order.
-                "deltas": [[round(t - t_q, 4), s] for t, s in cur["deltas"]],
-                "n_deltas": cur["n_deltas"],
-                "chars_stream": len(cur["text_stream"]),
-                "chars_at_first_sound": len(cur["text_at_first_sound"]),
-                "text": cur["text_stream"][:200],
-            })
+            playback = simulate_playback(
+                [(t - t_q, samples) for t, samples in cur["deltas"]],
+                sample_rate=24000,
+                prebuffer_s=PLAYBACK_PREBUFFER_S,
+            )
+            self.records.append(
+                {
+                    "user": self.name,
+                    "turn": i + 1,
+                    "q": q,
+                    "status": "ok",
+                    # Absolute monotonic stamps (one clock: all users share this
+                    # process). They let the analysis reconstruct, for any turn,
+                    # how many OTHER turns were mid-TTFA or mid-delivery when this
+                    # one arrived -- the split between "queued behind others" and
+                    # "everything got slower" that percentiles alone cannot give.
+                    "t_q": t_q,
+                    "t_ft": cur["t_first_text"],
+                    "t_fa": cur["t_first_audio"],
+                    "t_done": cur["t_done"],
+                    "ttfa_ms": ttfa,
+                    "ttft_ms": ttft,
+                    "wall_s": wall,
+                    "audio_s": audio_s,
+                    "rtf_deliver": (audio_s / deliver_s) if deliver_s and deliver_s > 0 else None,
+                    "playback_start_ms": (playback.start_s * 1000 if playback.start_s is not None else None),
+                    "stall_count": len(playback.stalls_s),
+                    "stall_total_ms": playback.stall_total_s * 1000,
+                    "stall_max_ms": playback.stall_max_s * 1000,
+                    "max_starve_ms": playback.stall_max_s * 1000,
+                    "session_id": self.name,
+                    "incarnation": self.session_incarnation,
+                    "epoch": cur.get("epoch"),
+                    "segment_id": cur.get("segment_id"),
+                    "input_audio_sha256": cur.get("input_audio_sha256"),
+                    # [seconds since t_q, samples] per audio delta, in arrival order.
+                    "deltas": [[round(t - t_q, 4), s] for t, s in cur["deltas"]],
+                    "n_deltas": cur["n_deltas"],
+                    "chars_stream": len(cur["text_stream"]),
+                    "chars_at_first_sound": len(cur["text_at_first_sound"]),
+                    "text": cur["text_stream"][:200],
+                }
+            )
             if SAVE_WAV_DIR and cur["pcm"]:
                 import wave
+
                 p = pathlib.Path(SAVE_WAV_DIR) / f"{self.name}_t{i + 1:02d}.wav"
                 with wave.open(str(p), "wb") as w:
                     w.setnchannels(1)
@@ -447,7 +567,7 @@ class User:
             # so both engines face the same number of simultaneous speakers.
             # MU_PLAYBACK_PACED=0 restores arrival-paced turns.
             if PLAYBACK_PACED and cur["t_first_audio"] and audio_s > 0:
-                _play_end = cur["t_first_audio"] + audio_s
+                _play_end = t_q + (playback.start_s or 0.0) + audio_s + playback.stall_total_s
                 _left = _play_end - time.monotonic()
                 if _left > 0:
                     await asyncio.sleep(_left)
@@ -458,8 +578,30 @@ class User:
         first = start if start is not None else 1
         for i in range(first, self.turns + 1):
             if i not in done:
-                self.records.append({"user": self.name, "turn": i, "status": "skipped",
-                                     "reason": reason})
+                self.records.append({"user": self.name, "turn": i, "status": "skipped", "reason": reason})
+
+
+def benchmark_provenance() -> dict:
+    """Pin source and deployment facts beside every capacity result."""
+    repo_root = pathlib.Path(__file__).resolve().parents[3]
+    try:
+        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_root, text=True).strip()
+        dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=repo_root, text=True).strip())
+    except Exception:
+        commit, dirty = None, None
+
+    deploy_path_raw = os.environ.get("MU_DEPLOY_CONFIG")
+    deploy_path = pathlib.Path(deploy_path_raw).resolve() if deploy_path_raw else None
+    deploy_sha256 = None
+    if deploy_path is not None and deploy_path.is_file():
+        deploy_sha256 = hashlib.sha256(deploy_path.read_bytes()).hexdigest()
+    return {
+        "source_commit": commit,
+        "source_dirty": dirty,
+        "deploy_config": str(deploy_path) if deploy_path is not None else None,
+        "deploy_config_sha256": deploy_sha256,
+        "engine_log": str(LOG),
+    }
 
 
 def summarize(records: list[dict], users: list[User], meta: dict, log_slice: str) -> dict:
@@ -470,8 +612,10 @@ def summarize(records: list[dict], users: list[User], meta: dict, log_slice: str
         xs = [r["ttfa_ms"] for r in u.records if r.get("ttfa_ms") is not None]
         if xs:
             per_user_p50[u.name] = pctl(xs, 0.5)
-    probes = {k: len(re.findall(p, log_slice)) for k, p in
-              {**LOG_PROBES_BAD, **LOG_PROBES_INFO}.items()}
+    audio_fingerprints = [r["input_audio_sha256"] for r in records if r.get("input_audio_sha256")]
+    frame_offsets = [u.frame_start_offset for u in users if u.frames]
+    stalls = [r["stall_max_ms"] for r in ok if "stall_max_ms" in r]
+    probes = {k: len(re.findall(p, log_slice)) for k, p in {**LOG_PROBES_BAD, **LOG_PROBES_INFO}.items()}
     return {
         **meta,
         "n_ok": len(ok),
@@ -482,12 +626,23 @@ def summarize(records: list[dict], users: list[User], meta: dict, log_slice: str
         "ttfa_over_1s_pct": 100 * sum(1 for x in ttfa if x > 1000) / len(ttfa) if ttfa else None,
         "ttfa_over_2s_pct": 100 * sum(1 for x in ttfa if x > 2000) / len(ttfa) if ttfa else None,
         "ttft_p50_ms": pctl([r["ttft_ms"] for r in ok if r.get("ttft_ms")], 0.5),
+        "stall_max_ms_p95": pctl(stalls, 0.95),
+        "stall_over_50ms_pct": (100 * sum(1 for value in stalls if value > 50) / len(stalls) if stalls else None),
+        "playback_prebuffer_ms": PLAYBACK_PREBUFFER_S * 1000,
         "audio_s_p50": pctl([r["audio_s"] for r in ok], 0.5),
         "chars_stream_p50": pctl([float(r["chars_stream"]) for r in ok], 0.5),
         "rtf_deliver_p50": pctl([r["rtf_deliver"] for r in ok if r.get("rtf_deliver")], 0.5),
         "max_starve_ms_p95": pctl([r["max_starve_ms"] for r in ok if "max_starve_ms" in r], 0.95),
+        "protocol_identity_mismatches": sum(u.protocol_mismatches for u in users),
+        "input_audio_turns": len(audio_fingerprints),
+        "unique_input_audio_turns": len(set(audio_fingerprints)),
+        "duplicate_input_audio_turns": len(audio_fingerprints) - len(set(audio_fingerprints)),
+        "frame_start_offsets": frame_offsets,
+        "unique_frame_start_offsets": len(set(frame_offsets)),
+        "duplicate_frame_start_offsets": len(frame_offsets) - len(set(frame_offsets)),
         "fairness_p50_spread": (max(per_user_p50.values()) / min(per_user_p50.values()))
-                               if len(per_user_p50) > 1 and min(per_user_p50.values()) > 0 else None,
+        if len(per_user_p50) > 1 and min(per_user_p50.values()) > 0
+        else None,
         "per_user_ttfa_p50": per_user_p50,
         "acks_accepted": sum(u.acks_accepted for u in users),
         "acks_filtered": sum(u.acks_filtered for u in users),
@@ -504,29 +659,49 @@ def summarize(records: list[dict], users: list[User], meta: dict, log_slice: str
 async def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--users", type=int, required=True)
-    ap.add_argument("--content", required=True,
-                    choices=["none", "synthetic", "screencast", "talkinghead", "handheld_walk_talk"])
+    ap.add_argument(
+        "--content", required=True, choices=["none", "synthetic", "screencast", "talkinghead", "handheld_walk_talk"]
+    )
     ap.add_argument("--turns", type=int, default=30)
     ap.add_argument("--repeat-sessions", type=int, default=1)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--out", required=True)
     # Video rides the audio grid at an integer multiple of 80 ms; audio input
     # streams at 80 ms per chunk.
-    ap.add_argument("--video-interval-active-ms", type=int, default=None,
-                    help="when set, frame interval while a turn is active (speech start -> "
-                         "response done); --video-interval-ms then applies only to idle/think time")
-    ap.add_argument("--video-interval-ms", type=int, default=int(FRAME_INTERVAL_S * 1000),
-                    help="frame pump interval; use a multiple of 80 (e.g. 480)")
-    ap.add_argument("--audio-input-s", type=float, default=0.0,
-                    help="stream this many seconds of synthetic speech before each query, "
-                         "paced at 80 ms/chunk (0 = text-only queries, the old behavior)")
-    ap.add_argument("--think", default=None, metavar="LO,HI",
-                    help=f"think-time range in seconds (default {THINK_S[0]},{THINK_S[1]})")
+    ap.add_argument(
+        "--video-interval-active-ms",
+        type=int,
+        default=None,
+        help="when set, frame interval while a turn is active (speech start -> "
+        "response done); --video-interval-ms then applies only to idle/think time",
+    )
+    ap.add_argument(
+        "--video-interval-ms",
+        type=int,
+        default=int(FRAME_INTERVAL_S * 1000),
+        help="frame pump interval; use a multiple of 80 (e.g. 480)",
+    )
+    ap.add_argument(
+        "--audio-input-s",
+        type=float,
+        default=0.0,
+        help="stream this many seconds of synthetic speech before each query, "
+        "paced at 80 ms/chunk (0 = text-only queries, the old behavior)",
+    )
+    ap.add_argument(
+        "--think",
+        default=None,
+        metavar="LO,HI",
+        help=f"think-time range in seconds (default {THINK_S[0]},{THINK_S[1]})",
+    )
     args = ap.parse_args()
     args.think_range = tuple(float(x) for x in args.think.split(",")) if args.think else THINK_S
     if args.video_interval_ms % AUDIO_CADENCE_MS:
-        print(f"warning: --video-interval-ms {args.video_interval_ms} is not a multiple "
-              f"of the {AUDIO_CADENCE_MS} ms audio grid", file=sys.stderr)
+        print(
+            f"warning: --video-interval-ms {args.video_interval_ms} is not a multiple "
+            f"of the {AUDIO_CADENCE_MS} ms audio grid",
+            file=sys.stderr,
+        )
 
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -536,8 +711,7 @@ async def main() -> int:
 
     all_users: list[User] = []
     for rep in range(args.repeat_sessions):
-        cohort = [User(uid, rep, frames, args.turns, args.seed, opts=args)
-                  for uid in range(args.users)]
+        cohort = [User(uid, rep, frames, args.turns, args.seed, opts=args) for uid in range(args.users)]
         await asyncio.gather(*(u.run() for u in cohort))
         all_users.extend(cohort)
 
@@ -553,18 +727,38 @@ async def main() -> int:
             fh.seek(log_offset)
             log_slice = re.sub(rb"\x1b\[[0-9;]*m", b"", fh.read()).decode(errors="replace")
 
-    meta = {"users": args.users, "content": args.content, "turns_per_user": args.turns,
-            "repeat_sessions": args.repeat_sessions, "seed": args.seed,
-            "video_interval_ms": args.video_interval_ms, "audio_input_s": args.audio_input_s,
-            "think_s": list(args.think_range),
-            "wall_s": time.monotonic() - t_start}
+    frame_hasher = hashlib.sha256()
+    for frame in frames:
+        frame_hasher.update(frame.encode("ascii"))
+    meta = {
+        **benchmark_provenance(),
+        "workload_schema": 1,
+        "users": args.users,
+        "content": args.content,
+        "turns_per_user": args.turns,
+        "repeat_sessions": args.repeat_sessions,
+        "seed": args.seed,
+        "video_interval_ms": args.video_interval_ms,
+        "audio_input_s": args.audio_input_s,
+        "think_s": list(args.think_range),
+        "playback_paced": PLAYBACK_PACED,
+        "playback_prebuffer_ms": PLAYBACK_PREBUFFER_S * 1000,
+        "frame_set_sha256": frame_hasher.hexdigest() if frames else None,
+        "question_set_sha256": hashlib.sha256(json.dumps(QUESTIONS, ensure_ascii=True).encode()).hexdigest(),
+        "session_config_overrides": os.environ.get("MU_SESSION_CFG_JSON"),
+        "wall_s": time.monotonic() - t_start,
+    }
     summary = summarize(records, all_users, meta, log_slice)
     (out / "summary.json").write_text(json.dumps(summary, indent=1))
 
-    print(f"== {args.content} x {args.users} users: "
-          f"ok={summary['n_ok']} timeout={summary['n_timeout']} skipped={summary['n_skipped']}")
-    print(f"   ttfa p50={summary['ttfa_p50_ms']} p95={summary['ttfa_p95_ms']} "
-          f">1s={summary['ttfa_over_1s_pct']}% rtf={summary['rtf_deliver_p50']}")
+    print(
+        f"== {args.content} x {args.users} users: "
+        f"ok={summary['n_ok']} timeout={summary['n_timeout']} skipped={summary['n_skipped']}"
+    )
+    print(
+        f"   ttfa p50={summary['ttfa_p50_ms']} p95={summary['ttfa_p95_ms']} "
+        f">1s={summary['ttfa_over_1s_pct']}% rtf={summary['rtf_deliver_p50']}"
+    )
     bad = {k: summary["engine_probes"][k] for k in LOG_PROBES_BAD}
     print(f"   probes bad={bad} stops={summary['engine_probes']['segment_stops']}")
     return 0 if summary["n_ok"] > 0 else 1

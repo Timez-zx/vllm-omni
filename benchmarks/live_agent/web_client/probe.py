@@ -30,7 +30,7 @@ import wave
 RATE = 16000
 
 
-def synth_speechlike_pcm(seconds: float) -> bytes:
+def synth_speechlike_pcm(seconds: float, *, variant: int = 0) -> bytes:
     """Amplitude-modulated tone: not speech, but not silence either.
 
     Real silence would be a fair test of the transport and an unfair test of the
@@ -38,11 +38,17 @@ def synth_speechlike_pcm(seconds: float) -> bytes:
     energy in it keeps the failure modes separable.
     """
     n = int(RATE * seconds)
+    phase = 2 * math.pi * (variant % 97) / 97
+    low_hz = 180 + 7 * (variant % 11)
+    high_hz = 420 + 11 * (variant % 13)
     out = bytearray()
     for i in range(n):
         t = i / RATE
-        env = 0.35 * (1.0 + math.sin(2 * math.pi * 3.0 * t)) / 2.0
-        sample = env * (0.6 * math.sin(2 * math.pi * 220 * t) + 0.4 * math.sin(2 * math.pi * 480 * t))
+        env = 0.35 * (1.0 + math.sin(2 * math.pi * 3.0 * t + phase)) / 2.0
+        sample = env * (
+            0.6 * math.sin(2 * math.pi * low_hz * t)
+            + 0.4 * math.sin(2 * math.pi * high_hz * t + phase)
+        )
         out += struct.pack("<h", max(-32768, min(32767, int(sample * 32767))))
     return bytes(out)
 

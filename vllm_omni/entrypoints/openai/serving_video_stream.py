@@ -113,7 +113,12 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         if config.system_prompt:
             messages.append({"role": "system", "content": config.system_prompt})
 
-        recent_history = message_history[-2:] if len(message_history) > 2 else message_history
+        if config.history_max_turns is None:
+            recent_history = message_history
+        elif config.history_max_turns == 0:
+            recent_history = []
+        else:
+            recent_history = message_history[-2 * config.history_max_turns :]
         for hist_msg in recent_history:
             messages.append(self._text_only_message(hist_msg))
 

@@ -16,6 +16,7 @@ Protocol:
         {"type": "video.done"}                  # End of session
 
     Server -> Client:
+        {"type": "session.created", "session_id": "...", "incarnation": "...", "epoch": 0}
         {"type": "video.frame.ack", ...}          # when frame_id is provided
         {"type": "video.frames.consumed", ...}    # after first engine output
         {"type": "response.start"}
@@ -37,7 +38,6 @@ import os
 import time as _time
 import uuid
 import wave
-from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
@@ -52,6 +52,12 @@ from vllm_omni.entrypoints.openai import video_stream_envs
 from vllm_omni.entrypoints.openai.video_frame_filter import FrameSimilarityFilter
 from vllm_omni.entrypoints.openai.video_stream_context import (
     text_only_message,
+)
+from vllm_omni.entrypoints.openai.video_stream_state import (
+    SegmentIdentity,
+    SegmentKind,
+    SegmentLedger,
+    SessionIdentity,
 )
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     PREFILL_ONLY_KEY as _TTS_PREFILL_ONLY_KEY,
@@ -75,7 +81,7 @@ _DEFAULT_IDLE_TIMEOUT = 60.0
 _DEFAULT_CONFIG_TIMEOUT = 10.0
 _MAX_FRAME_SIZE = 10 * 1024 * 1024  # 10MB per frame
 
-from vllm_omni.entrypoints.openai import media_pipeline as _media_pipeline
+from vllm_omni.entrypoints.openai import media_pipeline as _media_pipeline  # noqa: E402
 
 # [live-vllm CPU-plane] spawn the media workers before the first frame needs
 # them (spawn-context startup is seconds); daemon thread so shutdown is free.
@@ -100,7 +106,6 @@ _BAD_FRAME = object()
 # [path] recv->提交 这条路径上每个 await 点的时间戳。循环延迟和慢回调都看不见
 # "协程在 await 上等"，只能逐点打戳。VLLM_OMNI_LOG_PATH=1。
 _PATHPROBE = os.environ.get("VLLM_OMNI_LOG_PATH", "0") not in ("0", "", "false", "False")
-
 
 
 def _decode_frame_bytes(raw_bytes: bytes) -> Any:
@@ -142,7 +147,6 @@ def _downscale_frame_bytes(
     buf = io.BytesIO()
     resized.save(buf, format="JPEG", quality=jpeg_quality)
     return buf.getvalue()
-
 
 
 # ======================================================================================
@@ -482,6 +486,24 @@ class StreamingVideoSessionConfig(BaseModel):
 
     """Configuration sent as the first WebSocket message."""
 
+    session_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description=(
+            "Optional client correlation id. The server always creates a fresh "
+            "incarnation, so reconnecting with the same id cannot accept stale output."
+        ),
+    )
+    history_max_turns: int | None = Field(
+        default=1,
+        ge=0,
+        description=(
+            "How many completed user/assistant turns the stateless per-turn path "
+            "replays. The compatibility default is one previous turn; None replays "
+            "the complete history for the full-prefill baseline, and 0 disables history."
+        ),
+    )
     model: str | None = None
     modalities: list[str] = Field(
         default_factory=lambda: ["text", "audio"],
@@ -540,7 +562,8 @@ class StreamingVideoSessionConfig(BaseModel):
         le=8192,
         description=(
             "Downscale arriving frames to fit within this width, preserving aspect ratio. "
-            "Defaults to the measured baseline's 640x352; None disables it. A frame becomes (W/32)*(H/32) tokens, so halving each edge "
+            "Defaults to the measured baseline's 640x352; None disables it. A frame "
+            "becomes (W/32)*(H/32) tokens, so halving each edge "
             "cuts a frame's prompt cost 4x; this is the cheapest lever on per-turn latency "
             "for a video stream. Downscale only -- smaller frames are never upscaled."
         ),
@@ -725,6 +748,16 @@ class StreamingVideoSessionConfig(BaseModel):
             "seed is prefilled into the new request, so an unbounded transcript would grow "
             "every roll until the seed alone approached the wall the roll exists to avoid. "
             "This is what makes the session unbounded in TIME while bounded in MEMORY."
+        ),
+    )
+    evict_engine_request_after_turn: bool = Field(
+        default=False,
+        description=(
+            "Application-level hybrid baseline: retire the persistent engine request "
+            "immediately after each completed response, then rebuild it from the bounded "
+            "text transcript on the next turn. The websocket session and turn identity "
+            "remain stateful, but KV is not held while the user is idle. This uses the "
+            "existing roll path and does not change scheduler or model execution."
         ),
     )
     context_compression_trigger_tokens: int | None = Field(
@@ -953,7 +986,10 @@ class OmniStreamingVideoHandler:
                     lags.sort()
                     logger.info(
                         "[loop-lag] p50=%.1fms p99=%.1fms max=%.1fms (n=%d, sessions=%d)",
-                        lags[50], lags[99], lags[-1], len(lags),
+                        lags[50],
+                        lags[99],
+                        lags[-1],
+                        len(lags),
                         self._active_sessions,
                     )
                     lags = []
@@ -975,7 +1011,8 @@ class OmniStreamingVideoHandler:
             # days old. Post-mortems need the config that was live, not the one shipped.
             try:
                 non_default = {
-                    k: v for k, v in config.model_dump().items()
+                    k: v
+                    for k, v in config.model_dump().items()
                     if v != type(config).model_fields[k].default and k != "system_prompt"
                 }
                 logger.info("[session] config (non-default): %s", non_default)
@@ -988,34 +1025,38 @@ class OmniStreamingVideoHandler:
             # refused here, gracefully, instead. self._active_sessions already
             # counts this session.
             if config.stage1_kv_pool_tokens and config.session_scoped_request:
-                _share = int(_POOL_SHARE * config.stage1_kv_pool_tokens
-                             / max(1, self._active_sessions))
+                _share = int(_POOL_SHARE * config.stage1_kv_pool_tokens / max(1, self._active_sessions))
                 if _share < _TALKER_ROLL_FLOOR:
                     logger.warning(
-                        "[session] REFUSED at admission: stage-1 pool share %d < floor %d "
-                        "(pool=%d, active=%d)", _share, _TALKER_ROLL_FLOOR,
-                        config.stage1_kv_pool_tokens, self._active_sessions)
+                        "[session] REFUSED at admission: stage-1 pool share %d < floor %d (pool=%d, active=%d)",
+                        _share,
+                        _TALKER_ROLL_FLOOR,
+                        config.stage1_kv_pool_tokens,
+                        self._active_sessions,
+                    )
                     await self._send_error(
                         websocket,
                         "at capacity: the speech stage's KV pool cannot hold another "
-                        "session without preempting existing ones")
+                        "session without preempting existing ones",
+                    )
                     return
 
             # [live-vllm P3] Stage-0 twin of the guard above: same shared-wall
             # arithmetic, thinker pool edition.
             if config.stage0_kv_pool_tokens and config.session_scoped_request:
-                _share0 = int(_POOL_SHARE * config.stage0_kv_pool_tokens
-                              / max(1, self._active_sessions))
+                _share0 = int(_POOL_SHARE * config.stage0_kv_pool_tokens / max(1, self._active_sessions))
                 if _share0 < config.stage0_admission_floor_tokens:
                     logger.warning(
-                        "[session] REFUSED at admission: stage-0 pool share %d < floor %d "
-                        "(pool=%d, active=%d)", _share0,
+                        "[session] REFUSED at admission: stage-0 pool share %d < floor %d (pool=%d, active=%d)",
+                        _share0,
                         config.stage0_admission_floor_tokens,
-                        config.stage0_kv_pool_tokens, self._active_sessions)
+                        config.stage0_kv_pool_tokens,
+                        self._active_sessions,
+                    )
                     await self._send_error(
                         websocket,
-                        "at capacity: the thinker's KV pool cannot hold another "
-                        "session at a viable context share")
+                        "at capacity: the thinker's KV pool cannot hold another session at a viable context share",
+                    )
                     return
 
             # [live-vllm P3] Slot ledger: persistent requests + transient
@@ -1027,12 +1068,16 @@ class OmniStreamingVideoHandler:
                     logger.warning(
                         "[session] REFUSED at admission: slot ledger %d (active=%d + "
                         "shadows=%d + margin 2) > max_num_seqs=%d",
-                        _need, self._active_sessions,
-                        _MAX_CONCURRENT_SHADOW_WARMUPS, config.engine_max_seqs)
+                        _need,
+                        self._active_sessions,
+                        _MAX_CONCURRENT_SHADOW_WARMUPS,
+                        config.engine_max_seqs,
+                    )
                     await self._send_error(
                         websocket,
                         "at capacity: engine slots exhausted (sessions are persistent "
-                        "requests; shadows and rolls need headroom)")
+                        "requests; shadows and rolls need headroom)",
+                    )
                     return
 
             # Hard session cap. A session is a standing periodic obligation
@@ -1043,12 +1088,13 @@ class OmniStreamingVideoHandler:
             _cap = int(os.environ.get("VLLM_OMNI_ADMIT_MAX_SESSIONS", "0") or 0)
             if _cap > 0 and self._active_sessions > _cap:
                 logger.warning(
-                    "[session] REFUSED at admission: tick-capacity cap %d reached "
-                    "(active=%d)", _cap, self._active_sessions)
+                    "[session] REFUSED at admission: tick-capacity cap %d reached (active=%d)",
+                    _cap,
+                    self._active_sessions,
+                )
                 await self._send_error(
-                    websocket,
-                    f"at capacity: this instance is provisioned for {_cap} "
-                    "concurrent realtime sessions")
+                    websocket, f"at capacity: this instance is provisioned for {_cap} concurrent realtime sessions"
+                )
                 return
 
             # Resolve the compression trigger once per session. None anchors to the
@@ -1076,8 +1122,7 @@ class OmniStreamingVideoHandler:
             if config.context_compression_trigger_tokens is not None:
                 compression_trigger = max(0, config.context_compression_trigger_tokens)
             elif config.stage0_kv_pool_tokens and _cap_sessions > 0:
-                compression_trigger = int(_POOL_SHARE * config.stage0_kv_pool_tokens
-                                          / _cap_sessions)
+                compression_trigger = int(_POOL_SHARE * config.stage0_kv_pool_tokens / _cap_sessions)
                 if _mml:
                     compression_trigger = min(compression_trigger, int(0.75 * _mml))
             else:
@@ -1115,7 +1160,9 @@ class OmniStreamingVideoHandler:
             compression_target = (
                 config.context_compression_target_tokens
                 if config.context_compression_target_tokens is not None
-                else max(1024, compression_trigger // 2) if compression_trigger else 16384
+                else max(1024, compression_trigger // 2)
+                if compression_trigger
+                else 16384
             )
             compression_hard = 0
             if compression_trigger:
@@ -1126,8 +1173,12 @@ class OmniStreamingVideoHandler:
                     "[session] context compression armed: trigger=%d target=%d "
                     "hard_roll=%d (max_model_len=%d, stage0_pool=%s, cap=%d, "
                     "explicit_trigger=%s)",
-                    compression_trigger, compression_target, compression_hard, _mml,
-                    config.stage0_kv_pool_tokens, _cap_sessions,
+                    compression_trigger,
+                    compression_target,
+                    compression_hard,
+                    _mml,
+                    config.stage0_kv_pool_tokens,
+                    _cap_sessions,
                     config.context_compression_trigger_tokens is not None,
                 )
 
@@ -1156,6 +1207,8 @@ class OmniStreamingVideoHandler:
             msg_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=_MAX_MSG_QUEUE)
             # ---------------------------------------------------------------- PA_SESSION
 
+            session_identity = SessionIdentity(session_id=config.session_id) if config.session_id else SessionIdentity()
+
             def _new_request_ctx() -> dict[str, Any]:
                 """Per-ENGINE-REQUEST state. A session normally owns exactly one, but a
                 compression shadow briefly makes it two: the live request keeps serving
@@ -1164,17 +1217,17 @@ class OmniStreamingVideoHandler:
                 queue, its audio-attribution FIFO, its drain task) lives here; everything
                 whose identity is the SESSION (transcript, turn flags, counters) stays in
                 `sess`."""
+                epoch = session_identity.allocate_epoch()
                 return {
                     "rid": f"video-sess-{uuid.uuid4().hex[:12]}",
                     "queue": asyncio.Queue(maxsize=4),
-                    # One owner tag ("append" | "turn") per chunk submitted to this
-                    # request, pushed in submission order. The engine runs one segment per
-                    # chunk and cannot start segment k+1 before segment k's stop, so the
-                    # k-th audio stop the output loop sees belongs to the k-th submitted
-                    # chunk. That makes submission ORDER a structural identity for the
-                    # audio stream -- the per-chunk field that outputs do not carry. It is
-                    # per-request state: order across two requests means nothing.
-                    "fifo": deque(),
+                    "epoch": epoch,
+                    # One typed identity per OUTPUT-PRODUCING segment. Normal
+                    # prefill-only arrival appends stop in stage 0 with zero output and do
+                    # not enter this ledger; real turns and shadow seeds do. The engine
+                    # preserves segment order within one request, while epoch prevents
+                    # attribution from crossing request replacement boundaries.
+                    "fifo": SegmentLedger(epoch=epoch),
                     "task": None,
                     # Shadow warm-up bookkeeping; inert on the live request.
                     "ready": False,
@@ -1191,6 +1244,7 @@ class OmniStreamingVideoHandler:
                 "queue": main_ctx["queue"],
                 "audio_seg_fifo": main_ctx["fifo"],
                 "active_ctx": main_ctx,
+                "identity": session_identity,
                 "shadow": None,
                 "shadow_failed_at": 0.0,
                 "gen_task": None,
@@ -1219,6 +1273,25 @@ class OmniStreamingVideoHandler:
                 "arrival_frames": 0,
                 "arrival_tokens": 0,
             }
+
+            def _session_event(
+                event_type: str,
+                *,
+                segment: SegmentIdentity | None = None,
+                ctx: dict[str, Any] | None = None,
+                **payload: Any,
+            ) -> dict[str, Any]:
+                event = {"type": event_type}
+                if segment is not None:
+                    event.update(segment.event_fields())
+                else:
+                    epoch = ctx["epoch"] if ctx is not None else None
+                    event.update(session_identity.session_fields(epoch=epoch))
+                event.update(payload)
+                return event
+
+            if config.session_scoped_request:
+                await websocket.send_json(_session_event("session.created", ctx=main_ctx))
             session_request_id = main_ctx["rid"]
 
             async def _chunk_stream(ctx: dict[str, Any]):
@@ -1232,7 +1305,6 @@ class OmniStreamingVideoHandler:
                 no-op that looks like a null result.
                 """
                 from vllm.engine.protocol import StreamingInput
-
                 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
                 _yield_ret = [0.0]
@@ -1240,14 +1312,15 @@ class OmniStreamingVideoHandler:
                     if _PATHPROBE and _yield_ret[0]:
                         # [path] 上一次 yield 返回 = vLLM 回来要下一个 chunk。
                         # 这一段是背压：生成器停在 yield 上，等引擎消化完上一个。
-                        logger.info("[path] gen-resume rid=%s gap_ms=%.1f mono=%.6f",
-                                    ctx.get("rid"),
-                                    (_time.monotonic() - _yield_ret[0]) * 1e3,
-                                    _time.monotonic())
+                        logger.info(
+                            "[path] gen-resume rid=%s gap_ms=%.1f mono=%.6f",
+                            ctx.get("rid"),
+                            (_time.monotonic() - _yield_ret[0]) * 1e3,
+                            _time.monotonic(),
+                        )
                     item = await ctx["queue"].get()
                     if _PATHPROBE:
-                        logger.info("[path] gen-got rid=%s mono=%.6f",
-                                    ctx.get("rid"), _time.monotonic())
+                        logger.info("[path] gen-got rid=%s mono=%.6f", ctx.get("rid"), _time.monotonic())
                         _yield_ret[0] = _time.monotonic()
                     if item is None:
                         return
@@ -1298,9 +1371,15 @@ class OmniStreamingVideoHandler:
 
             def _new_turn_state() -> dict[str, Any]:
                 return {
-                    "text_parts": [], "prev_text": "", "text_done_sent": False,
-                    "audio_chunks": 0, "drained": 0, "started": False,
-                    "t0": _time.monotonic(), "t_first_text": None, "t_first_audio": None,
+                    "text_parts": [],
+                    "prev_text": "",
+                    "text_done_sent": False,
+                    "audio_chunks": 0,
+                    "drained": 0,
+                    "started": False,
+                    "t0": _time.monotonic(),
+                    "t_first_text": None,
+                    "t_first_audio": None,
                 }
 
             async def _session_output_loop(ctx: dict[str, Any]) -> None:
@@ -1366,7 +1445,13 @@ class OmniStreamingVideoHandler:
                                 # at swap time.
                                 ctx["junk_chunks"] += 1
                                 if _segment_finish_reason(output) is not None and ctx["fifo"]:
-                                    ctx["fifo"].popleft()
+                                    ctx["fifo"].finish_current()
+                            elif (
+                                "audio" not in (config.modalities or [])
+                                and _segment_finish_reason(output) is not None
+                                and ctx["fifo"]
+                            ):
+                                ctx["fifo"].finish_current()
                             if _segment_finish_reason(output) is not None and not ctx["ready"]:
                                 # Ready means the seed's AUDIO stop arrived, not merely
                                 # the stage-0 text finish. The talker free-runs junk for
@@ -1385,60 +1470,35 @@ class OmniStreamingVideoHandler:
                                     ctx["ready"] = True
                                     ctx["ready_evt"].set()
                                     logger.info(
-                                        "[session] COMPRESS: shadow %s is ready "
-                                        "(seed fully drained)",
+                                        "[session] COMPRESS: shadow %s is ready (seed fully drained)",
                                         ctx["rid"],
                                     )
                             continue
-                        # Attribute every AUDIO output to the chunk that caused it, by
-                        # submission order. An append flows through the whole pipeline on
-                        # purpose (withholding it from the talker desynchronised the stages
-                        # and killed the engine), and max_tokens=1 caps only stage 0 -- the
-                        # talker free-runs a few unprompted codec frames per append and ends
-                        # them with a REAL audio finish_reason=stop. That stop arrives a
-                        # median 1 s (max measured 36 s) after the append, so any flag read
-                        # AT ARRIVAL TIME tells you what is in flight now, not who caused
-                        # the output: measured closing a real turn at chars=2 while its
-                        # actual reply streamed into the void afterwards -- 27.5 s of real
-                        # speech swallowed in one session, every broken turn a collision of
-                        # an append's late stop with the next turn's open window.
-                        #
-                        # `audio_seg_fifo` is order-based, which is structural here: chunks
-                        # enter the engine through one queue, the engine finishes segment k
-                        # before starting k+1 (chunk polling is gated on the previous
-                        # segment's stop), and every submitted chunk yields exactly one
-                        # stage-2 stop -- held 141/141 in the log INCLUDING the error path
-                        # where the payload build fails and an empty stop still ships. So
-                        # head-of-FIFO == owner of the audio stream right now.
-                        #
-                        # This is not the counter that failed before (see git history of
-                        # this block): that one popped on the append's STAGE-0 finish, which
-                        # is not reliably delivered, so it latched and swallowed a real
-                        # turn's text. This one pops on the audio stream's OWN stop, which
-                        # the engine guarantees per chunk. And it cannot fail silently: a
-                        # stuck "append" head swallows the next turn's audio, turn_done
-                        # never sets, and the 240 s bounded wait already fatals the session
-                        # with "turn boundary lost".
-                        owner = None
+                        # The engine does not echo application ids on every stage
+                        # output, so attribution uses the active request epoch's typed
+                        # ledger. Segment order is an engine guarantee; session,
+                        # incarnation, epoch, turn and segment ids remain explicit instead
+                        # of being inferred from a mutable "turn busy" flag.
+                        owner = ctx["fifo"].current()
                         if getattr(output, "final_output_type", "text") == "audio":
                             fifo = ctx["fifo"]
-                            owner = fifo[0] if fifo else None
                             if _segment_finish_reason(output) is not None and fifo:
-                                fifo.popleft()
+                                fifo.finish_current()
                                 # Presence probe, not noise: pushes==pops at session end is
                                 # the invariant check, and absence of a warning proves
                                 # nothing (the inert-guard lesson).
                                 logger.info(
                                     "[session] audio segment stop owner=%s fifo_left=%d",
-                                    owner, len(fifo),
+                                    owner,
+                                    len(fifo),
                                 )
                         if interrupt_event.is_set():
                             continue
-                        if (getattr(output, "final_output_type", "text") == "audio"
-                                and owner != "turn"):
-                            # owner == "append": positively identified junk -- the talker's
-                            # unprompted frames and their stop. Dropping the stop HERE is
-                            # the actual fix: it can no longer close a real turn.
+                        if getattr(output, "final_output_type", "text") == "audio" and (
+                            owner is None or owner.kind is not SegmentKind.TURN
+                        ):
+                            # A shadow seed is deliberately drained off-wire. Its
+                            # stop must never close the first real turn after a swap.
                             # owner is None: audio nobody submitted a chunk for. Swallow,
                             # but say so loudly -- if this ever fires the one-stop-per-chunk
                             # invariant broke and attribution is shifted.
@@ -1456,21 +1516,27 @@ class OmniStreamingVideoHandler:
                         # textual belongs on the wire either. Sound only because append
                         # AUDIO is already filtered positively above -- this flag check
                         # alone lost the race for a year of debugging hours.
-                        if (config.prefill_frames_on_arrival
-                                and not sess.get("turn_busy")
-                                and not sess.get("query_claimed")):
+                        if (
+                            config.prefill_frames_on_arrival
+                            and not sess.get("turn_busy")
+                            and not sess.get("query_claimed")
+                        ):
                             sess["arrival_skipped"] = sess.get("arrival_skipped", 0) + 1
                             continue
 
                         if not st["started"]:
-                            await websocket.send_json({"type": "response.start"})
+                            await websocket.send_json(_session_event("response.start", segment=owner, ctx=ctx))
                             st["started"] = True
 
                         if getattr(output, "final_output_type", "text") == "audio":
                             if not st["text_done_sent"]:
                                 await websocket.send_json(
-                                    {"type": "response.text.done",
-                                     "text": "".join(st["text_parts"])}
+                                    _session_event(
+                                        "response.text.done",
+                                        segment=owner,
+                                        ctx=ctx,
+                                        text="".join(st["text_parts"]),
+                                    )
                                 )
                                 st["text_done_sent"] = True
                             if st["t_first_audio"] is None:
@@ -1479,10 +1545,16 @@ class OmniStreamingVideoHandler:
                             b64, st["drained"] = self._extract_audio_delta_b64(output, st["drained"])
                             if b64:
                                 await websocket.send_json(
-                                    {"type": "response.audio.delta", "data": b64, "format": "wav"}
+                                    _session_event(
+                                        "response.audio.delta",
+                                        segment=owner,
+                                        ctx=ctx,
+                                        data=b64,
+                                        format="wav",
+                                    )
                                 )
                             if _segment_finish_reason(output) is not None:
-                                await websocket.send_json({"type": "response.audio.done"})
+                                await websocket.send_json(_session_event("response.audio.done", segment=owner, ctx=ctx))
                                 # Prefer the submission stamp: st["t0"] is the
                                 # previous turn's end, which under duplex
                                 # feeding is minutes of think-time away.
@@ -1494,7 +1566,8 @@ class OmniStreamingVideoHandler:
                                     sess["turn_idx"],
                                     (st["t_first_text"] - _t0) if st["t_first_text"] else -1.0,
                                     (st["t_first_audio"] - _t0) if st["t_first_audio"] else -1.0,
-                                    st["audio_chunks"], len("".join(st["text_parts"])),
+                                    st["audio_chunks"],
+                                    len("".join(st["text_parts"])),
                                     sess.get("arrival_skipped", 0),
                                     sess.get("frames_dropped", 0),
                                 )
@@ -1507,8 +1580,7 @@ class OmniStreamingVideoHandler:
                                 # would track only the deltas and stay reassuringly small
                                 # right up to the point where the stage dies.
                                 sess["talker_tokens"] = (
-                                    sess.get("talker_tokens", 0)
-                                    + _TALKER_TOKENS_PER_AUDIO_CHUNK * st["audio_chunks"]
+                                    sess.get("talker_tokens", 0) + _TALKER_TOKENS_PER_AUDIO_CHUNK * st["audio_chunks"]
                                 )
                                 # `message_history` is still deliberately NOT updated: under
                                 # session mode the conversation lives in the engine request's
@@ -1531,10 +1603,7 @@ class OmniStreamingVideoHandler:
                                     q = sess.get("pending_query") or ""
                                     frames = sess.get("pending_frames") or []
                                     sess["pending_frames"] = []
-                                    carry_frames = bool(
-                                        compression_trigger
-                                        and config.context_compression_carry_frames
-                                    )
+                                    carry_frames = bool(compression_trigger and config.context_compression_carry_frames)
                                     if q or (frames and carry_frames):
                                         entry: dict[str, Any] = {"role": "user", "content": q}
                                         if frames and carry_frames:
@@ -1544,9 +1613,7 @@ class OmniStreamingVideoHandler:
                                             entry["frames"] = frames
                                         sess["transcript"].append(entry)
                                     if text:
-                                        sess["transcript"].append(
-                                            {"role": "assistant", "content": text}
-                                        )
+                                        sess["transcript"].append({"role": "assistant", "content": text})
                                     keep = 2 * max(0, config.session_roll_history_turns)
                                     if carry_frames:
                                         # The roll default (16 entries) binds far below a
@@ -1576,18 +1643,20 @@ class OmniStreamingVideoHandler:
                                 # solved. This is what makes duplex feeding legal on
                                 # text-only (talker-less) sessions.
                                 _fifo = ctx["fifo"]
-                                _owner_t = _fifo[0] if _fifo else None
+                                _owner_t = _fifo.current()
                                 if _segment_finish_reason(output) is not None and _fifo:
-                                    _fifo.popleft()
+                                    _fifo.finish_current()
                                     logger.info(
                                         "[session] text segment stop owner=%s fifo_left=%d",
-                                        _owner_t, len(_fifo),
+                                        _owner_t,
+                                        len(_fifo),
                                     )
-                                if _owner_t != "turn":
+                                if _owner_t is None or _owner_t.kind is not SegmentKind.TURN:
                                     if _owner_t is None:
                                         logger.warning(
                                             "[session] UNOWNED text output dropped -- "
-                                            "fifo empty, attribution may be shifted")
+                                            "fifo empty, attribution may be shifted"
+                                        )
                                     sess["arrival_skipped"] = sess.get("arrival_skipped", 0) + 1
                                     continue
                             delta, st["prev_text"] = self._extract_text_delta(output, st["prev_text"])
@@ -1609,13 +1678,19 @@ class OmniStreamingVideoHandler:
                                 # turns that survived v3-v5.
                                 logger.info(
                                     "[turnprobe] first-text rid=%s turn=%d mono=%.6f",
-                                    ctx.get("rid"), sess.get("turn_idx", -1),
+                                    ctx.get("rid"),
+                                    sess.get("turn_idx", -1),
                                     _time.monotonic(),
                                 )
                             if delta:
                                 st["text_parts"].append(delta)
                                 await websocket.send_json(
-                                    {"type": "response.text.delta", "delta": delta}
+                                    _session_event(
+                                        "response.text.delta",
+                                        segment=owner,
+                                        ctx=ctx,
+                                        delta=delta,
+                                    )
                                 )
                             if _segment_finish_reason(output) is not None:
                                 # The text segment ended. Audio normally closes the turn a
@@ -1624,8 +1699,12 @@ class OmniStreamingVideoHandler:
                                 if "audio" not in (config.modalities or []):
                                     if not st["text_done_sent"]:
                                         await websocket.send_json(
-                                            {"type": "response.text.done",
-                                             "text": "".join(st["text_parts"])}
+                                            _session_event(
+                                                "response.text.done",
+                                                segment=owner,
+                                                ctx=ctx,
+                                                text="".join(st["text_parts"]),
+                                            )
                                         )
                                     st = _new_turn_state()
                                     sess["turn_done"].set()
@@ -1635,7 +1714,7 @@ class OmniStreamingVideoHandler:
                     if sess.get("active_ctx") is ctx:
                         logger.exception("[session] output loop failed")
                         sess["fatal"] = str(e)
-                        sess["turn_done"].set()   # never leave a turn waiting forever
+                        sess["turn_done"].set()  # never leave a turn waiting forever
                     else:
                         # A non-live request's failure abandons that request, never the
                         # live session: reusing the fatal path here would let a shadow
@@ -1643,7 +1722,8 @@ class OmniStreamingVideoHandler:
                         # perfectly healthy conversation.
                         logger.warning(
                             "[session] COMPRESS: non-live request %s loop ended: %s",
-                            ctx["rid"], e,
+                            ctx["rid"],
+                            e,
                         )
                         ctx["failed"] = str(e)
                         ctx["ready_evt"].set()
@@ -1672,8 +1752,7 @@ class OmniStreamingVideoHandler:
                 query-time path picks it up. A latency optimisation must never be able to lose
                 a frame.
                 """
-                if (not sess["first_sent"] or sess.get("turn_busy")
-                        or sess.get("query_claimed") or sess["fatal"]):
+                if not sess["first_sent"] or sess.get("turn_busy") or sess.get("query_claimed") or sess["fatal"]:
                     return False
                 # While a compression shadow warms up, frames are HELD, not appended: an
                 # append lands in the OLD request's KV, which dies at the swap, and the
@@ -1698,7 +1777,11 @@ class OmniStreamingVideoHandler:
                 if sess["queue"].qsize() > 0:
                     return False
                 chunk = await self._build_session_chunk(
-                    config, frames, bytearray(), "", frame_pil_cache,
+                    config,
+                    frames,
+                    bytearray(),
+                    "",
+                    frame_pil_cache,
                     is_first=False,
                 )
                 if chunk is None or not isinstance(chunk, dict):
@@ -1756,10 +1839,13 @@ class OmniStreamingVideoHandler:
                 if compression_trigger and config.context_compression_carry_frames:
                     sess.setdefault("pending_frames", []).extend(frames)
                 logger.info(
-                    "[session] prefill-on-arrival: %d frame(s) -> %d tokens (appends=%d "
-                    "frames=%d tokens=%d cum=%d)",
-                    len(frames), ntok, sess["arrival_appends"], sess["arrival_frames"],
-                    sess["arrival_tokens"], sess.get("cum_tokens", 0),
+                    "[session] prefill-on-arrival: %d frame(s) -> %d tokens (appends=%d frames=%d tokens=%d cum=%d)",
+                    len(frames),
+                    ntok,
+                    sess["arrival_appends"],
+                    sess["arrival_frames"],
+                    sess["arrival_tokens"],
+                    sess.get("cum_tokens", 0),
                 )
                 # Frames alone can carry the context across the compression trigger during
                 # a long silence; without this hook the warm-up would only start at the
@@ -1780,8 +1866,7 @@ class OmniStreamingVideoHandler:
                 8 s attention blocks (bit-faithful split). Failure is soft:
                 the audio stays buffered and the turn-time path takes it all.
                 """
-                if (not sess["first_sent"] or sess.get("turn_busy")
-                        or sess.get("query_claimed") or sess["fatal"]):
+                if not sess["first_sent"] or sess.get("turn_busy") or sess.get("query_claimed") or sess["fatal"]:
                     return False
                 if sess.get("shadow") is not None:
                     return False
@@ -1799,7 +1884,11 @@ class OmniStreamingVideoHandler:
                 k = consume_s * bytes_per_s
                 prefix = bytes(audio_buffer[:k])
                 chunk = await self._build_session_chunk(
-                    config, [], bytearray(prefix), "", frame_pil_cache,
+                    config,
+                    [],
+                    bytearray(prefix),
+                    "",
+                    frame_pil_cache,
                     is_first=False,
                 )
                 if chunk is None or not isinstance(chunk, dict):
@@ -1807,7 +1896,8 @@ class OmniStreamingVideoHandler:
                 if not _strip_chatml_scaffolding(chunk):
                     logger.warning(
                         "[session] audio prefill-on-arrival: could not reduce the delta "
-                        "to its audio tokens; skipping (audio stays buffered)")
+                        "to its audio tokens; skipping (audio stays buffered)"
+                    )
                     return False
                 from vllm_omni.engine import (
                     AdditionalInformationEntry,
@@ -1832,10 +1922,12 @@ class OmniStreamingVideoHandler:
                 sess["arrival_tokens"] += ntok
                 sess["cum_tokens"] = sess.get("cum_tokens", 0) + ntok
                 logger.info(
-                    "[session] audio prefill-on-arrival: %ds -> %d tokens "
-                    "(appends=%d tokens=%d cum=%d)",
-                    consume_s, ntok, sess["arrival_appends"],
-                    sess["arrival_tokens"], sess.get("cum_tokens", 0),
+                    "[session] audio prefill-on-arrival: %ds -> %d tokens (appends=%d tokens=%d cum=%d)",
+                    consume_s,
+                    ntok,
+                    sess["arrival_appends"],
+                    sess["arrival_tokens"],
+                    sess.get("cum_tokens", 0),
                 )
                 if _warmup_due() and _shadow_allowed():
                     _launch_shadow_warmup("arrival")
@@ -1862,17 +1954,19 @@ class OmniStreamingVideoHandler:
                 """
                 if sess.get("turn_busy"):
                     logger.error(
-                        "[session] turn=%d is still in flight and another query "
-                        "arrived -- refusing to overlap turns",
+                        "[session] turn=%d is still in flight and another query arrived -- refusing to overlap turns",
                         sess["turn_idx"],
                     )
                     sess["fatal"] = "overlapping turn"
                     await self._send_error(websocket, "Overlapping turn")
                     return
                 if _PATHPROBE:
-                    logger.info("[path] enter rid=%s turn=%d mono=%.6f",
-                                (sess.get("active_ctx") or {}).get("rid"),
-                                sess.get("turn_idx", -1), _time.monotonic())
+                    logger.info(
+                        "[path] enter rid=%s turn=%d mono=%.6f",
+                        (sess.get("active_ctx") or {}).get("rid"),
+                        sess.get("turn_idx", -1),
+                        _time.monotonic(),
+                    )
                 sess["turn_busy"] = True
                 try:
                     sess["query_claimed"] = False
@@ -1890,7 +1984,8 @@ class OmniStreamingVideoHandler:
                 # [turnprobe] see the first-text probe for why.
                 logger.info(
                     "[turnprobe] recv rid=%s turn=%d mono=%.6f",
-                    (sess.get("active_ctx") or {}).get("rid"), sess.get("turn_idx", -1),
+                    (sess.get("active_ctx") or {}).get("rid"),
+                    sess.get("turn_idx", -1),
                     _time.monotonic(),
                 )
                 if sess["fatal"]:
@@ -1919,8 +2014,7 @@ class OmniStreamingVideoHandler:
                 #      the warm-up thresholds sit below the walls on purpose.
                 carry: list[dict[str, Any]] | None = None
                 shadow = sess.get("shadow")
-                if (shadow is not None and shadow["ctx"].get("ready")
-                        and not shadow["ctx"].get("failed")):
+                if shadow is not None and shadow["ctx"].get("ready") and not shadow["ctx"].get("failed"):
                     carry = await _swap_to_shadow()
                 elif _must_roll_now():
                     if _can_defer_roll():
@@ -1942,49 +2036,58 @@ class OmniStreamingVideoHandler:
                         logger.info(
                             "[session] roll waived: turn=%d served on live "
                             "request (cum=%d >= hard=%d); waiting for a shadow",
-                            sess["turn_idx"], sess.get("cum_tokens", 0),
+                            sess["turn_idx"],
+                            sess.get("cum_tokens", 0),
                             compression_hard,
                         )
                     else:
                         await _roll_session()
                         if sess["fatal"]:
-                            await self._send_error(
-                                websocket, f"Session failed: {sess['fatal']}"
-                            )
+                            await self._send_error(websocket, f"Session failed: {sess['fatal']}")
                             return
                 elif _warmup_due() and _shadow_allowed():
                     _launch_shadow_warmup("turn start")
 
                 if _PATHPROBE:
-                    logger.info("[path] ladder-done rid=%s turn=%d mono=%.6f",
-                                (sess.get("active_ctx") or {}).get("rid"),
-                                sess.get("turn_idx", -1), _time.monotonic())
+                    logger.info(
+                        "[path] ladder-done rid=%s turn=%d mono=%.6f",
+                        (sess.get("active_ctx") or {}).get("rid"),
+                        sess.get("turn_idx", -1),
+                        _time.monotonic(),
+                    )
                 new_frames = list(frame_buffer)
                 n_buffered = len(new_frames)
                 # Freshness (digit-clock study): without this, the frames adjacent to
                 # the question are the ones refused during the PREVIOUS answer -- the
                 # oldest in the delta -- and the model reads the frames nearest the
                 # question as "now". Ride the newest arrival at the delta's end.
-                if (config.fresh_frame_on_query and latest_frame[0] is not None
-                        and (not new_frames or new_frames[-1] != latest_frame[0])):
+                if (
+                    config.fresh_frame_on_query
+                    and latest_frame[0] is not None
+                    and (not new_frames or new_frames[-1] != latest_frame[0])
+                ):
                     new_frames.append(latest_frame[0])
                 # The blocking roll's seed is deliberately TEXT-ONLY even when frames are
                 # retained: it prefills in the foreground of a turn the user is waiting
                 # on, and recovery speed beats fidelity on the emergency path. The shadow
                 # seed is where frames ride (they prefill in silence).
-                seed = (
-                    _transcript_chat_msgs(sess["transcript"], with_frames=False)
-                    if not sess["first_sent"] else None
-                )
+                seed = _transcript_chat_msgs(sess["transcript"], with_frames=False) if not sess["first_sent"] else None
                 chunk = await self._build_session_chunk(
-                    config, new_frames, audio_buffer, query_text, frame_pil_cache,
+                    config,
+                    new_frames,
+                    audio_buffer,
+                    query_text,
+                    frame_pil_cache,
                     is_first=not sess["first_sent"],
                     seed_history=seed if seed is not None else carry,
                 )
                 if _PATHPROBE:
-                    logger.info("[path] chunk-built rid=%s turn=%d mono=%.6f",
-                                (sess.get("active_ctx") or {}).get("rid"),
-                                sess.get("turn_idx", -1), _time.monotonic())
+                    logger.info(
+                        "[path] chunk-built rid=%s turn=%d mono=%.6f",
+                        (sess.get("active_ctx") or {}).get("rid"),
+                        sess.get("turn_idx", -1),
+                        _time.monotonic(),
+                    )
                 audio_buffer.clear()
                 if chunk is None:
                     # Nothing to submit: keep the frames for the next turn rather than
@@ -2000,10 +2103,7 @@ class OmniStreamingVideoHandler:
                     # Post-filter list: a frame the chunk dropped as undecodable must not
                     # come back to poison a seed later. Captured before the cache pops
                     # below erase the _BAD_FRAME verdicts.
-                    kept = [
-                        f for f in new_frames
-                        if frame_pil_cache.get(f) is not _BAD_FRAME
-                    ]
+                    kept = [f for f in new_frames if frame_pil_cache.get(f) is not _BAD_FRAME]
                     if kept:
                         sess.setdefault("pending_frames", []).extend(kept)
                 for consumed in new_frames:
@@ -2027,6 +2127,7 @@ class OmniStreamingVideoHandler:
                     from vllm_omni.distributed.omni_connectors.adapter import (
                         compute_talker_prompt_ids_length,
                     )
+
                     tlen = compute_talker_prompt_ids_length(list(ids))
                 except Exception:
                     pass
@@ -2050,9 +2151,14 @@ class OmniStreamingVideoHandler:
                 logger.info(
                     "[session] turn=%d queue delta: %d new frames, %d tokens, "
                     "cum=%d, talker_placeholder=%d, talker_est=%d%s, first=%s",
-                    sess["turn_idx"], len(new_frames), ntok,
-                    sess["cum_tokens"], tlen, sess.get("talker_tokens", 0),
-                    f"/{budget}" if budget else "", not sess["first_sent"],
+                    sess["turn_idx"],
+                    len(new_frames),
+                    ntok,
+                    sess["cum_tokens"],
+                    tlen,
+                    sess.get("talker_tokens", 0),
+                    f"/{budget}" if budget else "",
+                    not sess["first_sent"],
                 )
                 if budget and sess.get("talker_tokens", 0) >= budget:
                     # Refuse the turn rather than submit one that may not come back. Ending
@@ -2066,7 +2172,9 @@ class OmniStreamingVideoHandler:
                         "it risks max_model_len, which does not fail cleanly: it either kills "
                         "the stage-1 engine core or makes the scheduler skip the request "
                         "silently forever. Ending the session instead.",
-                        sess["turn_idx"], sess.get("talker_tokens", 0), budget,
+                        sess["turn_idx"],
+                        sess.get("talker_tokens", 0),
+                        budget,
                     )
                     sess["fatal"] = "talker token budget exhausted"
                     await self._send_error(
@@ -2093,19 +2201,32 @@ class OmniStreamingVideoHandler:
                 # turn that never enters the FIFO is swallowed as unowned by whichever
                 # branch is doing the attributing (949 unowned drops, 0/1280 turns in
                 # the first thinker-only run, with the old audio-gated push).
-                sess["audio_seg_fifo"].append("turn")
+                active_ctx = sess["active_ctx"]
+                turn_segment = session_identity.new_segment(
+                    epoch=active_ctx["epoch"],
+                    kind=SegmentKind.TURN,
+                    turn_id=session_identity.turn_id,
+                )
+                sess["audio_seg_fifo"].submit(turn_segment)
+                sess["active_segment"] = turn_segment
                 if _PATHPROBE:
                     # [path] 队列深度。这个队列 maxsize=4，而到达路径（视频帧）也往
                     # 里塞，所以一轮的查询 chunk 可能排在若干个帧 chunk 后面。
-                    logger.info("[path] pre-put rid=%s turn=%d qsize=%d mono=%.6f",
-                                (sess.get("active_ctx") or {}).get("rid"),
-                                sess.get("turn_idx", -1), sess["queue"].qsize(),
-                                _time.monotonic())
+                    logger.info(
+                        "[path] pre-put rid=%s turn=%d qsize=%d mono=%.6f",
+                        (sess.get("active_ctx") or {}).get("rid"),
+                        sess.get("turn_idx", -1),
+                        sess["queue"].qsize(),
+                        _time.monotonic(),
+                    )
                 await sess["queue"].put(chunk)
                 if _PATHPROBE:
-                    logger.info("[path] post-put rid=%s turn=%d mono=%.6f",
-                                (sess.get("active_ctx") or {}).get("rid"),
-                                sess.get("turn_idx", -1), _time.monotonic())
+                    logger.info(
+                        "[path] post-put rid=%s turn=%d mono=%.6f",
+                        (sess.get("active_ctx") or {}).get("rid"),
+                        sess.get("turn_idx", -1),
+                        _time.monotonic(),
+                    )
                 # Bounded wait. A lost segment boundary must surface as an error rather
                 # than a hang: the first bring-up attempt used an unusable boundary signal
                 # and the symptom was the client sitting in its own timeout with no server
@@ -2122,10 +2243,14 @@ class OmniStreamingVideoHandler:
                     sess["fatal"] = "turn boundary lost"
                     await self._send_error(websocket, "Turn boundary lost")
                     return
-                sess["turn_idx"] += 1
-                # Start a due warm-up in the silence AFTER the turn, not during one: the
-                # seed prefill competes for the GPU with whatever is decoding.
-                if _warmup_due() and _shadow_allowed():
+                session_identity.advance_turn(turn_segment.turn_id)
+                sess["turn_idx"] = session_identity.turn_id
+                # The hybrid baseline releases KV for the whole idle window and
+                # rebuilds from the bounded text transcript on the next turn. Normal
+                # persistent mode instead uses idle time only for a due shadow warm-up.
+                if config.evict_engine_request_after_turn:
+                    await _roll_session()
+                elif _warmup_due() and _shadow_allowed():
                     _launch_shadow_warmup("turn end")
 
             def _talker_roll_at() -> int | None:
@@ -2140,8 +2265,7 @@ class OmniStreamingVideoHandler:
                 pool = config.stage1_kv_pool_tokens
                 if not pool:
                     return roll_at
-                share = max(_TALKER_ROLL_FLOOR,
-                            int(0.75 * pool / max(1, self._active_sessions)))
+                share = max(_TALKER_ROLL_FLOOR, int(0.75 * pool / max(1, self._active_sessions)))
                 return min(roll_at, share) if roll_at else share
 
             def _warmup_due() -> bool:
@@ -2196,13 +2320,14 @@ class OmniStreamingVideoHandler:
                         # the only visible trace that the POOL, not the per-session
                         # wall, forced this roll.
                         logger.warning(
-                            "[session] talker-pool guard rolls at %d (configured %s, "
-                            "pool=%d, active=%d)", roll_at,
+                            "[session] talker-pool guard rolls at %d (configured %s, pool=%d, active=%d)",
+                            roll_at,
                             config.session_roll_at_talker_tokens,
-                            config.stage1_kv_pool_tokens or 0, self._active_sessions)
+                            config.stage1_kv_pool_tokens or 0,
+                            self._active_sessions,
+                        )
                     return True
-                return bool(compression_hard
-                            and sess.get("cum_tokens", 0) >= compression_hard)
+                return bool(compression_hard and sess.get("cum_tokens", 0) >= compression_hard)
 
             def _shadow_allowed() -> bool:
                 if sess.get("shadow") is not None or sess["fatal"]:
@@ -2218,8 +2343,7 @@ class OmniStreamingVideoHandler:
                 # session simply retries at its next arrival/turn event --
                 # the waive machinery already makes riding past the trigger
                 # safe to 2x.
-                if (_time.monotonic() - OmniStreamingVideoHandler._last_warmup_launch
-                        < _COMPRESS_MIN_INTERVAL_S):
+                if _time.monotonic() - OmniStreamingVideoHandler._last_warmup_launch < _COMPRESS_MIN_INTERVAL_S:
                     return False
                 # Cooldown after a failed warm-up, so a broken shadow path degrades to
                 # the blocking roll instead of spinning warm-up attempts.
@@ -2231,9 +2355,7 @@ class OmniStreamingVideoHandler:
                 prewarm_tasks.add(t)
                 t.add_done_callback(prewarm_tasks.discard)
 
-            def _transcript_chat_msgs(
-                msgs: list[dict[str, Any]], *, with_frames: bool
-            ) -> list[dict[str, Any]]:
+            def _transcript_chat_msgs(msgs: list[dict[str, Any]], *, with_frames: bool) -> list[dict[str, Any]]:
                 """Project transcript entries into chat messages the request schema knows.
 
                 Transcript entries keep frames under a SIBLING key so every text-only
@@ -2258,9 +2380,7 @@ class OmniStreamingVideoHandler:
                             content.append({"type": "text", "text": text})
                         out.append({"role": m["role"], "content": content})
                     else:
-                        out.append(
-                            {"role": m["role"], "content": m.get("content") or ""}
-                        )
+                        out.append({"role": m["role"], "content": m.get("content") or ""})
                 return out
 
             def _trim_transcript_for_seed() -> list[dict[str, Any]]:
@@ -2325,7 +2445,8 @@ class OmniStreamingVideoHandler:
                 if queued:
                     logger.info(
                         "[session] COMPRESS: warm-up queued (%s): %d permits in use",
-                        where, _MAX_CONCURRENT_SHADOW_WARMUPS,
+                        where,
+                        _MAX_CONCURRENT_SHADOW_WARMUPS,
                     )
                 try:
                     await sem.acquire()
@@ -2370,7 +2491,11 @@ class OmniStreamingVideoHandler:
                 sess["shadow"] = {"ctx": ctx, "watermark": watermark, "seed_ntok": 0}
                 try:
                     chunk = await self._build_session_chunk(
-                        config, [], bytearray(), "", frame_pil_cache,
+                        config,
+                        [],
+                        bytearray(),
+                        "",
+                        frame_pil_cache,
                         is_first=True,
                         seed_history=_transcript_chat_msgs(seed_msgs, with_frames=True),
                         seed_only=True,
@@ -2378,15 +2503,16 @@ class OmniStreamingVideoHandler:
                     if not isinstance(chunk, dict):
                         raise RuntimeError("seed chunk did not build")
                     ntok = len(chunk.get("prompt_token_ids") or ())
-                    while (ntok > compression_target * 1.3
-                           and len(seed_msgs) > 2):
+                    while ntok > compression_target * 1.3 and len(seed_msgs) > 2:
                         seed_msgs = seed_msgs[2:]
                         chunk = await self._build_session_chunk(
-                            config, [], bytearray(), "", frame_pil_cache,
+                            config,
+                            [],
+                            bytearray(),
+                            "",
+                            frame_pil_cache,
                             is_first=True,
-                            seed_history=_transcript_chat_msgs(
-                                seed_msgs, with_frames=True
-                            ),
+                            seed_history=_transcript_chat_msgs(seed_msgs, with_frames=True),
                             seed_only=True,
                         )
                         if not isinstance(chunk, dict):
@@ -2411,11 +2537,10 @@ class OmniStreamingVideoHandler:
                         from vllm_omni.distributed.omni_connectors.adapter import (
                             compute_talker_prompt_ids_length,
                         )
+
                         seed_tlen = max(
                             0,
-                            compute_talker_prompt_ids_length(
-                                list(chunk.get("prompt_token_ids") or ())
-                            ),
+                            compute_talker_prompt_ids_length(list(chunk.get("prompt_token_ids") or ())),
                         )
                     except Exception:
                         # Err high -- the estimate guards a wall -- but from the TEXT,
@@ -2424,28 +2549,30 @@ class OmniStreamingVideoHandler:
                         # talker a step from its roll line and re-roll every turn.
                         seed_tlen = max(
                             64,
-                            sum(
-                                (len(str(m.get("content", ""))) // 3) * 2
-                                for m in seed_msgs
-                            ),
+                            sum((len(str(m.get("content", ""))) // 3) * 2 for m in seed_msgs),
                         )
                     sess["shadow"]["seed_tlen"] = seed_tlen
                     ctx["task"] = asyncio.create_task(_session_output_loop(ctx))
                     # The seed's junk audio needs an owner tag, exactly like an arrival
                     # append: its stage-2 stop can arrive AFTER the swap, on the by-then
                     # live loop, and an unowned stop would close the first real turn
-                    # early. Tagged "append", it is positively identified junk on either
-                    # side of the swap. No producer races this push: the shadow queue has
+                    # early. Its SHADOW_SEED identity remains explicit on either side
+                    # of the swap. No producer races this submit: the shadow queue has
                     # exactly one writer until the swap.
-                    if "audio" in (config.modalities or []):
-                        ctx["fifo"].append("append")
+                    seed_segment = session_identity.new_segment(epoch=ctx["epoch"], kind=SegmentKind.SHADOW_SEED)
+                    ctx["fifo"].submit(seed_segment)
                     await ctx["queue"].put((chunk, 2, "seed"))
                     seed_frames = sum(len(m.get("frames") or ()) for m in seed_msgs)
                     logger.info(
                         "[session] COMPRESS: warming shadow %s at %s (seed=%d msgs, "
                         "%d frames, %d tokens; cum=%d, talker_est=%d)",
-                        ctx["rid"], where, len(seed_msgs), seed_frames, ntok,
-                        sess.get("cum_tokens", 0), sess.get("talker_tokens", 0),
+                        ctx["rid"],
+                        where,
+                        len(seed_msgs),
+                        seed_frames,
+                        ntok,
+                        sess.get("cum_tokens", 0),
+                        sess.get("talker_tokens", 0),
                     )
                     try:
                         await asyncio.wait_for(
@@ -2460,8 +2587,7 @@ class OmniStreamingVideoHandler:
                     raise
                 except Exception as e:  # noqa: BLE001
                     logger.warning(
-                        "[session] COMPRESS: shadow warm-up abandoned (%s); the blocking "
-                        "roll remains the fallback",
+                        "[session] COMPRESS: shadow warm-up abandoned (%s); the blocking roll remains the fallback",
                         e,
                     )
                     task = ctx.get("task")
@@ -2490,9 +2616,7 @@ class OmniStreamingVideoHandler:
                 # Text view on purpose: the carry prefills on the swap turn's critical
                 # path. Its turns' frames stay in the transcript, inside the NEXT seed's
                 # window -- temporarily invisible to the model, never lost.
-                carry = _transcript_chat_msgs(
-                    sess["transcript"][shadow["watermark"]:], with_frames=False
-                )
+                carry = _transcript_chat_msgs(sess["transcript"][shadow["watermark"] :], with_frames=False)
                 if ctx["fifo"]:
                     # The seed's "append" tag is still pending: its audio stop has not
                     # arrived yet. KEEP it -- the live loop's append handling swallows the
@@ -2500,7 +2624,7 @@ class OmniStreamingVideoHandler:
                     # Clearing it here would hand the seed's stop to the first real turn.
                     logger.info(
                         "[session] COMPRESS: seed audio stop still pending at swap "
-                        "(fifo=%d) -- the append tag rides across",
+                        "(ledger=%d) -- the seed identity rides across",
                         len(ctx["fifo"]),
                     )
                 sess["active_ctx"] = ctx
@@ -2513,9 +2637,8 @@ class OmniStreamingVideoHandler:
                 # block mid-request and skip the <|im_end|> shim.
                 sess["first_sent"] = True
                 sess["cum_tokens"] = shadow["seed_ntok"]
-                sess["talker_tokens"] = (
-                    shadow.get("seed_tlen", 0)
-                    + _TALKER_TOKENS_PER_AUDIO_CHUNK * ctx.get("junk_chunks", 0)
+                sess["talker_tokens"] = shadow.get("seed_tlen", 0) + _TALKER_TOKENS_PER_AUDIO_CHUNK * ctx.get(
+                    "junk_chunks", 0
                 )
                 sess["rolls"] = sess.get("rolls", 0) + 1
                 this_turn = sess["turn_idx"]
@@ -2541,13 +2664,23 @@ class OmniStreamingVideoHandler:
                     "[session] COMPRESS #%d at turn=%d: %s -> %s, seed=%d tokens, "
                     "carry=%d message(s); the swap is a pointer flip, this turn pays no "
                     "cold prefill.",
-                    sess["rolls"], sess["turn_idx"], old_rid, ctx["rid"],
-                    shadow["seed_ntok"], len(carry),
+                    sess["rolls"],
+                    sess["turn_idx"],
+                    old_rid,
+                    ctx["rid"],
+                    shadow["seed_ntok"],
+                    len(carry),
                 )
                 try:
                     await websocket.send_json(
-                        {"type": "session.compressed", "turn": sess["turn_idx"],
-                         "rolls": sess["rolls"], "carried_messages": len(carry)}
+                        _session_event(
+                            "session.compressed",
+                            ctx=ctx,
+                            turn=sess["turn_idx"],
+                            turn_id=session_identity.turn_id,
+                            rolls=sess["rolls"],
+                            carried_messages=len(carry),
+                        )
                     )
                 except Exception:
                     # The client not understanding this event must not end the session.
@@ -2606,8 +2739,8 @@ class OmniStreamingVideoHandler:
                 sess["queue"] = ctx["queue"]
                 sess["audio_seg_fifo"] = ctx["fifo"]
                 sess["gen_task"] = None
-                sess["first_sent"] = False        # next chunk carries system + seed
-                sess["cum_tokens"] = 0            # new request, new context
+                sess["first_sent"] = False  # next chunk carries system + seed
+                sess["cum_tokens"] = 0  # new request, new context
                 sess["talker_tokens"] = 0
                 sess["rolls"] = sess.get("rolls", 0) + 1
                 session_request_id = ctx["rid"]
@@ -2623,14 +2756,23 @@ class OmniStreamingVideoHandler:
                     "[session] ROLL #%d at turn=%d: talker was at ~%d tokens, retiring "
                     "req=%s for req=%s, carrying %d transcript message(s). This turn pays a "
                     "cold prefill; the accumulated visual context is gone and the text is not.",
-                    sess["rolls"], sess["turn_idx"], prev_tokens,
-                    prev_id, session_request_id, len(sess["transcript"]),
+                    sess["rolls"],
+                    sess["turn_idx"],
+                    prev_tokens,
+                    prev_id,
+                    session_request_id,
+                    len(sess["transcript"]),
                 )
                 try:
                     await websocket.send_json(
-                        {"type": "session.rolled", "turn": sess["turn_idx"],
-                         "rolls": sess["rolls"],
-                         "carried_messages": len(sess["transcript"])}
+                        _session_event(
+                            "session.rolled",
+                            ctx=sess["active_ctx"],
+                            turn=sess["turn_idx"],
+                            turn_id=session_identity.turn_id,
+                            rolls=sess["rolls"],
+                            carried_messages=len(sess["transcript"]),
+                        )
                     )
                 except Exception:
                     # The client not understanding this event must not end the session.
@@ -2662,6 +2804,18 @@ class OmniStreamingVideoHandler:
                     if stask is not None and not stask.done():
                         stask.cancel()
                         await asyncio.gather(stask, return_exceptions=True)
+                    abandoned_shadow = shadow["ctx"]["fifo"].clear()
+                    if abandoned_shadow:
+                        logger.info(
+                            "[session] close abandoned %d shadow segment(s)",
+                            len(abandoned_shadow),
+                        )
+                abandoned_live = sess["active_ctx"]["fifo"].clear()
+                if abandoned_live:
+                    logger.info(
+                        "[session] close abandoned %d live segment(s)",
+                        len(abandoned_live),
+                    )
                 task = sess["gen_task"]
                 if task is None:
                     return
@@ -2682,7 +2836,6 @@ class OmniStreamingVideoHandler:
                 # runs one server boot per session rather than four sessions per boot.
                 # Fixing it properly belongs upstream, in stage 1's handling of a resumable
                 # request that is ending.
-
 
             async def _reader() -> None:
                 """Receive WebSocket messages and enqueue them."""
@@ -3048,13 +3201,11 @@ class OmniStreamingVideoHandler:
                         audio_buffer.extend(pcm_bytes)
                         # Opportunistic incremental prefill of
                         # the buffered speech; soft-fails and leaves the buffer.
-                        if (config.prefill_audio_on_arrival
-                                and config.session_scoped_request):
+                        if config.prefill_audio_on_arrival and config.session_scoped_request:
                             try:
                                 await _prefill_audio_on_arrival()
                             except Exception:
-                                logger.debug("audio prefill-on-arrival failed",
-                                             exc_info=True)
+                                logger.debug("audio prefill-on-arrival failed", exc_info=True)
 
                     elif msg_type == "video.query":
                         query_text = msg.get("text", "")
@@ -3076,7 +3227,7 @@ class OmniStreamingVideoHandler:
                         if query_task is not None and not query_task.done():
                             await asyncio.gather(query_task, return_exceptions=True)
                             query_task = None
-                        await websocket.send_json({"type": "session.done"})
+                        await websocket.send_json(_session_event("session.done", ctx=sess["active_ctx"]))
                         return
 
                     elif msg_type == "ping":
@@ -3194,7 +3345,6 @@ class OmniStreamingVideoHandler:
             prewarmed_frames,
             **engine_kwargs,
         )
-
 
     # ------------------------------------------------------------------
     # PA_SESSION: build ONE per-turn delta
@@ -3317,6 +3467,7 @@ class OmniStreamingVideoHandler:
                 _shift_mm_placeholders(engine_prompt, len(_IM_END_NEWLINE))
 
         return engine_prompt
+
     # ------------------------------------------------------------------
     # Engine-client path (async_chunk audio streaming)
     # ------------------------------------------------------------------
@@ -3629,7 +3780,8 @@ class OmniStreamingVideoHandler:
         if not isinstance(audio_data, list):
             tail_np = cls._tensor_to_1d_np(audio_data)
             return cls._encode_tail(
-                tail_np, chunks_drained,
+                tail_np,
+                chunks_drained,
                 new_drained=chunks_drained + 1,
                 is_first=(chunks_drained == 0),
             )
@@ -3667,7 +3819,8 @@ class OmniStreamingVideoHandler:
             if full_np is None:
                 return None, chunks_drained
             return cls._encode_tail(
-                full_np, chunks_drained,
+                full_np,
+                chunks_drained,
                 new_drained=new_drained,
                 is_first=(chunks_drained == 0),
             )
