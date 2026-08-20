@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from time import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -55,6 +56,29 @@ def _make_update(prompt_token_ids: list[int] | None = None) -> StreamingUpdate:
         arrival_time=200.0,
         sampling_params=SamplingParams(max_tokens=16),
     )
+
+
+def test_wedge_probe_ignores_request_waiting_for_upstream_chunk() -> None:
+    sched = _make_scheduler(stage_id=1)
+    request = SimpleNamespace(
+        output_token_ids=[],
+        status=RequestStatus.WAITING_FOR_CHUNK,
+        num_computed_tokens=10,
+    )
+    sched.requests = {"req-waiting-chunk": request}
+    sched._had_requests = 1
+    sched._empty_since = None
+    sched._req_seen_t = {"req-waiting-chunk": time() - 60}
+    sched._mute_reported = set()
+    sched._progress_fingerprint = None
+    sched._last_progress_t = time()
+    sched._wedge_reported = False
+    sched._log_request_table = MagicMock()
+
+    sched._check_for_wedged_requests(SimpleNamespace(total_num_scheduled_tokens=0))
+
+    sched._log_request_table.assert_not_called()
+    assert "req-waiting-chunk" not in sched._req_seen_t
 
 
 def _run_resumable_segment_stop(

@@ -71,9 +71,11 @@ def _prompt_is_prefill_only(prompt: Any) -> bool:
     failure mode that makes the model speak unasked with nothing pointing at
     the cause.
     """
-    if not isinstance(prompt, dict):
-        return False
-    info = prompt.get("additional_information")
+    info = (
+        prompt.get("additional_information")
+        if isinstance(prompt, dict)
+        else getattr(prompt, "additional_information", None)
+    )
     entries = getattr(info, "entries", None)
     if not isinstance(entries, dict) or _PREFILL_ONLY_KEY not in entries:
         return False
@@ -84,6 +86,7 @@ def _prompt_is_prefill_only(prompt: Any) -> bool:
     if isinstance(entry, list) and entry:
         entry = entry[0]
     return str(entry).strip().lower() in ("1", "true", "yes")
+
 
 logger = init_logger(__name__)
 

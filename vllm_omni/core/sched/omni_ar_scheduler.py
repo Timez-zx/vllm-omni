@@ -729,12 +729,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self._mute_reported.discard(rid)
                 self._req_seen_t.pop(rid, None)
                 continue
-            if getattr(r, "status", None) == RequestStatus.WAITING_FOR_STREAMING_REQ:
-                # Parked between segments is a session request's healthy
-                # resting state, and with zero-output appends (section 25) a
-                # duplex-fed session legitimately shows no sampled output for
-                # the entire inter-turn window. Only a request that is
-                # RUNNABLE and silent is wedge-suspect.
+            if getattr(r, "status", None) not in (RequestStatus.WAITING, RequestStatus.RUNNING):
+                # Parked between segments or waiting for an upstream chunk is
+                # a session request's healthy resting state. With zero-output
+                # appends, a duplex-fed session can legitimately show no
+                # sampled output for the entire inter-turn window. Only a
+                # RUNNABLE request that stays silent is wedge-suspect.
                 self._mute_reported.discard(rid)
                 self._req_seen_t.pop(rid, None)
                 continue
