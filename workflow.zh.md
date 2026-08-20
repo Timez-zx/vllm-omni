@@ -154,7 +154,7 @@ CPU 测试覆盖真实 WAV manifest、speaker/turn 计划、媒体 cadence、ses
 
 ### 当前结果与 root cause
 
-`seed=17`、30 轮/用户的 canonical 运行在 8 用户通过：224/224，service TTFA p50/p99 为 265/541 ms，可听播放启动 p99 为 972 ms，stall p99 为 0。16 用户完成 448/448，但 TTFA 为 456/1178 ms、播放启动 p99 为 2062 ms，因此容量边界在 8–16 用户之间，未继续 32。
+两个 30 轮/用户的 canonical seed 都在 8 用户通过、16 用户失败。`seed=17` 的 8/16 用户播放启动 p99 为 972/2062 ms；`seed=7` 为 824/2117 ms。四个 cell 分别完成 224/224、448/448 个计量 turn，均无 timeout 或 stall。容量边界稳定在 8–16 用户之间，因此未继续 32。
 
 同 workload 的 chunk-level 对照得到：
 

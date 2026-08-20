@@ -154,7 +154,7 @@ CPU tests cover real-WAV manifests, speaker/turn plans, media cadence, session i
 
 ### Current result and root cause
 
-The canonical `seed=17`, 30-turn run passes at eight users: 224/224 turns, service TTFA p50/p99 265/541 ms, audible playback-start p99 972 ms, and stall p99 0. Sixteen users complete all 448 turns, but TTFA rises to 456/1178 ms and playback-start p99 to 2062 ms. The boundary is therefore between 8 and 16 users; the ladder correctly did not continue to 32.
+Both canonical 30-turn seeds pass at eight users and fail at 16. Playback-start p99 at 8/16 users is 972/2062 ms for `seed=17` and 824/2117 ms for `seed=7`. All four cells complete their 224/224 or 448/448 measured turns without a timeout or playback stall. The boundary is stable between 8 and 16 users, so the ladder correctly does not continue to 32.
 
 Chunk-level runs on the same workload show:
 
