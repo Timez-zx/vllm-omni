@@ -89,12 +89,12 @@ bash benchmarks/live_agent/web_client/run_session_baselines.sh
 ```
 
 `run_av_session_ladder.sh` runs one policy. A cell passes only if every
-post-warmup turn completes, TTFA p99 is below 1 s, per-turn maximum playback
-audible playback-start p99 is below 1 s, playback stall p99 is below 50 ms,
-and protocol/client/engine correctness checks are clean. Percentiles use
-nearest rank and playback uses the browser's default 1.4 s smooth-buffer
-threshold; because chunks arrive discretely, this normally starts on the second
-audio delta rather than adding a fixed 1.4 s delay.
+post-warmup turn completes, audible playback-start p99 is below 1 s, playback
+stall p99 is below 50 ms, and protocol/client/engine correctness checks are
+clean. Service TTFA is reported separately for stage attribution. Percentiles
+use nearest rank and playback uses the browser's default 1.4 s smooth-buffer
+threshold; because chunks arrive discretely, this normally starts on the
+second audio delta rather than adding a fixed 1.4 s delay.
 
 Each cell stores `workload_plan.json`, `turns.jsonl`, `summary.json`,
 `gpu_samples.jsonl`, and `engine.log`. GPU samples include SM activity,

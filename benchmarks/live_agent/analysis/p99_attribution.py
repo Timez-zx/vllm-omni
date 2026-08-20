@@ -23,8 +23,10 @@ Four decompositions, each aimed at one hypothesis:
      context-cost story predicts late turns slower than early ones at the
      same user count. Buckets of 10.
 
-  4. HYGIENE -- timeouts, session rolls, bad probes per cell (from
-     summary.json), so a pathological cell cannot masquerade as a scaling law.
+  4. HYGIENE -- timeouts, session rolls, fatal probes, and self-repaired
+     warnings per cell (from summary.json), so a pathological cell cannot
+     masquerade as a scaling law without confusing a recorded warning with a
+     user-visible capacity boundary.
 
     p99_attribution.py --cells '/tmp/vllm-omni-results/avsession_*_u*'
 """
@@ -326,12 +328,12 @@ def cell_report(cell: dict) -> dict:
         in (
             "unowned_audio",
             "torch_cat_error",
-            "counter_leak_clamped",
             "zero_output_wedge",
             "negative_slice",
             "preempted_reqs",
         )
     }
+    out["warning_probes"] = {key: value for key, value in probes.items() if value and key == "counter_leak_clamped"}
     out["resources"] = resource_attribution(
         cell,
         ok,
@@ -378,6 +380,8 @@ def main() -> int:
         )
         if r["bad_probes"]:
             print(f"      !! bad probes: {r['bad_probes']}")
+        if r["warning_probes"]:
+            print(f"      -- engine warnings: {r['warning_probes']}")
         playback_tail = r.get("playback_tail_p95", {})
         print(
             f"      playback p50/p95/p99={r['playback_p50']:.0f}/{r['playback_p95']:.0f}/"
