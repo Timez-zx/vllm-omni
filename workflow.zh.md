@@ -4,6 +4,17 @@
 
 由于没有可本地部署的开源 realtime 模型，本项目用 Qwen3-Omni 的 thinker → talker → code2wav 流水线模拟 realtime 服务。它不是 Seed Realtime 或 Gemini Live 的等价实现，但足以研究长期会话、KV 占用、流水线调度和多租户尾延迟。
 
+## 快速恢复
+
+- 分支：`thinker-talker-vllm`；正式部署只使用 `benchmarks/thinker_talker/origin_deploy_3gpu.yaml`。
+- 主实现：每个 WebSocket 对应一个长期 engine request，跨轮保留 KV，只追加新音频、视频和 query。
+- 唯一容量 workload：真实语音、持续视频、playback-paced 的多用户 closed loop；8 用户通过、16 用户失败。
+- 最新公平 RCA：clean commit `54d80066`，三组逐轮媒体完全一致；query-time 合并比有序 arrival prefill 更差。
+- 当前应用结论：保留有序 incremental arrival prefill；similarity/freshness 过滤保留；不能用 query-time 合并规避 engine tail。
+- 下一步 engine 问题：在固定 media ledger 下比较 Thinker prefill/decode QoS 与 P/D 分离。
+
+恢复顺序：先读本文“阶段六”，再读 `benchmarks/live_agent/web_client/README.md`；容量运行看 `run_av_session_ladder.sh`，公平 RCA 看 `run_prefill_timing_rca.sh`，正式结果看 `/home/ubuntu/data/results/archive/2026-08-20_prefill_timing_fair_rca/`。
+
 ## 先统一口径
 
 - **有状态增量**：一个 WebSocket session 对应一个持续的 engine request；新一轮只追加增量，历史保留在 KV cache。
@@ -144,6 +155,23 @@ AV 慢请求自己的输入 token 与快请求接近；差别是它到达时撞�
 - 回复实际播放完后再进入 think time；think time 为确定性长尾分布，中位数约 3 秒，范围 1–12 秒；
 - 使用固定视频序列，但每个用户从不同 offset 开始。
 
+有效 session 配置为：`session_scoped_request=true`、`num_frames=16`、`max_frames=8`、640×352、similarity threshold 0.95、filter gap `[0,4]`、音视频 arrival prefill 开启、Talker 约 45k token 时 roll。用户启动时间默认在 0–40 秒内确定性错开。正式 cell 为 30 轮/用户、前 2 轮预热；`run_av_session_ladder.sh` 从 8、16、32……递增，并在首个 SLO 失败点停止该 seed。
+
+这是容量 workload，不是因果对照。因为下一轮在实际播放结束后才开始，较慢的服务会让 session 持续更久并接收更多视频；因此不同实现的 live closed-loop 结果可以比较产品容量，但不能证明某个 prefill 时机本身更优。提交时机的对照必须使用固定 trace：先记录 arrival 组实际发送的全部事件，再在其他组重放。
+
+正式容量命令：
+
+```bash
+MU_FRAMES_DIR=/home/ubuntu/data/workloads/continuous_av_v1/frames \
+MU_AUDIO_MANIFEST=/home/ubuntu/data/workloads/continuous_av_v1/audio_manifest.jsonl \
+VLLM_OMNI_BIN=/home/ubuntu/miniconda3/envs/omni/bin/vllm-omni \
+MU_PYTHON=/home/ubuntu/miniconda3/envs/omni/bin/python \
+RESULTS_DIR=/home/ubuntu/data/results/av_capacity_<commit> \
+RESULT_PREFIX=av_capacity USERS="8 16 32" SEEDS="7 17" \
+TURNS=30 WARMUP_TURNS=2 \
+bash benchmarks/live_agent/web_client/run_av_session_ladder.sh
+```
+
 三种 session 策略使用同一个由 seed 生成的 `workload_plan.json`。计划、语音 corpus、视频帧集、source commit 和 deploy YAML 都写入哈希，确保策略之间只改变 session/KV policy。
 
 客户端使用 1.4 s smooth-buffer 阈值；当前 4-frame 首块只有约 217 ms 音频，因此通常在第二块到达时开始播放，而不是固定等待 1.4 s。容量通过条件为：预热轮之后全部 turn 完成、可听播放启动 p99 < 1 s、播放卡顿 p99 < 50 ms，且无 protocol、client 或 fatal engine error。Service TTFA 单独用于 stage attribution。
@@ -214,7 +242,7 @@ RCA 固定在 clean commit `59b3a033`、同一三卡 YAML、`seed=17` 和同一 
 | Video query-time | 967 | 540,556 | 587/2353 ms | 3172 ms | 1371 ms | 715 ms | 65.6% | 0 |
 | All query-time | 160 | 538,942 | 566/2416 ms | 2946 ms | 2011 ms | 1594 ms | 71.6% | 223 ms |
 
-Query-time 合并减少的是 chunk 数，不是媒体量。公平输入下，两组都显著恶化 TTFA 和播放启动 tail；旧实验中的改善主要来自 8-frame buffer eviction，而不能归因于减少 P/D 竞争。Query-time 虽提高 inline hit，并降低第二块 gap 的中位数，但它把同量视频 prefill 集中到用户正在等待的 query 边界，tail 更差。Thinker SM active p50/p95 从 arrival 的 40%/61% 变为 video query-time 的 8%/84% 和 all query-time 的 0%/83%；播放 tail 内 p95 分别为 67%、95%、93%，说明集中提交制造了更强的 stage-0 burst。显存 p95 均约 94–95%，不是组间差异。
+Query-time 合并减少的是 chunk 数，不是媒体量。公平输入下，两组都显著恶化 TTFA 和播放启动 tail；旧实验的改善与 8-frame buffer eviction 强混杂，不能归因于减少 P/D 竞争。Query-time 虽提高 inline hit，并降低第二块 gap 的中位数，但它把同量视频 prefill 集中到用户正在等待的 query 边界，tail 更差。Thinker SM active p50/p95 从 arrival 的 40%/61% 变为 video query-time 的 8%/84% 和 all query-time 的 0%/83%；播放 tail 内 p95 分别为 67%、95%、93%，说明集中提交制造了更强的 stage-0 burst。显存 p95 均约 94–95%，不是组间差异。
 
 应用层结论：保留有序的 incremental arrival prefill；backlog 必须从最老帧逐帧 catch up，不能让新帧越过旧帧。不能再把 query-time 合并当成延迟优化。下一步 engine 实验应在相同媒体 ledger 下比较 Thinker prefill/decode QoS 与 P/D 分离。
 
@@ -246,11 +274,13 @@ Query-time 合并减少的是 chunk 数，不是媒体量。公平输入下，�
 | 多用户 workload | `benchmarks/live_agent/web_client/mu_bench.py` |
 | AV workload 计划与媒体加载 | `benchmarks/live_agent/web_client/continuous_av_workload.py` |
 | AV 容量阶梯 | `benchmarks/live_agent/web_client/run_av_session_ladder.sh` |
+| 公平 prefill-timing RCA | `benchmarks/live_agent/web_client/run_prefill_timing_rca.sh` |
 | 三种 session baseline | `benchmarks/live_agent/web_client/run_session_baselines.sh` |
 | 播放时间线 | `benchmarks/live_agent/playback_metrics.py` |
 | 正式三卡部署 | `benchmarks/thinker_talker/origin_deploy_3gpu.yaml` |
 | 运行机制验证 | `benchmarks/live_agent/analysis/verify_run.py` |
 | 音频 chunk root-cause 分析 | `benchmarks/live_agent/analysis/audio_chunk_rca.py` |
+| 跨组媒体等价校验 | `benchmarks/live_agent/analysis/media_fairness.py` |
 | Scheduler/connector 开关 | `vllm_omni/core/sched/runtime_flags.py` |
 | Chunk transport | `vllm_omni/distributed/omni_connectors/transfer_adapter/chunk_transfer_adapter.py` |
 | Code predictor KV | `vllm_omni/model_executor/models/common/qwen3_code_predictor.py` |

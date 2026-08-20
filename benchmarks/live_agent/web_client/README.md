@@ -52,6 +52,17 @@ Each user owns one long-lived WebSocket:
 - plan: one speaker per session, no recording repeated within a session,
   deterministic stagger, think time, frame offset, and random seed.
 
+The benchmark's effective session configuration is:
+
+- one persistent engine request per WebSocket (`session_scoped_request=true`);
+- `num_frames=16`, `max_frames=8`, and frames no larger than 640x352;
+- similarity threshold 0.95 and filter gap `[0,4]`;
+- audio and video prefilled incrementally on arrival;
+- Talker request rolling near 45k tokens.
+
+Users start at deterministic offsets within 0--40 seconds. A formal capacity
+cell uses 30 turns per user and excludes the first two turns from metrics.
+
 The audio manifest is JSONL:
 
 ```json
@@ -79,7 +90,8 @@ speakers are close-talk and 50% are distant-microphone. It converts audio to
 mono PCM16 16 kHz and samples DAVIS at an effective 2 fps.
 `corpus_provenance.json` records the selection and source revisions.
 
-Run all three session policies on the same workload plan:
+Run all three session policies on the same workload plan when comparing
+session/KV policies:
 
 ```bash
 MU_FRAMES_DIR=/path/to/ordered/jpeg/frames \
@@ -101,6 +113,24 @@ Each cell stores `workload_plan.json`, `turns.jsonl`, `summary.json`,
 achieved occupancy, tensor/FP activity, DRAM activity, PCIe traffic, power,
 clocks, resident memory, and per-process utilization. Source, deploy, audio
 corpus, frames, system prompt, and workload plan are hashed.
+
+The canonical capacity ladder is:
+
+```bash
+MU_FRAMES_DIR=/home/ubuntu/data/workloads/continuous_av_v1/frames \
+MU_AUDIO_MANIFEST=/home/ubuntu/data/workloads/continuous_av_v1/audio_manifest.jsonl \
+VLLM_OMNI_BIN=/home/ubuntu/miniconda3/envs/omni/bin/vllm-omni \
+MU_PYTHON=/home/ubuntu/miniconda3/envs/omni/bin/python \
+RESULTS_DIR=/home/ubuntu/data/results/av_capacity_<commit> \
+RESULT_PREFIX=av_capacity USERS="8 16 32" SEEDS="7 17" \
+TURNS=30 WARMUP_TURNS=2 \
+bash benchmarks/live_agent/web_client/run_av_session_ladder.sh
+```
+
+This live, playback-paced closed loop measures product capacity. It is not a
+causal timing experiment: a slower arm runs longer and therefore receives more
+continuous video. Any comparison of media-delivery timing must instead record
+one arm and replay its exact timestamped input trace in every other arm.
 
 Self-repaired engine bookkeeping drift remains in `engine_probes` and
 `engine_warning_count` for diagnosis, but does not stop the capacity ladder
@@ -136,8 +166,21 @@ python benchmarks/live_agent/analysis/audio_chunk_rca.py \
 The report separates the fixed Talker AR steps, upstream-chunk waiting, and
 Code2Wav latency between the first and second audible chunks.
 
-For the paired arrival-vs-query-time prefill RCA, use
-`run_prefill_timing_rca.sh`. It records the arrival arm's real closed-loop
-client input, replays the same timestamped frame/audio/query events in both
-query-time arms, and fails unless `media_fairness.py` verifies identical
-ordered media ledgers, zero frame drops, and zero replay schedule slips.
+For the paired arrival-vs-query-time prefill RCA, run:
+
+```bash
+MU_FRAMES_DIR=/home/ubuntu/data/workloads/continuous_av_v1/frames \
+MU_AUDIO_MANIFEST=/home/ubuntu/data/workloads/continuous_av_v1/audio_manifest.jsonl \
+RESULTS_ROOT=/home/ubuntu/data/results/av_prefill_fair_<commit> \
+USERS=16 SEED=17 TURNS=10 WARMUP_TURNS=2 \
+bash benchmarks/live_agent/web_client/run_prefill_timing_rca.sh
+```
+
+The runner requires a clean checkout. It records the arrival arm's real
+closed-loop client input, replays the same timestamped frame/audio/query events
+in both query-time arms, and fails unless `media_fairness.py` verifies identical
+ordered media ledgers, zero frame drops, and zero replay schedule slips. Chunk
+boundaries are intentionally different; selected media identity, order, and
+volume must match. Keep `media_fairness.json`, `root_cause.json`, every cell's
+`summary.json`, `turns.jsonl`, `gpu_samples.jsonl`, and `engine.log`, plus the
+arrival arm's `input_trace.jsonl.gz`, source/deploy hashes, and checksums.

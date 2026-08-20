@@ -4,6 +4,17 @@ This document records the research path, reproducible experiments, and current f
 
 No open realtime model is currently available for local deployment, so this project uses the Qwen3-Omni thinker → talker → code2wav pipeline as a realtime-serving surrogate. It is not equivalent to Seed Realtime or Gemini Live, but it is sufficient for studying long-lived sessions, KV residency, pipeline scheduling, and multi-tenant tail latency.
 
+## Quick recovery
+
+- Branch: `thinker-talker-vllm`; formal runs use only `benchmarks/thinker_talker/origin_deploy_3gpu.yaml`.
+- Main implementation: one long-lived engine request per WebSocket, persistent cross-turn KV, and delta-only audio, video, and query appends.
+- Only capacity workload: real speech, continuous video, and playback-paced multi-user closed loop; eight users pass and 16 fail.
+- Latest fair RCA: clean commit `54d80066`, with exact per-turn media equivalence; query-time consolidation is worse than ordered arrival prefill.
+- Application conclusion: retain ordered incremental arrival prefill and the similarity/freshness filters; query-time consolidation is not an engine-tail fix.
+- Next engine question: compare Thinker prefill/decode QoS and P/D separation under a fixed media ledger.
+
+Recovery order: read Phase 6 below, then `benchmarks/live_agent/web_client/README.md`; use `run_av_session_ladder.sh` for capacity, `run_prefill_timing_rca.sh` for paired RCA, and `/home/ubuntu/data/results/archive/2026-08-20_prefill_timing_fair_rca/` for the latest formal artifacts.
+
 ## Terminology and criteria
 
 - **Stateful incremental**: one WebSocket session owns one persistent engine request; each turn appends only new input while history remains in KV cache.
@@ -144,6 +155,23 @@ Capacity testing keeps one target scenario: a continuous AV session. Each user o
 - the next think period starts after playback; think time is a deterministic long-tailed distribution with median near 3 s and bounds of 1–12 s;
 - all users share one fixed video sequence but start at different offsets.
 
+The effective session configuration is `session_scoped_request=true`, `num_frames=16`, `max_frames=8`, 640×352, similarity threshold 0.95, filter gap `[0,4]`, audio/video arrival prefill enabled, and Talker rolling near 45k tokens. User starts are deterministically staggered over 0–40 seconds. A formal cell has 30 turns per user with two warm-up turns. `run_av_session_ladder.sh` increases 8, 16, 32, ... users and stops a seed at its first SLO failure.
+
+This is a capacity workload, not a causal ablation. Because the next turn begins after actual playback, a slower service keeps a session alive longer and naturally receives more video. Live closed-loop results can compare product capacity, but cannot by themselves prove that one prefill timing is better. Timing ablations must use a fixed trace: record every event from the arrival arm, then replay it in the other arms.
+
+Canonical capacity command:
+
+```bash
+MU_FRAMES_DIR=/home/ubuntu/data/workloads/continuous_av_v1/frames \
+MU_AUDIO_MANIFEST=/home/ubuntu/data/workloads/continuous_av_v1/audio_manifest.jsonl \
+VLLM_OMNI_BIN=/home/ubuntu/miniconda3/envs/omni/bin/vllm-omni \
+MU_PYTHON=/home/ubuntu/miniconda3/envs/omni/bin/python \
+RESULTS_DIR=/home/ubuntu/data/results/av_capacity_<commit> \
+RESULT_PREFIX=av_capacity USERS="8 16 32" SEEDS="7 17" \
+TURNS=30 WARMUP_TURNS=2 \
+bash benchmarks/live_agent/web_client/run_av_session_ladder.sh
+```
+
 All three session policies consume the same seed-derived `workload_plan.json`. The plan, audio corpus, frame set, source commit, and deploy YAML are hashed so only the session/KV policy changes between arms.
 
 The client uses a 1.4 s smooth-buffer threshold. The current four-frame initial chunk contains only about 217 ms of audio, so playback normally starts when the second chunk arrives rather than after a fixed 1.4 s delay. A cell passes only when every post-warmup turn completes, audible playback-start p99 < 1 s, playback-stall p99 < 50 ms, and there are no protocol, client, or fatal engine errors. Service TTFA is reported separately for stage attribution.
@@ -152,19 +180,71 @@ The per-content matrix, audio-only p99 ladder, and synthetic AV cell runner have
 
 CPU tests cover real-WAV manifests, speaker/turn plans, media cadence, session identity, and playback timelines.
 
-### Current result and root cause
+### Formal capacity results
 
-Both canonical 30-turn seeds pass at eight users and fail at 16. Playback-start p99 at 8/16 users is 972/2062 ms for `seed=17` and 824/2117 ms for `seed=7`. All four cells complete their 224/224 or 448/448 measured turns without a timeout or playback stall. The boundary is stable between 8 and 16 users, so the ladder correctly does not continue to 32.
+Formal deployment is fixed to `origin_deploy_3gpu.yaml`: Thinker, Talker, and Code2Wav each use one GPU. Both canonical seeds run 30 turns per user, with two warm-up and 28 measured turns. Every result pins a clean source tree and hashes the corpus, frame set, deploy YAML, and seed-specific `workload_plan.json`.
 
-Chunk-level runs on the same workload show:
+| Seed | Users | Measured turns | TTFA p99 | Playback-start p99 | Stall p99 | Result |
+|---:|---:|---:|---:|---:|---:|---|
+| 17 | 8 | 224/224 | 541 ms | 972 ms | 0 | Pass |
+| 17 | 16 | 448/448 | 1178 ms | 2062 ms | 0 | Fail |
+| 7 | 8 | 224/224 | 479 ms | 824 ms | 0 | Pass |
+| 7 | 16 | 448/448 | 1005 ms | 2117 ms | 0 | Fail |
 
-- the first-to-second chunk window always contains 25–26 Talker request steps;
-- at 16 users, second-chunk gap p50/p99 is 460/1482 ms and wait beyond normal step cost is 124/865 ms;
-- 90% of long Talker gaps overlap Thinker work for the same request, while the Thinker-to-Talker inline-receive hit rate is only 42.9%;
-- Code2Wav emit-to-waveform p99 is 41 ms and is not the tail source;
-- moving only video from arrival prefill to query-time prefill reduces 16-user TTFA p99 to 694 ms, second-chunk gap p99 to 611 ms, and raises inline-receive hit rate to 72.8%; disabling audio arrival prefill as well changes little.
+All cells complete without timeout, playback interruption, or protocol error. Sixteen users fail on playback-start tail, not request completion. The stable capacity boundary is 8–16 users, so 32 is not run.
 
-The root cause is stage-0 contention: continuous video arrival prefill shares the Thinker scheduler with response decode and delays incremental text/hidden-state delivery. Talker repeatedly waits for upstream chunks, and its fixed 25-step serial window amplifies the jitter. Code2Wav and browser playback are not causal, and the three GPUs are not simultaneously compute-saturated. The next engine work should target stage-0 prefill/decode QoS, deadline or priority scheduling, and cross-stage backpressure.
+### 16-user chunk-level RCA
+
+The RCA uses clean commit `59b3a033`, the same three-GPU YAML, `seed=17`, and the same workload plan. Each arm runs 10 turns per user with two warm-up turns, for 128 measured turns. It enables `VLLM_OMNI_LOG_SCHED_STEPS=1`, `VLLM_OMNI_LOG_REQ_STEPS=1`, and `VLLM_OMNI_LOG_AUDIO_CHUNKS=1`, then runs `benchmarks/live_agent/analysis/audio_chunk_rca.py`.
+
+The baseline retains real continuous AV behavior: clients upload video at 2 FPS and audio at 5 Hz; `prefill_frames_on_arrival=true` and `prefill_audio_on_arrival=true` append consumable single-session media to the persistent Thinker request without entering Talker or generating a reply.
+
+Baseline observations:
+
+- the first-to-second chunk window contains 25–26 Talker request steps;
+- second-chunk gap p50/p99 is 460/1482 ms, with 124/865 ms beyond a 25 ms normal-step envelope;
+- 90% of long Talker gaps overlap Thinker work for the same request; Thinker-to-Talker inline-receive hit rate is 42.9%;
+- Code2Wav emit-to-waveform p99 is 41 ms and is not the tail source.
+
+#### Query-time prefill diagnostic
+
+This diagnostic changes when one session's media enters Thinker. It is not multi-user batching, does not rebuild session history, and is not a capacity workload.
+
+| Mode | Session override | Server behavior |
+|---|---|---|
+| Arrival baseline | both flags `true` | Append each consumable audio/video delta on arrival |
+| Video query-time | `{"prefill_frames_on_arrival":false,"prefill_audio_on_arrival":true}` | Buffer video until `video.query`; keep audio arrival prefill |
+| All query-time | `{"prefill_frames_on_arrival":false,"prefill_audio_on_arrival":false}` | Buffer both audio and video until `video.query` |
+
+The original diagnostic reported:
+
+| 16-user mode | TTFA p99 | Playback-start p99 | Chunk-2 gap p99 | Wait p99 | Inline hit | Code2Wav p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| Arrival baseline | 1524 ms | 2153 ms | 1482 ms | 865 ms | 42.9% | 41 ms |
+| Video query-time | 694 ms | 1067 ms | 611 ms | 264 ms | 72.8% | 29 ms |
+| All query-time | 638 ms | 1078 ms | 447 ms | 157 ms | 81.5% | 41 ms |
+
+That comparison was not controlled. With an eight-frame buffer, the three arms logged 24, 886, and 803 dropped frames. Fresh-frame duplication also depended on buffer state. The query-time arms therefore changed both timing and the amount of video delivered, so the apparent improvement cannot establish a prefill/decode contention effect. The similarity filter runs before the delivery-mode branch and remains a valid application optimization.
+
+#### Fair paired rerun
+
+The arrival arm first runs the real closed loop and records every timestamped client frame/audio/query event. Both query-time arms replay that exact trace. All arms keep the same similarity filter; `max_frames=256` prevents eviction and `fresh_frame_force_append_on_query=true` fixes freshness multiplicity. A per-turn ledger records selected and submitted frame identity/content hashes, audio bytes/hashes, and prompt chunk token counts. Results are accepted only if ordered media matches exactly, dropped frames are zero, and replay schedule slips are zero. Chunk boundaries are the treatment: arrival uses small incremental appends, while query-time consolidates them.
+
+The formal rerun uses clean commit `54d80066`, 16 users, `seed=17`, 10 turns per user, and two warm-up turns. Every arm completes 128/128 measured turns. The recorded trace uploads 4,905 frames and 5,875 audio chunks. All arms submit 2,358/2,358 Thinker frame occurrences and 36,884,706/36,884,706 audio bytes; both query-time arms match the arrival arm on all 160 ordered per-turn ledgers, with zero drops and zero replay slips.
+
+| Mode | Prefill chunks | Prompt tokens | TTFA p50/p99 | Playback-start p99 | Chunk-2 gap p99 | Wait p99 | Inline hit | Stall p99 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Arrival | 2783 | 540,534 | 445/1283 ms | 2337 ms | 1240 ms | 683 ms | 44.4% | 0 |
+| Video query-time | 967 | 540,556 | 587/2353 ms | 3172 ms | 1371 ms | 715 ms | 65.6% | 0 |
+| All query-time | 160 | 538,942 | 566/2416 ms | 2946 ms | 2011 ms | 1594 ms | 71.6% | 223 ms |
+
+Query-time consolidation reduces chunk count, not media volume. With equal media it worsens both TTFA and playback-start tail. Although inline hit rises and median chunk-2 gap falls, the same video prefill moves onto the user-critical query boundary. Thinker SM-active p50/p95 changes from 40%/61% for arrival to 8%/84% for video query-time and 0%/83% for all query-time; p95 inside playback-tail intervals is 67%, 95%, and 93%. Consolidation creates a stronger stage-0 burst. Memory p95 remains about 94–95% in every arm and does not explain the difference.
+
+Application conclusion: retain ordered incremental arrival prefill. A backlog must catch up oldest-frame first; newer frames cannot bypass it. Query-time consolidation is not a latency optimization. The next engine experiment should compare Thinker prefill/decode QoS and P/D separation under the same media ledger.
+
+### Result archives
+
+The formal capacity and original RCA are archived at `/home/ubuntu/data/results/archive/2026-08-20_continuous_av_capacity_rca/`. The fair paired rerun is archived at `/home/ubuntu/data/results/archive/2026-08-20_prefill_timing_fair_rca/`, including the fixed input trace, all three cells, media fairness, chunk RCA, GPU tail attribution, and checksums.
 
 ## Current experiment procedure
 
@@ -188,11 +268,13 @@ New formal capacity claims use only `origin_deploy_3gpu.yaml`, this workload, th
 | Multi-user workload | `benchmarks/live_agent/web_client/mu_bench.py` |
 | AV workload planning and media loading | `benchmarks/live_agent/web_client/continuous_av_workload.py` |
 | AV capacity ladder | `benchmarks/live_agent/web_client/run_av_session_ladder.sh` |
+| Fair prefill-timing RCA | `benchmarks/live_agent/web_client/run_prefill_timing_rca.sh` |
 | Three session baselines | `benchmarks/live_agent/web_client/run_session_baselines.sh` |
 | Playback timeline | `benchmarks/live_agent/playback_metrics.py` |
 | Canonical three-GPU deployment | `benchmarks/thinker_talker/origin_deploy_3gpu.yaml` |
 | Run-mechanism verification | `benchmarks/live_agent/analysis/verify_run.py` |
 | Audio-chunk root-cause analysis | `benchmarks/live_agent/analysis/audio_chunk_rca.py` |
+| Cross-arm media-equivalence check | `benchmarks/live_agent/analysis/media_fairness.py` |
 | Scheduler and connector flags | `vllm_omni/core/sched/runtime_flags.py` |
 | Chunk transport | `vllm_omni/distributed/omni_connectors/transfer_adapter/chunk_transfer_adapter.py` |
 | Code predictor KV | `vllm_omni/model_executor/models/common/qwen3_code_predictor.py` |
