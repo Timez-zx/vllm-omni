@@ -179,6 +179,43 @@ def test_capacity_uses_audible_playback_start_and_accepts_short_released_reply()
     assert summary["capacity_pass"] is True
 
 
+def test_repaired_engine_counter_drift_is_reported_without_stopping_ladder() -> None:
+    record = {
+        "turn": 1,
+        "status": "ok",
+        "ttfa_ms": 200.0,
+        "ttft_ms": 100.0,
+        "playback_start_ms": 360.0,
+        "stall_max_ms": 0.0,
+        "rtf_deliver": 2.0,
+        "input_audio_s": 1.0,
+        "audio_s": 0.8,
+    }
+    media = {
+        "frames_sent": 1,
+        "mic_chunks_sent": 1,
+        "mic_audio_s_sent": 0.2,
+        "mic_speech_s_sent": 0.2,
+        "mic_ambient_s_sent": 0.0,
+        "mic_paused_s": 0.8,
+    }
+    user = SimpleNamespace(
+        name="u0",
+        protocol_mismatches=0,
+        stray_audio=0,
+        errors=[],
+        rolls=0,
+        stats=lambda: media,
+    )
+    log = "\n".join(["streaming-parked counter had leaked"] * 3)
+
+    summary = summarize([record], [user], {"turns_per_user": 1}, log, warmup_turns=0)
+
+    assert summary["engine_probes"]["counter_leak_clamped"] == 3
+    assert summary["engine_warning_count"] == 3
+    assert summary["capacity_pass"] is True
+
+
 def test_slurp_davis_preparation_emits_browser_compatible_media(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

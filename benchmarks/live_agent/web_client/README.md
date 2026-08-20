@@ -102,6 +102,11 @@ achieved occupancy, tensor/FP activity, DRAM activity, PCIe traffic, power,
 clocks, resident memory, and per-process utilization. Source, deploy, audio
 corpus, frames, system prompt, and workload plan are hashed.
 
+Self-repaired engine bookkeeping drift remains in `engine_probes` and
+`engine_warning_count` for diagnosis, but does not stop the capacity ladder
+unless it causes a missing turn, playback/SLO failure, wedge, or protocol
+error.
+
 ## Diagnostics
 
 These are diagnostics, not capacity workloads:

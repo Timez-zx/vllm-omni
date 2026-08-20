@@ -69,9 +69,14 @@ SYSTEM_PROMPT = (
 LOG_PROBES_BAD = {
     "unowned_audio": r"UNOWNED",
     "torch_cat_error": r"expected a non-empty list of Tensors",
-    "counter_leak_clamped": r"streaming-parked counter had leaked",
     "zero_output_wedge": r"sampled ZERO output tokens",
     "negative_slice": r"scope drift; shipping unadjusted",
+}
+LOG_PROBES_WARN = {
+    # The scheduler repairs this bookkeeping drift before admission. Keep it
+    # visible for engine analysis, but do not call it a user-visible capacity
+    # boundary when every turn and playback SLO still passes.
+    "counter_leak_clamped": r"streaming-parked counter had leaked",
 }
 LOG_PROBES_INFO = {
     "segment_stops": r"\[session\] audio segment stop",
@@ -513,7 +518,8 @@ def summarize(records: list[dict], users: list[User], meta: dict, log_slice: str
     stalls = [record["stall_max_ms"] for record in ok]
     playback_starts = [record["playback_start_ms"] for record in ok if record.get("playback_start_ms") is not None]
     probes = {
-        key: len(re.findall(pattern, log_slice)) for key, pattern in {**LOG_PROBES_BAD, **LOG_PROBES_INFO}.items()
+        key: len(re.findall(pattern, log_slice))
+        for key, pattern in {**LOG_PROBES_BAD, **LOG_PROBES_WARN, **LOG_PROBES_INFO}.items()
     }
     user_stats = [user.stats() for user in users]
     expected = len(users) * max(0, meta["turns_per_user"] - warmup_turns)
@@ -570,6 +576,7 @@ def summarize(records: list[dict], users: list[User], meta: dict, log_slice: str
         "mic_paused_s": sum(item["mic_paused_s"] for item in user_stats),
         "per_user_media": user_stats,
         "engine_probes": probes,
+        "engine_warning_count": sum(probes[key] for key in LOG_PROBES_WARN),
         "capacity_pass": capacity_pass,
     }
 
