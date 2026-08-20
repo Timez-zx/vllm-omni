@@ -204,9 +204,25 @@ RCA 固定在 clean commit `59b3a033`、同一三卡 YAML、`seed=17` 和同一 
 
 公平重测先让 arrival 组按真实 closed loop 运行并录制客户端输入，再由两组 query-time 配置重放同一时间戳、同一 frame/audio/query 序列。三组保留相同 similarity filter；`max_frames=256` 防止 eviction，`fresh_frame_force_append_on_query=true` 固定 freshness 重复次数。服务端逐轮记录筛选后与实际提交的 frame ID/content hash、audio bytes/hash 和 prompt chunk token 数；只有 ordered media ledger 全等、dropped frames 为 0、replay schedule slip 为 0 时才比较延迟。Chunk 边界是实验变量：arrival 组保持小块增量 append，query-time 组在 query 合并；因此要求相同的是媒体顺序与总量，不是 chunk hash。该流程由 `run_prefill_timing_rca.sh` 执行，`media_fairness.py` 负责 fail-closed 校验。
 
+#### 公平重测结果
+
+正式重测固定在 clean commit `54d80066`，16 用户、`seed=17`、10 轮/用户，前 2 轮预热。三组均完成 128/128 个计量 turn。客户端 trace 共上传 4905 个 frame 和 5875 个 audio chunk；三组逐轮 ledger 均为 2358/2358 个 Thinker frame occurrence、36,884,706/36,884,706 audio bytes、0 dropped frame、0 replay slip，且两组 query-time 与 arrival 的 160/160 个 turn 内容和顺序完全一致。
+
+| 模式 | Prefill chunks | Prompt tokens | TTFA p50/p99 | 播放启动 p99 | 第二块 gap p99 | Wait p99 | Inline hit | Stall p99 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Arrival | 2783 | 540,534 | 445/1283 ms | 2337 ms | 1240 ms | 683 ms | 44.4% | 0 |
+| Video query-time | 967 | 540,556 | 587/2353 ms | 3172 ms | 1371 ms | 715 ms | 65.6% | 0 |
+| All query-time | 160 | 538,942 | 566/2416 ms | 2946 ms | 2011 ms | 1594 ms | 71.6% | 223 ms |
+
+Query-time 合并减少的是 chunk 数，不是媒体量。公平输入下，两组都显著恶化 TTFA 和播放启动 tail；旧实验中的改善主要来自 8-frame buffer eviction，而不能归因于减少 P/D 竞争。Query-time 虽提高 inline hit，并降低第二块 gap 的中位数，但它把同量视频 prefill 集中到用户正在等待的 query 边界，tail 更差。Thinker SM active p50/p95 从 arrival 的 40%/61% 变为 video query-time 的 8%/84% 和 all query-time 的 0%/83%；播放 tail 内 p95 分别为 67%、95%、93%，说明集中提交制造了更强的 stage-0 burst。显存 p95 均约 94–95%，不是组间差异。
+
+应用层结论：保留有序的 incremental arrival prefill；backlog 必须从最老帧逐帧 catch up，不能让新帧越过旧帧。不能再把 query-time 合并当成延迟优化。下一步 engine 实验应在相同媒体 ledger 下比较 Thinker prefill/decode QoS 与 P/D 分离。
+
 ### 结果归档
 
 2026-08-20 的正式容量、RCA、query-time 对照、原始 turn、engine log、GPU samples、workload plan、汇总和 SHA256 清单统一归档在 `/home/ubuntu/data/results/archive/2026-08-20_continuous_av_capacity_rca/`。归档只保存实验产物，不作为 Git source；复现以归档 `README.md` 中的 commit、YAML、输入哈希和 session overrides 为准。
+
+同日的公平 prefill-timing 重测归档在 `/home/ubuntu/data/results/archive/2026-08-20_prefill_timing_fair_rca/`，包含固定 input trace、三组完整产物、media fairness、chunk RCA、GPU tail attribution 和 SHA256 清单。
 
 ## 当前标准实验流程
 
