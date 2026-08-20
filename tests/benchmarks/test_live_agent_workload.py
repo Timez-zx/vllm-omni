@@ -21,7 +21,12 @@ from benchmarks.live_agent.web_client.continuous_av_workload import (
     make_room_tone_chunks,
     plan_sha256,
 )
-from benchmarks.live_agent.web_client.mu_bench import PLAYBACK_PREBUFFER_S, summarize
+from benchmarks.live_agent.web_client.mu_bench import (
+    PLAYBACK_PREBUFFER_S,
+    load_input_trace,
+    summarize,
+    write_input_trace,
+)
 from benchmarks.live_agent.web_client.prepare_slurp_davis import main as prepare_corpus
 
 
@@ -142,6 +147,29 @@ def test_workload_constants_match_the_browser_client() -> None:
     assert ENDPOINT_SILENCE_MS == 700
     assert ECHO_GUARD_MS == 300
     assert PLAYBACK_PREBUFFER_S == 1.4
+
+
+def test_input_trace_round_trip_uses_frame_references(tmp_path: Path) -> None:
+    users = [
+        SimpleNamespace(
+            name="r0u0",
+            input_trace=[
+                {"type": "video.frame", "frame_index": 7, "frame_id": "r0u0-f0", "at_s": 0.5, "seq": 0},
+                {"type": "audio.chunk", "data": "AA==", "at_s": 0.6, "seq": 1},
+                {"type": "video.query", "text": "", "turn": 0, "at_s": 1.0, "seq": 2},
+                {"type": "video.done", "at_s": 2.0, "seq": 3},
+            ],
+        )
+    ]
+    path = tmp_path / "trace.jsonl.gz"
+    metadata = {"trace_schema": 1, "frame_set_sha256": "a" * 64}
+
+    write_input_trace(path, users, metadata)
+    loaded_metadata, events = load_input_trace(path)
+
+    assert loaded_metadata == metadata
+    assert events["r0u0"] == users[0].input_trace
+    assert "data" not in events["r0u0"][0]
 
 
 def test_capacity_uses_audible_playback_start_and_accepts_short_released_reply() -> None:

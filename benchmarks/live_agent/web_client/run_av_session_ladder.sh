@@ -69,9 +69,19 @@ healthy() {
 
 run_cell() {
   local users=$1 seed=$2 reps=1 out sampler rc
+  local -a trace_args=()
   [ "$users" = "1" ] && reps=2
   out=$RESULTS_DIR/${RESULT_PREFIX}_seed${seed}_u${users}
   mkdir -p "$out"
+  case "${MU_INPUT_TRACE_MODE:-live}" in
+    live) ;;
+    record) trace_args+=(--record-input-trace) ;;
+    replay)
+      : "${MU_REPLAY_INPUT_TRACE:?set MU_REPLAY_INPUT_TRACE when MU_INPUT_TRACE_MODE=replay}"
+      trace_args+=(--replay-input-trace "$MU_REPLAY_INPUT_TRACE")
+      ;;
+    *) echo "MU_INPUT_TRACE_MODE must be live, record, or replay" >&2; return 2 ;;
+  esac
   log "continuous AV: users=$users seed=$seed turns=$TURNS reps=$reps -> $out"
   "$PYBIN" "$REPO_ROOT/benchmarks/live_agent/harness/gpu_sampler.py" \
     --devices "${MU_GPU_IDS:-0,1,2}" --hz "${MU_GPU_SAMPLE_HZ:-5}" \
@@ -84,7 +94,7 @@ run_cell() {
       --users "$users" --turns "$TURNS" --repeat-sessions "$reps" \
       --warmup-turns "$WARMUP_TURNS" --seed "$seed" \
       --frames-dir "$MU_FRAMES_DIR" --audio-manifest "$MU_AUDIO_MANIFEST" \
-      --out "$out" 2>&1 | tee "$out/driver.log"
+      --out "$out" "${trace_args[@]}" 2>&1 | tee "$out/driver.log"
   rc=${PIPESTATUS[0]}
 
   kill -INT "$sampler" 2>/dev/null

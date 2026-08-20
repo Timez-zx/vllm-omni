@@ -135,3 +135,9 @@ python benchmarks/live_agent/analysis/audio_chunk_rca.py \
 
 The report separates the fixed Talker AR steps, upstream-chunk waiting, and
 Code2Wav latency between the first and second audible chunks.
+
+For the paired arrival-vs-query-time prefill RCA, use
+`run_prefill_timing_rca.sh`. It records the arrival arm's real closed-loop
+client input, replays the same timestamped frame/audio/query events in both
+query-time arms, and fails unless `media_fairness.py` verifies identical
+ordered media ledgers, zero frame drops, and zero replay schedule slips.

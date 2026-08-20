@@ -108,6 +108,26 @@ _BAD_FRAME = object()
 _PATHPROBE = os.environ.get("VLLM_OMNI_LOG_PATH", "0") not in ("0", "", "false", "False")
 
 
+def _media_ledger_digest(entries: list[tuple[str, str]]) -> str:
+    """Hash an ordered media ledger without ambiguous concatenation."""
+    digest = hashlib.sha256()
+    for identity, content_hash in entries:
+        for value in (identity, content_hash):
+            encoded = value.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _update_token_ledger(digest: Any, token_ids: Any) -> int:
+    """Append one prompt-token chunk, preserving boundaries and order."""
+    values = [int(token_id) for token_id in token_ids]
+    digest.update(len(values).to_bytes(8, "big"))
+    for value in values:
+        digest.update(value.to_bytes(8, "big", signed=True))
+    return len(values)
+
+
 def _decode_frame_bytes(raw_bytes: bytes) -> Any:
     return Image.open(io.BytesIO(raw_bytes)).convert("RGB")
 
@@ -601,6 +621,21 @@ class StreamingVideoSessionConfig(BaseModel):
             "answers ran one query-gap stale at 3 fps (median 4 s) and the filter's "
             "frame-denominated min_gap added an 8-frame blind window on top. Costs at most "
             "one duplicate frame (~222 tokens) per turn."
+        ),
+    )
+    fresh_frame_force_append_on_query: bool = Field(
+        default=False,
+        description=(
+            "Diagnostic control: append the latest frame even when it is already the "
+            "query buffer tail. This makes freshness multiplicity independent of "
+            "arrival-vs-query-time prefill for paired RCA."
+        ),
+    )
+    log_media_ledger: bool = Field(
+        default=False,
+        description=(
+            "Emit one ordered frame/audio/token ledger per session turn so RCA can reject "
+            "delivery arms that did not process identical media."
         ),
     )
     frame_filter_min_gap: int = Field(
@@ -1186,6 +1221,7 @@ class OmniStreamingVideoHandler:
             # Newest arrived frame, similarity-filter-agnostic: the query-time
             # sweep rides it at the delta's end (fresh_frame_on_query).
             latest_frame: list[str | None] = [None]
+            latest_frame_metadata: list[dict[str, Any] | None] = [None]
             frame_metadata: list[dict[str, Any]] = []
             # Per-frame PIL cache + uuid for mm_hash reuse. Aligned with frame_buffer by index.
             frame_pil_cache: dict[str, tuple[Any, str] | object] = {}  # b64 -> (PIL.Image, uuid) or _BAD_FRAME
@@ -1272,6 +1308,16 @@ class OmniStreamingVideoHandler:
                 "arrival_appends": 0,
                 "arrival_frames": 0,
                 "arrival_tokens": 0,
+                # Paired-RCA audit state. Selection records every frame retained by
+                # similarity/freshness; submission records every frame occurrence
+                # actually placed in a Thinker chunk.
+                "selected_frame_ledger": [],
+                "submitted_frame_ledger": [],
+                "selected_audio_ledger": bytearray(),
+                "submitted_audio_ledger": bytearray(),
+                "prefill_token_hash": hashlib.sha256(),
+                "prefill_token_counts": [],
+                "ledger_dropped_frames": 0,
             }
 
             def _session_event(
@@ -1833,6 +1879,10 @@ class OmniStreamingVideoHandler:
                 sess["arrival_frames"] += len(frames)
                 sess["arrival_tokens"] += ntok
                 sess["cum_tokens"] = sess.get("cum_tokens", 0) + ntok
+                if config.log_media_ledger:
+                    ids = chunk.get("prompt_token_ids") or ()
+                    sess["prefill_token_counts"].append(ntok)
+                    _update_token_ledger(sess["prefill_token_hash"], ids)
                 # Arrival-consumed frames never reach the turn body's new_frames list,
                 # so the transcript would lose exactly the frames this optimisation
                 # touches. Same pending list the turn body feeds, same turn-close drain.
@@ -1921,6 +1971,11 @@ class OmniStreamingVideoHandler:
                 sess["arrival_appends"] += 1
                 sess["arrival_tokens"] += ntok
                 sess["cum_tokens"] = sess.get("cum_tokens", 0) + ntok
+                if config.log_media_ledger:
+                    sess["submitted_audio_ledger"].extend(prefix)
+                    ids = chunk.get("prompt_token_ids") or ()
+                    sess["prefill_token_counts"].append(ntok)
+                    _update_token_ledger(sess["prefill_token_hash"], ids)
                 logger.info(
                     "[session] audio prefill-on-arrival: %ds -> %d tokens (appends=%d tokens=%d cum=%d)",
                     consume_s,
@@ -2057,6 +2112,7 @@ class OmniStreamingVideoHandler:
                     )
                 new_frames = list(frame_buffer)
                 n_buffered = len(new_frames)
+                new_frame_metadata = list(frame_metadata[:n_buffered])
                 # Freshness (digit-clock study): without this, the frames adjacent to
                 # the question are the ones refused during the PREVIOUS answer -- the
                 # oldest in the delta -- and the model reads the frames nearest the
@@ -2064,9 +2120,23 @@ class OmniStreamingVideoHandler:
                 if (
                     config.fresh_frame_on_query
                     and latest_frame[0] is not None
-                    and (not new_frames or new_frames[-1] != latest_frame[0])
+                    and (
+                        config.fresh_frame_force_append_on_query or not new_frames or new_frames[-1] != latest_frame[0]
+                    )
                 ):
                     new_frames.append(latest_frame[0])
+                    fresh_metadata = dict(latest_frame_metadata[0] or {})
+                    new_frame_metadata.append(fresh_metadata)
+                    if config.log_media_ledger:
+                        sess["selected_frame_ledger"].append(
+                            (
+                                str(fresh_metadata.get("frame_id") or ""),
+                                str(fresh_metadata.get("content_sha256") or ""),
+                            )
+                        )
+                selected_frame_snapshot = list(sess["selected_frame_ledger"])
+                selected_audio_snapshot = bytes(sess["selected_audio_ledger"])
+                query_audio = bytes(audio_buffer)
                 # The blocking roll's seed is deliberately TEXT-ONLY even when frames are
                 # retained: it prefills in the foreground of a turn the user is waiting
                 # on, and recovery speed beats fidelity on the emergency path. The shadow
@@ -2075,7 +2145,7 @@ class OmniStreamingVideoHandler:
                 chunk = await self._build_session_chunk(
                     config,
                     new_frames,
-                    audio_buffer,
+                    bytearray(query_audio),
                     query_text,
                     frame_pil_cache,
                     is_first=not sess["first_sent"],
@@ -2088,7 +2158,9 @@ class OmniStreamingVideoHandler:
                         sess.get("turn_idx", -1),
                         _time.monotonic(),
                     )
-                audio_buffer.clear()
+                # Preserve media that arrived while preprocessing this turn. It belongs
+                # to the next query; clearing the whole live buffer silently lost it.
+                del audio_buffer[: len(query_audio)]
                 if chunk is None:
                     # Nothing to submit: keep the frames for the next turn rather than
                     # dropping them on the floor.
@@ -2099,6 +2171,7 @@ class OmniStreamingVideoHandler:
                 # n_buffered, NOT len(new_frames): the fresh-frame rider was never in the
                 # buffer, and counting it here would delete one frame that arrived mid-build.
                 del frame_buffer[:n_buffered]
+                del frame_metadata[:n_buffered]
                 if compression_trigger and config.context_compression_carry_frames:
                     # Post-filter list: a frame the chunk dropped as undecodable must not
                     # come back to poison a seed later. Captured before the cache pops
@@ -2106,11 +2179,25 @@ class OmniStreamingVideoHandler:
                     kept = [f for f in new_frames if frame_pil_cache.get(f) is not _BAD_FRAME]
                     if kept:
                         sess.setdefault("pending_frames", []).extend(kept)
+                if config.log_media_ledger:
+                    for frame, metadata in zip(new_frames, new_frame_metadata):
+                        if frame_pil_cache.get(frame) is _BAD_FRAME:
+                            continue
+                        sess["submitted_frame_ledger"].append(
+                            (
+                                str(metadata.get("frame_id") or ""),
+                                str(metadata.get("content_sha256") or ""),
+                            )
+                        )
+                    sess["submitted_audio_ledger"].extend(query_audio)
                 for consumed in new_frames:
                     frame_pil_cache.pop(consumed, None)
 
                 ids = (chunk.get("prompt_token_ids") or ()) if isinstance(chunk, dict) else ()
                 ntok = len(ids)
+                if config.log_media_ledger:
+                    sess["prefill_token_counts"].append(ntok)
+                    _update_token_ledger(sess["prefill_token_hash"], ids)
                 sess["cum_tokens"] = sess.get("cum_tokens", 0) + ntok
                 # Session mode loses StageRequestStats entirely -- those tables are printed
                 # when a request FINISHES, and a resumable session request never does. So
@@ -2160,6 +2247,45 @@ class OmniStreamingVideoHandler:
                     f"/{budget}" if budget else "",
                     not sess["first_sent"],
                 )
+                if config.log_media_ledger:
+                    submitted_frame_snapshot = list(sess["submitted_frame_ledger"])
+                    submitted_audio_snapshot = bytes(sess["submitted_audio_ledger"])
+                    selected_frame_sha = _media_ledger_digest(selected_frame_snapshot)
+                    submitted_frame_sha = _media_ledger_digest(submitted_frame_snapshot)
+                    selected_audio_sha = hashlib.sha256(selected_audio_snapshot).hexdigest()
+                    submitted_audio_sha = hashlib.sha256(submitted_audio_snapshot).hexdigest()
+                    token_counts = list(sess["prefill_token_counts"])
+                    logger.info(
+                        "[media-ledger] sid=%s turn=%d frames_selected=%d "
+                        "frames_submitted=%d frame_selected_sha=%s frame_submitted_sha=%s "
+                        "audio_selected_bytes=%d audio_submitted_bytes=%d "
+                        "audio_selected_sha=%s audio_submitted_sha=%s "
+                        "prefill_chunks=%s prefill_tokens=%d prefill_token_sha=%s "
+                        "dropped=%d",
+                        config.session_id or "",
+                        sess["turn_idx"],
+                        len(selected_frame_snapshot),
+                        len(submitted_frame_snapshot),
+                        selected_frame_sha,
+                        submitted_frame_sha,
+                        len(selected_audio_snapshot),
+                        len(submitted_audio_snapshot),
+                        selected_audio_sha,
+                        submitted_audio_sha,
+                        ",".join(str(count) for count in token_counts) or "-",
+                        sum(token_counts),
+                        sess["prefill_token_hash"].hexdigest(),
+                        sess.get("ledger_dropped_frames", 0),
+                    )
+                    # Keep arrivals that raced with preprocessing for the next turn;
+                    # consume only the snapshotted prefixes audited above.
+                    del sess["selected_frame_ledger"][: len(selected_frame_snapshot)]
+                    del sess["submitted_frame_ledger"][: len(submitted_frame_snapshot)]
+                    del sess["selected_audio_ledger"][: len(selected_audio_snapshot)]
+                    del sess["submitted_audio_ledger"][: len(submitted_audio_snapshot)]
+                    sess["prefill_token_hash"] = hashlib.sha256()
+                    sess["prefill_token_counts"] = []
+                    sess["ledger_dropped_frames"] = 0
                 if budget and sess.get("talker_tokens", 0) >= budget:
                     # Refuse the turn rather than submit one that may not come back. Ending
                     # here is a real limitation, not a fix: the conversation is over. The
@@ -3063,6 +3189,16 @@ class OmniStreamingVideoHandler:
                         # Stash BEFORE the filter: a dropped frame is still the newest
                         # picture of the world, and fresh_frame_on_query needs exactly that.
                         latest_frame[0] = frame_data
+                        current_frame_metadata = {
+                            "frame_id": msg.get("frame_id"),
+                            "pts_ms": msg.get("pts_ms"),
+                            "source_pts_ms": msg.get("source_pts_ms"),
+                            "quality_profile": msg.get("quality_profile"),
+                            "capture_ts_ms": msg.get("capture_ts_ms"),
+                            "receiver_received_ts_ms": msg.get("_receiver_received_ts_ms"),
+                            "content_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+                        }
+                        latest_frame_metadata[0] = current_frame_metadata
                         if frame_filter is not None:
                             try:
                                 # Bracket the GAP between retained frames, in frames. The
@@ -3117,28 +3253,37 @@ class OmniStreamingVideoHandler:
                             # refused, so this number is the size of the sweep that did
                             # NOT land on the next turn.
                             sess["frames_dropped"] = sess.get("frames_dropped", 0) + 1
+                            sess["ledger_dropped_frames"] = sess.get("ledger_dropped_frames", 0) + 1
                         frame_buffer.append(frame_data)
-                        frame_metadata.append(
-                            {
-                                "frame_id": msg.get("frame_id"),
-                                "pts_ms": msg.get("pts_ms"),
-                                "source_pts_ms": msg.get("source_pts_ms"),
-                                "quality_profile": msg.get("quality_profile"),
-                                "capture_ts_ms": msg.get("capture_ts_ms"),
-                                "receiver_received_ts_ms": msg.get("_receiver_received_ts_ms"),
-                            }
-                        )
+                        frame_metadata.append(current_frame_metadata)
+                        if config.log_media_ledger:
+                            sess["selected_frame_ledger"].append(
+                                (
+                                    str(current_frame_metadata.get("frame_id") or ""),
+                                    current_frame_metadata["content_sha256"],
+                                )
+                            )
                         self.on_frame_buffered(raw_bytes, frame_data, message_history, config)
-                        # Prefill this frame now rather than when the query arrives. Only if it
-                        # is actually consumed does it leave frame_buffer -- see the helper: a
-                        # refusal leaves the frame for the ordinary query-time path.
+                        # Catch up from the oldest buffered frame, one append at a
+                        # time. A refusal leaves the remaining ordered suffix for
+                        # the next arrival or query. Submitting only the newest
+                        # frame here used to reorder the visual stream whenever an
+                        # older arrival had been refused while the turn was busy.
                         if config.prefill_frames_on_arrival and config.session_scoped_request:
-                            if await _prefill_frames_on_arrival([frame_data]):
-                                try:
-                                    frame_buffer.remove(frame_data)
-                                except ValueError:
-                                    pass
-                                frame_pil_cache.pop(frame_data, None)
+                            while frame_buffer:
+                                candidate = frame_buffer[0]
+                                if not await _prefill_frames_on_arrival([candidate]):
+                                    break
+                                consumed_metadata = frame_metadata.pop(0)
+                                frame_buffer.pop(0)
+                                if config.log_media_ledger:
+                                    sess["submitted_frame_ledger"].append(
+                                        (
+                                            str(consumed_metadata.get("frame_id") or ""),
+                                            str(consumed_metadata.get("content_sha256") or ""),
+                                        )
+                                    )
+                                frame_pil_cache.pop(candidate, None)
                         await self._send_frame_ack(
                             websocket,
                             msg,
@@ -3150,12 +3295,12 @@ class OmniStreamingVideoHandler:
                         # can skip base64+Image.open. uuid=md5 lets mm_cache dedupe identical frames.
                         # [CPU-plane] With the media pool the decode already happened in the
                         # worker: rebuild the PIL via frombytes (a memcpy) and skip the task.
-                        if _mp_res is not None and frame_data not in frame_pil_cache:
+                        if frame_data in frame_buffer and _mp_res is not None and frame_data not in frame_pil_cache:
                             frame_pil_cache[frame_data] = (
                                 Image.frombytes("RGB", _mp_res.size, _mp_res.rgb),
                                 _mp_res.md5,
                             )
-                        elif frame_data not in frame_pil_cache:
+                        elif frame_data in frame_buffer and frame_data not in frame_pil_cache:
                             mm_uuid = hashlib.md5(raw_bytes, usedforsecurity=False).hexdigest()
 
                             async def _prewarm(b64: str, b: bytes, u: str) -> None:
@@ -3199,6 +3344,8 @@ class OmniStreamingVideoHandler:
                             audio_buffer.clear()
                             continue
                         audio_buffer.extend(pcm_bytes)
+                        if config.log_media_ledger:
+                            sess["selected_audio_ledger"].extend(pcm_bytes)
                         # Opportunistic incremental prefill of
                         # the buffered speech; soft-fails and leaves the buffer.
                         if config.prefill_audio_on_arrival and config.session_scoped_request:
@@ -3215,6 +3362,8 @@ class OmniStreamingVideoHandler:
                                 decoded = base64.b64decode(audio_data_b64)
                                 if len(audio_buffer) + len(decoded) <= _MAX_AUDIO_BUFFER_BYTES:
                                     audio_buffer.extend(decoded)
+                                    if config.log_media_ledger:
+                                        sess["selected_audio_ledger"].extend(decoded)
                                 else:
                                     await self._send_error(websocket, "Audio buffer overflow")
                                     audio_buffer.clear()

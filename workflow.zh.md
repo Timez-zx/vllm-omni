@@ -152,19 +152,61 @@ AV 慢请求自己的输入 token 与快请求接近；差别是它到达时撞�
 
 CPU 测试覆盖真实 WAV manifest、speaker/turn 计划、媒体 cadence、session identity 和 playback timeline。
 
-### 当前结果与 root cause
+### 正式容量结果
 
-两个 30 轮/用户的 canonical seed 都在 8 用户通过、16 用户失败。`seed=17` 的 8/16 用户播放启动 p99 为 972/2062 ms；`seed=7` 为 824/2117 ms。四个 cell 分别完成 224/224、448/448 个计量 turn，均无 timeout 或 stall。容量边界稳定在 8–16 用户之间，因此未继续 32。
+正式部署固定为 `origin_deploy_3gpu.yaml`：Thinker、Talker、Code2Wav 各占一张 GPU。两个 canonical seed 都运行 30 轮/用户，前 2 轮预热、后 28 轮计量；source 均为 clean tree，输入 corpus、视频帧集、deploy YAML 和每个 seed 的 `workload_plan.json` 均由结果中的 SHA256 固定。
 
-同 workload 的 chunk-level 对照得到：
+| Seed | 用户 | 计量 turn | TTFA p99 | 播放启动 p99 | Stall p99 | 结果 |
+|---:|---:|---:|---:|---:|---:|---|
+| 17 | 8 | 224/224 | 541 ms | 972 ms | 0 | Pass |
+| 17 | 16 | 448/448 | 1178 ms | 2062 ms | 0 | Fail |
+| 7 | 8 | 224/224 | 479 ms | 824 ms | 0 | Pass |
+| 7 | 16 | 448/448 | 1005 ms | 2117 ms | 0 | Fail |
+
+四个 cell 均无 timeout、播放中断或协议错误。16 用户失败是播放启动 tail 超标，不是请求无法完成；容量边界稳定在 8–16 用户之间，因此未继续 32 用户。
+
+### 16 用户 chunk-level RCA
+
+RCA 固定在 clean commit `59b3a033`、同一三卡 YAML、`seed=17` 和同一 `workload_plan.json`。每组运行 10 轮/用户，前 2 轮预热，共 128 个计量 turn。分析需要同时开启 `VLLM_OMNI_LOG_SCHED_STEPS=1`、`VLLM_OMNI_LOG_REQ_STEPS=1` 和 `VLLM_OMNI_LOG_AUDIO_CHUNKS=1`，再运行 `benchmarks/live_agent/analysis/audio_chunk_rca.py`。
+
+基线保持真实 continuous-AV 行为：客户端始终以 2 FPS 上传视频、以 5 Hz 上传音频；服务端启用 `prefill_frames_on_arrival=true` 和 `prefill_audio_on_arrival=true`，把可消费的单用户增量媒体作为 prefill-only append 送入该 session 的 Thinker request。它不进入 Talker，也不生成回复。
+
+基线观测为：
 
 - 第一块到第二块固定需要 25–26 个 Talker request step；
-- 16 用户时第二块 gap p50/p99 为 460/1482 ms，超过正常 step 成本的等待为 124/865 ms；
-- 90% 的 Talker 长间隔内，Thinker 正在执行同一个 request；Thinker→Talker inline receive hit rate 只有 42.9%；
-- Code2Wav emit→waveform p99 为 41 ms，不是 tail 来源；
-- 只把视频从 arrival prefill 改为 query-time prefill 后，16 用户 TTFA p99 降至 694 ms，第二块 gap p99 降至 611 ms，inline receive hit rate升至 72.8%；再关闭 audio arrival prefill 只带来小幅变化。
+- 第二块 gap p50/p99 为 460/1482 ms，其中超过 25 ms 正常 step envelope 的累计等待为 124/865 ms；
+- 90% 的 Talker 长间隔内，Thinker 正在执行同一个 request；Thinker→Talker inline receive hit rate 为 42.9%；
+- Code2Wav emit→waveform p99 为 41 ms，不是 tail 来源。
 
-结论：持续视频 arrival prefill 与 Thinker 的回复 decode 共享同一 stage-0 调度，拖慢增量 text/hidden-state 供给；Talker 因等待上游 chunk 断续运行，其固定 25-step 串行窗口放大抖动。Code2Wav 和应用层播放不是主因，也没有证据表明三张 GPU 同时算力饱和。后续 engine 优化应优先研究 stage-0 prefill/decode QoS、deadline/priority scheduling 和跨阶段 backpressure。
+#### Query-time prefill 对照
+
+该对照只用于定位 tail，不是正式 workload，也不是 multi-user batching。三组中客户端都继续按原始 cadence 上传音视频；不同点只在服务端何时把单个 session 的媒体送入 Thinker：
+
+| 模式 | Session override | 服务端行为 |
+|---|---|---|
+| Arrival baseline | 默认值，即两个开关均为 `true` | 每个可消费的音频/视频增量到达后立即做 prefill-only append |
+| Video query-time | `{"prefill_frames_on_arrival":false,"prefill_audio_on_arrival":true}` | 视频仍实时接收，但保留在该 session 的 `frame_buffer`；收到空文本 `video.query` 后，与该轮剩余输入组成一个增量 chunk。音频仍 arrival prefill |
+| All query-time | `{"prefill_frames_on_arrival":false,"prefill_audio_on_arrival":false}` | 音频和视频仍实时接收，但都留在该 session 的 buffer；`video.query` 时组成该轮一个增量 chunk |
+
+这里没有把不同用户的数据合并，没有新增 engine-level video batch，也没有重新 prefill session 历史。对照的目的是把“响应 decode 期间不断插入的小 prefill”改成“query 边界的一次 per-turn delta”，观察 Thinker→Talker 供给是否恢复。
+
+| 16 用户模式 | TTFA p99 | 播放启动 p99 | 第二块 gap p99 | Wait excess p99 | Inline hit | Code2Wav p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| Arrival baseline | 1524 ms | 2153 ms | 1482 ms | 865 ms | 42.9% | 41 ms |
+| Video query-time | 694 ms | 1067 ms | 611 ms | 264 ms | 72.8% | 29 ms |
+| All query-time | 638 ms | 1078 ms | 447 ms | 157 ms | 81.5% | 41 ms |
+
+对照结果与“持续 arrival prefill 干扰 Thinker response decode”一致：关闭视频 arrival prefill 已带来主要改善；再关闭音频 arrival prefill 对 TTFA 和第二块 gap 只有较小增益，播放启动 p99 没有继续改善。
+
+该实验不是严格控制变量。`frame_buffer` 上限为 8；关闭视频 arrival prefill 后，旧帧可能在 query 前被丢弃。三组 160 个 turn 的日志分别记录 24、886、803 个 dropped frames，因此 query-time 组既改变了 prefill 时序和粒度，也减少了实际视频 prefill 量。`fresh_frame_on_query=true` 也与 buffer 状态耦合：arrival 组的最新帧可能已经进入 KV、query 时再次追加，query-time 组的同一帧通常仍是 buffer 尾部而不会重复追加。相似性 filter 在媒体接收后、delivery mode 分支前运行，本身是合理且应保留的降载策略；但当前结果没有逐轮 frame-ID/token ledger，不能证明三组最终送入 Thinker 的选帧集合与重复次数相同。RCA 运行本身较短，其 baseline TTFA p99 也不能与 30 轮正式容量 cell 直接比较。
+
+当前能够成立的结论是：tail 位于 Thinker→Talker 供给路径，Code2Wav 和播放器不是主因；持续视频 arrival prefill 是 stage-0 竞争的最强候选原因，但上述对照不能单独证明纯粹的 prefill/decode GPU 阻塞。
+
+公平重测先让 arrival 组按真实 closed loop 运行并录制客户端输入，再由两组 query-time 配置重放同一时间戳、同一 frame/audio/query 序列。三组保留相同 similarity filter；`max_frames=256` 防止 eviction，`fresh_frame_force_append_on_query=true` 固定 freshness 重复次数。服务端逐轮记录筛选后与实际提交的 frame ID/content hash、audio bytes/hash 和 prompt chunk token 数；只有 ordered media ledger 全等、dropped frames 为 0、replay schedule slip 为 0 时才比较延迟。Chunk 边界是实验变量：arrival 组保持小块增量 append，query-time 组在 query 合并；因此要求相同的是媒体顺序与总量，不是 chunk hash。该流程由 `run_prefill_timing_rca.sh` 执行，`media_fairness.py` 负责 fail-closed 校验。
+
+### 结果归档
+
+2026-08-20 的正式容量、RCA、query-time 对照、原始 turn、engine log、GPU samples、workload plan、汇总和 SHA256 清单统一归档在 `/home/ubuntu/data/results/archive/2026-08-20_continuous_av_capacity_rca/`。归档只保存实验产物，不作为 Git source；复现以归档 `README.md` 中的 commit、YAML、输入哈希和 session overrides 为准。
 
 ## 当前标准实验流程
 
