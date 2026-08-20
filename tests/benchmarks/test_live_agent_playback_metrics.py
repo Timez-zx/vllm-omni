@@ -36,6 +36,17 @@ def test_prebuffer_can_cover_first_gap() -> None:
     assert report.stalls_s == ()
 
 
+def test_audio_done_releases_reply_shorter_than_prebuffer() -> None:
+    report = simulate_playback(
+        [(0.20, 2400), (0.35, 4800)],
+        sample_rate=24000,
+        prebuffer_s=1.4,
+        release_at_s=0.36,
+    )
+    assert report.start_s == 0.36
+    assert report.stalls_s == ()
+
+
 def test_playback_rejects_non_monotonic_input() -> None:
     with pytest.raises(ValueError, match="monotonic"):
         simulate_playback([(0.2, 100), (0.1, 100)])

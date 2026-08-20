@@ -8,11 +8,9 @@
 //
 // Two behaviours are deliberate:
 //
-//   * A prebuffer before the first sample plays, and it must be well under the
-//     FIRST delta -- not merely enough for network jitter. The server sends a small
-//     first granule on purpose so speech starts early (measured 0.217 s), then 2 s
-//     granules. A 250 ms threshold sat above that first delta, so playback never
-//     started on it.
+//   * A prebuffer before the first sample plays. The server sends a small first
+//     granule (measured 0.217 s), then larger steady-state granules. Fast mode starts
+//     on the first; smooth mode deliberately waits through the second.
 //   * On underrun the processor emits SILENCE and keeps running. Returning
 //     false, or throwing, permanently kills the node -- and a dead node is
 //     silent for the rest of the session with nothing in the console.

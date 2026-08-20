@@ -61,6 +61,24 @@ The audio manifest is JSONL:
 Every speaker needs at least `TURNS` recordings. Audio paths are relative to
 the manifest.
 
+The canonical corpus uses real close-talk SLURP requests and DAVIS 2017 video.
+SLURP real audio is CC BY-NC 4.0. After downloading the official archives,
+prepare the deterministic 80-speaker workload with:
+
+```bash
+python benchmarks/live_agent/web_client/prepare_slurp_davis.py \
+  --slurp-annotations /path/to/slurp-repo \
+  --slurp-audio /path/to/slurp_real \
+  --davis-jpegs /path/to/DAVIS/JPEGImages/480p \
+  --out /path/to/continuous-av-v1
+```
+
+It selects 60 distinct, correctly annotated recordings per speaker, balances
+assistant scenarios, and uses a fixed microphone profile per session: 50% of
+speakers are close-talk and 50% are distant-microphone. It converts audio to
+mono PCM16 16 kHz and samples DAVIS at an effective 2 fps.
+`corpus_provenance.json` records the selection and source revisions.
+
 Run all three session policies on the same workload plan:
 
 ```bash
@@ -72,12 +90,17 @@ bash benchmarks/live_agent/web_client/run_session_baselines.sh
 
 `run_av_session_ladder.sh` runs one policy. A cell passes only if every
 post-warmup turn completes, TTFA p99 is below 1 s, per-turn maximum playback
-stall p99 is below 50 ms, and protocol/client/engine correctness checks are
-clean. Percentiles use nearest rank and playback uses a 60 ms prebuffer.
+audible playback-start p99 is below 1 s, playback stall p99 is below 50 ms,
+and protocol/client/engine correctness checks are clean. Percentiles use
+nearest rank and playback uses the browser's default 1.4 s smooth-buffer
+threshold; because chunks arrive discretely, this normally starts on the second
+audio delta rather than adding a fixed 1.4 s delay.
 
 Each cell stores `workload_plan.json`, `turns.jsonl`, `summary.json`,
-`gpu.csv`, and `engine.log`. Source, deploy, audio corpus, frames, system
-prompt, and workload plan are hashed.
+`gpu_samples.jsonl`, and `engine.log`. GPU samples include SM activity,
+achieved occupancy, tensor/FP activity, DRAM activity, PCIe traffic, power,
+clocks, resident memory, and per-process utilization. Source, deploy, audio
+corpus, frames, system prompt, and workload plan are hashed.
 
 ## Diagnostics
 

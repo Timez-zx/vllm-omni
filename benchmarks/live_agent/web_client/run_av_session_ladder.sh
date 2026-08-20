@@ -6,7 +6,7 @@
 #   MU_AUDIO_MANIFEST=/path/to/utterances.jsonl
 #
 # Optional:
-#   USERS="1 8 16 24 32 48 64 96 128 160" SEEDS="7" TURNS=30
+#   USERS="8 16 32 48 64 96 128 160" SEEDS="7" TURNS=30
 #   RESULT_PREFIX=avsession RESULTS_DIR=/path/to/results
 set -uo pipefail
 
@@ -38,7 +38,7 @@ MU_DEPLOY=${MU_DEPLOY:-$REPO_ROOT/benchmarks/thinker_talker/origin_deploy_3gpu.y
   exit 2
 }
 
-USERS=${USERS:-"1 8 16 24 32 48 64 96 128 160"}
+USERS=${USERS:-"8 16 32 48 64 96 128 160"}
 SEEDS=${SEEDS:-"7"}
 TURNS=${TURNS:-30}
 WARMUP_TURNS=${WARMUP_TURNS:-2}
@@ -73,9 +73,9 @@ run_cell() {
   out=$RESULTS_DIR/${RESULT_PREFIX}_seed${seed}_u${users}
   mkdir -p "$out"
   log "continuous AV: users=$users seed=$seed turns=$TURNS reps=$reps -> $out"
-  nvidia-smi --id="${MU_GPU_IDS:-0,1,2}" \
-    --query-gpu=timestamp,index,utilization.gpu,memory.used \
-    --format=csv,noheader -l 2 > "$out/gpu.csv" 2>/dev/null &
+  "$PYBIN" "$REPO_ROOT/benchmarks/live_agent/harness/gpu_sampler.py" \
+    --devices "${MU_GPU_IDS:-0,1,2}" --hz "${MU_GPU_SAMPLE_HZ:-5}" \
+    --out "$out/gpu_samples.jsonl" > "$out/gpu_sampler.log" 2>&1 &
   sampler=$!
 
   MU_URL="${MU_URL:-ws://127.0.0.1:$PORT/v1/video/chat/stream}" \
@@ -87,7 +87,8 @@ run_cell() {
       --out "$out" 2>&1 | tee "$out/driver.log"
   rc=${PIPESTATUS[0]}
 
-  kill "$sampler" 2>/dev/null
+  kill -INT "$sampler" 2>/dev/null
+  wait "$sampler" 2>/dev/null || true
   cp -f "$ENGINE_LOG" "$out/engine.log" 2>/dev/null || true
   if ! healthy; then echo "engine_died_after=true" >> "$out/summary_note.txt"; fi
   return "$rc"
@@ -103,7 +104,16 @@ for seed in $SEEDS; do
     stop_engine || exit 1
     RESULTS_DIR="$RESULTS_DIR" QWEN_LOG="$ENGINE_LOG" MU_PORT="$PORT" \
       DEPLOY_CONFIG="$MU_DEPLOY" bash "$SCRIPT_DIR/run_qwen_server.sh" || exit 1
-    run_cell "$users" "$seed" || exit 1
+    run_cell "$users" "$seed"
+    rc=$?
+    if [ "$rc" -eq 3 ]; then
+      log "capacity boundary reached at users=$users seed=$seed; stopping this seed"
+      if [ "${LEAVE_ENGINE_RUNNING:-0}" != "1" ]; then stop_engine || exit 1; fi
+      break
+    elif [ "$rc" -ne 0 ]; then
+      if [ "${LEAVE_ENGINE_RUNNING:-0}" != "1" ]; then stop_engine || true; fi
+      exit "$rc"
+    fi
   done
 done
 

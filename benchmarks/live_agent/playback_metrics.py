@@ -25,12 +25,15 @@ def simulate_playback(
     *,
     sample_rate: int = 24000,
     prebuffer_s: float = 0.06,
+    release_at_s: float | None = None,
 ) -> PlaybackReport:
     """Replay a 1x player against ``(arrival_s, samples)`` deltas.
 
     Playback begins at the arrival that first takes queued audio over the
-    prebuffer threshold.  A later delta creates a listener-visible stall only
-    when it arrives after all previously delivered samples would have played.
+    prebuffer threshold. ``release_at_s`` models ``response.audio.done``:
+    the browser releases a short reply even when its total audio never reaches
+    the smooth-start threshold. A later delta creates a listener-visible stall
+    only when it arrives after all previously delivered samples would have played.
     """
     if sample_rate <= 0:
         raise ValueError("sample_rate must be positive")
@@ -49,7 +52,11 @@ def simulate_playback(
             start_index = index
             break
     if start_index is None:
-        return PlaybackReport(start_s=None, stalls_s=())
+        if not deltas or release_at_s is None:
+            return PlaybackReport(start_s=None, stalls_s=())
+        if release_at_s < deltas[-1][0]:
+            raise ValueError("release must not precede the final delta")
+        return PlaybackReport(start_s=release_at_s, stalls_s=())
 
     start_s = deltas[start_index][0]
     covered_until = start_s + queued_s

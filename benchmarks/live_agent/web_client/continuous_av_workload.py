@@ -27,6 +27,8 @@ class Utterance:
     transcript: str
     pcm: bytes
     source: str
+    mic_condition: str | None = None
+    source_asr_wer: float | None = None
 
     @property
     def duration_s(self) -> float:
@@ -51,6 +53,8 @@ class TurnPlan:
             "transcript": self.utterance.transcript,
             "input_audio_s": round(self.utterance.duration_s, 4),
             "input_audio_sha256": self.utterance.sha256,
+            "mic_condition": self.utterance.mic_condition,
+            "source_asr_wer": self.utterance.source_asr_wer,
             "think_s": self.think_s,
         }
 
@@ -111,6 +115,8 @@ def load_audio_manifest(path: pathlib.Path) -> tuple[list[Utterance], dict]:
                 transcript=str(item["transcript"]),
                 pcm=_load_pcm16_mono(audio_path),
                 source=str(audio_path),
+                mic_condition=str(item["mic_condition"]) if item.get("mic_condition") else None,
+                source_asr_wer=float(item["source_asr_wer"]) if item.get("source_asr_wer") is not None else None,
             )
         )
     if not records:
@@ -169,12 +175,19 @@ def build_user_plan(
     cohort_index = rep * users + uid
     rng = random.Random(seed * 1_000_003 + cohort_index * 9_973)
     speakers = sorted({record.speaker for record in utterances})
-    speaker = speakers[cohort_index % len(speakers)]
+    speaker_index = cohort_index % len(speakers)
+    speaker_round = cohort_index // len(speakers)
+    speaker = speakers[speaker_index]
     speaker_turns = [record for record in utterances if record.speaker == speaker]
     if len(speaker_turns) < turns:
         raise ValueError(f"speaker {speaker!r} has {len(speaker_turns)} utterances; need at least {turns}")
-    rng.shuffle(speaker_turns)
-    start = cohort_index % len(speaker_turns)
+    # Every concurrency point is a nested workload: user N receives the same
+    # recording plan at 8, 16, 32, ... users.  When concurrency exceeds the
+    # number of speakers, repeated speakers consume disjoint windows before
+    # any recording is reused across sessions.
+    speaker_seed = int.from_bytes(hashlib.sha256(f"{seed}:{speaker}".encode()).digest()[:8], "big")
+    random.Random(speaker_seed).shuffle(speaker_turns)
+    start = (speaker_round * turns) % len(speaker_turns)
     planned: list[TurnPlan] = []
     for turn in range(1, turns + 1):
         utterance = speaker_turns[(start + turn - 1) % len(speaker_turns)]

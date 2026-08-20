@@ -372,7 +372,7 @@ check('a re-arm while the previous reply is still sounding does not cut it off',
       + `waits for the queue to drain instead of truncating a word`);
 
 // ---------------------------------------------------------------------------
-// 5. the SHIPPED schedule (codec_chunk_frames: 4), where early is also smooth
+// 5. a low-latency steady schedule (codec_chunk_frames: 4), where early is smooth
 //
 // The schedule in section 3 is what codec_chunk_frames: 25 produces, and the whole
 // prebuffer trade only exists because of it. At 4 the granules are 0.32 s and arrive
@@ -386,7 +386,7 @@ check('a re-arm while the previous reply is still sounding does not cut it off',
 const SHIPPED = [{ at: 350, audio: 217 }].concat(
   Array.from({ length: 12 }, (_, i) => ({ at: 350 + 213 * (i + 1), audio: 320 })));
 
-console.log('\n5. the shipped schedule (codec_chunk_frames: 4)');
+console.log('\n5. a low-latency steady schedule (codec_chunk_frames: 4)');
 
 const shipped = runSchedule(60, SHIPPED);
 const shippedWorst = shipped.gaps.reduce((m, g) => Math.max(m, g.durMs), 0);

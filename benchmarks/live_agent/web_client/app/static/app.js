@@ -67,15 +67,15 @@
   // benchmarks/live_agent/web_client/audio_timeline.py, and the right value depends
   // entirely on the server's `codec_chunk_frames`.
   //
-  // With the shipped 4 (0.32 s granules, one every ~0.213 s):
+  // With steady-state codec_chunk_frames=4 (0.32 s granules, one every ~0.213 s):
   //   delta 0  0.35 s  0.217 s of audio      delta 1+  every 0.213 s, 0.320 s each
   //   Delivery outruns playback from the first boundary, so 60 ms is smooth AND early.
   //
-  // With 25 (2.0 s granules, one every ~1.28 s) it is not: 0.217 s of audio cannot
+  // The canonical deploy uses 25 (2.0 s granules). Under concurrency, 0.217 s of audio cannot
   // cover the 1.34 s the next granule takes, so an early start stalls ~1.1 s one word
   // in and the only alternative is to wait for delta 1 at 1.70 s. That is what `smooth`
-  // is for, and why the choice is still on the page -- a page cannot see the server's
-  // chunk size, so if speech ever stutters one word in, this is the switch.
+  // is for. Smooth is the default because audible continuity is the baseline SLO;
+  // fast remains available when measuring the raw first-granule tradeoff.
   //
   // The first boundary is TIGHT even at 4: 0.217 s of playable audio against 0.213 s to
   // produce the next granule is a 4 ms margin, and one turn in nine showed exactly a
@@ -687,8 +687,21 @@
     sendTimer = clockTimer = null;
     stopCamera();
     if (socket && socket.readyState === WebSocket.OPEN) {
-      try { socket.send(JSON.stringify({ type: 'video.done' })); } catch (_) {}
-      try { socket.close(); } catch (_) {}
+      const closingSocket = socket;
+      try { closingSocket.send(JSON.stringify({ type: 'video.done' })); } catch (_) {}
+      // Let the server retire the persistent stage requests before closing
+      // the transport. A forced close is only a fallback for a wedged server.
+      const forceClose = window.setTimeout(() => {
+        try { closingSocket.close(); } catch (_) {}
+      }, 5000);
+      closingSocket.addEventListener('message', (event) => {
+        try {
+          if (JSON.parse(event.data).type === 'session.done') {
+            window.clearTimeout(forceClose);
+            closingSocket.close();
+          }
+        } catch (_) {}
+      });
     }
     socket = null;
     if (captureNode) { try { captureNode.disconnect(); } catch (_) {} captureNode = null; }

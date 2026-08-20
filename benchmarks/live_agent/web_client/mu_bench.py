@@ -56,7 +56,10 @@ LOG = pathlib.Path(os.environ.get("MU_ENGINE_LOG", "/tmp/vllm-omni-results/qwen_
 TURN_TIMEOUT_S = 180.0
 WARMUP_S = 4.0
 GIVE_UP_AFTER = 3
-PLAYBACK_PREBUFFER_S = 0.060
+# The canonical deploy emits a 217 ms initial granule and then 2 s granules.
+# Buffer through the second granule so the user does not hear a one-word start
+# followed by silence. This is the browser's default smooth mode.
+PLAYBACK_PREBUFFER_S = 1.400
 WS_DEFLATE = False
 SYSTEM_PROMPT = (
     "You are a friendly voice assistant in a live video call. You can see the camera and hear the user. "
@@ -110,6 +113,7 @@ class User:
         self.stray_audio = 0
         self.cur: dict | None = None
         self.done_evt = asyncio.Event()
+        self.session_done_evt = asyncio.Event()
 
         self.frames_sent = 0
         self.mic_chunks_sent = 0
@@ -181,6 +185,7 @@ class User:
                     await asyncio.sleep(WARMUP_S)
                     await self._turn_loop(ws)
                     await ws.send(json.dumps({"type": "video.done"}))
+                    await asyncio.wait_for(self.session_done_evt.wait(), timeout=30.0)
                 finally:
                     for task in tasks:
                         task.cancel()
@@ -261,6 +266,9 @@ class User:
                     continue
                 self.session_incarnation = msg.get("incarnation")
                 self.session_epoch = msg.get("epoch")
+                continue
+            if event_type == "session.done":
+                self.session_done_evt.set()
                 continue
             if event_type in ("session.rolled", "session.compressed"):
                 if msg.get("incarnation") != self.session_incarnation:
@@ -410,6 +418,7 @@ class User:
             [(stamp - queried_at, samples) for stamp, samples in cur["deltas"]],
             sample_rate=24_000,
             prebuffer_s=PLAYBACK_PREBUFFER_S,
+            release_at_s=cur["t_done"] - queried_at,
         )
         playback_end = (
             queried_at + (playback.start_s or 0.0) + audio_s + playback.stall_total_s
@@ -502,6 +511,7 @@ def summarize(records: list[dict], users: list[User], meta: dict, log_slice: str
     ttfa = [record["ttfa_ms"] for record in ok if record.get("ttfa_ms") is not None]
     ttft = [record["ttft_ms"] for record in ok if record.get("ttft_ms") is not None]
     stalls = [record["stall_max_ms"] for record in ok]
+    playback_starts = [record["playback_start_ms"] for record in ok if record.get("playback_start_ms") is not None]
     probes = {
         key: len(re.findall(pattern, log_slice)) for key, pattern in {**LOG_PROBES_BAD, **LOG_PROBES_INFO}.items()
     }
@@ -512,11 +522,13 @@ def summarize(records: list[dict], users: list[User], meta: dict, log_slice: str
     client_errors = sum(len(user.errors) for user in users)
     ttfa_p99 = pctl(ttfa, 0.99)
     stall_p99 = pctl(stalls, 0.99)
+    playback_start_p99 = pctl(playback_starts, 0.99)
     capacity_pass = bool(
         len(ok) == expected
         and len(ttfa) == expected
-        and ttfa_p99 is not None
-        and ttfa_p99 < 1000
+        and len(playback_starts) == expected
+        and playback_start_p99 is not None
+        and playback_start_p99 < 1000
         and stall_p99 is not None
         and stall_p99 < 50
         and protocol_mismatches == 0
@@ -536,6 +548,9 @@ def summarize(records: list[dict], users: list[User], meta: dict, log_slice: str
         "ttfa_p99_ms": ttfa_p99,
         "ttft_p50_ms": pctl(ttft, 0.50),
         "ttft_p99_ms": pctl(ttft, 0.99),
+        "playback_start_p50_ms": pctl(playback_starts, 0.50),
+        "playback_start_p95_ms": pctl(playback_starts, 0.95),
+        "playback_start_p99_ms": playback_start_p99,
         "stall_max_ms_p50": pctl(stalls, 0.50),
         "stall_max_ms_p95": pctl(stalls, 0.95),
         "stall_max_ms_p99": stall_p99,
@@ -658,10 +673,17 @@ async def main() -> int:
         f"timeout={summary['n_timeout']} skipped={summary['n_skipped']}"
     )
     print(
-        f"   ttfa p50/p99={summary['ttfa_p50_ms']}/{summary['ttfa_p99_ms']} ms "
+        f"   service-ttfa p50/p99={summary['ttfa_p50_ms']}/{summary['ttfa_p99_ms']} ms "
+        f"playback-start p99={summary['playback_start_p99_ms']} ms "
         f"stall-max p99={summary['stall_max_ms_p99']} ms pass={summary['capacity_pass']}"
     )
-    return 0 if records and summary["client_errors"] == 0 else 1
+    if summary["capacity_pass"]:
+        return 0
+    # Keep an SLO boundary distinct from a broken harness/protocol. The
+    # capacity ladder treats 3 as an expected stopping condition.
+    if records and summary["client_errors"] == 0:
+        return 3
+    return 1
 
 
 if __name__ == "__main__":
