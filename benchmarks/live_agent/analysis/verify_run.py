@@ -17,7 +17,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 FLAGS_PY = REPO_ROOT / "vllm_omni/core/sched/runtime_flags.py"
 TRACES = {
-    "VLLM_OMNI_INLINE_RECV": (re.compile(r"stage=1 .*irecv=(\d+)/"), "inline receive"),
     "VLLM_OMNI_MAILBOX": (re.compile(r"shm_mailbox_connector|ShmMailboxConnector"), "SHM mailbox"),
 }
 
@@ -60,10 +59,6 @@ def check(result_dir: Path) -> int:
         if not hits:
             print(f"   !! {label}: enabled by default but no log evidence")
             bad += 1
-        elif flag == "VLLM_OMNI_INLINE_RECV":
-            count = max(int(hit) for hit in hits)
-            print(f"   {'ok' if count else '!!'} {label}: {count}")
-            bad += int(count == 0)
         else:
             print(f"   ok {label}: {len(hits)} log entries")
 
@@ -72,6 +67,47 @@ def check(result_dir: Path) -> int:
     if stages != {"0", "1", "2"}:
         print("   !! expected separate thinker, talker, and code2wav processes")
         bad += 1
+
+    finite_ids = re.findall(r"\[finite-request\].* request=(video-[0-9a-f]+)", log)
+    expected_requests = (
+        int(summary.get("users") or 0)
+        * int(summary.get("turns_per_user") or 0)
+        * int(summary.get("repeat_sessions") or 1)
+    )
+    if len(finite_ids) != expected_requests or len(set(finite_ids)) != len(finite_ids):
+        print(
+            f"   !! finite requests: lines={len(finite_ids)} unique={len(set(finite_ids))} "
+            f"expected={expected_requests}"
+        )
+        bad += 1
+    else:
+        print(f"   ok finite requests: {len(finite_ids)} turns, all request ids unique")
+
+    try:
+        deploy_text = deploy.read_text()
+        thinker = deploy_text.split("- stage_id: 1", 1)[0]
+        prefix_enabled = bool(re.search(r"enable_prefix_caching:\s*true", thinker))
+    except OSError:
+        prefix_enabled = False
+    if not prefix_enabled:
+        print("   !! thinker prefix caching is not enabled")
+        bad += 1
+    else:
+        print("   ok thinker prefix caching enabled")
+
+    prefix_hits = [
+        int(value)
+        for value in re.findall(r"\[prefix-cache\].*hit_tokens=(\d+)", log)
+    ]
+    if expected_requests > int(summary.get("users") or 0) and not any(prefix_hits):
+        print("   !! no non-zero prefix-cache hit was observed after first turns")
+        bad += 1
+    elif prefix_hits:
+        nonzero = sum(value > 0 for value in prefix_hits)
+        print(
+            f"   ok prefix-cache observations: {nonzero}/{len(prefix_hits)} hit, "
+            f"max={max(prefix_hits)} tokens"
+        )
 
     if not summary.get("capacity_pass"):
         print("   -- capacity SLO did not pass")

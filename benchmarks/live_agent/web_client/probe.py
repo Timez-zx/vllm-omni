@@ -68,28 +68,20 @@ def session_config(system_prompt: str) -> dict:
         "type": "session.config",
         "system_prompt": system_prompt,
         "modalities": ["text", "audio"],
-        "num_frames": 16,
-        # 8, not 256: the buffer holds frames whose on-arrival prefill was refused
-        # (a turn is in flight, or a compression shadow is warming), and a turn
-        # submits the WHOLE buffer at once. Measured single-user cost of a turn is
-        # 348 ms + 59 ms per frame, so an unbounded buffer turns a stalled moment
-        # into a 13-19 frame sweep (876 ms single-user, ~4.7 s at 13 users). The
-        # cap evicts the OLDEST frame, which is the right one to lose on a live
-        # feed. See workflow section 16.
+        "num_frames": 8,
+        # Each retained frame is consumed by one turn, so this caps the backlog
+        # accumulated while another finite request is running.
         "max_frames": 8,
         "max_frame_width": 640,
         "max_frame_height": 352,
         "frame_jpeg_quality": 90,
         "enable_frame_filter": True,
         "frame_filter_threshold": 0.95,
-        "frame_filter_min_gap": 8,
-        "frame_filter_max_gap": 16,
+        "frame_filter_min_gap": 0,
+        "frame_filter_max_gap": 4,
         "use_audio_in_video": True,
-        "session_scoped_request": True,
-        # OFF: crashes stage 1 with a CUDA device-side assert under continuous frames.
-        "prefill_frames_on_arrival": True,
-        "session_roll_at_talker_tokens": 45000,
-        "session_roll_history_turns": 8,
+        "context_window_trigger_tokens": 49152,
+        "context_window_target_tokens": 16384,
     }
 
 

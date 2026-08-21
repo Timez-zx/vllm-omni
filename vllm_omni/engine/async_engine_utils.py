@@ -10,7 +10,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
 
-from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreRequest
+from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.messages import EngineQueueMessage, ShutdownRequestMessage
 from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
 from vllm_omni.engine.serialization import (
@@ -56,14 +56,6 @@ def upgrade_to_omni_request(
         raw_buffer = raw_prompt.get("model_intermediate_buffer")
         if isinstance(raw_info, dict):
             wire_payload = dict(raw_info)
-        elif isinstance(raw_info, AdditionalInformationPayload):
-            # An already-serialized payload (the entrypoint attaches real
-            # AdditionalInformationPayload structs -- e.g. the prefill-only
-            # marker on arrival appends). The dict-only filter above silently
-            # dropped these for every streaming chunk, which is why the marker
-            # historically survived only on the extra_args channel; the
-            # serializer below passes structs through untouched.
-            wire_payload = raw_info
         if isinstance(raw_buffer, dict):
             model_intermediate_buffer = raw_buffer
         additional_information = serialize_additional_information(

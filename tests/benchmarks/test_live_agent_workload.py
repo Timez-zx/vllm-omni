@@ -207,7 +207,7 @@ def test_capacity_uses_audible_playback_start_and_accepts_short_released_reply()
     assert summary["capacity_pass"] is True
 
 
-def test_repaired_engine_counter_drift_is_reported_without_stopping_ladder() -> None:
+def test_finite_request_and_prefix_hit_probes_are_reported() -> None:
     record = {
         "turn": 1,
         "status": "ok",
@@ -235,12 +235,18 @@ def test_repaired_engine_counter_drift_is_reported_without_stopping_ladder() -> 
         rolls=0,
         stats=lambda: media,
     )
-    log = "\n".join(["streaming-parked counter had leaked"] * 3)
+    log = "\n".join(
+        [
+            "[finite-request] session=u0 request=video-abc turn=0 prompt_tokens=100 history_messages=0",
+            "[prefix-cache] request=video-abc-stage0 hit_tokens=64 prompt_tokens=100",
+        ]
+    )
 
     summary = summarize([record], [user], {"turns_per_user": 1}, log, warmup_turns=0)
 
-    assert summary["engine_probes"]["counter_leak_clamped"] == 3
-    assert summary["engine_warning_count"] == 3
+    assert summary["engine_probes"]["finite_requests"] == 1
+    assert summary["engine_probes"]["prefix_cache_hits"] == 1
+    assert summary["engine_warning_count"] == 0
     assert summary["capacity_pass"] is True
 
 

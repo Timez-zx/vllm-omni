@@ -19,11 +19,11 @@ Four decompositions, each aimed at one hypothesis:
      "everything got slower". Valid because every user shares one driver
      process and therefore one monotonic clock.
 
-  3. TURN INDEX -- session mode grows the context every turn, so a
+  3. TURN INDEX -- canonical history grows between compactions, so a
      context-cost story predicts late turns slower than early ones at the
      same user count. Buckets of 10.
 
-  4. HYGIENE -- timeouts, session rolls, fatal probes, and self-repaired
+  4. HYGIENE -- timeouts, history compactions, fatal probes, and self-repaired
      warnings per cell (from summary.json), so a pathological cell cannot
      masquerade as a scaling law without confusing a recorded warning with a
      user-visible capacity boundary.
@@ -225,7 +225,7 @@ def cell_report(cell: dict) -> dict:
         "users": cell["users"],
         "n_ok": len(ok),
         "n_timeout": cell["summary"].get("n_timeout"),
-        "rolls": cell["summary"].get("session_rolls"),
+        "compactions": (cell["summary"].get("engine_probes") or {}).get("history_compactions"),
         "ttfa_p50": pct(ttfa, 50),
         "ttfa_p95": pct(ttfa, 95),
         "ttfa_p99": pct(ttfa, 99),
@@ -359,7 +359,7 @@ def main() -> int:
     hdr = (
         f"{'users':>5} {'n':>4} {'p50':>6} {'p95':>7} {'p99':>7} "
         f"{'thk p50/p99':>12} {'spc p50/p99':>12} "
-        f"{'tail95 thk/spc':>14} {'wait all/tail':>13} {'to':>3} {'roll':>4}"
+        f"{'tail95 thk/spc':>14} {'wait all/tail':>13} {'to':>3} {'cmp':>4}"
     )
     print(hdr)
     for r in reports:
@@ -376,7 +376,7 @@ def main() -> int:
             f"{r['speech_p50']:>5.0f}/{r['speech_p99']:>5.0f} "
             f"{share:>14} "
             f"{r['n_wait_mean_all']:>5.2f}/{r['n_wait_mean_tail95']:>5.2f} "
-            f"{r['n_timeout'] or 0:>3} {r['rolls'] or 0:>4}"
+            f"{r['n_timeout'] or 0:>3} {r['compactions'] or 0:>4}"
         )
         if r["bad_probes"]:
             print(f"      !! bad probes: {r['bad_probes']}")

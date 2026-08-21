@@ -109,8 +109,6 @@ async def one_user(uid: int, args, frames: list[bytes], utter: bytes,
     st = {"first_audio": None, "text_done": False, "audio_done": False,
           "rep": -1, "err": None, "done": False, "ntext": 0, "naudio": 0,
           "q_time": None, "stale_text": 0, "stale_audio": 0}
-    results: list[dict] = []
-
     async with websockets.connect(args.uri, max_size=args.ws_max_mb * 1024 * 1024,
                                   ping_interval=None, open_timeout=60) as ws:
         cfg = {
@@ -131,16 +129,6 @@ async def one_user(uid: int, args, frames: list[bytes], utter: bytes,
             cfg["frame_filter_min_gap"] = args.frame_filter_min_gap
         if args.frame_filter_max_gap:
             cfg["frame_filter_max_gap"] = args.frame_filter_max_gap
-        if args.session_scoped_request:
-            cfg["session_scoped_request"] = True
-        if args.session_talker_token_budget:
-            cfg["session_talker_token_budget"] = args.session_talker_token_budget
-        if args.session_roll_at_talker_tokens:
-            cfg["session_roll_at_talker_tokens"] = args.session_roll_at_talker_tokens
-        if args.session_roll_history_turns is not None:
-            cfg["session_roll_history_turns"] = args.session_roll_history_turns
-        if args.session_roll_settle_s is not None:
-            cfg["session_roll_settle_s"] = args.session_roll_settle_s
         if args.system_prompt:
             cfg["system_prompt"] = args.system_prompt
         await ws.send(json.dumps(cfg))
@@ -230,15 +218,6 @@ async def one_user(uid: int, args, frames: list[bytes], utter: bytes,
                     elif t == "response.audio.done":
                         st["audio_done"] = True
                         tr.rec("rx_audio_done", rep=r)
-                    elif t == "session.rolled":
-                        # The server retired the engine request and opened a fresh one seeded
-                        # with recent text. Recorded because the turn that follows pays a cold
-                        # prefill, and that cost is the whole price of an unbounded session --
-                        # without this event in the trace it would show up as an unexplained
-                        # TTFA outlier with nothing to attribute it to.
-                        tr.rec("rx_session_rolled", rep=r, turn=m.get("turn"),
-                               rolls=m.get("rolls"),
-                               carried_messages=m.get("carried_messages"))
                     elif t == "session.done":
                         st["done"] = True
                         tr.rec("rx_session_done")
@@ -407,21 +386,6 @@ def main() -> int:
     ap.add_argument("--max-frame-height", type=int, default=None)
     ap.add_argument("--frame-filter-min-gap", type=int, default=0)
     ap.add_argument("--frame-filter-max-gap", type=int, default=0)
-    ap.add_argument("--session-scoped-request", action="store_true", default=False,
-                    help="one resumable engine request for the whole session")
-    ap.add_argument("--session-roll-at-talker-tokens", type=int, default=None,
-                    help="roll the session (new engine request seeded with recent text) when "
-                         "the talker's estimate reaches this, so the conversation continues "
-                         "past stage-1 max_model_len")
-    ap.add_argument("--session-roll-history-turns", type=int, default=None,
-                    help="how many recent turns of text to carry across a roll")
-    ap.add_argument("--session-roll-settle-s", type=float, default=None,
-                    help="seconds to let the stages retire the old request before submitting "
-                         "the first chunk of the rolled one")
-    ap.add_argument("--session-talker-token-budget", type=int, default=None,
-                    help="end the session cleanly at this many estimated talker tokens, "
-                         "rather than letting it reach stage-1 max_model_len, which either "
-                         "kills the stage or makes the scheduler skip the request forever")
     ap.add_argument("--think-s", type=float, default=2.0,
                     help="silence before the utterance in each repetition")
     ap.add_argument("--lead-in-s", type=float, default=4.0,

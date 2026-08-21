@@ -14,12 +14,10 @@ import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 
-from vllm_omni.engine import AdditionalInformationEntry, AdditionalInformationPayload
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
     OrchestratorRequestState,
     _OrchestratorDuplexStagePort,
-    _prompt_is_prefill_only,
 )
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.experimental.fullduplex.engine.contracts import (
@@ -29,50 +27,6 @@ from vllm_omni.experimental.fullduplex.engine.contracts import (
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-
-def test_prefill_only_gate_accepts_raw_and_processed_prompts() -> None:
-    payload = AdditionalInformationPayload(
-        entries={
-            "vllm_omni_prefill_only": AdditionalInformationEntry(list_data=["1"]),
-        }
-    )
-
-    assert _prompt_is_prefill_only({"additional_information": payload})
-    assert _prompt_is_prefill_only(SimpleNamespace(additional_information=payload))
-    assert not _prompt_is_prefill_only(SimpleNamespace(additional_information=None))
-
-
-def test_prefill_only_streaming_update_stays_at_stage_zero() -> None:
-    payload = AdditionalInformationPayload(
-        entries={
-            "vllm_omni_prefill_only": AdditionalInformationEntry(list_data=["1"]),
-        }
-    )
-    request = SimpleNamespace(additional_information=payload)
-    req_state = OrchestratorRequestState(
-        request_id="req-arrival-prefill",
-        sampling_params_list=[SamplingParams(max_tokens=1), SamplingParams(max_tokens=1)],
-        final_stage_id=1,
-    )
-    stage0 = SimpleNamespace(submit_update=AsyncMock())
-    orchestrator = object.__new__(Orchestrator)
-    orchestrator.request_states = {req_state.request_id: req_state}
-    orchestrator.stage_pools = [stage0]
-    orchestrator.async_chunk = True
-    orchestrator._prewarm_async_chunk_stages = AsyncMock()
-    message = SimpleNamespace(
-        request_id=req_state.request_id,
-        prompt=request,
-        final_stage_id=1,
-        sampling_params_list=[],
-        output_prompt_text=None,
-    )
-
-    asyncio.run(orchestrator._handle_streaming_update(message))
-
-    stage0.submit_update.assert_awaited_once()
-    orchestrator._prewarm_async_chunk_stages.assert_not_awaited()
 
 
 class FakeStageClient:

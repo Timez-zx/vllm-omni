@@ -28,87 +28,13 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_language_from_request,
     extract_speaker_from_prompt,
     extract_speaker_from_request,
-    prefill_only_channel,
-    request_is_prefill_only,
 )
 
 logger = logging.getLogger(__name__)
 
-# [live-vllm diagnosis] same env as the orchestrator's [AUDIO-CHUNK] stamps:
-# per-chunk emit stamps at the stage-1 send point.
-import os as _os
-
-_LOG_CHUNK_EMIT = _os.environ.get("VLLM_OMNI_LOG_AUDIO_CHUNKS", "0") not in ("0", "", "false", "False")
-
-# Drop payload fields the consumer never reads on the decode path; see the
-# long note at the return site. Default ON -- it is a pure "stop sending unread
-# bytes" change -- with an env to restore the fat payload for A/B.
-_T2T_LEAN_DECODE = _os.environ.get("VLLM_OMNI_T2T_LEAN_DECODE", "1") not in ("0", "", "false", "False")
-
-
-
 # Pooling output layer keys: "0" = word embedding, "24" = accept_hidden_layer
 _EMBED_LAYER_KEY = "0"
 _HIDDEN_LAYER_KEY = "24"
-
-
-def _s01_edge_is_intra_process() -> bool:
-    """True when stages 0 and 1 are colocated in one process.
-
-    Mirrors ColocInProcConnector's flat-group parse of
-    VLLM_OMNI_COLOCATE_STAGES. When true, payloads on the thinker->talker edge
-    pass by reference through the in-process store, so the transport copy to
-    CPU is pure waste (measured: 291 MB and 57-77% of the talker's added
-    latency at long contexts).
-    """
-    import os
-
-    raw = os.environ.get("VLLM_OMNI_COLOCATE_STAGES", "").strip()
-    if not raw:
-        return False
-    members: set[int] = set()
-    for pair in raw.split(","):
-        guest_s, _, host_s = pair.partition(":")
-        try:
-            members.add(int(guest_s.strip()))
-            members.add(int(host_s.strip()))
-        except ValueError:
-            return False
-    return 0 in members and 1 in members
-
-
-_S01_INTRA_PROCESS = _s01_edge_is_intra_process()
-_SNAPSHOT_DEVICE_LOGGED = False
-
-
-def _snapshot_for_talker(t: torch.Tensor) -> torch.Tensor:
-    """Detach-and-snapshot a thinker tensor for shipment to the talker.
-
-    The copy is load-bearing beyond transport: it decouples the payload from
-    GPU buffers the next engine step overwrites (async scheduling relies on
-    that). Separate-process mode must go through CPU anyway (SHM transport).
-    In-process mode keeps the snapshot but takes it as a same-device clone --
-    a D2D copy instead of a pageable D2H, and the consumer's .to(device)
-    becomes a no-op. The synchronize matches the implicit sync today's
-    .cpu() performs, so payload-readiness semantics are unchanged across the
-    producer thread / consumer stream boundary.
-    """
-    global _SNAPSHOT_DEVICE_LOGGED
-    if not _SNAPSHOT_DEVICE_LOGGED:
-        _SNAPSHOT_DEVICE_LOGGED = True
-        logger.warning(
-            "[stage0->1] first payload tensor: device=%s intra_process=%s "
-            "(cuda+intra = D2D snapshot active; cpu = an upstream copy already paid the D2H)",
-            t.device,
-            _S01_INTRA_PROCESS,
-        )
-    if _S01_INTRA_PROCESS and t.is_cuda:
-        # Already a decoupled snapshot: under full tri-colocation the runner's
-        # async output path ships its D2D clone (keep_on_device) instead of a
-        # CPU copy, and this builder is that payload's sole owner -- pass the
-        # reference through, no further copy needed.
-        return t.detach()
-    return t.detach().cpu()
 # Per-model REPLACE-keys for the full-payload accumulator.  Keys in this
 # set use REPLACE semantics (subsequent emissions discard prior chunks)
 # instead of CONCAT.  qwen3-omni currently has none — model_outputs is
@@ -143,26 +69,10 @@ def _compute_talker_prompt_ids_length(info: OmniPayload, device: torch.device | 
 
     input_ids = torch.tensor(ids["prompt"], dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
 
-    # The closing sentinel must be the end of THIS DELTA, not the end of the whole session.
-    #
-    # `ids["all"]` is the request's full accumulated sequence; `ids["prompt"]` is only the
-    # rows of this forward. They are equal whenever every stage-0 forward is a talker
-    # segment, which is why using the former was harmless -- and it is precisely wrong as
-    # soon as they are not. A frames-on-arrival append is a stage-0 forward with no talker
-    # segment, so `all` runs ahead of `prompt` and this sentinel overshoots: the final user
-    # block's length is computed as (full_length - s), the placeholder is sized far too
-    # large, and the talker reads past its codec embedding table --
-    # `indexSelectSmallIndex: srcIndex < srcSelectDimSize`, stage 1 dead, engine gone.
-    #
-    # min() keeps it a no-op for every existing path and bounds it for the new one. This is
-    # the fix three earlier attempts were working around from the outside: withholding the
-    # append, passing it through, and stripping its chatml headers all left this arithmetic
-    # untouched and all died identically on turn 1.
-    _delta_end = min(int(thinker_sequences.shape[-1]), int(input_ids.shape[-1]))
     im_start_indexes = torch.cat(
         [
             torch.nonzero(input_ids[0] == im_start_token_id).squeeze(1),
-            torch.tensor([_delta_end], device=input_ids.device, dtype=input_ids.dtype),
+            torch.tensor([thinker_sequences.shape[-1]], device=input_ids.device, dtype=input_ids.dtype),
         ],
         dim=0,
     )
@@ -373,100 +283,28 @@ def _construct_thinker2talker_streaming_input_async_chunk(
     speaker = extract_speaker_from_request(request)
     language = extract_language_from_request(request)
     finished = torch.tensor(is_finished, dtype=torch.bool)
-    emb_cpu = _snapshot_for_talker(thinker_emb)
-    hid_cpu = _snapshot_for_talker(thinker_hid)
-
-    # Has the engine finished prefilling every prompt token it has been given?
-    # This is the ENGINE's own bookkeeping, and it is the only trustworthy answer:
-    # a watermark of "prompt tokens shipped to the talker" cannot work, because
-    # prefill-only appends (frames prefilled on arrival) deliberately ship nothing,
-    # so their tokens would be counted against the next segment forever -- measured
-    # as segments reported short by exactly 1, 2 or 4 frames' worth of tokens.
-    # Placeholders subtracted for the same reason the chunk adapter's
-    # _confirmed_num_computed_tokens does it: async scheduling advances
-    # num_computed_tokens for output tokens that are not committed yet, so the raw
-    # counter would call a segment prefilled while rows are still missing.
-    prompt_len = len(request.prompt_token_ids)
-    computed = max(
-        0,
-        int(getattr(request, "num_computed_tokens", 0) or 0)
-        - int(getattr(request, "num_output_placeholders", 0) or 0),
-    )
-    fully_prefilled = computed >= prompt_len
+    emb_cpu = thinker_emb.detach().cpu()
+    hid_cpu = thinker_hid.detach().cpu()
 
     if output_token_ids:
         if thinker_emb.shape[0] > 1:
             # if thinker_emb.shape[0] > 1, new streaming input segment is added
             # and will transfer prefill embeddings and hidden states to talker.
-            #
-            # ACCUMULATE across steps, and size the ids from the SEGMENT, not from
-            # this step. One segment's prefill can span several engine steps --
-            # chunked prefill splits it whenever the batch token budget runs out,
-            # which a long chunk (many frames, or a compression seed) does routinely
-            # under load -- and every step arrives here. Sizing the ids by the last
-            # step's row count shipped the segment's TAIL: the delta reached the
-            # talker without its leading `<|im_end|>\n<|im_start|>user` and with only
-            # the trailing `<|im_start|>assistant`. Measured consequence: stage 1 died
-            # in _thinker_to_talker_prefill (a lone im_start collapses torch.nonzero's
-            # [n,1] to a 0-d tensor that torch.cat refuses), and with that crash
-            # guarded the failure goes SILENT instead -- the talker conditioned on an
-            # assistant header alone, because compute_talker_prompt_ids_length reads
-            # the same truncated ids and returns 9.
-            prev = transfer_manager._pending_streaming_prefills.get(request_id)
-            prompt_rows = int(thinker_emb.shape[0])
-            if prev is not None:
-                prev_emb = prev.get("embed", {}).get("prefill")
-                prev_hid = prev.get("hidden_states", {}).get("output")
-                if isinstance(prev_emb, torch.Tensor) and isinstance(prev_hid, torch.Tensor):
-                    emb_cpu = torch.cat((prev_emb, emb_cpu), dim=0)
-                    hid_cpu = torch.cat((prev_hid, hid_cpu), dim=0)
-                    prompt_rows = int(prev.get("_prompt_rows", prev_emb.shape[0])) + int(
-                        thinker_emb.shape[0]
-                    )
-            # A split segment is otherwise invisible, and it is the shape that broke
-            # stage 1 -- so report its presence, at WARNING because this module's
-            # logger is not part of vLLM's configured tree and its INFO lines never
-            # reach the log at all.
-            if prompt_rows != thinker_emb.shape[0]:
-                logger.warning(
-                    "[stage0->1] req %s: streaming segment split across prefill steps "
-                    "(%d rows accumulated; computed=%d prompt_len=%d)",
-                    request_id, prompt_rows, computed, prompt_len,
-                )
-            ids_len = prompt_rows
+            new_prompt_len = thinker_emb.shape[0]
             payload = OmniPayloadStruct(
                 meta=MetaStruct(finished=finished),
                 embed=EmbeddingsStruct(prefill=emb_cpu),
                 hidden_states=HiddenStatesStruct(output=hid_cpu),
                 ids=IdsStruct(
-                    all=_ensure_list(request.all_token_ids[-ids_len - 1 :]),
-                    prompt=_ensure_list(request.prompt_token_ids[-ids_len:]),
+                    all=_ensure_list(request.all_token_ids[-new_prompt_len - 1 :]),
+                    prompt=_ensure_list(request.prompt_token_ids[-new_prompt_len:]),
                 ),
                 speaker=speaker,
                 language=language,
             )
-            pending = to_dict(payload)
-            pending["_prompt_rows"] = prompt_rows
-            transfer_manager._pending_streaming_prefills[request_id] = pending
+            transfer_manager._pending_streaming_prefills[request_id] = to_dict(payload)
             return None
         else:
-            if (
-                not fully_prefilled
-                and transfer_manager._pending_streaming_prefills.get(request_id) is not None
-            ):
-                # Prompt tokens are still unprefilled, so the payload about to ship
-                # covers only PART of the segment: the talker will be conditioned on a
-                # fragment. Reported, not repaired -- and deliberately so. Withholding
-                # the payload until the rest arrives was measured to kill stage 1 with
-                # `KeyError: 'prefill'`: the stages are coupled step-by-step, so the
-                # next step's decode-only payload is then read as this segment's
-                # prefill. A real repair belongs in the payload framing (one payload
-                # per SEGMENT rather than per step), which is an upstream change.
-                logger.warning(
-                    "[stage0->1] req %s: shipping a PARTIAL segment -- %d of %d prompt "
-                    "tokens prefilled; the talker sees a fragment of this turn",
-                    request_id, computed, prompt_len,
-                )
             save_payload = transfer_manager._pending_streaming_prefills.pop(request_id, None)
             if save_payload is not None:
                 saved_prefill = save_payload.get("embed", {}).get("prefill")
@@ -483,28 +321,6 @@ def _construct_thinker2talker_streaming_input_async_chunk(
                         speaker=speaker,
                         language=language,
                     )
-            # [lean decode payload] Ship only what the consumer reads. On this
-            # path -- a plain decode step, no pending prefill to flush -- the
-            # talker reads embed.decode and nothing else: hidden_states.output
-            # is consumed only by talker_preprocess_prefill (qwen3_omni.py:888)
-            # and ids is consumed only there too (ids.all / ids.prompt at
-            # :892-899); ids.output has no reader anywhere on the receiving
-            # side. Both were being sent per token per session anyway: the
-            # hidden row is a fixed 4096 bytes (half the payload) and the id
-            # list grows through the turn, which is what made per-turn transfer
-            # bytes grow quadratically. Measured motivation: the talker's GPU
-            # runs 2.5 ms per 28.7 ms pass (8.5% duty) at 64 users while ~1 ms
-            # per session per pass goes to CPU -- deserialize and payload build
-            # are 30% of that stage's samples, so the cheapest capacity left is
-            # to stop sending unread bytes. VLLM_OMNI_T2T_LEAN_DECODE=0 restores
-            # the fat payload for A/B.
-            if _T2T_LEAN_DECODE:
-                return OmniPayloadStruct(
-                    meta=MetaStruct(finished=finished),
-                    embed=EmbeddingsStruct(decode=emb_cpu),
-                    speaker=speaker,
-                    language=language,
-                )
             return OmniPayloadStruct(
                 meta=MetaStruct(
                     finished=finished,
@@ -630,55 +446,6 @@ def thinker2talker_async_chunk(
 
     request_id = request.external_req_id
     chunk_id = transfer_manager.put_req_chunk[request_id]
-
-    # A prefill-only append ships NOTHING to the talker, and this is now correct rather than
-    # a guess -- two independent defects had to be fixed before it could be, and each one hid
-    # the other:
-    #
-    # 1. `-1` reaching the codec embedding. Under async scheduling `token_ids_cpu` never holds
-    #    a sampled id; vLLM writes the sentinel -1 and patches the real value onto the GPU row
-    #    from `prev_sampled_token_ids`, which only reaches requests that were in the PREVIOUS
-    #    forward's batch. An append parks the talker, so it leaves the batch and is re-admitted
-    #    on an output row -- readable only from CPU, and reads -1. codec_embedding has 3072
-    #    rows, so `indexSelectSmallIndex: srcIndex < srcSelectDimSize`, stage 1 dead. FIXED by
-    #    `async_scheduling: false` on stage 1 in the deploy YAML, not here.
-    #
-    # 2. A prefill tensor labelled as a decode payload -- what this branch prevents. An append
-    #    stops on the very forward that prefills it, and omni_ar_scheduler.py clears
-    #    `_output_token_ids` before calling save_async, so the code below takes its
-    #    decode-shaped path and ships the append's [N_rows, 1024] prefill tensor as
-    #    `embed.decode`. The runner then copies it into a ONE-ROW decode slot:
-    #    `RuntimeError: output with shape [1, 1024] doesn't match the broadcast shape
-    #    [222, 1024]` at gpu_model_runner.py:1793.
-    #
-    # Defect 2 was invisible until defect 1 was fixed -- the CUDA assert killed the process
-    # first, on the same turn, which is why four earlier attempts all "failed identically"
-    # while actually failing for two different reasons at once.
-    # STRUCTURAL, not marker-based. The marker (SamplingParams.extra_args) does reach the stage
-    # processes -- proven by log -- but it does NOT survive to here: by the time either the
-    # scheduler's save_async or this save-thread call reads it, the next streaming update has
-    # replaced sampling_params, so both the live read and an enqueue-time snapshot came back
-    # False while the crash they were meant to prevent happened. Two silent misses; stop
-    # relying on transported state.
-    #
-    # The condition below cannot be lost, because it is a property of THIS forward: a forward
-    # that both PREFILLS (more than one row of thinker embeddings) and ENDS the segment carries
-    # no talker obligation -- the segment produced no text, so there is nothing to speak. Only
-    # a frames-on-arrival append can do that, because it is submitted with max_tokens=1 and so
-    # stops on the very forward that prefills it. With the feature off, a segment's first
-    # forward never stops, so this branch is unreachable and the shipping path is untouched.
-    if is_finished and isinstance(multimodal_output, Mapping):
-        _emb = multimodal_output.get("hidden_states", {})
-        _layers = _emb.get("layers", {}) if isinstance(_emb, dict) else {}
-        _rows = _layer_tensor(_layers, _EMBED_LAYER_KEY)
-        if _rows is not None and int(_rows.shape[0]) > 1:
-            logger.info(
-                "[prefill-only] context-only forward: %d rows prefilled and the segment ended, "
-                "so nothing is shipped to the talker (req=%s chunk_id=%d)",
-                int(_rows.shape[0]), request_id, chunk_id,
-            )
-            return None
-
     if not isinstance(multimodal_output, Mapping):
         logger.debug("thinker2talker_async_chunk: skip non-dict multimodal_output for req=%s", request_id)
         return None
@@ -701,19 +468,19 @@ def thinker2talker_async_chunk(
     language = extract_language_from_request(request)
 
     def _maybe_cpu(t: Any) -> torch.Tensor | None:
-        return _snapshot_for_talker(t) if isinstance(t, torch.Tensor) else None
+        return t.detach().cpu() if isinstance(t, torch.Tensor) else None
 
     if chunk_id == 0:
         all_token_ids = _ensure_list(request.all_token_ids)
         prompt_token_ids = _ensure_list(request.prompt_token_ids)
         payload = OmniPayloadStruct(
             embed=EmbeddingsStruct(
-                prefill=_snapshot_for_talker(thinker_emb),
+                prefill=thinker_emb.detach().cpu(),
                 tts_bos=_maybe_cpu(thinker_embed.get("tts_bos")),
                 tts_eos=_maybe_cpu(thinker_embed.get("tts_eos")),
                 tts_pad=_maybe_cpu(thinker_embed.get("tts_pad")),
             ),
-            hidden_states=HiddenStatesStruct(output=_snapshot_for_talker(thinker_hid)),
+            hidden_states=HiddenStatesStruct(output=thinker_hid.detach().cpu()),
             ids=IdsStruct(all=all_token_ids, prompt=prompt_token_ids),
             meta=MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool)),
             speaker=speaker,
@@ -753,7 +520,7 @@ def thinker2talker_async_chunk(
         meta = MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool))
         payload = OmniPayloadStruct(
             meta=meta,
-            embed=EmbeddingsStruct(decode=_snapshot_for_talker(thinker_emb)),
+            embed=EmbeddingsStruct(decode=thinker_emb.detach().cpu()),
             speaker=speaker,
             language=language,
         )
@@ -953,20 +720,7 @@ def talker2code2wav_async_chunk(
     left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
     configured_initial_chunk_size = int(cfg.get("initial_codec_chunk_frames") or 0)
 
-    # Segment-local, NOT session-global. `put_req_chunk` survives segment
-    # boundaries (the connector key needs continuity), but `code_prompt_token_ids`
-    # is popped at every segment end -- so under session mode the two diverge from
-    # the second turn onward, and this function's arithmetic runs against a list
-    # that restarted while the counter kept going. Concretely, with the session-
-    # global counter every post-first segment took the `length -=` branch below
-    # against a list that never shipped an initial chunk: the second chunk of
-    # every turn went out with left_context_size=0 (an audible seam every chunk
-    # until the ramp caught up), and a segment ending with fewer frames than
-    # initial_codec_chunk_frames drove `length` negative, sliced past the end,
-    # and dropped the segment's audio entirely (the torch.cat error upstream of
-    # here). qwen3_tts.py already uses the segment-local counter for exactly
-    # this reason.
-    chunk_id = transfer_manager.ramp_chunk_count[request_id]
+    chunk_id = transfer_manager.put_req_chunk[request_id]
     length = len(transfer_manager.code_prompt_token_ids[request_id])
     if length <= 0:
         return None
@@ -975,19 +729,7 @@ def talker2code2wav_async_chunk(
         if chunk_id == 0:
             chunk_size_config = configured_initial_chunk_size
         else:
-            adjusted = length - configured_initial_chunk_size
-            if adjusted < 0:
-                # chunk_id >= 1 guarantees >= initial frames shipped from THIS
-                # list, so this cannot happen unless the counter and the list
-                # drift out of scope again. Ship unadjusted rather than slicing
-                # past the end and losing the audio -- and say so.
-                logger.warning(
-                    "[code2wav-chunk] chunk_id=%d but only %d frame(s) in the "
-                    "segment list -- counter/list scope drift; shipping unadjusted",
-                    chunk_id, length,
-                )
-            else:
-                length = adjusted
+            length -= configured_initial_chunk_size
 
     chunk_length = length % chunk_size_config
     if chunk_length != 0 and not is_finished:
@@ -1008,17 +750,6 @@ def talker2code2wav_async_chunk(
     codes = (
         torch.cat(transfer_manager.code_prompt_token_ids[request_id][-end_index:], dim=0).transpose(0, 1).reshape(-1)
     )
-
-    # [live-vllm diagnosis] per-chunk emit stamp at the stage-1 SEND point --
-    # the last unstamped hop of the chunk pipeline (emit -> vocode ->
-    # orchestrator stamp -> client). CLOCK_MONOTONIC is host-wide, so this
-    # aligns with [SCHED-STEP] mono across processes.
-    if _LOG_CHUNK_EMIT:
-        import time as _t
-        logger.info(
-            "[CHUNK-EMIT] rid=%s chunk_id=%d frames=%d mono=%.6f",
-            request_id, chunk_id, context_length, _t.monotonic(),
-        )
 
     return OmniPayloadStruct(
         codes=CodesStruct(audio=codes),

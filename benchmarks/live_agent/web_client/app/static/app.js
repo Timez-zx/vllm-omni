@@ -282,22 +282,17 @@
       type: 'session.config',
       system_prompt: instructions,
       modalities: ['text', 'audio'],
-      // Frames the server samples per turn, and how many it keeps buffered.
-      // max_frames is a LATENCY cap, not a memory one: the buffer holds frames
-      // whose on-arrival prefill was refused (a turn in flight, or a compression
-      // shadow warming), and the next turn submits the whole buffer at once --
-      // 348 ms + 59 ms per frame, measured. 8 bounds that sweep; the oldest frame
-      // is the one evicted, which is the right one to lose on a live feed.
-      num_frames: 16,
+      // Frames are consumed by one user turn. max_frames bounds the backlog
+      // accumulated while the preceding finite request is generating.
+      num_frames: 8,
       max_frames: 8,
       // Shrink on arrival: one 1280x720 frame is 880 tokens against 220 at
       // 640x352, and that cost lands on every turn's latency.
       max_frame_width: 640,
       max_frame_height: 352,
       frame_jpeg_quality: 90,
-      // FRESHNESS FLOOR: after 3 consecutive similarity-drops the 4th frame is
-      // force-retained (and, with arrival prefill on, turned into tokens right
-      // then), so the model's picture of the scene is never older than 4 sends
+      // FRESHNESS FLOOR: after 3 consecutive similarity drops the 4th frame is
+      // force-retained, so the model's picture of the scene is never older than 4 sends
       // = 2 s at this page's 2 fps. min_gap stays 0 ON PURPOSE: it is checked
       // before max_gap and short-circuits, so any nonzero value here would
       // delay the forced retain behind an unconditional drop window. The flood
@@ -308,29 +303,11 @@
       frame_filter_min_gap: 0,
       frame_filter_max_gap: 4,
       use_audio_in_video: true,
-      // One engine request per conversation, so turn 20 does not re-read turns
-      // 1..19, and an automatic roll before the speech stage's limit so the
-      // conversation can run indefinitely.
-      session_scoped_request: true,
-      // Turn each retained frame into tokens as it ARRIVES, so its prefill happens while
-      // you are still speaking instead of after you stop. Session mode already only ever
-      // submits new frames; this changes when that work runs, not how much of it there is.
-      // Measured, 6 turns per arm, 6 s of streaming before each query:
-      //   OFF  median 355.4 ms   range 344.2-379.3  (spread 35.1)
-      //   ON   median 345.5 ms   range 343.0-348.6  (spread  5.6)
-      // The median gain is small and matches the token arithmetic (232 tokens moved off the
-      // critical path). The SPREAD is the real result: 6x tighter, because frame prefill is
-      // no longer racing the query. An earlier measurement claimed -73%; that was audio
-      // landing against the wrong turn, and it went away when the marker was fixed.
-      // HISTORY, kept because the failure mode is worth knowing: with this on, a
-      // hand-driven browser session used to kill the stage-1 engine core about 10 s
-      // in (CUDA device-side assert). The cause was the prefill-only marker not
-      // reaching the engine, so every append added a spurious `<|im_start|>assistant`
-      // header and its sampled token to the thinker's context and desynchronised the
-      // talker's span accounting. Root-caused and fixed 2026-08-01; on since.
-      prefill_frames_on_arrival: true,
-      session_roll_at_talker_tokens: 45000,
-      session_roll_history_turns: 8,
+      // Conversation state lives here at the service layer. Every turn is a
+      // finite engine request over the canonical multimodal history; prefix KV
+      // is an opportunistic engine cache, never a correctness dependency.
+      context_window_trigger_tokens: 49152,
+      context_window_target_tokens: 16384,
     };
   }
 

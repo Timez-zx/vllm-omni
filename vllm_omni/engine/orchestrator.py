@@ -30,7 +30,7 @@ from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
-from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreRequest
+from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.messages import (
@@ -53,40 +53,7 @@ from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
-from vllm_omni.model_executor.stage_input_processors.tts_utils import (
-    PREFILL_ONLY_KEY as _PREFILL_ONLY_KEY,
-)
 from vllm_omni.outputs import OmniRequestOutput
-
-
-def _prompt_is_prefill_only(prompt: Any) -> bool:
-    """Does this streaming update's PROMPT carry the prefill-only marker?
-
-    Replaces a helper that read sampling_params.extra_args and was never
-    called -- a dead gate whose channel assumption was also wrong (arrival
-    appends are dual-marked; additional_information on the prompt dict is the
-    one channel guaranteed to survive every boundary). The key is imported,
-    not re-typed: the entrypoint, the stage processors, the scheduler and this
-    fan-out gate must agree on one string, and two of them drifting is the
-    failure mode that makes the model speak unasked with nothing pointing at
-    the cause.
-    """
-    info = (
-        prompt.get("additional_information")
-        if isinstance(prompt, dict)
-        else getattr(prompt, "additional_information", None)
-    )
-    entries = getattr(info, "entries", None)
-    if not isinstance(entries, dict) or _PREFILL_ONLY_KEY not in entries:
-        return False
-    entry = entries[_PREFILL_ONLY_KEY]
-    list_data = getattr(entry, "list_data", None)
-    if isinstance(list_data, list) and list_data:
-        entry = list_data[0]
-    if isinstance(entry, list) and entry:
-        entry = entry[0]
-    return str(entry).strip().lower() in ("1", "true", "yes")
-
 
 logger = init_logger(__name__)
 
@@ -166,14 +133,9 @@ def build_engine_core_request_from_tokens(
     prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
     raw_additional_information = prompt.get("additional_information")
     model_intermediate_buffer = prompt.get("model_intermediate_buffer")
-    wire_payload: dict[str, Any] | AdditionalInformationPayload | None = None
+    wire_payload: dict[str, Any] | None = None
     if isinstance(raw_additional_information, dict):
         wire_payload = dict(raw_additional_information)
-    elif isinstance(raw_additional_information, AdditionalInformationPayload):
-        # Pass real payload structs through -- the serializer accepts them
-        # verbatim; the dict-only filter silently dropped the entrypoint's
-        # structs (e.g. the prefill-only marker) on this path.
-        wire_payload = raw_additional_information
     additional_info_payload = serialize_additional_information(
         wire_payload,
         log_prefix=f"build_engine_core_request_from_tokens req={request_id}",
@@ -759,14 +721,7 @@ class Orchestrator:
         )
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
-            # Prefill-only appends are invisible below stage 0 (section 25):
-            # the engine parks them with zero output and ships no boundary, so
-            # prewarming stages 1..N here would push one placeholder update
-            # per append into streaming queues that nothing ever drains --
-            # measured as unbounded queue growth and, at teardown, stage-1
-            # requests that can never finish (the four-session-wedge shape).
-            if not _prompt_is_prefill_only(request):
-                await self._prewarm_async_chunk_stages(request_id, request, req_state)
+            await self._prewarm_async_chunk_stages(request_id, request, req_state)
 
     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
         """Handle an add_companion_request message: submit companion to stage 0."""
@@ -1743,23 +1698,13 @@ class Orchestrator:
         request_id: str,
         tx_ms: float,
     ) -> None:
-        """Emit the per-edge transfer_tx_s histogram.
+        """Emit per-edge transfer_tx_s + transfer_size_bytes histograms.
 
-        ``tx_ms`` is the orchestrator-side wall-clock spent in ``next_pool.submit_*``
-        (serialize + queue submit to the receiving worker).
-
-        The size histogram is deliberately NOT observed here. It used to be fed a literal
-        0 on every transfer, which is worse than reporting nothing: a histogram of zeros
-        reads as "every payload is empty", so transfer_size_bytes had a p50 of 0 while real
-        payloads on this edge can run to hundreds of megabytes. Anyone reading the metric
-        would have concluded the edge was free.
-
-        The real size is known in ``OmniChunkTransferAdapter._send_single_request``, where
-        ``connector.put`` returns it, and is now accumulated there (see ``tx_totals()``).
-        That adapter is constructed by the scheduler and therefore lives in the engine-core
-        process, which has no route to this aggregator, so the value cannot simply be read
-        from here -- carrying it across would mean adding a field to the engine-core output.
-        Until that exists, emitting nothing is the honest option.
+        ``tx_ms`` is the orchestrator-side wall-clock spent in ``next_pool.
+        submit_*`` (serialize + queue submit to the receiving worker). Best-
+        effort size_bytes left at 0 — orchestrator doesn't have a cheap handle
+        on the serialized payload size; a follow-up can plumb that from the
+        connector adapter.
         """
         if self._transfer_emitter is None:
             return
@@ -1767,6 +1712,7 @@ class Orchestrator:
         if to_replica is None:
             return
         try:
+            self._transfer_emitter.observe_size(from_stage, from_replica, to_stage, to_replica, 0)
             self._transfer_emitter.observe_tx_time(from_stage, from_replica, to_stage, to_replica, tx_ms / 1000.0)
         except Exception:
             logger.debug(

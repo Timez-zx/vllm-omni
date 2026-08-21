@@ -74,9 +74,8 @@ def main() -> int:
     )
 
     wanted = {
-        "session_scoped_request",
-        "session_roll_at_talker_tokens",
-        "session_roll_history_turns",
+        "context_window_trigger_tokens",
+        "context_window_target_tokens",
         "max_frame_width",
         "max_frame_height",
         "enable_frame_filter",

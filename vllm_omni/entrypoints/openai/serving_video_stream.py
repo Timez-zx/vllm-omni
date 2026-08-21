@@ -113,14 +113,11 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         if config.system_prompt:
             messages.append({"role": "system", "content": config.system_prompt})
 
-        if config.history_max_turns is None:
-            recent_history = message_history
-        elif config.history_max_turns == 0:
-            recent_history = []
-        else:
-            recent_history = message_history[-2 * config.history_max_turns :]
-        for hist_msg in recent_history:
-            messages.append(self._text_only_message(hist_msg))
+        # The application owns the canonical conversation. Reuse the exact
+        # accepted multimodal messages on every finite engine request so vLLM
+        # can match both token hashes and multimodal hashes in its prefix cache.
+        # A cache miss changes cost, never prompt semantics.
+        messages.extend(message_history)
 
         messages.append(user_message)
 

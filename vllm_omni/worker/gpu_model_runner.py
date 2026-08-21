@@ -109,8 +109,8 @@ def _mtp_probe_begin(runner):
 def _mtp_probe_end(runner, start_ev, batch: int):
     if start_ev is None:
         return
-    from collections import deque
     import time as _t
+    from collections import deque
     end = torch.cuda.Event(enable_timing=True)
     end.record()
     q = getattr(runner, "_mtp_probe_q", None)
@@ -170,8 +170,8 @@ def _span_begin():
 def _span_end(runner, begin, tag: str, batch: int):
     if begin is None:
         return
-    from collections import deque
     import time as _t
+    from collections import deque
 
     start_ev, t0 = begin
     end = torch.cuda.Event(enable_timing=True)
@@ -796,6 +796,13 @@ class OmniGPUModelRunner(GPUModelRunner):
             # later on as needed.
             if self.omni_prefix_cache is not None and new_req_data.num_computed_tokens > 0:
                 self.omni_prefix_cache.add_prefix_cached_new_req_id(req_id)
+            if self.omni_prefix_cache is not None:
+                logger.info(
+                    "[prefix-cache] request=%s hit_tokens=%d prompt_tokens=%d",
+                    req_id,
+                    new_req_data.num_computed_tokens,
+                    len(new_req_data.prompt_token_ids or ()),
+                )
 
             sampling_params = new_req_data.sampling_params
             pooling_params = new_req_data.pooling_params

@@ -33,9 +33,8 @@ deploy_name=${DEPLOY##*/}
 
 
 for variable in \
-  VLLM_OMNI_INLINE_RECV VLLM_OMNI_INLINE_RECV_ASYNC VLLM_OMNI_INLINE_SEND \
   VLLM_OMNI_MAILBOX VLLM_OMNI_STREAM_VOCODER VLLM_OMNI_FUSED_SNAKE \
-  VLLM_OMNI_T2T_LEAN_DECODE VLLM_OMNI_TALKER_TEXT_ONLY; do
+  VLLM_OMNI_TALKER_TEXT_ONLY; do
   if [ -n "${!variable+x}" ]; then
     echo "unset $variable for the canonical baseline" >&2
     exit 2
@@ -70,8 +69,8 @@ repo = Path(os.environ["REPO_ROOT_ENV"]).resolve()
 loaded = Path(vllm_omni.__file__).resolve()
 assert repo in loaded.parents, f"loaded {loaded}, expected checkout under {repo}"
 required = {
-    "session_scoped_request",
-    "session_roll_at_talker_tokens",
+    "context_window_trigger_tokens",
+    "context_window_target_tokens",
     "max_frame_width",
     "frame_filter_min_gap",
 }
@@ -90,7 +89,6 @@ fi
 
 CUDA_VISIBLE_DEVICES="$GPU_IDS" PYTHONPATH="$REPO_ROOT" \
 VLLM_OMNI_TALKER_TEXT_ONLY="${VLLM_OMNI_TALKER_TEXT_ONLY:-1}" \
-VLLM_OMNI_LOG_SESSION_OUTPUTS=1 \
 setsid "$VLLM_OMNI_BIN" serve "$MODEL" \
   --omni --deploy-config "$DEPLOY" \
   --trust-remote-code --host 127.0.0.1 --port "$PORT" \

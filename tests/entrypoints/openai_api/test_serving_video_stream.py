@@ -564,6 +564,7 @@ async def test_frame_prewarm_does_not_block_following_query(monkeypatch):
             query_started.set()
 
     monkeypatch.setattr(video_stream_base, "_decode_frame_bytes", blocked_decode)
+    monkeypatch.setattr(video_stream_base.media_pipeline, "enabled", lambda: False)
 
     ws = TimedWebSocket()
     handler = BlockingHandler(chat_service=object(), idle_timeout=5.0)
@@ -628,7 +629,7 @@ async def test_client_cannot_send_internal_frame_decode_failed_message():
 
 
 @pytest.mark.asyncio
-async def test_failed_frame_prewarm_removes_frame_before_query():
+async def test_invalid_frame_is_rejected_before_query():
     ws = TimedWebSocket()
     handler = OmniStreamingVideoHandler(chat_service=object(), idle_timeout=5.0)
     task = asyncio.create_task(handler.handle_session(ws))
@@ -638,18 +639,18 @@ async def test_failed_frame_prewarm_removes_frame_before_query():
     ws.put({"type": "video.frame", "data": _b64(b"not-a-jpeg")})
 
     for _ in range(100):
-        if any(m.get("message") == "Frame decode failed" for m in ws.sent):
+        if any(m.get("message") == "Invalid image data" for m in ws.sent):
             break
         await asyncio.sleep(0.01)
 
-    assert {"type": "error", "message": "Frame decode failed"} in ws.sent
+    assert {"type": "error", "message": "Invalid image data"} in ws.sent
 
-    ws.put({"type": "video.query", "text": "describe"})
+    ws.put({"type": "video.query", "text": ""})
     await asyncio.sleep(0)
     ws.put({"type": "video.done"})
     await asyncio.wait_for(task, timeout=2.0)
 
-    assert {"type": "error", "message": "No frames buffered"} in ws.sent
+    assert {"type": "error", "message": "No input buffered"} in ws.sent
 
 
 @pytest.mark.asyncio
@@ -658,6 +659,7 @@ async def test_frame_filter_error_sends_invalid_image(monkeypatch):
         raise ValueError("decode failed")
 
     monkeypatch.setattr(video_stream_base.FrameSimilarityFilter, "should_retain", fail_should_retain)
+    monkeypatch.setattr(video_stream_base.media_pipeline, "enabled", lambda: False)
 
     ws = TimedWebSocket()
     handler = OmniStreamingVideoHandler(chat_service=object(), idle_timeout=5.0)
@@ -724,7 +726,7 @@ async def test_audio_buffer_overflow_clears_buffer_before_query(monkeypatch):
     assert captured_audio_lengths == [0]
 
 
-def test_build_messages_keeps_recent_history_text_only():
+def test_build_messages_replays_canonical_multimodal_history():
     handler = QwenOmniStreamingVideoHandler(chat_service=object())
     old_frame = _b64(_make_jpeg(1, 2, 3))
     current_frame = _b64(_make_jpeg(4, 5, 6))
@@ -751,13 +753,14 @@ def test_build_messages_keeps_recent_history_text_only():
         {},
     )
 
-    assert messages[0] == {"role": "user", "content": "recent question"}
-    assert messages[1] == {"role": "assistant", "content": "recent answer"}
-    assert messages[2] == user_message
+    assert messages[:-1] == history
+    assert messages[2]["content"][0]["image_url"]["url"].endswith(old_frame)
+    assert messages[2]["content"][1]["type"] == "input_audio"
+    assert messages[-1] == user_message
     assert user_message["content"][-1] == {"type": "text", "text": "current question"}
 
 
-def test_build_messages_can_replay_complete_history():
+def test_build_messages_does_not_expose_a_per_turn_history_limit():
     handler = QwenOmniStreamingVideoHandler(chat_service=object())
     history = [
         {"role": "user", "content": "question one"},
@@ -767,9 +770,7 @@ def test_build_messages_can_replay_complete_history():
     ]
 
     messages, user_message = handler._build_messages(
-        StreamingVideoSessionConfig(
-            model="test", num_frames=1, history_max_turns=None
-        ),
+        StreamingVideoSessionConfig(model="test", num_frames=1),
         [],
         bytearray(),
         history,
@@ -779,3 +780,116 @@ def test_build_messages_can_replay_complete_history():
 
     assert messages[:-1] == history
     assert messages[-1] == user_message
+
+
+@pytest.mark.asyncio
+async def test_context_compaction_drops_only_complete_oldest_turns():
+    rendered_message_counts: list[int] = []
+    generated_prompts: list[dict[str, Any]] = []
+
+    class EmptyEngine:
+        def generate(self, *, prompt, **_kwargs):
+            generated_prompts.append(prompt)
+
+            async def _gen():
+                if False:
+                    yield None
+
+            return _gen()
+
+    class CountingHandler(QwenOmniStreamingVideoHandler):
+        async def _preprocess_to_engine_prompt(self, request):
+            rendered_message_counts.append(len(request.messages))
+            return {"prompt_token_ids": list(range(1100 * len(request.messages)))}
+
+    history = [
+        {"role": "user", "content": "question one"},
+        {"role": "assistant", "content": "answer one"},
+        {"role": "user", "content": "question two"},
+        {"role": "assistant", "content": "answer two"},
+    ]
+    handler = CountingHandler(chat_service=object(), engine_client=EmptyEngine())
+
+    await handler._process_query_engine(
+        MockWebSocket(),
+        StreamingVideoSessionConfig(
+            model="test",
+            modalities=["text"],
+            context_window_trigger_tokens=3000,
+            context_window_target_tokens=1500,
+        ),
+        [],
+        bytearray(),
+        history,
+        "current question",
+        "req-current",
+        asyncio.Event(),
+        {},
+    )
+
+    assert rendered_message_counts == [5, 3, 1]
+    assert len(generated_prompts[0]["prompt_token_ids"]) == 1100
+    # The completed current turn becomes the new application-owned lineage.
+    assert len(history) == 2
+    assert history[0]["role"] == "user"
+    assert history[1] == {"role": "assistant", "content": ""}
+
+
+@pytest.mark.asyncio
+async def test_websocket_turns_use_distinct_finite_requests_and_replay_media():
+    request_ids: list[str] = []
+    rendered_requests: list[Any] = []
+
+    class TextEngine:
+        def generate(self, *, request_id, **_kwargs):
+            request_ids.append(request_id)
+
+            async def _gen():
+                yield _text_result("answer")
+
+            return _gen()
+
+    class CapturingHandler(QwenOmniStreamingVideoHandler):
+        async def _preprocess_to_engine_prompt(self, request):
+            rendered_requests.append(request)
+            return {"prompt_token_ids": list(range(32 * len(request.messages)))}
+
+    async def wait_for_responses(ws: TimedWebSocket, count: int) -> None:
+        for _ in range(200):
+            if ws.sent_types().count("response.text.done") >= count:
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError(f"only {ws.sent_types().count('response.text.done')} responses")
+
+    ws = TimedWebSocket()
+    handler = CapturingHandler(
+        chat_service=object(),
+        engine_client=TextEngine(),
+        idle_timeout=5.0,
+    )
+    task = asyncio.create_task(handler.handle_session(ws))
+    ws.put(
+        {
+            "type": "session.config",
+            "model": "test",
+            "modalities": ["text"],
+            "enable_frame_filter": False,
+        }
+    )
+    await asyncio.sleep(0)
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg(1, 2, 3))})
+    ws.put({"type": "video.query", "text": "first"})
+    await wait_for_responses(ws, 1)
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg(4, 5, 6))})
+    ws.put({"type": "video.query", "text": "second"})
+    await wait_for_responses(ws, 2)
+    ws.put({"type": "video.done"})
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert len(request_ids) == 2
+    assert request_ids[0] != request_ids[1]
+    assert all(request_id.startswith("video-") for request_id in request_ids)
+    assert len(rendered_requests[0].messages) == 1
+    assert len(rendered_requests[1].messages) == 3
+    first_turn = rendered_requests[1].messages[0]
+    assert any(item["type"] in {"image_url", "image_pil"} for item in first_turn["content"])

@@ -70,22 +70,12 @@ SYSTEM_PROMPT = (
 LOG_PROBES_BAD = {
     "unowned_audio": r"UNOWNED",
     "torch_cat_error": r"expected a non-empty list of Tensors",
-    "zero_output_wedge": r"sampled ZERO output tokens",
-    "negative_slice": r"scope drift; shipping unadjusted",
 }
-LOG_PROBES_WARN = {
-    # The scheduler repairs this bookkeeping drift before admission. Keep it
-    # visible for engine analysis, but do not call it a user-visible capacity
-    # boundary when every turn and playback SLO still passes.
-    "counter_leak_clamped": r"streaming-parked counter had leaked",
-}
+LOG_PROBES_WARN = {}
 LOG_PROBES_INFO = {
-    "segment_stops": r"\[session\] audio segment stop",
-    "arrival_prefill": r"prefill-on-arrival",
-    "compress_warm": r"COMPRESS: warming shadow",
-    "compress_swap": r"COMPRESS #\d+ at turn",
-    "warmup_queued": r"warm-up queued",
-    "blocking_roll": r"(?i)blocking roll",
+    "finite_requests": r"\[finite-request\]",
+    "history_compactions": r"\[session-history\] compact",
+    "prefix_cache_hits": r"\[prefix-cache\].*hit_tokens=[1-9]",
     "preempted_reqs": r"preemptions=[1-9]",
     "recompute": r"(?i)recomput",
 }
@@ -116,13 +106,8 @@ class User:
         self.frame_pos = plan.frame_start_offset
         self.records: list[dict] = []
         self.errors: list[str] = []
-        self.protocol_mismatches = 0
-        self.session_incarnation: str | None = None
-        self.session_epoch: int | None = None
-        self.expect_session_identity = True
         self.acks_accepted = 0
         self.acks_filtered = 0
-        self.rolls = 0
         self.stray_audio = 0
         self.cur: dict | None = None
         self.done_evt = asyncio.Event()
@@ -180,14 +165,11 @@ class User:
                 "session_id": self.name,
                 "frame_filter_min_gap": 0,
                 "frame_filter_max_gap": 4,
-                "prefill_frames_on_arrival": True,
-                "prefill_audio_on_arrival": True,
             }
         )
         extra = os.environ.get("MU_SESSION_CFG_JSON")
         if extra:
             cfg.update(json.loads(extra))
-        self.expect_session_identity = bool(cfg.get("session_scoped_request", True))
 
         try:
             await asyncio.sleep(self.plan.start_delay_s)
@@ -309,24 +291,8 @@ class User:
             except Exception:
                 continue
             event_type = msg.get("type")
-            if event_type == "session.created":
-                if msg.get("session_id") != self.name:
-                    self.protocol_mismatches += 1
-                    self.errors.append("session.created id mismatch")
-                    continue
-                self.session_incarnation = msg.get("incarnation")
-                self.session_epoch = msg.get("epoch")
-                continue
             if event_type == "session.done":
                 self.session_done_evt.set()
-                continue
-            if event_type in ("session.rolled", "session.compressed"):
-                if msg.get("incarnation") != self.session_incarnation:
-                    self.protocol_mismatches += 1
-                    self.errors.append(f"{event_type} incarnation mismatch")
-                    continue
-                self.session_epoch = msg.get("epoch")
-                self.rolls += int(event_type == "session.rolled")
                 continue
             if event_type == "video.frame.ack":
                 self.acks_accepted += int(bool(msg.get("accepted")))
@@ -341,21 +307,6 @@ class User:
                 if event_type == "response.audio.delta":
                     self.stray_audio += 1
                 continue
-            if event_type.startswith("response.") and self.expect_session_identity:
-                got = (msg.get("session_id"), msg.get("incarnation"), msg.get("turn_id"))
-                expected = (self.name, self.session_incarnation, cur["expected_turn_id"])
-                if got != expected:
-                    self.protocol_mismatches += 1
-                    self.errors.append(f"{event_type} identity mismatch: got={got} expected={expected}")
-                    continue
-                if cur["segment_id"] is None:
-                    cur["segment_id"] = msg.get("segment_id")
-                    cur["epoch"] = msg.get("epoch")
-                elif msg.get("segment_id") != cur["segment_id"] or msg.get("epoch") != cur["epoch"]:
-                    self.protocol_mismatches += 1
-                    self.errors.append(f"{event_type} segment/epoch changed mid-turn")
-                    continue
-
             if event_type == "response.text.delta":
                 if cur["t_first_text"] is None:
                     cur["t_first_text"] = received_at
@@ -403,9 +354,6 @@ class User:
                 "n_deltas": 0,
                 "deltas": [],
                 "pcm": bytearray(),
-                "expected_turn_id": index,
-                "segment_id": None,
-                "epoch": None,
             }
             self.done_evt.clear()
             queried_at = time.monotonic()
@@ -454,9 +402,6 @@ class User:
             "n_deltas": 0,
             "deltas": [],
             "pcm": bytearray(),
-            "expected_turn_id": turn_index,
-            "segment_id": None,
-            "epoch": None,
         }
         self.done_evt.clear()
         return time.monotonic()
@@ -538,9 +483,6 @@ class User:
             "wall_s": None,
             "audio_s": cur.get("audio_samples", 0) / 24_000.0,
             "session_id": self.name,
-            "incarnation": self.session_incarnation,
-            "epoch": cur.get("epoch"),
-            "segment_id": cur.get("segment_id"),
         }
 
     def _complete_record(self, turn: TurnPlan, queried_at: float, cur: dict) -> tuple[dict, float]:
@@ -579,9 +521,6 @@ class User:
                 "stall_total_ms": playback.stall_total_s * 1000,
                 "stall_max_ms": playback.stall_max_s * 1000,
                 "session_id": self.name,
-                "incarnation": self.session_incarnation,
-                "epoch": cur["epoch"],
-                "segment_id": cur["segment_id"],
                 "deltas": [[round(stamp - queried_at, 4), samples] for stamp, samples in cur["deltas"]],
                 "n_deltas": cur["n_deltas"],
                 "chars_stream": len(cur["text_stream"]),
@@ -689,7 +628,6 @@ def summarize(records: list[dict], users: list[User], meta: dict, log_slice: str
     }
     user_stats = [user.stats() for user in users]
     expected = len(users) * max(0, meta["turns_per_user"] - warmup_turns)
-    protocol_mismatches = sum(user.protocol_mismatches for user in users)
     stray_audio_deltas = sum(user.stray_audio for user in users)
     client_errors = sum(len(user.errors) for user in users)
     ttfa_p99 = pctl(ttfa, 0.99)
@@ -703,7 +641,6 @@ def summarize(records: list[dict], users: list[User], meta: dict, log_slice: str
         and playback_start_p99 < 1000
         and stall_p99 is not None
         and stall_p99 < 50
-        and protocol_mismatches == 0
         and stray_audio_deltas == 0
         and client_errors == 0
         and all(probes[key] == 0 for key in LOG_PROBES_BAD)
@@ -729,11 +666,9 @@ def summarize(records: list[dict], users: list[User], meta: dict, log_slice: str
         "rtf_deliver_p50": pctl([record["rtf_deliver"] for record in ok if record.get("rtf_deliver")], 0.50),
         "input_audio_s_p50": pctl([record["input_audio_s"] for record in ok], 0.50),
         "output_audio_s_p50": pctl([record["audio_s"] for record in ok], 0.50),
-        "protocol_identity_mismatches": protocol_mismatches,
         "stray_audio_deltas": stray_audio_deltas,
         "client_errors": client_errors,
         "per_user_errors": {user.name: user.errors[:5] for user in users if user.errors},
-        "session_rolls": sum(user.rolls for user in users),
         "frames_sent": sum(item["frames_sent"] for item in user_stats),
         "mic_chunks_sent": sum(item["mic_chunks_sent"] for item in user_stats),
         "mic_audio_s_sent": sum(item["mic_audio_s_sent"] for item in user_stats),

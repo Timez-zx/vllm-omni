@@ -3,21 +3,31 @@
 This directory contains the browser client and the only supported capacity
 workload for `thinker-talker-vllm`.
 
-The model is not natively full duplex. Video is continuous, but microphone
-upload pauses while assistant audio is playing and for a 300 ms echo guard.
-Turn boundaries come from the client after 700 ms of endpoint silence.
+## Request and state model
+
+The WebSocket is stateful, but engine requests are not:
+
+- the application retains accepted user audio, selected video, text, and the
+  assistant response for the conversation;
+- every turn renders that canonical multimodal history and creates a new,
+  finite engine request;
+- the Thinker may reuse identical blocks through vLLM prefix caching;
+- cache eviction or a miss changes latency only, never prompt semantics;
+- when the rendered prompt reaches 49,152 tokens, the application drops oldest
+  complete turns until the prompt fits 16,384 tokens.
+
+Frames accepted since the preceding query are consumed by exactly one turn.
+Frames arriving during generation accumulate for the next turn. Similarity and
+freshness filtering happen before a frame enters application history.
+
+The old persistent/resumable engine request, arrival append, shadow
+compression, and Talker rolling paths have been removed.
 
 ## Canonical deployment
 
-Formal measurements use only:
-
-`benchmarks/thinker_talker/origin_deploy_3gpu.yaml`
-
-It assigns thinker, talker, and code2wav to GPUs 0, 1, and 2. The engine and
-capacity launchers reject another deploy basename, and the benchmark records
-its SHA256.
-
-Start the engine:
+Formal measurements use only
+`benchmarks/thinker_talker/origin_deploy_3gpu.yaml`: GPU 0 is Thinker, GPU 1 is
+Talker, and GPU 2 is Code2Wav. Thinker prefix caching is enabled.
 
 ```bash
 RESULTS_DIR=/path/to/results \
@@ -25,13 +35,7 @@ VLLM_OMNI_BIN=/path/to/bin/vllm-omni \
 bash benchmarks/live_agent/web_client/run_qwen_server.sh
 ```
 
-Optional variables are `MU_GPU_IDS` (default `0,1,2`), `MU_PORT`
-(default `8091`), `QWEN_MODEL`, and `QWEN_EXTRA_ARGS`.
-The launcher refuses inherited stage colocation and engine-ablation flags so
-the canonical baseline always uses three separate processes and default engine
-features.
-
-Start the page server:
+Start the browser server with:
 
 ```bash
 MU_PYTHON=/path/to/python \
@@ -44,37 +48,21 @@ Forward port 7870 and open `http://localhost:7870/`.
 
 Each user owns one long-lived WebSocket:
 
-- video: one JPEG frame every 500 ms for the full session;
-- microphone: one PCM chunk every 200 ms except during playback and echo guard;
-- turn input: a real mono PCM16 16 kHz recording plus 700 ms endpoint silence;
-- query: empty `video.query`; semantics come only from recorded audio;
-- pacing: next think time begins after simulated 1x playback completes;
-- plan: one speaker per session, no recording repeated within a session,
-  deterministic stagger, think time, frame offset, and random seed.
+- one JPEG frame every 500 ms throughout the session;
+- one PCM chunk every 200 ms except during assistant playback and a 300 ms
+  echo guard;
+- one real mono PCM16 16 kHz recording per turn, followed by 700 ms endpoint
+  silence;
+- an empty `video.query`, so query semantics come from speech;
+- playback-paced closed loop: the next think interval begins after simulated
+  1x playback;
+- one speaker per session and no recording reuse within that session.
 
-The benchmark's effective session configuration is:
+The server samples at most 8 new frames per turn, buffers at most 8, scales
+frames to at most 640x352, and uses similarity threshold 0.95 with freshness
+gap `[0,4]`.
 
-- one persistent engine request per WebSocket (`session_scoped_request=true`);
-- `num_frames=16`, `max_frames=8`, and frames no larger than 640x352;
-- similarity threshold 0.95 and filter gap `[0,4]`;
-- audio and video prefilled incrementally on arrival;
-- Talker request rolling near 45k tokens.
-
-Users start at deterministic offsets within 0--40 seconds. A formal capacity
-cell uses 30 turns per user and excludes the first two turns from metrics.
-
-The audio manifest is JSONL:
-
-```json
-{"id":"speaker01-turn01","speaker":"speaker01","transcript":"What do you see?","audio":"speaker01/turn01.wav"}
-```
-
-Every speaker needs at least `TURNS` recordings. Audio paths are relative to
-the manifest.
-
-The canonical corpus uses real close-talk SLURP requests and DAVIS 2017 video.
-SLURP real audio is CC BY-NC 4.0. After downloading the official archives,
-prepare the deterministic 80-speaker workload with:
+Prepare the deterministic SLURP/DAVIS workload:
 
 ```bash
 python benchmarks/live_agent/web_client/prepare_slurp_davis.py \
@@ -84,103 +72,39 @@ python benchmarks/live_agent/web_client/prepare_slurp_davis.py \
   --out /path/to/continuous-av-v1
 ```
 
-It selects 60 distinct, correctly annotated recordings per speaker, balances
-assistant scenarios, and uses a fixed microphone profile per session: 50% of
-speakers are close-talk and 50% are distant-microphone. It converts audio to
-mono PCM16 16 kHz and samples DAVIS at an effective 2 fps.
-`corpus_provenance.json` records the selection and source revisions.
-
-Run all three session policies on the same workload plan when comparing
-session/KV policies:
-
-```bash
-MU_FRAMES_DIR=/path/to/ordered/jpeg/frames \
-MU_AUDIO_MANIFEST=/path/to/utterances.jsonl \
-RESULTS_DIR=/path/to/results \
-bash benchmarks/live_agent/web_client/run_session_baselines.sh
-```
-
-`run_av_session_ladder.sh` runs one policy. A cell passes only if every
-post-warmup turn completes, audible playback-start p99 is below 1 s, playback
-stall p99 is below 50 ms, and protocol/client/engine correctness checks are
-clean. Service TTFA is reported separately for stage attribution. Percentiles
-use nearest rank and playback uses the browser's default 1.4 s smooth-buffer
-threshold; because chunks arrive discretely, this normally starts on the
-second audio delta rather than adding a fixed 1.4 s delay.
-
-Each cell stores `workload_plan.json`, `turns.jsonl`, `summary.json`,
-`gpu_samples.jsonl`, and `engine.log`. GPU samples include SM activity,
-achieved occupancy, tensor/FP activity, DRAM activity, PCIe traffic, power,
-clocks, resident memory, and per-process utilization. Source, deploy, audio
-corpus, frames, system prompt, and workload plan are hashed.
-
-The canonical capacity ladder is:
+Run the capacity ladder:
 
 ```bash
 MU_FRAMES_DIR=/home/ubuntu/data/workloads/continuous_av_v1/frames \
 MU_AUDIO_MANIFEST=/home/ubuntu/data/workloads/continuous_av_v1/audio_manifest.jsonl \
 VLLM_OMNI_BIN=/home/ubuntu/miniconda3/envs/omni/bin/vllm-omni \
 MU_PYTHON=/home/ubuntu/miniconda3/envs/omni/bin/python \
-RESULTS_DIR=/home/ubuntu/data/results/av_capacity_<commit> \
-RESULT_PREFIX=av_capacity USERS="8 16 32" SEEDS="7 17" \
+RESULTS_DIR=/home/ubuntu/data/results/finite_request_capacity_<commit> \
+RESULT_PREFIX=finite_request USERS="8 16 32" SEEDS="7 17" \
 TURNS=30 WARMUP_TURNS=2 \
 bash benchmarks/live_agent/web_client/run_av_session_ladder.sh
 ```
 
-This live, playback-paced closed loop measures product capacity. It is not a
-causal timing experiment: a slower arm runs longer and therefore receives more
-continuous video. Any comparison of media-delivery timing must instead record
-one arm and replay its exact timestamped input trace in every other arm.
+A cell passes only if every measured turn completes, playback-start p99 is
+below 1 s, playback stall p99 is below 50 ms, and client/engine checks are
+clean. Every cell records source and deploy hashes, the workload plan,
+per-turn output, the engine log, and GPU samples.
 
-Self-repaired engine bookkeeping drift remains in `engine_probes` and
-`engine_warning_count` for diagnosis, but does not stop the capacity ladder
-unless it causes a missing turn, playback/SLO failure, wedge, or protocol
-error.
+Verify that every turn used a unique finite request and that Thinker prefix
+caching was enabled:
+
+```bash
+python benchmarks/live_agent/analysis/verify_run.py RESULT_DIR
+```
 
 ## Diagnostics
-
-These are diagnostics, not capacity workloads:
 
 ```bash
 python benchmarks/live_agent/web_client/selftest.py
 node benchmarks/live_agent/web_client/playback_test.js
 python benchmarks/live_agent/web_client/audio_timeline.py --direct
 python benchmarks/live_agent/web_client/probe.py --direct
-python benchmarks/live_agent/analysis/verify_run.py RESULT_DIR
 ```
 
-`probe.py` uses synthetic media only to validate the protocol. Capacity claims
-must come from `mu_bench.py` with the real manifest and frame sequence.
-
-For chunk-level root-cause runs, start the engine with
-`VLLM_OMNI_LOG_SCHED_STEPS=1`, `VLLM_OMNI_LOG_REQ_STEPS=1`, and
-`VLLM_OMNI_LOG_AUDIO_CHUNKS=1`, then compare cells with:
-
-```bash
-python benchmarks/live_agent/analysis/audio_chunk_rca.py \
-  --cell baseline=/path/to/baseline_cell \
-  --cell ablation=/path/to/ablation_cell \
-  --json-out /path/to/root_cause.json
-```
-
-The report separates the fixed Talker AR steps, upstream-chunk waiting, and
-Code2Wav latency between the first and second audible chunks.
-
-For the paired arrival-vs-query-time prefill RCA, run:
-
-```bash
-MU_FRAMES_DIR=/home/ubuntu/data/workloads/continuous_av_v1/frames \
-MU_AUDIO_MANIFEST=/home/ubuntu/data/workloads/continuous_av_v1/audio_manifest.jsonl \
-RESULTS_ROOT=/home/ubuntu/data/results/av_prefill_fair_<commit> \
-USERS=16 SEED=17 TURNS=10 WARMUP_TURNS=2 \
-bash benchmarks/live_agent/web_client/run_prefill_timing_rca.sh
-```
-
-The runner requires a clean checkout. It records the arrival arm's real
-closed-loop client input, replays the same timestamped frame/audio/query events
-in both query-time arms, and fails unless `media_fairness.py` verifies identical
-ordered media ledgers, zero frame drops, and zero replay schedule slips. Chunk
-boundaries are intentionally different; selected media identity, order, and
-volume must match. Keep `media_fairness.json`, `root_cause.json`, every cell's
-`summary.json`, `turns.jsonl`, `gpu_samples.jsonl`, and `engine.log`, plus the
-arrival arm's `input_trace.jsonl.gz`, source/deploy hashes, and checksums.
+`probe.py` uses synthetic media only for protocol validation. Capacity claims
+must use `mu_bench.py` with the real audio manifest and frame sequence.
