@@ -1009,6 +1009,53 @@ async def test_context_compaction_drops_only_complete_oldest_turns():
 
 
 @pytest.mark.asyncio
+async def test_arrival_prefill_compacts_the_application_owned_history():
+    rendered_message_counts: list[int] = []
+    generated_prompts: list[dict[str, Any]] = []
+
+    class EmptyEngine:
+        def generate(self, *, prompt, **_kwargs):
+            generated_prompts.append(prompt)
+
+            async def _gen():
+                if False:
+                    yield None
+
+            return _gen()
+
+    class CountingHandler(QwenOmniStreamingVideoHandler):
+        async def _preprocess_to_engine_prompt(self, request):
+            rendered_message_counts.append(len(request.messages))
+            return {"prompt_token_ids": list(range(1100 * len(request.messages)))}
+
+    history = [
+        {"role": "user", "content": "question one"},
+        {"role": "assistant", "content": "answer one"},
+        {"role": "user", "content": "question two"},
+        {"role": "assistant", "content": "answer two"},
+    ]
+    handler = CountingHandler(chat_service=object(), engine_client=EmptyEngine())
+
+    ok = await handler._process_video_arrival_prefill(
+        StreamingVideoSessionConfig(
+            model="test",
+            modalities=["text"],
+            context_window_trigger_tokens=3000,
+            context_window_target_tokens=1500,
+        ),
+        [_b64(_make_jpeg())],
+        history,
+        "video-warm-current",
+        {},
+    )
+
+    assert ok is True
+    assert rendered_message_counts == [5, 3, 1]
+    assert len(generated_prompts[0]["prompt_token_ids"]) == 1100
+    assert history == []
+
+
+@pytest.mark.asyncio
 async def test_websocket_turns_use_distinct_finite_requests_and_replay_media():
     request_ids: list[str] = []
     rendered_requests: list[Any] = []

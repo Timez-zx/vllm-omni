@@ -376,7 +376,6 @@ class OmniStreamingVideoHandler:
                     while arrival_prefill_dirty and active_request_id is None and frame_buffer:
                         arrival_prefill_dirty = False
                         frames = list(frame_buffer)
-                        history = list(message_history)
                         cached = {
                             frame: frame_pil_cache[frame]
                             for frame in frames
@@ -386,7 +385,7 @@ class OmniStreamingVideoHandler:
                         await self._process_video_arrival_prefill(
                             config,
                             frames,
-                            history,
+                            message_history,
                             request_id,
                             cached,
                         )
@@ -883,7 +882,7 @@ class OmniStreamingVideoHandler:
         if self._engine_client is None or not frame_buffer:
             return False
         try:
-            engine_prompt, _ = await self._render_engine_prompt(
+            engine_prompt, _ = await self._render_engine_prompt_with_compaction(
                 config,
                 frame_buffer,
                 bytearray(),
@@ -926,6 +925,62 @@ class OmniStreamingVideoHandler:
             )
             return False
 
+    async def _render_engine_prompt_with_compaction(
+        self,
+        config: StreamingVideoSessionConfig,
+        frame_buffer: list[str],
+        audio_buffer: bytearray,
+        message_history: list[dict[str, Any]],
+        query_text: str,
+        prewarmed_frames: dict[str, tuple[Any, str]],
+        *,
+        output_modalities: list[str],
+    ) -> tuple[Any, dict[str, Any]]:
+        """Render one canonical prompt and compact history at turn boundaries.
+
+        Arrival warm-ups and final response requests must make the same lineage
+        decision. Otherwise a warm-up can exceed ``max_model_len`` using stale
+        history even though the final request would compact that history and
+        remain valid.
+        """
+
+        async def _render(
+            history: list[dict[str, Any]],
+        ) -> tuple[Any, dict[str, Any]]:
+            return await self._render_engine_prompt(
+                config,
+                frame_buffer,
+                audio_buffer,
+                history,
+                query_text,
+                prewarmed_frames,
+                output_modalities=output_modalities,
+            )
+
+        engine_prompt, user_message = await _render(message_history)
+        prompt_tokens = _prompt_token_count(engine_prompt)
+        if prompt_tokens < config.context_window_trigger_tokens or not message_history:
+            return engine_prompt, user_message
+
+        before_turns = len(message_history) // 2
+        compacted_history = list(message_history)
+        while compacted_history and prompt_tokens > config.context_window_target_tokens:
+            del compacted_history[:2]
+            engine_prompt, user_message = await _render(compacted_history)
+            prompt_tokens = _prompt_token_count(engine_prompt)
+
+        # The application owns canonical history. Commit the new lineage only
+        # after every prompt rebuild succeeds; cache entries remain disposable.
+        message_history[:] = compacted_history
+        logger.info(
+            "[session-history] compact session=%s turns=%d->%d prompt_tokens=%d",
+            config.session_id or "-",
+            before_turns,
+            len(message_history) // 2,
+            prompt_tokens,
+        )
+        return engine_prompt, user_message
+
     async def _process_query_engine(
         self,
         websocket: WebSocket,
@@ -940,50 +995,16 @@ class OmniStreamingVideoHandler:
         frame_metadata: list[dict[str, Any]] | None = None,
     ) -> None:
         """Direct engine_client.generate() path for async_chunk audio."""
-        async def _render_prompt(
-            history: list[dict[str, Any]],
-        ) -> tuple[Any, dict[str, Any]]:
-            return await self._render_engine_prompt(
+        try:
+            engine_prompt, user_message = await self._render_engine_prompt_with_compaction(
                 config,
                 frame_buffer,
                 audio_buffer,
-                history,
+                message_history,
                 query_text,
                 prewarmed_frames,
                 output_modalities=config.modalities,
             )
-
-        try:
-            engine_prompt, user_message = await _render_prompt(message_history)
-            prompt_tokens = _prompt_token_count(engine_prompt)
-            if (
-                prompt_tokens >= config.context_window_trigger_tokens
-                and message_history
-            ):
-                before_turns = len(message_history) // 2
-                # Compact only at complete turn boundaries. Prefix caching is
-                # append-only between these rare resets; after a reset the new
-                # canonical prompt becomes the next cache lineage.
-                compacted_history = list(message_history)
-                while (
-                    compacted_history
-                    and prompt_tokens > config.context_window_target_tokens
-                ):
-                    del compacted_history[:2]
-                    engine_prompt, user_message = await _render_prompt(
-                        compacted_history
-                    )
-                    prompt_tokens = _prompt_token_count(engine_prompt)
-                # Commit only after every rebuild succeeds; preprocessing
-                # failure must not corrupt the application's canonical state.
-                message_history[:] = compacted_history
-                logger.info(
-                    "[session-history] compact session=%s turns=%d->%d prompt_tokens=%d",
-                    config.session_id or "-",
-                    before_turns,
-                    len(message_history) // 2,
-                    prompt_tokens,
-                )
         except Exception as e:
             await self._send_error(websocket, f"Prompt preprocessing failed: {e}")
             return
