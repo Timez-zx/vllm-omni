@@ -94,18 +94,22 @@ A cell passes only when every post-warm-up turn completes, playback-start p99 is
 
 `analysis/verify_run.py` additionally checks unique response requests, unique successful warm-ups, agreement between engine frame counts and the client consumed ledger, real Thinker prefix hits, and separate processes for all three stages.
 
-## Phase 5: next experiment
+## Phase 5: eight-user baseline and conclusion
 
-The direct GPU smoke on 2026-08-21 passed. With four changing frames, the first warm-up contained one frame/265 prompt tokens; frames queued while it ran were coalesced into a second warm-up with four frames/931 tokens. Both reported only `stages=[0]`. The final request contained the same four frames plus complete audio/959 tokens, hit 912 Thinker prefix tokens, ran `stages=[0,1,2]`, and produced complete speech. No duplicate four-frame snapshot was submitted. This host lacked `nvcc`, so the smoke temporarily set `VLLM_USE_FLASHINFER_SAMPLER=0` and `--attention-backend TRITON_ATTN`. This proves functionality, not capacity; formal results must use one fixed backend and cannot be mixed across backends.
+The formal eight-user cell completed on clean commit `cbb3556c` on 2026-08-21. It used the fixed `origin_deploy_3gpu.yaml`, `TRITON_ATTN`, seed 7, 30 turns per user, and two warm-up turns. Results are in `/home/ubuntu/data/results/finite_request_capacity_cbb3556c_triton_20260821/finite_request_seed7_u8`.
 
-The current code has no new formal capacity result. Rebuild the 8 → 16 → 32 curve from a clean commit:
+A serving error was fixed before this run. The WebSocket handler copied the deploy sampling params explicitly and thereby bypassed AsyncOmni's `DELTA` coercion. Code2Wav consequently sent cumulative waveform snapshots that the client correctly consumed as new audio deltas. The prior 345.8-second audio, prolonged session, and later context overflow were contaminated by this error and cannot support a capacity claim. After the fix, every first granule contains 5,205 samples and all 1,141 later granules contain at most 48,000 samples. A three-GPU smoke and 38 related tests passed.
 
-1. Confirm unique request IDs, non-zero prefix hits after the first turn, and the actual processed-frame count.
-2. At the first failure point, collect TTFA/playback tails, Thinker prefill/decode steps, Talker waits, GPU SM active, memory, and KV-cache use.
-3. Distinguish active GPU computation from memory occupancy while the GPU is idle.
-4. Compare P/D disaggregation with the same workload and media trace; implementation difficulty does not lower its experimental priority.
+Eight-user result:
 
-Results are directly comparable only when commit, YAML, input hashes, seed, users, turns, prebuffer, and SLO definitions match. Use at least two seeds near the boundary and do not claim changes smaller than normal run-to-run variation.
+- All 224 measured turns completed, with no timeout, client error, warm-up failure, preemption, or recompute.
+- TTFA p50/p95/p99 was 2.42/7.65/9.07 seconds.
+- Playback-start p50/p95/p99 was 4.37/12.77/17.48 seconds.
+- Stall-max p50/p95/p99 was 0/9.8/1,658 ms. The cell failed the capacity SLO, so 16 users was not run.
+- The run issued 2,830 silent warm-ups and 240 response requests; 3,068 of 3,069 prefix-cache observations hit.
+- Thinker SM active p50/p95 was 39%/98% overall and 43%/99% in playback-tail windows. Talker was 1.1%/19.8% overall and 0%/14% in those windows; Code2Wav was 0%/1.9% overall. Memory occupancy is not a substitute for these activity metrics.
+
+Conclusion: Thinker remains the primary bottleneck at eight users. Arrival prefill and response decode share GPU 0. As concurrent responses waiting for first audio rise from zero to four or five, TTFA p50 rises from about 1.37 seconds to 7.1–7.6 seconds. Delay after the first granule is also not evidence of Talker or Code2Wav saturation: both are mostly idle while waiting for further Thinker hidden/text supply. The next direct experiment should hold workload, media, YAML, and SLO fixed and compare Thinker P/D disaggregation at eight users. Run 1/2/4-user cells only if an exact non-P/D capacity below eight is needed, and use at least two seeds near the boundary.
 
 ## Recovery map
 

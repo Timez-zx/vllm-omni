@@ -94,18 +94,22 @@ bash benchmarks/live_agent/web_client/run_av_session_ladder.sh
 
 `analysis/verify_run.py` 还会检查：每个 turn 对应一个唯一回答 request、warm-up request 唯一且无失败、engine 最终处理帧数与客户端 consumed ledger 一致、Thinker prefix cache 已开启且出现实际命中、部署确为三阶段独立进程。
 
-## 阶段五：下一轮实验
+## 阶段五：8 用户基线结果与结论
 
-2026-08-21 的 direct GPU smoke 已通过。4 个动态帧到达时，第一个 warm-up 为 1 帧/265 prompt tokens；其运行期间积压的帧被合并，第二个 warm-up 为 4 帧/931 tokens。两者都只有 `stages=[0]`。最终 query 为 4 帧加完整音频、959 tokens，Thinker prefix hit 为 912 tokens，运行 `stages=[0,1,2]` 并生成完整语音；没有重复提交相同 4 帧快照。此机缺少 `nvcc`，smoke 临时设置 `VLLM_USE_FLASHINFER_SAMPLER=0` 和 `--attention-backend TRITON_ATTN`。该结果只验证功能，不是容量数据；正式实验必须固定 backend，不能与其他 backend 的结果混用。
+2026-08-21 在 clean commit `cbb3556c` 上完成正式 8 用户 cell。部署为固定的 `origin_deploy_3gpu.yaml`，backend 为 `TRITON_ATTN`，seed 7，30 轮/用户，前 2 轮预热。结果位于 `/home/ubuntu/data/results/finite_request_capacity_cbb3556c_triton_20260821/finite_request_seed7_u8`。
 
-当前代码尚无新的正式容量数字。下一步必须在 clean commit 上重新建立 8 → 16 → 32 容量曲线：
+运行前修复了一个服务层错误：WebSocket handler 显式复制 deploy sampling params 后绕过了 AsyncOmni 的 `DELTA` 转换，导致 Code2Wav 每次发送累计 waveform，而客户端按协议将其当作新增音频播放。旧运行中的 345.8 秒音频、超长 session 和后续 context overflow 均受此错误污染，不能用于容量结论。修复后首块恒为 5,205 samples，其余 1,141 个非首块均不超过 48,000 samples；三卡 smoke 和 38 个相关测试通过。
 
-1. 先确认每轮 request ID 唯一，第二轮以后 prefix hit 非零，实际处理帧数符合配置。
-2. 在首个失败点同时记录 TTFA/playback tail、Thinker prefill/decode step、Talker 等待、GPU SM active、显存和 KV cache 使用。
-3. 区分“GPU 真正在计算”与“显存占满但 GPU 空闲”。
-4. 再以同一 workload 和媒体 trace 比较 P/D 分离；不因实现难度降低实验优先级。
+8 用户结果：
 
-只有 commit、YAML、输入哈希、seed、用户数、轮数、预缓冲和 SLO 口径全部一致的结果才可直接比较。拐点附近至少跑两个 seed；小于历史运行波动的差异不作结论。
+- 224/224 个测量 turn 成功，无 timeout、client error、warm-up failure、preemption 或 recompute。
+- TTFA p50/p95/p99：2.42/7.65/9.07 秒。
+- Playback-start p50/p95/p99：4.37/12.77/17.48 秒。
+- Stall-max p50/p95/p99：0/9.8/1,658 ms。因此该 cell 不通过容量 SLO，停止 16 用户测试。
+- 共 2,830 个静默 warm-up 和 240 个回答 request；prefix cache 观测 3,068/3,069 次命中。
+- Thinker GPU 的 SM active 总体 p50/p95 为 39%/98%，playback-tail 窗口为 43%/99%。Talker 总体为 1.1%/19.8%、tail 为 0%/14%；Code2Wav 总体为 0%/1.9%。显存占用不能替代这些 active 指标。
+
+结论：8 用户下的主要瓶颈仍是 Thinker。arrival prefill 和回答 decode 共享 GPU0；等待首音频的并发回答从 0 增至 4–5 个时，TTFA p50 从约 1.37 秒升至 7.1–7.6 秒。第一块音频之后的等待也不能解释为 Talker/Code2Wav 饱和：后两级大多空闲，它们在等待 Thinker 继续提供 hidden/text。下一项直接实验应固定本 workload、媒体、YAML 和 SLO，在 8 用户比较 Thinker P/D 分离；若需要精确报告非 P/D 容量，再补 1/2/4 用户 cell。拐点附近至少跑两个 seed。
 
 ## 快速恢复入口
 
