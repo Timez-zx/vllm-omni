@@ -61,29 +61,33 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         query_text: str,
         prewarmed_frames: dict[str, tuple[Any, str]],
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        n_buf = len(frame_buffer)
-        if n_buf <= config.num_frames:
-            frames = list(frame_buffer)
-        else:
-            stride = max(1, n_buf // config.num_frames)
-            idx = [i * stride for i in range(config.num_frames - 1)] + [n_buf - 1]
-            frames = [frame_buffer[i] for i in idx]
-
         prewarmed = prewarmed_frames or {}
         user_content: list[dict] = []
-        for frame_b64 in frames:
+        # The similarity/freshness filter is the sole frame-selection policy.
+        # Every accepted frame remains in this turn in arrival order so each
+        # cache-warming prompt is an exact extension of the previous one.
+        for frame_b64 in frame_buffer:
             cached = prewarmed.get(frame_b64)
             if cached is _BAD_FRAME:
                 continue
             if cached is not None:
                 pil, pil_uuid = cached
-                user_content.append(
-                    {
-                        "type": "image_pil",
-                        "image_pil": pil,
-                        "uuid": pil_uuid,
-                    }
-                )
+                if pil is not None:
+                    user_content.append(
+                        {
+                            "type": "image_pil",
+                            "image_pil": pil,
+                            "uuid": pil_uuid,
+                        }
+                    )
+                else:
+                    user_content.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"},
+                            "uuid": pil_uuid,
+                        }
+                    )
             else:
                 user_content.append(
                     {

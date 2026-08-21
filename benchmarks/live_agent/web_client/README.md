@@ -9,8 +9,10 @@ The WebSocket is stateful, but engine requests are not:
 
 - the application retains accepted user audio, selected video, text, and the
   assistant response for the conversation;
-- every turn renders that canonical multimodal history and creates a new,
-  finite engine request;
+- each accepted frame triggers or coalesces a silent, finite Thinker-only
+  request over full history plus the cumulative current-turn frames;
+- the final query appends one complete WAV and creates a separate finite
+  response request;
 - the Thinker may reuse identical blocks through vLLM prefix caching;
 - cache eviction or a miss changes latency only, never prompt semantics;
 - when the rendered prompt reaches 49,152 tokens, the application drops oldest
@@ -18,10 +20,13 @@ The WebSocket is stateful, but engine requests are not:
 
 Frames accepted since the preceding query are consumed by exactly one turn.
 Frames arriving during generation accumulate for the next turn. Similarity and
-freshness filtering happen before a frame enters application history.
+freshness filtering are the only selection policy: accepted frames remain
+append-only and are never replaced by a latest-eight sliding window.
 
-The old persistent/resumable engine request, arrival append, shadow
-compression, and Talker rolling paths have been removed.
+The old persistent/resumable engine request, append into that live request,
+shadow compression, and Talker rolling paths have been removed. Arrival
+warm-ups are independent `output_modalities=["text"]`, `max_tokens=1` requests;
+their token is discarded and they cannot invoke Talker.
 
 ## Canonical deployment
 
@@ -58,9 +63,10 @@ Each user owns one long-lived WebSocket:
   1x playback;
 - one speaker per session and no recording reuse within that session.
 
-The server samples at most 8 new frames per turn, buffers at most 8, scales
-frames to at most 640x352, and uses similarity threshold 0.95 with freshness
-gap `[0,4]`.
+The server scales frames to at most 640x352 and uses similarity threshold 0.95
+with freshness gap `[0,4]`. Every retained frame enters the cumulative turn
+prefix. Audio remains one complete WAV at query time so Qwen audio semantics do
+not depend on synthetic chunks.
 
 Prepare the deterministic SLURP/DAVIS workload:
 
@@ -90,8 +96,8 @@ below 1 s, playback stall p99 is below 50 ms, and client/engine checks are
 clean. Every cell records source and deploy hashes, the workload plan,
 per-turn output, the engine log, and GPU samples.
 
-Verify that every turn used a unique finite request and that Thinker prefix
-caching was enabled:
+Verify response and warm-up request identities, frame-ledger equality, and
+Thinker prefix-cache activity:
 
 ```bash
 python benchmarks/live_agent/analysis/verify_run.py RESULT_DIR

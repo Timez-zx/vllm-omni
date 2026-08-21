@@ -29,6 +29,7 @@ Protocol:
 
 import asyncio
 import base64
+import copy
 import hashlib
 import io
 import json
@@ -55,7 +56,6 @@ logger = init_logger(__name__)
 _DEFAULT_IDLE_TIMEOUT = 60.0
 _DEFAULT_CONFIG_TIMEOUT = 10.0
 _MAX_FRAME_SIZE = 10 * 1024 * 1024  # 10MB per frame
-_MAX_BUFFER_FRAMES = 64
 _MAX_AUDIO_BUFFER_BYTES = 4 * 1024 * 1024
 _MAX_MSG_QUEUE = 200
 _CODEC_FRAME_SAMPLES = 1920  # CausalConv leading-edge artifact length
@@ -152,17 +152,12 @@ class StreamingVideoSessionConfig(BaseModel):
         default_factory=lambda: ["text", "audio"],
         description="Output modalities: 'text', 'audio', or both.",
     )
-    num_frames: int = Field(
-        default=8,
-        ge=1,
-        le=128,
-        description="Max frames to sample from buffer for the model.",
-    )
-    max_frames: int = Field(
-        default=8,
-        ge=1,
-        le=256,
-        description="Max frames to keep in the buffer.",
+    enable_video_arrival_prefill: bool = Field(
+        default=True,
+        description=(
+            "Materialize the cumulative accepted-frame prefix with silent, "
+            "Thinker-only finite requests as frames arrive."
+        ),
     )
     system_prompt: str | None = Field(
         default=None,
@@ -300,6 +295,8 @@ class OmniStreamingVideoHandler:
             interrupt_event = asyncio.Event()
             prewarm_tasks: set[asyncio.Task[Any]] = set()
             query_task: asyncio.Task[Any] | None = None
+            arrival_prefill_task: asyncio.Task[Any] | None = None
+            arrival_prefill_dirty = False
 
             msg_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=_MAX_MSG_QUEUE)
 
@@ -360,6 +357,55 @@ class OmniStreamingVideoHandler:
                         await asyncio.gather(query_task, return_exceptions=True)
                     query_task = None
 
+            def _schedule_arrival_prefill() -> None:
+                """Coalesce accepted frames into serial finite warm-up requests."""
+                nonlocal arrival_prefill_task, arrival_prefill_dirty
+                if (
+                    not config.enable_video_arrival_prefill
+                    or self._engine_client is None
+                    or active_request_id is not None
+                    or not frame_buffer
+                ):
+                    return
+                arrival_prefill_dirty = True
+                if arrival_prefill_task is not None and not arrival_prefill_task.done():
+                    return
+
+                async def _run() -> None:
+                    nonlocal arrival_prefill_dirty
+                    while arrival_prefill_dirty and active_request_id is None and frame_buffer:
+                        arrival_prefill_dirty = False
+                        frames = list(frame_buffer)
+                        history = list(message_history)
+                        cached = {
+                            frame: frame_pil_cache[frame]
+                            for frame in frames
+                            if frame in frame_pil_cache
+                        }
+                        request_id = f"video-warm-{uuid.uuid4().hex[:12]}"
+                        await self._process_video_arrival_prefill(
+                            config,
+                            frames,
+                            history,
+                            request_id,
+                            cached,
+                        )
+
+                arrival_prefill_task = asyncio.create_task(_run())
+
+            async def _finish_arrival_prefill() -> None:
+                nonlocal arrival_prefill_task
+                # Every accepted frame schedules a warm-up immediately.  At
+                # query time only join that work; calling the scheduler again
+                # would mark an already-current snapshot dirty and submit the
+                # same cumulative prefix twice.
+                if arrival_prefill_task is None:
+                    _schedule_arrival_prefill()
+                task = arrival_prefill_task
+                if task is not None and not task.done():
+                    await asyncio.gather(task, return_exceptions=True)
+                arrival_prefill_task = None
+
             async def _start_query_turn(*, query_text: str) -> None:
                 """Schedule a new inference turn from the current buffers."""
                 nonlocal active_request_id, prev_request_id, prev_was_interrupted, query_task
@@ -369,6 +415,10 @@ class OmniStreamingVideoHandler:
                 if not frame_buffer and not audio_buffer and not query_text:
                     await self._send_error(websocket, "No input buffered")
                     return
+
+                # Serialize the final response behind the latest cumulative
+                # frame warm-up so its prefix is visible to the cache lookup.
+                await _finish_arrival_prefill()
 
                 if prev_was_interrupted and prev_request_id and self._engine_client:
                     try:
@@ -418,6 +468,10 @@ class OmniStreamingVideoHandler:
                         if active_request_id == request_id:
                             prev_request_id = request_id
                             active_request_id = None
+                        # Frames received while this response was generated now
+                        # have a completed assistant turn in front of them and
+                        # can start the next cache lineage immediately.
+                        _schedule_arrival_prefill()
 
                 query_task = asyncio.create_task(_run_query())
 
@@ -447,6 +501,7 @@ class OmniStreamingVideoHandler:
                             frame_pil_cache.pop(frame_data, None)
                         if removed:
                             await self._send_error(websocket, "Frame decode failed")
+                            _schedule_arrival_prefill()
 
                     elif msg_type == "video.frame":
                         frame_data = msg.get("data", "")
@@ -519,13 +574,7 @@ class OmniStreamingVideoHandler:
                                 await self._send_error(websocket, "Invalid image data")
                                 continue
                         frames_since_retained = 0
-                        max_buf = config.max_frames
-                        dropped_frame_id: str | None = None
-                        if len(frame_buffer) >= max_buf:
-                            dropped = frame_buffer.pop(0)
-                            dropped_metadata = frame_metadata.pop(0)
-                            dropped_frame_id = dropped_metadata.get("frame_id")
-                            frame_pil_cache.pop(dropped, None)
+                        mm_uuid = hashlib.md5(raw_bytes, usedforsecurity=False).hexdigest()
                         frame_buffer.append(frame_data)
                         frame_metadata.append(
                             {
@@ -543,16 +592,18 @@ class OmniStreamingVideoHandler:
                             msg,
                             accepted=True,
                             buffered_frames=len(frame_buffer),
-                            dropped_frame_id=dropped_frame_id,
                         )
                         # Reuse the worker's single decode for prompt construction.
                         if media_result is not None:
                             frame_pil_cache[frame_data] = (
                                 Image.frombytes("RGB", media_result.size, media_result.rgb),
-                                media_result.md5,
+                                mm_uuid,
                             )
                         elif frame_data not in frame_pil_cache:
-                            mm_uuid = hashlib.md5(raw_bytes, usedforsecurity=False).hexdigest()
+                            # Publish the stable UUID before the asynchronous PIL
+                            # decode completes. A warm-up may render immediately;
+                            # image_url and image_pil must hash as the same item.
+                            frame_pil_cache[frame_data] = (None, mm_uuid)
 
                             async def _prewarm(b64: str, b: bytes, u: str) -> None:
                                 try:
@@ -578,6 +629,8 @@ class OmniStreamingVideoHandler:
                             task = asyncio.create_task(_prewarm(frame_data, raw_bytes, mm_uuid))
                             prewarm_tasks.add(task)
                             task.add_done_callback(prewarm_tasks.discard)
+
+                        _schedule_arrival_prefill()
 
                         is_generating = active_request_id is not None or (
                             query_task is not None and not query_task.done()
@@ -648,6 +701,9 @@ class OmniStreamingVideoHandler:
                     t.cancel()
                 if prewarm_tasks:
                     await asyncio.gather(*prewarm_tasks, return_exceptions=True)
+                if arrival_prefill_task is not None and not arrival_prefill_task.done():
+                    arrival_prefill_task.cancel()
+                    await asyncio.gather(arrival_prefill_task, return_exceptions=True)
                 if query_task is not None and not query_task.done():
                     await _cancel_active_query(abort_now=True)
 
@@ -686,7 +742,6 @@ class OmniStreamingVideoHandler:
 
         config_data = {k: v for k, v in msg.items() if k != "type"}
         alias_map = {
-            "num_sample_frames": "num_frames",
             "evs_enabled": "enable_frame_filter",
             "evs_threshold": "frame_filter_threshold",
         }
@@ -743,6 +798,134 @@ class OmniStreamingVideoHandler:
     # Engine-client path (async_chunk audio streaming)
     # ------------------------------------------------------------------
 
+    def _sampling_params_for_request(
+        self,
+        config: StreamingVideoSessionConfig,
+        *,
+        thinker_max_tokens: int | None = None,
+    ) -> list[Any] | None:
+        """Build request-local stage params without mutating deploy defaults."""
+        if config.sampling_params_list:
+            converter = getattr(self._chat_service, "_to_sampling_params_list", None)
+            if converter is not None:
+                params = list(converter(config.sampling_params_list))
+            else:
+                from vllm import SamplingParams
+
+                params = [SamplingParams(**value) for value in config.sampling_params_list]
+        else:
+            defaults = getattr(self._engine_client, "default_sampling_params_list", None)
+            params = copy.deepcopy(list(defaults)) if defaults else []
+
+        if thinker_max_tokens is not None:
+            if not params:
+                from vllm import SamplingParams
+
+                params = [SamplingParams()]
+            params[0].max_tokens = thinker_max_tokens
+            params[0].min_tokens = 0
+        return params or None
+
+    async def _render_engine_prompt(
+        self,
+        config: StreamingVideoSessionConfig,
+        frame_buffer: list[str],
+        audio_buffer: bytearray,
+        message_history: list[dict[str, Any]],
+        query_text: str,
+        prewarmed_frames: dict[str, tuple[Any, str]],
+        *,
+        output_modalities: list[str],
+    ) -> tuple[Any, dict[str, Any]]:
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionRequest,
+        )
+
+        messages, current_user_message = self.build_engine_prompt(
+            config,
+            frame_buffer,
+            audio_buffer,
+            message_history,
+            query_text,
+            prewarmed_frames,
+        )
+        request_kwargs: dict[str, Any] = {
+            "model": config.model or "default",
+            "messages": messages,
+            "stream": True,
+            "modalities": output_modalities,
+            "add_generation_prompt": True,
+            "continue_final_message": False,
+            "add_special_tokens": False,
+        }
+        # Keep multimodal hashing identical between image-only warm-ups and
+        # the final request that appends audio. A changed processor kwarg is a
+        # different cache key even when the image UUID stays the same.
+        if config.use_audio_in_video:
+            request_kwargs["mm_processor_kwargs"] = {"use_audio_in_video": True}
+        if config.sampling_params_list:
+            request_kwargs["sampling_params_list"] = config.sampling_params_list
+        chat_request = ChatCompletionRequest(**request_kwargs)
+        return (
+            await self._preprocess_to_engine_prompt(chat_request),
+            current_user_message,
+        )
+
+    async def _process_video_arrival_prefill(
+        self,
+        config: StreamingVideoSessionConfig,
+        frame_buffer: list[str],
+        message_history: list[dict[str, Any]],
+        request_id: str,
+        prewarmed_frames: dict[str, tuple[Any, str]],
+    ) -> bool:
+        """Materialize one cumulative video prefix without invoking Talker."""
+        if self._engine_client is None or not frame_buffer:
+            return False
+        try:
+            engine_prompt, _ = await self._render_engine_prompt(
+                config,
+                frame_buffer,
+                bytearray(),
+                message_history,
+                "",
+                prewarmed_frames,
+                output_modalities=["text"],
+            )
+            logger.info(
+                "[arrival-prefill] session=%s request=%s frames=%d prompt_tokens=%d",
+                config.session_id or "-",
+                request_id,
+                len(frame_buffer),
+                _prompt_token_count(engine_prompt),
+            )
+            outputs = self._engine_client.generate(
+                prompt=engine_prompt,
+                request_id=request_id,
+                sampling_params_list=self._sampling_params_for_request(
+                    config,
+                    thinker_max_tokens=1,
+                ),
+                output_modalities=["text"],
+            )
+            # The single Thinker token is deliberately discarded. No response
+            # event is emitted and final_stage_id=0 keeps Talker/Code2Wav idle.
+            async for _ in outputs:
+                pass
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Cache warming is optional for correctness. The query path still
+            # submits the complete canonical prompt on any failure or miss.
+            logger.warning(
+                "[arrival-prefill] failed session=%s request=%s",
+                config.session_id or "-",
+                request_id,
+                exc_info=True,
+            )
+            return False
+
     async def _process_query_engine(
         self,
         websocket: WebSocket,
@@ -757,38 +940,17 @@ class OmniStreamingVideoHandler:
         frame_metadata: list[dict[str, Any]] | None = None,
     ) -> None:
         """Direct engine_client.generate() path for async_chunk audio."""
-        from vllm.entrypoints.openai.chat_completion.protocol import (
-            ChatCompletionRequest,
-        )
-
         async def _render_prompt(
             history: list[dict[str, Any]],
         ) -> tuple[Any, dict[str, Any]]:
-            messages, current_user_message = self.build_engine_prompt(
+            return await self._render_engine_prompt(
                 config,
                 frame_buffer,
                 audio_buffer,
                 history,
                 query_text,
                 prewarmed_frames,
-            )
-            request_kwargs: dict[str, Any] = {
-                "model": config.model or "default",
-                "messages": messages,
-                "stream": True,
-                "modalities": config.modalities,
-                "add_generation_prompt": True,
-                "continue_final_message": False,
-                "add_special_tokens": False,
-            }
-            if config.use_audio_in_video and audio_buffer:
-                request_kwargs["mm_processor_kwargs"] = {"use_audio_in_video": True}
-            if config.sampling_params_list:
-                request_kwargs["sampling_params_list"] = config.sampling_params_list
-            chat_request = ChatCompletionRequest(**request_kwargs)
-            return (
-                await self._preprocess_to_engine_prompt(chat_request),
-                current_user_message,
+                output_modalities=config.modalities,
             )
 
         try:
@@ -826,7 +988,7 @@ class OmniStreamingVideoHandler:
             await self._send_error(websocket, f"Prompt preprocessing failed: {e}")
             return
         decoded_ready_ts_ms = _time.monotonic() * 1000
-        selected_metadata = self._sample_frame_metadata(frame_metadata or [], config.num_frames)
+        selected_metadata = list(frame_metadata or [])
         model_selected_ts_ms = _time.monotonic() * 1000
 
         await websocket.send_json({"type": "response.start"})
@@ -852,16 +1014,20 @@ class OmniStreamingVideoHandler:
 
         try:
             logger.info(
-                "[finite-request] session=%s request=%s turn=%d prompt_tokens=%d history_messages=%d",
+                "[finite-request] session=%s request=%s turn=%d prompt_tokens=%d "
+                "history_messages=%d frames=%d audio_bytes=%d",
                 config.session_id or "-",
                 request_id,
                 len(message_history) // 2,
                 _prompt_token_count(engine_prompt),
                 len(message_history),
+                len(frame_buffer),
+                len(audio_buffer),
             )
             result_gen = self._engine_client.generate(
                 prompt=engine_prompt,
                 request_id=request_id,
+                sampling_params_list=self._sampling_params_for_request(config),
                 output_modalities=config.modalities,
             )
 
@@ -1232,17 +1398,6 @@ class OmniStreamingVideoHandler:
             await websocket.send_json({"type": "error", "message": message})
         except Exception:
             pass
-
-    @staticmethod
-    def _sample_frame_metadata(
-        frame_metadata: list[dict[str, Any]],
-        num_frames: int,
-    ) -> list[dict[str, Any]]:
-        if len(frame_metadata) <= num_frames:
-            return list(frame_metadata)
-        stride = max(1, len(frame_metadata) // num_frames)
-        indices = [index * stride for index in range(num_frames - 1)] + [len(frame_metadata) - 1]
-        return [frame_metadata[index] for index in indices]
 
     @staticmethod
     async def _send_frame_ack(

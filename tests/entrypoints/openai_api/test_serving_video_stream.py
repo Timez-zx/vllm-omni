@@ -121,7 +121,6 @@ async def test_receive_config_accepts_client_legacy_aliases():
                 {
                     "type": "session.config",
                     "model": "test",
-                    "num_sample_frames": 7,
                     "evs_enabled": False,
                     "evs_threshold": 0.87,
                 }
@@ -133,7 +132,6 @@ async def test_receive_config_accepts_client_legacy_aliases():
     config = await handler._receive_config(ws)
 
     assert config is not None
-    assert config.num_frames == 7
     assert config.enable_frame_filter is False
     assert config.frame_filter_threshold == 0.87
 
@@ -195,7 +193,6 @@ async def test_video_frames_consumed_is_emitted_after_engine_uses_frame_prompt()
                     "type": "session.config",
                     "model": "test",
                     "modalities": ["text"],
-                    "num_frames": 1,
                     "enable_frame_filter": False,
                 }
             ),
@@ -242,6 +239,182 @@ async def test_video_frames_consumed_is_emitted_after_engine_uses_frame_prompt()
     assert ws.sent.index(consumed) < next(
         index for index, message in enumerate(ws.sent) if message.get("type") == "response.text.delta"
     )
+
+
+@pytest.mark.asyncio
+async def test_arrival_prefill_is_silent_thinker_only_one_token():
+    calls: list[dict[str, Any]] = []
+
+    class TextEngine:
+        def generate(self, **kwargs):
+            calls.append(kwargs)
+
+            async def _gen():
+                yield _text_result("discard me")
+
+            return _gen()
+
+    class CapturingHandler(QwenOmniStreamingVideoHandler):
+        async def _preprocess_to_engine_prompt(self, request):
+            return {"prompt_token_ids": list(range(64))}
+
+    handler = CapturingHandler(chat_service=object(), engine_client=TextEngine())
+    ok = await handler._process_video_arrival_prefill(
+        StreamingVideoSessionConfig(model="test"),
+        [_b64(_make_jpeg())],
+        [],
+        "video-warm-test",
+        {},
+    )
+
+    assert ok is True
+    assert len(calls) == 1
+    assert calls[0]["output_modalities"] == ["text"]
+    assert calls[0]["sampling_params_list"][0].max_tokens == 1
+
+
+@pytest.mark.asyncio
+async def test_arrival_prefill_prompts_are_cumulative_and_final_appends_audio():
+    rendered: list[Any] = []
+    calls: list[dict[str, Any]] = []
+
+    class TextEngine:
+        def generate(self, **kwargs):
+            calls.append(kwargs)
+
+            async def _gen():
+                yield _text_result("discarded-or-final")
+
+            return _gen()
+
+    class CapturingHandler(QwenOmniStreamingVideoHandler):
+        async def _preprocess_to_engine_prompt(self, request):
+            rendered.append(request)
+            return {"prompt_token_ids": list(range(64 * len(request.messages)))}
+
+    first = _b64(_make_jpeg(1, 2, 3))
+    second = _b64(_make_jpeg(4, 5, 6))
+    config = StreamingVideoSessionConfig(model="test", modalities=["text", "audio"])
+    handler = CapturingHandler(chat_service=object(), engine_client=TextEngine())
+
+    assert await handler._process_video_arrival_prefill(config, [first], [], "video-warm-1", {})
+    assert await handler._process_video_arrival_prefill(config, [first, second], [], "video-warm-2", {})
+    await handler._process_query_engine(
+        MockWebSocket(),
+        config,
+        [first, second],
+        bytearray(b"\x00\x00"),
+        [],
+        "",
+        "video-final",
+        asyncio.Event(),
+        {},
+    )
+
+    content = [request.messages[-1]["content"] for request in rendered]
+    assert [part["type"] for part in content[0]] == ["image_url"]
+    assert [part["type"] for part in content[1]] == ["image_url", "image_url"]
+    assert [part["type"] for part in content[2]] == ["image_url", "image_url", "input_audio"]
+    assert [call["output_modalities"] for call in calls] == [
+        ["text"],
+        ["text"],
+        ["text", "audio"],
+    ]
+    assert calls[0]["sampling_params_list"][0].max_tokens == 1
+    assert calls[1]["sampling_params_list"][0].max_tokens == 1
+
+
+@pytest.mark.asyncio
+async def test_query_joins_current_arrival_prefill_without_resubmitting_snapshot():
+    warm_snapshots: list[int] = []
+    query_done = asyncio.Event()
+
+    class CapturingHandler(QwenOmniStreamingVideoHandler):
+        async def _process_video_arrival_prefill(
+            self,
+            config,
+            frame_buffer,
+            message_history,
+            request_id,
+            prewarmed_frames,
+        ):
+            warm_snapshots.append(len(frame_buffer))
+            await asyncio.sleep(0.05)
+            return True
+
+        async def _process_query(self, *args, **kwargs):
+            query_done.set()
+
+    ws = TimedWebSocket()
+    handler = CapturingHandler(chat_service=object(), engine_client=object(), idle_timeout=5.0)
+    task = asyncio.create_task(handler.handle_session(ws))
+    ws.put(
+        {
+            "type": "session.config",
+            "model": "test",
+            "enable_frame_filter": False,
+        }
+    )
+    await asyncio.sleep(0)
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg())})
+    ws.put({"type": "video.query", "text": "describe"})
+    await asyncio.wait_for(query_done.wait(), timeout=2.0)
+    ws.put({"type": "video.done"})
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert warm_snapshots == [1]
+
+
+@pytest.mark.asyncio
+async def test_more_than_eight_filtered_frames_remain_in_one_turn():
+    captured_frames: list[list[str]] = []
+
+    class CapturingHandler(QwenOmniStreamingVideoHandler):
+        async def _process_query(
+            self,
+            websocket,
+            config,
+            frame_buffer,
+            audio_buffer,
+            message_history,
+            query_text,
+            request_id,
+            interrupt_event,
+            prewarmed_frames,
+            **kwargs,
+        ):
+            captured_frames.append(list(frame_buffer))
+
+    ws = TimedWebSocket()
+    handler = CapturingHandler(chat_service=object(), idle_timeout=5.0)
+    task = asyncio.create_task(handler.handle_session(ws))
+    ws.put(
+        {
+            "type": "session.config",
+            "model": "test",
+            "enable_frame_filter": False,
+            "enable_video_arrival_prefill": False,
+        }
+    )
+    await asyncio.sleep(0)
+    for index in range(9):
+        ws.put(
+            {
+                "type": "video.frame",
+                "data": _b64(_make_jpeg(index, index + 1, index + 2)),
+                "frame_id": f"frame-{index}",
+            }
+        )
+    ws.put({"type": "video.query", "text": "describe"})
+    await asyncio.sleep(0.1)
+    ws.put({"type": "video.done"})
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert [len(frames) for frames in captured_frames] == [9]
+    accepted = [message for message in ws.sent if message.get("type") == "video.frame.ack"]
+    assert len(accepted) == 9
+    assert all(message["accepted"] is True for message in accepted)
+    assert not any("dropped_frame_id" in message for message in accepted)
 
 
 @pytest.mark.asyncio
@@ -745,7 +918,7 @@ def test_build_messages_replays_canonical_multimodal_history():
     ]
 
     messages, user_message = handler._build_messages(
-        StreamingVideoSessionConfig(model="test", num_frames=1),
+        StreamingVideoSessionConfig(model="test"),
         [current_frame],
         bytearray(),
         history,
@@ -770,7 +943,7 @@ def test_build_messages_does_not_expose_a_per_turn_history_limit():
     ]
 
     messages, user_message = handler._build_messages(
-        StreamingVideoSessionConfig(model="test", num_frames=1),
+        StreamingVideoSessionConfig(model="test"),
         [],
         bytearray(),
         history,
@@ -874,6 +1047,7 @@ async def test_websocket_turns_use_distinct_finite_requests_and_replay_media():
             "model": "test",
             "modalities": ["text"],
             "enable_frame_filter": False,
+            "enable_video_arrival_prefill": False,
         }
     )
     await asyncio.sleep(0)

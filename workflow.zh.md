@@ -9,7 +9,7 @@
 当前架构决定：
 
 - WebSocket 应用维护 session、完整多模态对话和媒体接收状态。
-- 每一轮创建一个新的、有限生命周期的普通 engine request。
+- 每个媒体 warm-up 和最终回答都创建新的、有限生命周期的普通 engine request。
 - Engine 在请求内维护 KV；请求结束后只允许保留可淘汰的 prefix/KV cache。
 - 每轮仍提交完整 canonical history；prefix cache 命中只减少计算，不影响语义正确性。
 - 不再把跨轮生命周期塞进同一个 resumable engine request。
@@ -20,17 +20,20 @@
 
 当前实现位于 `vllm_omni/entrypoints/openai/video_stream_base.py` 和 `serving_video_stream.py`。
 
-- 每个 `video.query` 生成唯一的 `video-<uuid>` request ID。
+- 每个 `video.query` 生成唯一的 `video-<uuid>` 回答 request ID。
 - 应用保存已完成的 user/assistant turn；user history 保留原始文本、音频和选中视频，不退化为纯文本摘要。
 - 本轮已接收的音视频只消费一次；生成期间到达的数据进入下一轮。
-- 每轮重新渲染完整 canonical prompt。Thinker 开启 prefix caching，复用与上一轮完全一致的前缀。
+- similarity/freshness filter 是唯一的视频选择策略；接受后的帧在当前轮全部按到达顺序保留，不再做最近 8 帧滑动或二次采样。
+- 每次接受新帧，应用触发或合并进 `video-warm-<uuid>`：完整历史加当前轮累计帧，`output_modalities=["text"]`、Thinker `max_tokens=1`。输出 token 被丢弃，Talker/Code2Wav 不运行，也不向客户端发送 response 事件。
+- 同一 session 的 warm-up 串行执行并合并积压快照。后一次请求通过 Thinker prefix cache 复用前一次的完整块，只计算新增帧和未满 block 尾部；cache miss 只增加计算。
+- `video.query` 提交同一媒体前缀加完整 WAV，并正常运行 Thinker → Talker → Code2Wav。音频不做增量切块，保持当前 Qwen 输入语义。
 - prompt 达到 49,152 tokens 时，只按完整 turn 从最旧处删除，直到不超过 16,384 tokens。压缩后形成新的 cache lineage。
-- 视频最多保留并提交最近 8 帧，分辨率不超过 640×352。
+- 视频分辨率不超过 640×352；通过 filter 的帧没有第二个数量上限或采样步骤。
 - similarity filter 阈值 0.95，freshness gap 为 `[0,4]`；相似帧可丢弃，但连续过滤 4 帧后强制保留一帧。
 - JPEG 解码、缩放和 thumbnail 生成在子进程池完成，避免阻塞 WebSocket event loop。
 - 流式音频 DELTA 逐块转发；客户端用播放时间线判断启动和卡顿。
 
-已删除的旧路径包括：跨轮 persistent request、arrival-time prefill-only append、Talker 45k rolling、Thinker shadow compression、session epoch/segment ledger，以及依赖这些机制的 benchmark 和诊断脚本。上游通用 streaming/resumable 能力仍保留，但当前应用不使用。
+已删除的旧路径包括：跨轮 persistent request、向同一 resumable request 做 arrival append、Talker 45k rolling、Thinker shadow compression、session epoch/segment ledger，以及依赖这些机制的 benchmark 和诊断脚本。当前 arrival prefill 使用独立 finite request 和可淘汰 prefix cache，不使用 streaming/resumable engine state。
 
 ## 阶段二：固定部署
 
@@ -57,8 +60,10 @@ bash benchmarks/live_agent/web_client/run_qwen_server.sh
 容量测试只模拟持续 AV session。每个用户拥有一条长期 WebSocket：
 
 - 视频在整个 session 内以 2 FPS 上传。
+- 每个通过 filter 的帧立即触发或合并进静默 Thinker warm-up；当前轮累计帧保持 append-only。
 - 麦克风以 5 Hz 上传 PCM16；assistant 播放期间暂停，并保留 300 ms echo guard。
 - 每轮使用一条真实 16 kHz mono 录音，末尾追加 700 ms endpoint silence；query 文本为空，问题语义来自音频。
+- 音频在 query 时作为一个完整 WAV 加到已 warm 的视频 prefix 后；只有该最终请求会触发 Talker 发声。
 - 同一 session 固定 speaker，录音不重复；视频使用固定序列和不同起点。
 - 下一轮在回复按 1× 速度播放完成后开始，属于 playback-paced closed loop。
 - 用户启动时间在 0–40 秒内确定性错开。
@@ -87,32 +92,11 @@ bash benchmarks/live_agent/web_client/run_av_session_ladder.sh
 
 容量通过必须同时满足：预热后所有 turn 完成、playback-start p99 < 1 s、stall-max p99 < 50 ms、无 client/protocol/fatal engine error。TTFA、GPU 利用率、显存和 engine step 数据用于 root-cause，不替代体验 SLO。
 
-`analysis/verify_run.py` 还会检查：每个 turn 对应一个唯一 finite request、Thinker prefix cache 已开启、后续轮次出现实际 prefix hit、部署确为三阶段独立进程。
+`analysis/verify_run.py` 还会检查：每个 turn 对应一个唯一回答 request、warm-up request 唯一且无失败、engine 最终处理帧数与客户端 consumed ledger 一致、Thinker prefix cache 已开启且出现实际命中、部署确为三阶段独立进程。
 
-## 阶段五：旧架构实验归档
+## 阶段五：下一轮实验
 
-以下结果只描述已删除的 persistent-request + arrival-prefill 实现，不能并入新架构容量曲线。
-
-30 轮 continuous-AV 容量实验中，两个 seed 均为 8 用户通过、16 用户失败：8 用户 TTFA p99 为 479–541 ms、playback-start p99 为 824–972 ms；16 用户 TTFA p99 为 1005–1178 ms、playback-start p99 为 2062–2117 ms。失败来自播放启动 tail，不是 timeout 或播放中断。
-
-16 用户公平 prefill-timing RCA 固定了相同客户端 trace 和逐轮 media ledger：三组均提交 2,358 个视频 occurrence、36,884,706 audio bytes，0 丢帧、0 replay slip。
-
-| 旧实现提交方式 | Prefill chunks | TTFA p99 | Playback-start p99 | 第二块 gap p99 | Stall p99 |
-|---|---:|---:|---:|---:|---:|
-| Arrival incremental | 2783 | 1283 ms | 2337 ms | 1240 ms | 0 |
-| Video query-time | 967 | 2353 ms | 3172 ms | 1371 ms | 0 |
-| All query-time | 160 | 2416 ms | 2946 ms | 2011 ms | 223 ms |
-
-结论仅限旧实现：把同量媒体集中到 query 边界会制造更强的 Thinker prefill burst；之前看似改善的结果由 8-frame buffer 丢帧混杂，不能成立。日志同时表明 Talker 的长等待大多与 Thinker step 重叠，Code2Wav 不是主要 tail 来源。这支持继续研究 Thinker prefill/decode 干扰和 P/D 分离，但不能预言新 finite-request 架构的容量。
-
-归档：
-
-- `/home/ubuntu/data/results/archive/2026-08-20_continuous_av_capacity_rca/`
-- `/home/ubuntu/data/results/archive/2026-08-20_prefill_timing_fair_rca/`
-
-## 阶段六：下一轮实验
-
-2026-08-21 的两轮 direct smoke 已通过：prompt 分别为 280/314 tokens，两个 request ID 不同，Thinker prefix hit 为 0/288 tokens，两轮均生成完整语音。此机缺少 `nvcc`，smoke 临时使用 `--attention-backend TRITON_ATTN`；该结果只验证功能，不是容量数据。正式实验必须先固定 FlashInfer 环境或明确采用 Triton，二者结果不能混用。
+2026-08-21 的 direct GPU smoke 已通过。4 个动态帧到达时，第一个 warm-up 为 1 帧/265 prompt tokens；其运行期间积压的帧被合并，第二个 warm-up 为 4 帧/931 tokens。两者都只有 `stages=[0]`。最终 query 为 4 帧加完整音频、959 tokens，Thinker prefix hit 为 912 tokens，运行 `stages=[0,1,2]` 并生成完整语音；没有重复提交相同 4 帧快照。此机缺少 `nvcc`，smoke 临时设置 `VLLM_USE_FLASHINFER_SAMPLER=0` 和 `--attention-backend TRITON_ATTN`。该结果只验证功能，不是容量数据；正式实验必须固定 backend，不能与其他 backend 的结果混用。
 
 当前代码尚无新的正式容量数字。下一步必须在 clean commit 上重新建立 8 → 16 → 32 容量曲线：
 

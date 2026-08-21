@@ -50,11 +50,17 @@ def synth_speechlike_pcm(seconds: float, *, variant: int = 0) -> bytes:
     return bytes(out)
 
 
-def synth_frame_jpeg(label: str, width: int = 640, height: int = 360) -> bytes:
+def synth_frame_jpeg(label: str, frame_index: int = 0, width: int = 640, height: int = 360) -> bytes:
     import cv2
     import numpy as np
 
     img = np.full((height, width, 3), 240, dtype=np.uint8)
+    # Move a sizeable coloured region so successive synthetic frames exercise
+    # the accepted-frame path instead of all being removed as static duplicates.
+    box_width = width // 3
+    x = (frame_index * width // 5) % (width - box_width)
+    colour = ((53 * frame_index) % 220, (97 * frame_index) % 220, 180)
+    cv2.rectangle(img, (x, 20), (x + box_width, height - 20), colour, -1)
     cv2.putText(img, label, (30, int(height * 0.62)), cv2.FONT_HERSHEY_SIMPLEX, 3.0, (15, 15, 15), 9)
     ok, enc = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
     assert ok
@@ -68,10 +74,7 @@ def session_config(system_prompt: str) -> dict:
         "type": "session.config",
         "system_prompt": system_prompt,
         "modalities": ["text", "audio"],
-        "num_frames": 8,
-        # Each retained frame is consumed by one turn, so this caps the backlog
-        # accumulated while another finite request is running.
-        "max_frames": 8,
+        "enable_video_arrival_prefill": True,
         "max_frame_width": 640,
         "max_frame_height": 352,
         "frame_jpeg_quality": 90,
@@ -163,7 +166,7 @@ async def run(args) -> int:
                         json.dumps(
                             {
                                 "type": "video.frame",
-                                "data": base64.b64encode(synth_frame_jpeg(str(turn))).decode(),
+                                "data": base64.b64encode(synth_frame_jpeg(str(turn), frames)).decode(),
                             }
                         )
                     )

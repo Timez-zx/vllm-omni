@@ -70,10 +70,12 @@ SYSTEM_PROMPT = (
 LOG_PROBES_BAD = {
     "unowned_audio": r"UNOWNED",
     "torch_cat_error": r"expected a non-empty list of Tensors",
+    "arrival_prefill_failed": r"\[arrival-prefill\] failed",
 }
 LOG_PROBES_WARN = {}
 LOG_PROBES_INFO = {
     "finite_requests": r"\[finite-request\]",
+    "arrival_prefills": r"\[arrival-prefill\].*frames=",
     "history_compactions": r"\[session-history\] compact",
     "prefix_cache_hits": r"\[prefix-cache\].*hit_tokens=[1-9]",
     "preempted_reqs": r"preemptions=[1-9]",
@@ -108,6 +110,7 @@ class User:
         self.errors: list[str] = []
         self.acks_accepted = 0
         self.acks_filtered = 0
+        self.frames_consumed = 0
         self.stray_audio = 0
         self.cur: dict | None = None
         self.done_evt = asyncio.Event()
@@ -297,6 +300,9 @@ class User:
             if event_type == "video.frame.ack":
                 self.acks_accepted += int(bool(msg.get("accepted")))
                 self.acks_filtered += int(not msg.get("accepted"))
+                continue
+            if event_type == "video.frames.consumed":
+                self.frames_consumed += len(msg.get("frame_ids") or [])
                 continue
             if event_type == "error":
                 self.errors.append(str(msg.get("message"))[:200])
@@ -549,6 +555,9 @@ class User:
             "user": self.name,
             "session_wall_s": wall_s,
             "frames_sent": self.frames_sent,
+            "frames_accepted": self.acks_accepted,
+            "frames_filtered": self.acks_filtered,
+            "frames_consumed": self.frames_consumed,
             "mic_chunks_sent": self.mic_chunks_sent,
             "mic_audio_s_sent": self.mic_samples_sent / AUDIO_RATE,
             "mic_speech_s_sent": self.mic_speech_samples_sent / AUDIO_RATE,
@@ -670,6 +679,9 @@ def summarize(records: list[dict], users: list[User], meta: dict, log_slice: str
         "client_errors": client_errors,
         "per_user_errors": {user.name: user.errors[:5] for user in users if user.errors},
         "frames_sent": sum(item["frames_sent"] for item in user_stats),
+        "frames_accepted": sum(item.get("frames_accepted", 0) for item in user_stats),
+        "frames_filtered": sum(item.get("frames_filtered", 0) for item in user_stats),
+        "frames_consumed": sum(item.get("frames_consumed", 0) for item in user_stats),
         "mic_chunks_sent": sum(item["mic_chunks_sent"] for item in user_stats),
         "mic_audio_s_sent": sum(item["mic_audio_s_sent"] for item in user_stats),
         "mic_speech_s_sent": sum(item["mic_speech_s_sent"] for item in user_stats),

@@ -83,6 +83,34 @@ def check(result_dir: Path) -> int:
     else:
         print(f"   ok finite requests: {len(finite_ids)} turns, all request ids unique")
 
+    warm_ids = re.findall(r"\[arrival-prefill\].* request=(video-warm-[0-9a-f]+)", log)
+    warm_failures = len(re.findall(r"\[arrival-prefill\] failed", log))
+    if not warm_ids:
+        print("   !! no video arrival-prefill request was observed")
+        bad += 1
+    elif warm_failures:
+        print(f"   !! arrival-prefill failures: {warm_failures}")
+        bad += 1
+    elif len(set(warm_ids)) != len(warm_ids):
+        print(f"   !! arrival-prefill request ids are not unique: {len(warm_ids)} lines")
+        bad += 1
+    else:
+        print(f"   ok arrival-prefill requests: {len(warm_ids)}, all finite and unique")
+
+    final_frame_counts = [
+        int(value)
+        for value in re.findall(r"\[finite-request\].* frames=(\d+)", log)
+    ]
+    client_consumed = int(summary.get("frames_consumed") or 0)
+    if len(final_frame_counts) != expected_requests or sum(final_frame_counts) != client_consumed:
+        print(
+            f"   !! final media ledger: engine_frames={sum(final_frame_counts)} "
+            f"client_consumed={client_consumed} request_rows={len(final_frame_counts)}/{expected_requests}"
+        )
+        bad += 1
+    else:
+        print(f"   ok final media ledger: {client_consumed} accepted frame occurrences consumed")
+
     try:
         deploy_text = deploy.read_text()
         thinker = deploy_text.split("- stage_id: 1", 1)[0]

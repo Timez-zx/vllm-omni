@@ -1,8 +1,9 @@
 # live_agent benchmark
 
 The supported benchmark is the playback-paced continuous AV workload in
-`web_client/`. It measures a stateful WebSocket service whose model engine
-receives one finite request per turn and may reuse prefix KV opportunistically.
+`web_client/`. The stateful WebSocket submits silent finite Thinker warm-ups as
+accepted frames arrive, then one finite response request per turn. All requests
+may reuse disposable prefix KV opportunistically.
 
 ```text
 web_client/  canonical client, browser, workload preparation, and capacity runner

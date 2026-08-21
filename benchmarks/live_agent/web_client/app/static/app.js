@@ -282,10 +282,10 @@
       type: 'session.config',
       system_prompt: instructions,
       modalities: ['text', 'audio'],
-      // Frames are consumed by one user turn. max_frames bounds the backlog
-      // accumulated while the preceding finite request is generating.
-      num_frames: 8,
-      max_frames: 8,
+      // Every frame accepted by the similarity/freshness filter remains in
+      // the current turn. Silent Thinker-only requests materialize the
+      // cumulative prefix as those frames arrive.
+      enable_video_arrival_prefill: true,
       // Shrink on arrival: one 1280x720 frame is 880 tokens against 220 at
       // 640x352, and that cost lands on every turn's latency.
       max_frame_width: 640,

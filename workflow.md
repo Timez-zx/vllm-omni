@@ -9,7 +9,7 @@ No locally deployable open-source realtime model exposes semantics equivalent to
 The current architecture is:
 
 - the WebSocket application owns the session, full multimodal conversation, and media-receive state;
-- every turn creates a new, finite, ordinary engine request;
+- every media warm-up and final response creates a new, finite, ordinary engine request;
 - the engine owns KV within a request and may retain only disposable prefix/KV cache after it ends;
 - every turn submits the complete canonical history; a prefix-cache hit reduces work but never determines correctness;
 - a cross-turn lifecycle is no longer embedded in one resumable engine request.
@@ -20,17 +20,20 @@ This is a better research baseline than an engine-resident session: it matches t
 
 The implementation lives in `vllm_omni/entrypoints/openai/video_stream_base.py` and `serving_video_stream.py`.
 
-- Each `video.query` receives a unique `video-<uuid>` request ID.
+- Each `video.query` receives a unique `video-<uuid>` response request ID.
 - The application stores completed user/assistant turns. User history preserves accepted text, audio, and selected video rather than degrading to text-only summaries.
 - Audio and video received for the current turn are consumed exactly once. Data arriving during generation belongs to the next turn.
-- Each turn renders the full canonical prompt. Thinker prefix caching reuses the prefix identical to the preceding request.
+- The similarity/freshness filter is the only video-selection policy. Every accepted frame remains in the current turn in arrival order; there is no latest-eight sliding window or second sampling pass.
+- Each accepted frame triggers or coalesces a `video-warm-<uuid>` request containing full history plus the cumulative current-turn frames. It uses `output_modalities=["text"]` and Thinker `max_tokens=1`; the token is discarded, Talker/Code2Wav do not run, and the client receives no response event.
+- Warm-ups are serial per session. A later request uses Thinker prefix caching to reuse complete blocks from its predecessor and computes only new frames plus the partial-block tail. A miss changes cost only.
+- `video.query` appends one complete WAV to that media prefix and runs Thinker → Talker → Code2Wav. Audio is not incrementally split, preserving the current Qwen input semantics.
 - At 49,152 prompt tokens, history is removed from the oldest end only at complete-turn boundaries until at most 16,384 tokens remain. The compacted prompt starts a new cache lineage.
-- At most the latest eight frames are retained and submitted per turn, at no more than 640×352.
+- Frames are at most 640×352. Filter-accepted frames have no second count bound or sampling pass.
 - The similarity threshold is 0.95 and the freshness gap is `[0,4]`: redundant frames may be dropped, but one frame is forced after four consecutive drops.
 - JPEG decode, resize, and thumbnail generation run in a subprocess pool so they do not block the WebSocket event loop.
 - Streaming audio DELTAs are forwarded one by one; the client evaluates startup and stalls on a playback timeline.
 
-Removed paths include the cross-turn persistent request, arrival-time prefill-only append, Talker 45k rolling, Thinker shadow compression, the session epoch/segment ledger, and benchmark/diagnostic scripts that required them. Upstream generic streaming/resumable support remains, but this application does not use it.
+Removed paths include the cross-turn persistent request, arrival append into the same resumable request, Talker 45k rolling, Thinker shadow compression, the session epoch/segment ledger, and benchmark/diagnostic scripts that required them. Current arrival prefill uses independent finite requests plus disposable prefix cache, not streaming/resumable engine state.
 
 ## Phase 2: fixed deployment
 
@@ -57,8 +60,10 @@ bash benchmarks/live_agent/web_client/run_qwen_server.sh
 Capacity testing models continuous AV sessions. Each user owns one long-lived WebSocket:
 
 - video is uploaded throughout the session at 2 FPS;
+- each filter-accepted frame immediately triggers or coalesces into a silent Thinker warm-up, while the current-turn media prefix remains append-only;
 - the microphone uploads PCM16 at 5 Hz, pausing during assistant playback plus a 300 ms echo guard;
 - each turn uses one real 16 kHz mono recording followed by 700 ms endpoint silence; query text is empty, so semantics come from speech;
+- audio is appended as one complete WAV at query time; only this final request invokes Talker;
 - a session keeps one speaker and does not reuse recordings; video uses a fixed sequence with different starting offsets;
 - the next turn starts after the response has played at 1× speed, making this a playback-paced closed loop;
 - user starts are deterministically staggered over 0–40 seconds.
@@ -87,32 +92,11 @@ Synthetic media in `probe.py` is for protocol validation only and cannot support
 
 A cell passes only when every post-warm-up turn completes, playback-start p99 is below 1 second, stall-max p99 is below 50 ms, and no client, protocol, or fatal engine error occurs. TTFA, GPU utilization, memory, and engine-step data are root-cause signals, not substitutes for the experience SLO.
 
-`analysis/verify_run.py` additionally checks that every turn used a unique finite request, Thinker prefix caching was enabled, later turns produced real prefix hits, and all three stages ran in separate processes.
+`analysis/verify_run.py` additionally checks unique response requests, unique successful warm-ups, agreement between engine frame counts and the client consumed ledger, real Thinker prefix hits, and separate processes for all three stages.
 
-## Phase 5: archived old-architecture experiments
+## Phase 5: next experiment
 
-The following results describe the deleted persistent-request plus arrival-prefill implementation. They must not be merged into the new architecture's capacity curve.
-
-In the 30-turn continuous-AV capacity run, both seeds passed at 8 users and failed at 16. At 8 users, TTFA p99 was 479–541 ms and playback-start p99 was 824–972 ms. At 16 users, TTFA p99 was 1005–1178 ms and playback-start p99 was 2062–2117 ms. The failure was a playback-start tail, not timeouts or playback stalls.
-
-The fair 16-user prefill-timing RCA replayed the same client trace and per-turn media ledger. Every arm submitted 2,358 video occurrences and 36,884,706 audio bytes, with zero dropped frames and zero replay slip.
-
-| Old submission policy | Prefill chunks | TTFA p99 | Playback-start p99 | Second-granule gap p99 | Stall p99 |
-|---|---:|---:|---:|---:|---:|
-| Arrival incremental | 2783 | 1283 ms | 2337 ms | 1240 ms | 0 |
-| Video at query time | 967 | 2353 ms | 3172 ms | 1371 ms | 0 |
-| All media at query time | 160 | 2416 ms | 2946 ms | 2011 ms | 223 ms |
-
-The conclusion is limited to the old implementation: concentrating the same media at the query boundary produced a stronger Thinker prefill burst. An earlier apparent improvement was confounded by eviction from an eight-frame buffer and is invalid. Logs also showed that most long Talker waits overlapped a Thinker step, while Code2Wav was not the primary tail source. This motivates studying Thinker prefill/decode interference and P/D disaggregation, but it does not predict the finite-request architecture's capacity.
-
-Archives:
-
-- `/home/ubuntu/data/results/archive/2026-08-20_continuous_av_capacity_rca/`
-- `/home/ubuntu/data/results/archive/2026-08-20_prefill_timing_fair_rca/`
-
-## Phase 6: next experiment
-
-The two-turn direct smoke on 2026-08-21 passed: prompts were 280/314 tokens, request IDs differed, Thinker prefix hits were 0/288 tokens, and both turns produced complete speech. This host lacked `nvcc`, so the smoke temporarily used `--attention-backend TRITON_ATTN`. It proves functionality, not capacity. A formal run must first restore the FlashInfer environment or explicitly adopt Triton; results from the two backends cannot be mixed.
+The direct GPU smoke on 2026-08-21 passed. With four changing frames, the first warm-up contained one frame/265 prompt tokens; frames queued while it ran were coalesced into a second warm-up with four frames/931 tokens. Both reported only `stages=[0]`. The final request contained the same four frames plus complete audio/959 tokens, hit 912 Thinker prefix tokens, ran `stages=[0,1,2]`, and produced complete speech. No duplicate four-frame snapshot was submitted. This host lacked `nvcc`, so the smoke temporarily set `VLLM_USE_FLASHINFER_SAMPLER=0` and `--attention-backend TRITON_ATTN`. This proves functionality, not capacity; formal results must use one fixed backend and cannot be mixed across backends.
 
 The current code has no new formal capacity result. Rebuild the 8 → 16 → 32 curve from a clean commit:
 

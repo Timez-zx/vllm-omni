@@ -82,6 +82,7 @@ def main() -> int:
         "frame_filter_min_gap",
         "frame_filter_max_gap",
         "use_audio_in_video",
+        "enable_video_arrival_prefill",
         "system_prompt",
         "modalities",
     }
