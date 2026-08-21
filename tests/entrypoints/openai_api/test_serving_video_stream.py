@@ -13,6 +13,8 @@ from typing import Any
 
 import pytest
 from PIL import Image
+from vllm import SamplingParams
+from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.entrypoints.openai import video_stream_base, video_stream_envs
 from vllm_omni.entrypoints.openai.serving_video_stream import (
@@ -111,6 +113,20 @@ def test_api_server_registers_video_stream_route():
     from vllm_omni.entrypoints.openai.api_server import router
 
     assert any(getattr(route, "path", None) == "/v1/video/chat/stream" for route in router.routes)
+
+
+def test_video_stream_requests_delta_outputs_without_mutating_deploy_defaults():
+    defaults = [SamplingParams(), SamplingParams(), SamplingParams()]
+
+    class Engine:
+        default_sampling_params_list = defaults
+
+    handler = OmniStreamingVideoHandler(chat_service=object(), engine_client=Engine())
+    params = handler._sampling_params_for_request(StreamingVideoSessionConfig(model="test"))
+
+    assert params is not None
+    assert all(param.output_kind == RequestOutputKind.DELTA for param in params)
+    assert all(param.output_kind == RequestOutputKind.CUMULATIVE for param in defaults)
 
 
 @pytest.mark.asyncio

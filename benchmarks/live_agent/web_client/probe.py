@@ -182,11 +182,13 @@ async def run(args) -> int:
 
             samples = 0
             rate = 0
+            chunk_samples = []
             for blob in state["wavs"]:
                 try:
                     with wave.open(io.BytesIO(blob), "rb") as w:
                         rate = w.getframerate()
-                        samples += w.getnframes()
+                        chunk_samples.append(w.getnframes())
+                        samples += chunk_samples[-1]
                 except Exception:
                     pass
             secs = samples / rate if rate else 0.0
@@ -196,7 +198,7 @@ async def run(args) -> int:
                 f"turn {turn}: frames={frames} chunks={len(state['wavs'])} "
                 f"audio={secs:.2f}s@{rate or '?'}Hz "
                 f"first_audio={state['first_audio_ms'] and round(state['first_audio_ms']) or '-'}ms "
-                f"{'OK' if ok else 'NO AUDIO'}"
+                f"chunk_samples={chunk_samples} {'OK' if ok else 'NO AUDIO'}"
             )
             if state["text"]:
                 print(f"         text: {state['text'][:110]}")

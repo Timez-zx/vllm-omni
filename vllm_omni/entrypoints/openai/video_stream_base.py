@@ -49,6 +49,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai import media_pipeline, video_stream_envs
 from vllm_omni.entrypoints.openai.video_frame_filter import FrameSimilarityFilter
+from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -815,6 +816,14 @@ class OmniStreamingVideoHandler:
         else:
             defaults = getattr(self._engine_client, "default_sampling_params_list", None)
             params = copy.deepcopy(list(defaults)) if defaults else []
+
+        # This WebSocket endpoint always consumes an output stream, including
+        # when wire-level audio buffering is enabled. Passing an explicit copy
+        # of the deploy defaults bypasses AsyncOmni's implicit DELTA coercion;
+        # leaving the defaults as CUMULATIVE makes every Code2Wav event replay
+        # all prior waveform chunks. Force per-stage engine outputs to DELTA so
+        # each response.audio.delta contains only newly generated samples.
+        params = coerce_param_message_types(params, is_streaming=True)
 
         if thinker_max_tokens is not None:
             if not params:
