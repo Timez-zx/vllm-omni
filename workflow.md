@@ -178,6 +178,24 @@ On 2026-08-22, schema 4 was run with seed 7, 30 turns per user, and two warm-up 
 
 Conclusion: eight users now show a small startup-tail violation whose direct source is concurrent Thinker work delaying first token. The speech pipeline contributes part of the delay, but Talker and Code2Wav are not resource-saturated. The next discussion should focus on Thinker prefill/decode isolation or scheduling, not further application-render tuning.
 
+### Same-commit context-alignment control
+
+On 2026-08-22, commit `854535bb` was tested with the same schema-4 workload, seed 7, eight users × 30 turns, and two warm-up turns. Both arms have workload-plan SHA256 `99dc083388...`. The default arm has no override; the aligned arm changes only history compaction to `32k -> 0`. Because that arm discards completed turns, it is a compute-envelope control rather than a production semantic policy.
+
+Results: `/home/ubuntu/data/results/current_default_854535bb_20260822/current_default_seed7_u8` and `/home/ubuntu/data/results/current_context_aligned_854535bb_20260822/context_aligned_seed7_u8`; persistent archive: `/home/ubuntu/data/results/av_real_formal_4650f134/avreal_formal_seed7_u8`.
+
+| Path | Context p50/p95/p99/max | Audio-ready-500 p50/p95/p99/max |
+|---|---:|---:|
+| Current default `49k -> 16k`, 16k headroom | 22.5k/32.0k/32.4k/32.8k | 478/723/1186/1215 ms |
+| Current `32k -> 0` control | 16.8k/30.6k/31.8k/31.9k | 410/635/796/883 ms |
+| Archived persistent path | 14.8k/30.9k/34.5k/36.8k | 515/740/824/900 ms |
+
+Both current arms completed 224/224 measured turns without timeout, skip, or stall and passed finite-request, arrival-request, frame-ledger, prefix-cache, and three-process validation. The persistent archive's first packet held only about 217 ms of audio, so its raw TTFA p50/p95/p99 of 244/392/479 ms is not comparable with the current roughly 537 ms packet. The archived values in the table were recomputed from `turns.jsonl` audio deltas at a cumulative 500 ms of PCM.
+
+At the same commit, shortening context reduced p99 by 389 ms. GPU0 SM-active p95 in p99-tail windows fell from 94.7% in the default arm to 52.4% in the aligned arm, which returned inside the SLO. More importantly, after alignment the finite-request p99 is only 28 ms from the persistent archive and is slightly lower. Destroying each engine request after a turn is therefore not the fundamental source of the old gap. Application-owned canonical session state, finite engine requests, and disposable prefix/KV reuse can deliver the same class of tail latency.
+
+Limitations: this is a single-seed live closed-loop control, not a bit-identical replay; different response lengths alter later media-arrival trajectories. `32k -> 0` also loses conversational semantics. A production policy should retain semantics through an application-generated short text summary/seed plus a few recent complete turns, then hold that context envelope fixed while studying Thinker scheduling or P/D isolation at higher concurrency.
+
 ### Audio arrival-prefill approximation
 
 On 2026-08-22 an explicit experimental path was implemented. Each full second of PCM16 becomes an immutable media item, and audio/video items remain append-only in actual arrival order. Adjacent audio items lose only their internal `<audio_end><audio_start>` pair while retaining separate media hashes and continuous MRoPE. Arrival requests remain low-priority, Thinker-only, and finite; the query appends the sub-second tail and is the only request allowed to speak. Qwen's audio encoder uses bidirectional attention within an approximately eight-second window, so independent item encoding changes model semantics. This is a workload approximation, not equivalent inference.

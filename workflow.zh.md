@@ -178,6 +178,24 @@ bash benchmarks/live_agent/web_client/run_av_session_ladder.sh
 
 结论：8 用户已出现轻微启动 tail 超标，直接 root cause 是并发 Thinker 工作造成的首 token tail；语音流水线贡献部分延迟，但 Talker/Code2Wav 资源没有饱和。下一步应讨论 Thinker prefill/decode 隔离或调度，而不是继续调应用 render 参数。
 
+### 同提交 context 对齐控制
+
+2026-08-22 在提交 `854535bb` 上用同一 schema 4 workload、seed 7、8 用户×30 轮、前 2 轮预热做正式 A/B；两组 workload-plan SHA256 均为 `99dc083388...`。默认组不加 override；对齐组只把 history compaction 改为 `32k -> 0`。后者会丢弃已完成 turn，只用于对齐计算包络，不是生产语义策略。
+
+结果：`/home/ubuntu/data/results/current_default_854535bb_20260822/current_default_seed7_u8`、`/home/ubuntu/data/results/current_context_aligned_854535bb_20260822/context_aligned_seed7_u8`；persistent 归档：`/home/ubuntu/data/results/av_real_formal_4650f134/avreal_formal_seed7_u8`。
+
+| 路径 | context p50/p95/p99/max | Audio-ready-500 p50/p95/p99/max |
+|---|---:|---:|
+| 当前默认 `49k -> 16k`，16k headroom | 22.5k/32.0k/32.4k/32.8k | 478/723/1186/1215 ms |
+| 当前 `32k -> 0` 控制组 | 16.8k/30.6k/31.8k/31.9k | 410/635/796/883 ms |
+| 旧 persistent 归档 | 14.8k/30.9k/34.5k/36.8k | 515/740/824/900 ms |
+
+当前两组均为 224/224 成功、无 timeout、skip 或 stall，并通过 finite request、arrival request、frame ledger、prefix-cache 和三阶段进程验证。旧 persistent 首包只有约 217 ms 音频，原始 TTFA p50/p95/p99 为 244/392/479 ms，不能和当前约 537 ms 首包直接比较；表中旧值由 `turns.jsonl` 的音频 delta 按累计 500 ms PCM 重新计算。
+
+同提交下缩短 context 后，p99 降低 389 ms。默认组的 p99-tail GPU0 SM-active p95 为 94.7%，对齐组为 52.4%；对齐组已回到 SLO 内。更关键的是，对齐后当前 finite-request 与旧 persistent 的 p99 只差 28 ms，且当前略低。这证明每轮销毁 engine request 不是旧方案更快的根本原因；应用维护 canonical session、engine 处理有限 request、通过可淘汰 prefix/KV cache 复用前缀的架构可以达到同等级 tail。
+
+限制：这是单 seed live closed-loop 控制，不是 bit-identical replay；不同回答长度会改变后续媒体到达轨迹。`32k -> 0` 也会损失历史语义。生产策略应在应用层用短文本摘要/seed 加少量最近完整 turn 保留语义，同时把 context 包络固定后再研究更高并发下的 Thinker 调度或 P/D 隔离。
+
 ### 音频 arrival-prefill 近似实验
 
 2026-08-22 实现了显式实验路径：PCM16 每满 1 秒形成稳定媒体 item，音视频按实际到达顺序 append-only；相邻音频块删除内部 `<audio_end><audio_start>`，保留独立媒体 hash 和连续 MRoPE。arrival request 仍是低优先级、Thinker-only、有限生命周期；query 补未满 1 秒的尾块并正常发声。Qwen audio encoder 在约 8 秒窗口内使用双向 attention，因此每块独立编码会改变模型语义；这是 workload approximation，不是等价推理。
