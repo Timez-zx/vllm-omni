@@ -7,15 +7,23 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
-      initial_codec_chunk_frames: 4
-      codec_chunk_frames: 25
+      # A ~0.56 s playable first granule clears the 500 ms client prebuffer;
+      # 4-frame steady chunks then arrive faster than their ~0.32 s duration.
+      initial_codec_chunk_frames: 8
+      codec_chunk_frames: 4
       codec_left_context_frames: 25
 
 stages:
   - stage_id: 0
     max_num_batched_tokens: 32768
     max_num_seqs: 64
+    # Final responses use priority 0; silent arrival warm-ups use priority 10.
+    scheduling_policy: priority
     gpu_memory_utilization: 0.9
+    # Full-history finite requests reuse processed media by UUID. Keep the
+    # bounded eight-user working set in the API-side processor cache; the
+    # canonical launcher disables the unsafe mirrored EngineCore LRU.
+    mm_processor_cache_gb: 16
     trust_remote_code: true
     quantization: fp8
     kv_cache_dtype: fp8
@@ -32,7 +40,9 @@ stages:
     trust_remote_code: true
     quantization: fp8
     kv_cache_dtype: fp8
-    enable_prefix_caching: false
+    # Finite response requests carry a session-isolated, token-exact Talker
+    # conditioning lineage; reuse only complete historical user-prefix blocks.
+    enable_prefix_caching: true
     devices: "1"
     input_connectors:
       from_stage_0: connector_of_shared_memory

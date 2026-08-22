@@ -51,6 +51,19 @@ def check(result_dir: Path) -> int:
         print(f"   !! unexpected deploy: {deploy}")
         bad += 1
 
+    if summary.get("workload_schema") != 4:
+        print(
+            "   !! workload schema is not 4; this result does not use the "
+            "fixed audio-ready-500 measurement contract"
+        )
+        bad += 1
+    if summary.get("audio_ready_threshold_ms") != 500.0:
+        print(
+            "   !! audio-ready threshold is not the canonical 500 ms: "
+            f"{summary.get('audio_ready_threshold_ms')}"
+        )
+        bad += 1
+
     for flag, (pattern, label) in TRACES.items():
         value = DEFAULTS.get(flag, "0")
         if value in ("0", "", "false", "False"):

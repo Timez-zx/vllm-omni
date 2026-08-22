@@ -10,7 +10,7 @@ lengths were being INFERRED by inverting a fitted ms/1k rate, which is circular 
 thing under test is that very rate.
 
 The server already logs what we wanted. Each finished request emits a StageRequestStats
-table (stats.py:861) with one column per stage:
+table with one column per stage:
 
   | num_tokens_in                   |  2,624 |     0 |    0 |
   | vllm_ttft_ms                    | 879.27 | 1086.32 | 1192.61 |
@@ -50,7 +50,7 @@ import statistics as st
 import sys
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
-STAGE_HDR = re.compile(r"\[StageRequestStats \[request_id=([^\]]+)\]\]")
+STAGE_HDR = re.compile(r"(\[stats\.py:\d+\]).*\[StageRequestStats \[request_id=([^\]]+)\]\]")
 TS = re.compile(r"(\d\d-\d\d \d\d:\d\d:\d\d)")
 BOOT = re.compile(r"Initializing a V1 LLM engine")
 ROW = re.compile(r"^\s*\|\s*([a-z0-9_]+)\s*\|(.+)\|\s*$")
@@ -89,19 +89,25 @@ def parse(path: pathlib.Path) -> list[dict]:
         m = STAGE_HDR.search(line)
         if m:
             t = TS.search(line)
-            cur = {"request_id": m.group(1), "t": t.group(1) if t else None,
-                   "boot": boot, "stages": {}}
+            cur = {
+                "request_id": m.group(2),
+                "t": t.group(1) if t else None,
+                "boot": boot,
+                "stages": {},
+                "log_marker": m.group(1),
+            }
             out.append(cur)
             continue
         if cur is None:
             continue
         # rows belonging to the table we are inside
-        if "[stats.py:861]" not in line:
-            # a non-861 line means the table is over
+        marker = cur["log_marker"]
+        if marker not in line:
+            # A different stats callsite means this table is over.
             if "[stats.py" in line:
                 cur = None
             continue
-        body = line.split("[stats.py:861]", 1)[1]
+        body = line.split(marker, 1)[1]
         rm = ROW.match(body)
         if not rm:
             continue
@@ -120,7 +126,10 @@ def derive(recs: list[dict]) -> list[dict]:
     rows = []
     for r in recs:
         s = r["stages"]
-        g = lambda i, k: (s.get(i) or {}).get(k)
+
+        def g(i, k):
+            return (s.get(i) or {}).get(k)
+
         t0, t1, t2 = g(0, "vllm_ttft_ms"), g(1, "vllm_ttft_ms"), g(2, "vllm_ttft_ms")
         if t0 is None or t1 is None:
             continue
@@ -182,6 +191,9 @@ def main() -> int:
                     help="restrict the regression to requests below this prompt-token "
                          "count. Needed because an arm that hits the context cap piles up "
                          "many points at one x value and flattens the fit.")
+    ap.add_argument("--request-regex", default=None,
+                    help="keep only request IDs matching this regex, e.g. "
+                         "'^video-(?!warm-)' for foreground AV turns")
     args = ap.parse_args()
 
     bins = []
@@ -199,6 +211,9 @@ def main() -> int:
             print(f"!! missing {p}", file=sys.stderr)
             continue
         rows = derive(parse(p))
+        if args.request_regex:
+            request_pattern = re.compile(args.request_regex)
+            rows = [row for row in rows if request_pattern.search(row["request_id"])]
         by_boot = {}
         for r in rows:
             by_boot.setdefault(r["boot"], []).append(r)

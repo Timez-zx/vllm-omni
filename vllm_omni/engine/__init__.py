@@ -79,6 +79,26 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     # GPUModelRunner.model_intermediate_buffer instead of using the deprecated
     # additional_information request transport.
     model_intermediate_buffer: dict[str, Any] | None = None
+    # Optional prompt identity used only by the KV block hasher.  Some Omni
+    # stages execute placeholder token ids because real conditioning arrives
+    # as embeddings after admission; their cache identity must not be coupled
+    # to those executable placeholders.
+    cache_token_ids: list[int] | None = None
+    # Finish immediately after the prompt forward. Used by disposable cache
+    # population requests; it is request policy, not persistent engine state.
+    prefill_only: bool = False
+    # Opaque, disposable KV lineage metadata.  The application still sends a
+    # complete canonical prompt; these fields only let the engine reuse the
+    # already-hashed prefix from a completed finite request.
+    kv_lineage_id: str | None = None
+    kv_lineage_parent_revision: int = 0
+    kv_lineage_revision: int = 0
+    kv_lineage_prefix_tokens: int = 0
+    # Populated inside StageEngineCoreProc from its scheduler-owned registry;
+    # never serialized by the application or treated as correctness state.
+    kv_lineage_snapshot_block_hashes: list[bytes] | None = None
+    kv_lineage_snapshot_num_computed_tokens: int = 0
+    kv_lineage_snapshot_hash_block_size: int = 0
 
     @classmethod
     def from_request(
@@ -88,6 +108,11 @@ class OmniEngineCoreRequest(EngineCoreRequest):
         prompt_embeds: torch.Tensor | None = None,
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict[str, Any] | None = None,
+        prefill_only: bool | None = None,
+        kv_lineage_id: str | None = None,
+        kv_lineage_parent_revision: int | None = None,
+        kv_lineage_revision: int | None = None,
+        kv_lineage_prefix_tokens: int | None = None,
     ) -> "OmniEngineCoreRequest":
         """Clone an EngineCoreRequest into an OmniEngineCoreRequest with optional payload overrides."""
 
@@ -97,6 +122,16 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             additional_information = getattr(request, "additional_information", None)
         if model_intermediate_buffer is None:
             model_intermediate_buffer = getattr(request, "model_intermediate_buffer", None)
+        if prefill_only is None:
+            prefill_only = bool(getattr(request, "prefill_only", False))
+        if kv_lineage_id is None:
+            kv_lineage_id = getattr(request, "kv_lineage_id", None)
+        if kv_lineage_parent_revision is None:
+            kv_lineage_parent_revision = int(getattr(request, "kv_lineage_parent_revision", 0))
+        if kv_lineage_revision is None:
+            kv_lineage_revision = int(getattr(request, "kv_lineage_revision", 0))
+        if kv_lineage_prefix_tokens is None:
+            kv_lineage_prefix_tokens = int(getattr(request, "kv_lineage_prefix_tokens", 0))
 
         return cls(
             request_id=request.request_id,
@@ -121,6 +156,17 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             abort_immediately=request.abort_immediately,
             additional_information=additional_information,
             model_intermediate_buffer=model_intermediate_buffer,
+            cache_token_ids=getattr(request, "cache_token_ids", None),
+            prefill_only=prefill_only,
+            kv_lineage_id=kv_lineage_id,
+            kv_lineage_parent_revision=kv_lineage_parent_revision,
+            kv_lineage_revision=kv_lineage_revision,
+            kv_lineage_prefix_tokens=kv_lineage_prefix_tokens,
+            kv_lineage_snapshot_block_hashes=getattr(request, "kv_lineage_snapshot_block_hashes", None),
+            kv_lineage_snapshot_num_computed_tokens=getattr(
+                request, "kv_lineage_snapshot_num_computed_tokens", 0
+            ),
+            kv_lineage_snapshot_hash_block_size=getattr(request, "kv_lineage_snapshot_hash_block_size", 0),
         )
 
 

@@ -46,6 +46,11 @@ def upgrade_to_omni_request(
     additional_information = None
     wire_payload = None
     model_intermediate_buffer = None
+    prefill_only = False
+    kv_lineage_id = None
+    kv_lineage_parent_revision = 0
+    kv_lineage_revision = 0
+    kv_lineage_prefix_tokens = 0
 
     if isinstance(raw_prompt, dict):
         if prompt_embeds is None:
@@ -58,12 +63,25 @@ def upgrade_to_omni_request(
             wire_payload = dict(raw_info)
         if isinstance(raw_buffer, dict):
             model_intermediate_buffer = raw_buffer
+        prefill_only = raw_prompt.get("prefill_only") is True
+        raw_lineage_id = raw_prompt.get("kv_lineage_id")
+        if isinstance(raw_lineage_id, str) and raw_lineage_id:
+            kv_lineage_id = raw_lineage_id
+            kv_lineage_parent_revision = int(raw_prompt.get("kv_lineage_parent_revision", 0))
+            kv_lineage_revision = int(raw_prompt.get("kv_lineage_revision", 0))
+            kv_lineage_prefix_tokens = max(0, int(raw_prompt.get("kv_lineage_prefix_tokens", 0)))
         additional_information = serialize_additional_information(
             wire_payload,
             log_prefix="AsyncOmniEngine",
         )
 
-    if prompt_embeds is None and additional_information is None and model_intermediate_buffer is None:
+    if (
+        prompt_embeds is None
+        and additional_information is None
+        and model_intermediate_buffer is None
+        and not prefill_only
+        and kv_lineage_id is None
+    ):
         return request
 
     return OmniEngineCoreRequest.from_request(
@@ -71,6 +89,11 @@ def upgrade_to_omni_request(
         prompt_embeds=prompt_embeds,
         additional_information=additional_information,
         model_intermediate_buffer=model_intermediate_buffer,
+        prefill_only=prefill_only,
+        kv_lineage_id=kv_lineage_id,
+        kv_lineage_parent_revision=kv_lineage_parent_revision,
+        kv_lineage_revision=kv_lineage_revision,
+        kv_lineage_prefix_tokens=kv_lineage_prefix_tokens,
     )
 
 

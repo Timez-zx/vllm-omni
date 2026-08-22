@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections import defaultdict
+import threading
+from collections import OrderedDict, defaultdict
 from collections.abc import Iterable
 from time import time
 from typing import Any
@@ -35,6 +36,7 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.outputs import OmniConnectorOutput
 
 logger = init_logger(__name__)
+_MAX_KV_LINEAGE_SNAPSHOTS = 4096
 
 
 class SampledLogprobContractError(RuntimeError):
@@ -127,6 +129,64 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
+        # Hash-only metadata for completed finite requests. This registry owns
+        # no KV blocks; normal prefix-cache eviction remains authoritative.
+        self.kv_cache_manager._omni_kv_lineage_lock = threading.Lock()
+        self.kv_cache_manager._omni_kv_lineage_snapshots = OrderedDict()
+
+    def _kv_lineage_registry(
+        self,
+    ) -> tuple[
+        threading.Lock,
+        OrderedDict[
+            tuple[str, int], tuple[tuple[object, ...], int, int]
+        ],
+    ]:
+        manager = self.kv_cache_manager
+        # Some unit tests construct the scheduler with __new__.
+        if not hasattr(manager, "_omni_kv_lineage_lock"):
+            manager._omni_kv_lineage_lock = threading.Lock()
+            manager._omni_kv_lineage_snapshots = OrderedDict()
+        return manager._omni_kv_lineage_lock, manager._omni_kv_lineage_snapshots
+
+    def prepare_kv_lineage_request(self, request: Any) -> None:
+        """Resolve an opaque parent handle before Request hashing begins."""
+        lineage_id = getattr(request, "kv_lineage_id", None)
+        parent_revision = int(getattr(request, "kv_lineage_parent_revision", 0))
+        if not lineage_id or parent_revision <= 0:
+            return
+        lineage_lock, lineage_snapshots = self._kv_lineage_registry()
+        key = (lineage_id, parent_revision)
+        with lineage_lock:
+            snapshot = lineage_snapshots.get(key)
+            if snapshot is not None:
+                lineage_snapshots.move_to_end(key)
+        if snapshot is None:
+            return
+        hashes, num_computed_tokens, hash_block_size = snapshot
+        request.kv_lineage_snapshot_block_hashes = list(hashes)
+        request.kv_lineage_snapshot_num_computed_tokens = num_computed_tokens
+        request.kv_lineage_snapshot_hash_block_size = hash_block_size
+
+    def _store_kv_lineage_snapshot(
+        self,
+        lineage_id: str,
+        revision: int,
+        block_hashes: list[object],
+        num_computed_tokens: int,
+        hash_block_size: int,
+    ) -> None:
+        if revision <= 0 or num_computed_tokens <= 0 or hash_block_size <= 0:
+            return
+        full_blocks = min(len(block_hashes), num_computed_tokens // hash_block_size)
+        snapshot = (tuple(block_hashes[:full_blocks]), num_computed_tokens, hash_block_size)
+        key = (lineage_id, revision)
+        lineage_lock, lineage_snapshots = self._kv_lineage_registry()
+        with lineage_lock:
+            lineage_snapshots[key] = snapshot
+            lineage_snapshots.move_to_end(key)
+            while len(lineage_snapshots) > _MAX_KV_LINEAGE_SNAPSHOTS:
+                lineage_snapshots.popitem(last=False)
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -470,7 +530,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             routed_experts = None
 
             # Check for stop and update request status.
-            if new_token_ids:
+            if bool(getattr(request, "prefill_only", False)) and (
+                self._get_confirmed_num_computed_tokens(request) >= request.num_prompt_tokens
+            ):
+                # The prompt KV is now materialized. Do not commit the sampled
+                # next token: this request exists only to populate reusable
+                # prefix blocks and must not create model-visible output.
+                request.status = RequestStatus.FINISHED_STOPPED
+                new_token_ids = []
+                stopped = True
+            elif new_token_ids:
                 num_sampled_tokens = len(new_token_ids)
                 new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
                 if new_logprobs is not None and len(new_token_ids) < num_sampled_tokens:
@@ -832,6 +901,34 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # TODO(wzliu)! for offline mode, we should not end process until all data is transferred
         """Mark a request as finished and free its resources."""
         assert request.is_finished()
+
+        lineage_id = getattr(request, "kv_lineage_id", None)
+        lineage_revision = int(getattr(request, "kv_lineage_revision", 0))
+        if (
+            lineage_id
+            and lineage_revision > 0
+            and request.status != RequestStatus.FINISHED_ABORTED
+        ):
+            confirmed_computed = self._get_confirmed_num_computed_tokens(request)
+            hash_block_size = int(getattr(self.kv_cache_manager.block_pool, "hash_block_size", 0))
+            self._store_kv_lineage_snapshot(
+                lineage_id,
+                lineage_revision,
+                request.block_hashes,
+                confirmed_computed,
+                hash_block_size,
+            )
+            logger.debug(
+                "[kv-lineage] store id=%s parent=%d revision=%d computed=%d "
+                "hashes=%d snapshot_found=%s seeded=%d",
+                lineage_id,
+                int(getattr(request, "kv_lineage_parent_revision", 0)),
+                lineage_revision,
+                confirmed_computed,
+                len(request.block_hashes),
+                bool(getattr(request, "kv_lineage_snapshot_found", False)),
+                int(getattr(request, "kv_lineage_seeded_tokens", 0)),
+            )
 
         self._omits_kv_transfer_cache.pop(request.request_id, None)
 

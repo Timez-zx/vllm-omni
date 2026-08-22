@@ -25,6 +25,71 @@ from vllm_omni.request import OmniRequest, OmniStreamingUpdate
 
 _PATCH_LOGGER = logging.getLogger("vllm_omni.patch")
 
+
+# =============================================================================
+# Make the multimodal processor cache safe for concurrent Omni requests
+# =============================================================================
+#
+# vLLM's default ``lru`` mode mirrors cache metadata in the API process and
+# payloads in EngineCore.  A cache hit therefore sends ``None`` over IPC and
+# assumes both LRUs still contain the same key.  Multi-stage Omni preprocesses
+# requests concurrently before handing them to a separate stage runtime, so
+# sender and receiver access order can differ.  Once either LRU evicts a
+# different item, EngineCore can receive a UUID-only hit for data it no longer
+# owns and abort the request with ``Expected a cached item for mm_hash``.
+#
+# ``processor_only`` is already an internal vLLM cache mode: it keeps complete
+# processed features in the API process and sends them on every request, while
+# EngineCore has no mirrored receiver cache.  It costs additional IPC but
+# makes eviction a performance event instead of a correctness failure.  vLLM
+# does not expose this internal mode through ModelConfig, so the canonical Omni
+# deployment opts in through this compatibility switch until shared-memory
+# cache startup is supported by the multi-stage runtime.
+_SAFE_MM_PROCESSOR_CACHE_ENV = "VLLM_OMNI_SAFE_MM_PROCESSOR_CACHE"
+
+
+def _safe_mm_processor_cache_type(cache_type: str | None) -> str | None:
+    enabled = os.environ.get(_SAFE_MM_PROCESSOR_CACHE_ENV, "0").lower() not in {
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    if enabled and cache_type == "lru":
+        return "processor_only"
+    return cache_type
+
+
+def _patch_multimodal_processor_cache_type() -> None:
+    try:
+        from vllm.multimodal.registry import MultiModalRegistry
+    except ImportError:
+        return
+
+    original = MultiModalRegistry._get_cache_type
+    if getattr(original, "_omni_safe_mm_cache_patched", False):
+        return
+
+    logged_safe_selection = False
+
+    def _patched_get_cache_type(self, vllm_config):
+        nonlocal logged_safe_selection
+        cache_type = original(self, vllm_config)
+        selected = _safe_mm_processor_cache_type(cache_type)
+        if selected != cache_type and not logged_safe_selection:
+            _PATCH_LOGGER.info(
+                "[mm-processor-cache] using processor_only instead of mirrored lru"
+            )
+            logged_safe_selection = True
+        return selected
+
+    _patched_get_cache_type._omni_safe_mm_cache_patched = True
+    MultiModalRegistry._get_cache_type = _patched_get_cache_type
+
+
+_patch_multimodal_processor_cache_type()
+
 # =============================================================================
 # Patch ModelConfig.is_mm_prefix_lm to support omni-specific models
 # =============================================================================

@@ -125,6 +125,7 @@ def test_video_stream_requests_delta_outputs_without_mutating_deploy_defaults():
     params = handler._sampling_params_for_request(StreamingVideoSessionConfig(model="test"))
 
     assert params is not None
+    assert params[0].max_tokens == 256
     assert all(param.output_kind == RequestOutputKind.DELTA for param in params)
     assert all(param.output_kind == RequestOutputKind.CUMULATIVE for param in defaults)
 
@@ -286,7 +287,166 @@ async def test_arrival_prefill_is_silent_thinker_only_one_token():
     assert ok is True
     assert len(calls) == 1
     assert calls[0]["output_modalities"] == ["text"]
+    assert calls[0]["priority"] == 10
     assert calls[0]["sampling_params_list"][0].max_tokens == 1
+    assert calls[0]["prompt"]["prefill_only"] is True
+
+
+@pytest.mark.asyncio
+async def test_audio_arrival_prefill_seals_one_second_and_leaves_query_tail():
+    warm_snapshots: list[tuple[int, list[int]]] = []
+    query_chunks: list[int] = []
+    warm_done = asyncio.Event()
+    query_done = asyncio.Event()
+
+    class EmptyEngine:
+        async def abort(self, _request_id):
+            return None
+
+    class CapturingHandler(QwenOmniStreamingVideoHandler):
+        async def _process_video_arrival_prefill(
+            self,
+            _config,
+            _frame_buffer,
+            _message_history,
+            _request_id,
+            _prewarmed_frames,
+            audio_buffer=None,
+            media_events=None,
+        ):
+            warm_snapshots.append(
+                (
+                    len(audio_buffer or ()),
+                    [
+                        len(event.payload)
+                        for event in (media_events or ())
+                        if event.modality == "audio"
+                    ],
+                )
+            )
+            warm_done.set()
+            return True
+
+        async def _process_query(self, *args, media_events=None, **kwargs):
+            del args, kwargs
+            query_chunks.extend(
+                len(event.payload)
+                for event in (media_events or ())
+                if event.modality == "audio"
+            )
+            query_done.set()
+
+    ws = TimedWebSocket()
+    handler = CapturingHandler(chat_service=object(), engine_client=EmptyEngine(), idle_timeout=5.0)
+    task = asyncio.create_task(handler.handle_session(ws))
+    ws.put(
+        {
+            "type": "session.config",
+            "model": "test",
+            "enable_video_arrival_prefill": False,
+            "enable_audio_arrival_prefill_approximation": True,
+        }
+    )
+    await asyncio.sleep(0)
+
+    pcm_200ms = b"\x01\x02" * 3200
+    for _ in range(4):
+        ws.put({"type": "audio.chunk", "data": _b64(pcm_200ms)})
+        await asyncio.sleep(0)
+    assert warm_snapshots == []
+
+    ws.put({"type": "audio.chunk", "data": _b64(pcm_200ms)})
+    await asyncio.wait_for(warm_done.wait(), timeout=2.0)
+    assert warm_snapshots == [(32000, [32000])]
+
+    tail = b"\x03\x04" * 1600
+    ws.put({"type": "audio.chunk", "data": _b64(tail)})
+    ws.put({"type": "video.query", "text": ""})
+    await asyncio.wait_for(query_done.wait(), timeout=2.0)
+    assert query_chunks == [32000, 3200]
+
+    ws.put({"type": "video.done"})
+    await asyncio.wait_for(task, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_arrival_prefill_admission_is_globally_bounded():
+    started: list[str] = []
+    release = asyncio.Event()
+
+    class HoldingEngine:
+        def generate(self, **kwargs):
+            async def _gen():
+                started.append(kwargs["request_id"])
+                await release.wait()
+                yield _text_result("discarded")
+
+            return _gen()
+
+    class CapturingHandler(QwenOmniStreamingVideoHandler):
+        async def _render_engine_prompt_with_compaction(self, *args, **kwargs):
+            return {"prompt_token_ids": list(range(64))}, {}
+
+    handler = CapturingHandler(chat_service=object(), engine_client=HoldingEngine())
+    config = StreamingVideoSessionConfig(model="test")
+    tasks = [
+        asyncio.create_task(handler._process_video_arrival_prefill(config, ["frame"], [], f"warm-{index}", {}))
+        for index in range(3)
+    ]
+    for _ in range(20):
+        if len(started) == 1:
+            break
+        await asyncio.sleep(0)
+
+    assert len(started) == 1
+    release.set()
+    assert await asyncio.gather(*tasks) == [True, True, True]
+
+
+@pytest.mark.asyncio
+async def test_arrival_prefill_is_not_globally_suppressed_by_foreground_work():
+    started = asyncio.Event()
+
+    class HoldingEngine:
+        def __init__(self):
+            self.aborted: list[str] = []
+
+        def generate(self, **kwargs):
+            async def _gen():
+                started.set()
+                await asyncio.Event().wait()
+                yield _text_result("unreachable")
+
+            return _gen()
+
+        async def abort(self, request_id):
+            self.aborted.append(request_id)
+
+    class CapturingHandler(QwenOmniStreamingVideoHandler):
+        async def _render_engine_prompt_with_compaction(self, *args, **kwargs):
+            return {"prompt_token_ids": list(range(64))}, {}
+
+    engine = HoldingEngine()
+    handler = CapturingHandler(chat_service=object(), engine_client=engine)
+    warmup = asyncio.create_task(
+        handler._process_video_arrival_prefill(
+            StreamingVideoSessionConfig(model="test"),
+            ["frame"],
+            [],
+            "warm-active",
+            {},
+        )
+    )
+    await started.wait()
+
+    # A foreground query in another session is not represented by a global
+    # admission gate. The single low-priority warm-up remains admitted until
+    # its owning session cancels it or it completes.
+    assert not warmup.done()
+    assert engine.aborted == []
+    warmup.cancel()
+    await asyncio.gather(warmup, return_exceptions=True)
+    assert handler._active_arrival_prefills == {}
 
 
 @pytest.mark.asyncio
@@ -336,14 +496,237 @@ async def test_arrival_prefill_prompts_are_cumulative_and_final_appends_audio():
         ["text"],
         ["text", "audio"],
     ]
+    assert [call["priority"] for call in calls] == [10, 10, 0]
     assert calls[0]["sampling_params_list"][0].max_tokens == 1
     assert calls[1]["sampling_params_list"][0].max_tokens == 1
+    cache_salts = [call["prompt"]["talker_cache_salt"] for call in calls]
+    assert len(set(cache_salts)) == 1
+    assert cache_salts[0].startswith("video-session:")
+
+
+def test_talker_cache_salt_is_private_and_session_isolated():
+    first = StreamingVideoSessionConfig(session_id="same-client-id")
+    second = StreamingVideoSessionConfig(session_id="same-client-id")
+
+    assert first._talker_cache_salt != second._talker_cache_salt
+    assert "talker_cache_salt" not in first.model_dump()
+
+
+def test_thinker_lineage_tracks_prefix_and_generated_tokens():
+    config = StreamingVideoSessionConfig(session_id="lineage-test")
+    first_prompt = {"prompt_token_ids": [1, 2, 3, 4]}
+    first = video_stream_base._attach_thinker_lineage(config, first_prompt)
+
+    assert first is not None
+    assert first.prefix_tokens == 0
+    assert video_stream_base._commit_thinker_lineage(config, first, [5, 6])
+
+    second_prompt = {"prompt_token_ids": [1, 2, 3, 4, 5, 6, 7]}
+    second = video_stream_base._attach_thinker_lineage(config, second_prompt)
+
+    assert second is not None
+    assert second.parent_revision == 1
+    assert second.prefix_tokens == 6
+    assert second_prompt["kv_lineage_prefix_tokens"] == 6
+
+
+def test_thinker_lineage_reset_invalidates_old_ticket():
+    config = StreamingVideoSessionConfig(session_id="lineage-reset")
+    prompt = {"prompt_token_ids": [1, 2, 3]}
+    ticket = video_stream_base._attach_thinker_lineage(config, prompt)
+    old_id = config._thinker_lineage_id
+
+    video_stream_base._reset_thinker_lineage(config)
+
+    assert config._thinker_lineage_id != old_id
+    assert config._thinker_lineage_revision == 0
+    assert not video_stream_base._commit_thinker_lineage(config, ticket)
+
+
+def test_processed_canonical_blocks_merge_multimodal_offsets_and_items():
+    from vllm.multimodal.inputs import (
+        MultiModalKwargsItem,
+        MultiModalKwargsItems,
+        PlaceholderRange,
+    )
+
+    first = {
+        "type": "multimodal",
+        "prompt_token_ids": [1, 2, 3],
+        "mm_kwargs": MultiModalKwargsItems({"image": [MultiModalKwargsItem.dummy()]}),
+        "mm_hashes": {"image": ["image-a"]},
+        "mm_placeholders": {"image": [PlaceholderRange(offset=1, length=1)]},
+    }
+    second = {
+        "type": "multimodal",
+        "prompt_token_ids": [4, 5, 6, 7],
+        "mm_kwargs": MultiModalKwargsItems({"audio": [MultiModalKwargsItem.dummy()]}),
+        "mm_hashes": {"audio": ["audio-b"]},
+        "mm_placeholders": {"audio": [PlaceholderRange(offset=0, length=2)]},
+    }
+
+    merged = OmniStreamingVideoHandler._merge_engine_prompt_blocks([first, second])
+
+    assert merged["prompt_token_ids"] == [1, 2, 3, 4, 5, 6, 7]
+    assert merged["mm_hashes"] == {"image": ["image-a"], "audio": ["audio-b"]}
+    assert merged["mm_placeholders"]["image"][0].offset == 1
+    assert merged["mm_placeholders"]["audio"][0].offset == 3
+    assert len(merged["mm_kwargs"]["image"]) == 1
+    assert len(merged["mm_kwargs"]["audio"]) == 1
+
+
+def test_audio_arrival_prompt_preserves_interleaved_media_order_and_stable_chunks():
+    handler = QwenOmniStreamingVideoHandler(chat_service=object())
+    first_frame = _b64(_make_jpeg(1, 2, 3))
+    second_frame = _b64(_make_jpeg(4, 5, 6))
+    first_audio = b"\x01\x02" * 16000
+    second_audio = b"\x03\x04" * 3200
+    events = [
+        video_stream_base._TurnMediaEvent("image", first_frame),
+        video_stream_base._TurnMediaEvent("audio", first_audio),
+        video_stream_base._TurnMediaEvent("image", second_frame),
+        video_stream_base._TurnMediaEvent("audio", second_audio),
+    ]
+
+    _, user = handler.build_engine_prompt(
+        StreamingVideoSessionConfig(enable_audio_arrival_prefill_approximation=True),
+        [first_frame, second_frame],
+        bytearray(first_audio + second_audio),
+        [],
+        "question",
+        {},
+        events,
+    )
+
+    content = user["content"]
+    assert [item["type"] for item in content] == [
+        "image_url",
+        "input_audio",
+        "image_url",
+        "input_audio",
+        "text",
+    ]
+    assert content[1]["uuid"].startswith("audio-stream-approx-v1:")
+    assert content[3]["uuid"].startswith("audio-stream-approx-v1:")
+    assert content[1]["uuid"] != content[3]["uuid"]
+
+
+def test_audio_arrival_prompt_removes_only_adjacent_internal_audio_boundaries():
+    from vllm.multimodal.inputs import PlaceholderRange
+
+    handler = QwenOmniStreamingVideoHandler(chat_service=object())
+    config = StreamingVideoSessionConfig(enable_audio_arrival_prefill_approximation=True)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_audio"},
+                {"type": "input_audio"},
+                {"type": "image_url"},
+            ],
+        }
+    ]
+    prompt = {
+        "type": "multimodal",
+        "prompt_token_ids": list(range(12)),
+        "mm_placeholders": {
+            "audio": [
+                PlaceholderRange(offset=1, length=2),
+                PlaceholderRange(offset=5, length=3),
+            ],
+            "image": [PlaceholderRange(offset=9, length=1)],
+        },
+    }
+
+    normalized = handler._normalize_engine_prompt_for_messages(config, messages, prompt)
+
+    assert normalized["prompt_token_ids"] == [0, 1, 2, 5, 6, 7, 8, 9, 10, 11]
+    assert [item.offset for item in normalized["mm_placeholders"]["audio"]] == [1, 3]
+    assert normalized["mm_placeholders"]["image"][0].offset == 7
 
 
 @pytest.mark.asyncio
-async def test_query_joins_current_arrival_prefill_without_resubmitting_snapshot():
+async def test_incremental_canonical_prompt_never_rerenders_completed_history():
+    rendered_roles: list[list[str]] = []
+    generated_prompts: list[dict[str, Any]] = []
+
+    class TextEngine:
+        def generate(self, *, prompt, **_kwargs):
+            generated_prompts.append(prompt)
+
+            async def _gen():
+                yield _text_result("answer")
+
+            return _gen()
+
+    class IncrementalHandler(QwenOmniStreamingVideoHandler):
+        def supports_incremental_canonical_prompt(self):
+            return True
+
+        async def _preprocess_to_engine_prompt(self, request):
+            roles = [message["role"] for message in request.messages]
+            rendered_roles.append(roles)
+            role_tokens = {"system": 10, "user": 20, "assistant": 30}
+            token_ids = [role_tokens[role] for role in roles]
+            if request.add_generation_prompt:
+                token_ids.append(99)
+            return {"type": "token", "prompt_token_ids": token_ids}
+
+    config = StreamingVideoSessionConfig(
+        model="test",
+        modalities=["text"],
+        system_prompt="system",
+        context_window_compaction_headroom_tokens=0,
+    )
+    history: list[dict[str, Any]] = []
+    handler = IncrementalHandler(chat_service=object(), engine_client=TextEngine())
+
+    await handler._process_query_engine(
+        MockWebSocket(),
+        config,
+        [],
+        bytearray(),
+        history,
+        "first",
+        "req-first",
+        asyncio.Event(),
+        {},
+    )
+    calls_after_first = len(rendered_roles)
+    await handler._process_query_engine(
+        MockWebSocket(),
+        config,
+        [],
+        bytearray(),
+        history,
+        "second",
+        "req-second",
+        asyncio.Event(),
+        {},
+    )
+
+    # Initialization renders only one-message blocks. The second turn renders
+    # only its current user block and the short completed assistant block.
+    assert all(len(roles) == 1 for roles in rendered_roles)
+    assert rendered_roles[calls_after_first:] == [["user"], ["assistant"]]
+    assert generated_prompts[0]["prompt_token_ids"] == [10, 20, 99]
+    assert generated_prompts[1]["prompt_token_ids"] == [10, 20, 30, 20, 99]
+    assert len(config._canonical_prompt_state.turn_blocks) == 2
+
+
+@pytest.mark.asyncio
+async def test_query_aborts_current_arrival_prefill_without_resubmitting_snapshot():
     warm_snapshots: list[int] = []
+    warm_started = asyncio.Event()
+    warm_cancelled = asyncio.Event()
     query_done = asyncio.Event()
+
+    class AbortableEngine:
+        def __init__(self):
+            self.aborted: list[str] = []
+
+        async def abort(self, request_id):
+            self.aborted.append(request_id)
 
     class CapturingHandler(QwenOmniStreamingVideoHandler):
         async def _process_video_arrival_prefill(
@@ -355,14 +738,19 @@ async def test_query_joins_current_arrival_prefill_without_resubmitting_snapshot
             prewarmed_frames,
         ):
             warm_snapshots.append(len(frame_buffer))
-            await asyncio.sleep(0.05)
-            return True
+            warm_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                warm_cancelled.set()
+                raise
 
         async def _process_query(self, *args, **kwargs):
             query_done.set()
 
     ws = TimedWebSocket()
-    handler = CapturingHandler(chat_service=object(), engine_client=object(), idle_timeout=5.0)
+    engine = AbortableEngine()
+    handler = CapturingHandler(chat_service=object(), engine_client=engine, idle_timeout=5.0)
     task = asyncio.create_task(handler.handle_session(ws))
     ws.put(
         {
@@ -373,12 +761,16 @@ async def test_query_joins_current_arrival_prefill_without_resubmitting_snapshot
     )
     await asyncio.sleep(0)
     ws.put({"type": "video.frame", "data": _b64(_make_jpeg())})
+    await asyncio.wait_for(warm_started.wait(), timeout=2.0)
     ws.put({"type": "video.query", "text": "describe"})
     await asyncio.wait_for(query_done.wait(), timeout=2.0)
     ws.put({"type": "video.done"})
     await asyncio.wait_for(task, timeout=2.0)
 
     assert warm_snapshots == [1]
+    assert warm_cancelled.is_set()
+    assert len(engine.aborted) == 1
+    assert engine.aborted[0].startswith("video-warm-")
 
 
 @pytest.mark.asyncio
@@ -1006,6 +1398,7 @@ async def test_context_compaction_drops_only_complete_oldest_turns():
             modalities=["text"],
             context_window_trigger_tokens=3000,
             context_window_target_tokens=1500,
+            context_window_compaction_headroom_tokens=0,
         ),
         [],
         bytearray(),
@@ -1058,6 +1451,7 @@ async def test_arrival_prefill_compacts_the_application_owned_history():
             modalities=["text"],
             context_window_trigger_tokens=3000,
             context_window_target_tokens=1500,
+            context_window_compaction_headroom_tokens=0,
         ),
         [_b64(_make_jpeg())],
         history,
@@ -1069,6 +1463,135 @@ async def test_arrival_prefill_compacts_the_application_owned_history():
     assert rendered_message_counts == [5, 3, 1]
     assert len(generated_prompts[0]["prompt_token_ids"]) == 1100
     assert history == []
+
+
+@pytest.mark.asyncio
+async def test_arrival_prefill_uses_compaction_headroom():
+    rendered_message_counts: list[int] = []
+
+    class EmptyEngine:
+        def generate(self, **_kwargs):
+            async def _gen():
+                if False:
+                    yield None
+
+            return _gen()
+
+    class CountingHandler(QwenOmniStreamingVideoHandler):
+        async def _preprocess_to_engine_prompt(self, request):
+            rendered_message_counts.append(len(request.messages))
+            return {"prompt_token_ids": list(range(1000 * len(request.messages)))}
+
+    history = [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    handler = CountingHandler(chat_service=object(), engine_client=EmptyEngine())
+
+    ok = await handler._process_video_arrival_prefill(
+        StreamingVideoSessionConfig(
+            model="test",
+            modalities=["text"],
+            context_window_trigger_tokens=5_000,
+            context_window_target_tokens=1_500,
+            context_window_compaction_headroom_tokens=2_000,
+        ),
+        [_b64(_make_jpeg())],
+        history,
+        "video-warm-headroom",
+        {},
+    )
+
+    assert ok is True
+    assert rendered_message_counts == [3, 1]
+    assert history == []
+
+
+@pytest.mark.asyncio
+async def test_context_compaction_uses_logarithmic_prompt_renders():
+    rendered_message_counts: list[int] = []
+
+    class CountingHandler(QwenOmniStreamingVideoHandler):
+        async def _preprocess_to_engine_prompt(self, request):
+            rendered_message_counts.append(len(request.messages))
+            return {"prompt_token_ids": list(range(1000 * len(request.messages)))}
+
+    history = []
+    for turn in range(16):
+        history.extend(
+            [
+                {"role": "user", "content": f"question {turn}"},
+                {"role": "assistant", "content": f"answer {turn}"},
+            ]
+        )
+    handler = CountingHandler(chat_service=object())
+
+    prompt, _ = await handler._render_engine_prompt_with_compaction(
+        StreamingVideoSessionConfig(
+            model="test",
+            context_window_trigger_tokens=20_000,
+            context_window_target_tokens=5_000,
+            context_window_compaction_headroom_tokens=0,
+        ),
+        [],
+        bytearray(),
+        history,
+        "current",
+        {},
+        output_modalities=["text"],
+    )
+
+    assert len(prompt["prompt_token_ids"]) == 5_000
+    assert len(history) == 4
+    assert rendered_message_counts[0] == 33
+    assert len(rendered_message_counts) <= 6
+
+
+@pytest.mark.asyncio
+async def test_post_response_headroom_compacts_before_next_turn():
+    rendered_message_counts: list[int] = []
+
+    class TextEngine:
+        def generate(self, **_kwargs):
+            async def _gen():
+                yield _text_result("new answer")
+
+            return _gen()
+
+    class CountingHandler(QwenOmniStreamingVideoHandler):
+        async def _preprocess_to_engine_prompt(self, request):
+            rendered_message_counts.append(len(request.messages))
+            return {"prompt_token_ids": list(range(1000 * len(request.messages)))}
+
+    history = [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    handler = CountingHandler(chat_service=object(), engine_client=TextEngine())
+
+    await handler._process_query_engine(
+        MockWebSocket(),
+        StreamingVideoSessionConfig(
+            model="test",
+            modalities=["text"],
+            context_window_trigger_tokens=5_000,
+            context_window_target_tokens=3_500,
+            context_window_compaction_headroom_tokens=2_000,
+        ),
+        [],
+        bytearray(),
+        history,
+        "new question",
+        "req-proactive-compact",
+        asyncio.Event(),
+        {},
+    )
+
+    assert rendered_message_counts == [3, 5, 3]
+    assert history == [
+        {"role": "user", "content": [{"type": "text", "text": "new question"}]},
+        {"role": "assistant", "content": "new answer"},
+    ]
 
 
 @pytest.mark.asyncio

@@ -8,11 +8,8 @@ busy loop in a subprocess, communicating with StageEngineCoreClient via ZMQ.
 from __future__ import annotations
 
 import contextlib
-import math
 import os
-import queue as _queue
 import signal
-import time as _time
 from typing import Any
 
 import vllm.v1.engine.core as _vllm_engine_core_module
@@ -61,6 +58,9 @@ class StageEngineCoreProc(EngineCoreProc):
 
     def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
         """Preserve omni payloads when vLLM builds its scheduler request."""
+        prepare_lineage = getattr(self.scheduler, "prepare_kv_lineage_request", None)
+        if prepare_lineage is not None:
+            prepare_lineage(request)
         scheduler_request, current_wave = super().preprocess_add_request(request)
         scheduler_request.additional_information = request.additional_information
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)

@@ -29,7 +29,7 @@ import wave
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 from probe import session_config, synth_frame_jpeg, synth_speechlike_pcm  # noqa: E402
 
-DEFAULT_PREBUFFER_MS = 60.0  # keep in step with app.js PLAYBACK_PREBUFFER_MS
+DEFAULT_PREBUFFER_MS = 500.0  # keep in step with app.js smooth mode
 
 
 def wav_seconds(raw: bytes) -> float:

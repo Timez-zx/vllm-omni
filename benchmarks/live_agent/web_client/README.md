@@ -9,14 +9,24 @@ The WebSocket is stateful, but engine requests are not:
 
 - the application retains accepted user audio, selected video, text, and the
   assistant response for the conversation;
+- processed canonical message blocks are retained by the application; each
+  turn renders only its new user block and completed assistant block, then
+  assembles the full token/media prompt for the finite engine request;
 - each accepted frame triggers or coalesces a silent, finite Thinker-only
-  request over full history plus the cumulative current-turn frames;
+  prefill request over full history plus the cumulative current-turn frames;
+- at most one low-priority arrival prefill runs across all sessions, preventing
+  a multi-user prefill batch without starving cache population whenever any
+  unrelated session is answering;
+- a final query cancels its session's unfinished warm-up; cache population is
+  background work and never blocks a correct full-prompt response;
 - the final query appends one complete WAV and creates a separate finite
   response request;
 - the Thinker may reuse identical blocks through vLLM prefix caching;
 - cache eviction or a miss changes latency only, never prompt semantics;
-- when the rendered prompt reaches 49,152 tokens, the application drops oldest
-  complete turns until the prompt fits 16,384 tokens.
+- at 32,768 tokens, ahead of the hard 49,152-token limit, the application uses
+  a logarithmic search to drop complete oldest turns toward 16,384 tokens; the
+  next arrival prefill warms that compacted lineage before it becomes
+  query-critical.
 
 Frames accepted since the preceding query are consumed by exactly one turn.
 Frames arriving during generation accumulate for the next turn. Similarity and
@@ -25,14 +35,20 @@ append-only and are never replaced by a latest-eight sliding window.
 
 The old persistent/resumable engine request, append into that live request,
 shadow compression, and Talker rolling paths have been removed. Arrival
-warm-ups are independent `output_modalities=["text"]`, `max_tokens=1` requests;
-their token is discarded and they cannot invoke Talker.
+warm-ups are independent `output_modalities=["text"]`, prefill-only requests;
+the scheduler does not commit their sampled next token and they cannot invoke
+Talker. Normal Thinker replies
+are capped at 256 tokens so one malformed long answer cannot turn a live voice
+capacity cell into a minutes-long generation test. Final responses use priority
+0 and warm-ups use priority 10.
 
 ## Canonical deployment
 
 Formal measurements use only
 `benchmarks/thinker_talker/origin_deploy_3gpu.yaml`: GPU 0 is Thinker, GPU 1 is
-Talker, and GPU 2 is Code2Wav. Thinker prefix caching is enabled.
+Talker, and GPU 2 is Code2Wav. Thinker prefix caching and priority scheduling
+are enabled. The launcher requires FlashInfer for Thinker and uses the safe
+API-side multimodal processor cache mode.
 
 ```bash
 RESULTS_DIR=/path/to/results \
@@ -60,13 +76,18 @@ Each user owns one long-lived WebSocket:
   silence;
 - an empty `video.query`, so query semantics come from speech;
 - playback-paced closed loop: the next think interval begins after simulated
-  1x playback;
+  1x playback; startup is measured when exactly 500 ms is available;
 - one speaker per session and no recording reuse within that session.
 
 The server scales frames to at most 640x352 and uses similarity threshold 0.95
 with freshness gap `[0,4]`. Every retained frame enters the cumulative turn
 prefix. Audio remains one complete WAV at query time so Qwen audio semantics do
 not depend on synthetic chunks.
+
+The canonical audio path emits an eight-frame initial codec chunk and
+four-frame steady chunks. This makes the first useful waveform large enough
+to clear the 500 ms prebuffer while later chunks replenish playback faster
+than real time.
 
 Prepare the deterministic SLURP/DAVIS workload:
 
@@ -91,9 +112,10 @@ TURNS=30 WARMUP_TURNS=2 \
 bash benchmarks/live_agent/web_client/run_av_session_ladder.sh
 ```
 
-A cell passes only if every measured turn completes, playback-start p99 is
+A cell passes only if every measured turn completes, audio-ready-500 p99 is
 below 1 s, playback stall p99 is below 50 ms, and client/engine checks are
-clean. Every cell records source and deploy hashes, the workload plan,
+clean. Raw TTFA is packetization-dependent and remains diagnostic only. Every
+cell records source and deploy hashes, the workload plan,
 per-turn output, the engine log, and GPU samples.
 
 Verify response and warm-up request identities, frame-ledger equality, and

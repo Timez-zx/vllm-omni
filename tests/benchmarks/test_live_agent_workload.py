@@ -146,7 +146,7 @@ def test_workload_constants_match_the_browser_client() -> None:
     assert VIDEO_INTERVAL_MS == 500
     assert ENDPOINT_SILENCE_MS == 700
     assert ECHO_GUARD_MS == 300
-    assert PLAYBACK_PREBUFFER_S == 1.4
+    assert PLAYBACK_PREBUFFER_S == 0.5
 
 
 def test_input_trace_round_trip_uses_frame_references(tmp_path: Path) -> None:
@@ -204,6 +204,8 @@ def test_capacity_uses_audible_playback_start_and_accepts_short_released_reply()
     summary = summarize([record], [user], {"turns_per_user": 1}, "", warmup_turns=0)
 
     assert summary["playback_start_p99_ms"] == 360.0
+    assert summary["audio_ready_500_p99_ms"] == 360.0
+    assert summary["audio_ready_threshold_ms"] == 500.0
     assert summary["capacity_pass"] is True
 
 

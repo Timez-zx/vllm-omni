@@ -38,13 +38,13 @@ import time as _time
 import uuid
 import wave
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol, runtime_checkable
 
 import torch
 from fastapi import WebSocket, WebSocketDisconnect
 from PIL import Image
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError, model_validator
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai import media_pipeline, video_stream_envs
@@ -60,6 +60,14 @@ _MAX_FRAME_SIZE = 10 * 1024 * 1024  # 10MB per frame
 _MAX_AUDIO_BUFFER_BYTES = 4 * 1024 * 1024
 _MAX_MSG_QUEUE = 200
 _CODEC_FRAME_SAMPLES = 1920  # CausalConv leading-edge artifact length
+_ARRIVAL_PREFILL_PRIORITY = 10  # Larger values are lower priority in vLLM.
+_ARRIVAL_PREFILL_MAX_CONCURRENCY = 1
+_AUDIO_INPUT_SAMPLE_RATE = 16000
+_AUDIO_INPUT_SAMPLE_WIDTH = 2
+_AUDIO_ARRIVAL_CHUNK_MS = 1000
+_AUDIO_ARRIVAL_CHUNK_BYTES = (
+    _AUDIO_INPUT_SAMPLE_RATE * _AUDIO_INPUT_SAMPLE_WIDTH * _AUDIO_ARRIVAL_CHUNK_MS // 1000
+)
 _BAD_FRAME = object()
 
 
@@ -103,6 +111,68 @@ def _prompt_token_count(prompt: Any) -> int:
     return len(token_ids or ())
 
 
+def _common_token_prefix(left: list[int], right: list[int]) -> int:
+    limit = min(len(left), len(right))
+    index = 0
+    while index < limit and left[index] == right[index]:
+        index += 1
+    return index
+
+
+def _attach_thinker_lineage(
+    config: "StreamingVideoSessionConfig",
+    engine_prompt: Any,
+) -> "_ThinkerLineageTicket | None":
+    """Attach an optimization hint while retaining the complete prompt."""
+    if not isinstance(engine_prompt, dict):
+        return None
+    raw_ids = engine_prompt.get("prompt_token_ids")
+    if not isinstance(raw_ids, list) or not all(isinstance(token, int) for token in raw_ids):
+        return None
+
+    prompt_ids = list(raw_ids)
+    prefix_tokens = _common_token_prefix(config._thinker_lineage_token_ids, prompt_ids)
+    parent_revision = config._thinker_lineage_revision
+    revision = parent_revision + 1
+    engine_prompt["kv_lineage_id"] = config._thinker_lineage_id
+    engine_prompt["kv_lineage_parent_revision"] = parent_revision
+    engine_prompt["kv_lineage_revision"] = revision
+    engine_prompt["kv_lineage_prefix_tokens"] = prefix_tokens
+    return _ThinkerLineageTicket(
+        lineage_id=config._thinker_lineage_id,
+        parent_revision=parent_revision,
+        revision=revision,
+        prompt_token_ids=tuple(prompt_ids),
+        prefix_tokens=prefix_tokens,
+    )
+
+
+def _commit_thinker_lineage(
+    config: "StreamingVideoSessionConfig",
+    ticket: "_ThinkerLineageTicket | None",
+    generated_token_ids: list[int] | None = None,
+) -> bool:
+    if (
+        ticket is None
+        or ticket.lineage_id != config._thinker_lineage_id
+        or ticket.parent_revision != config._thinker_lineage_revision
+    ):
+        return False
+    config._thinker_lineage_revision = ticket.revision
+    config._thinker_lineage_token_ids = [
+        *ticket.prompt_token_ids,
+        *(generated_token_ids or ()),
+    ]
+    return True
+
+
+def _reset_thinker_lineage(config: "StreamingVideoSessionConfig") -> None:
+    """Start a new cache lineage after canonical history is rewritten."""
+    config._thinker_lineage_id = f"thinker-session:{uuid.uuid4().hex}"
+    config._thinker_lineage_revision = 0
+    config._thinker_lineage_token_ids = []
+
+
 @runtime_checkable
 class VideoStreamPipelineHooks(Protocol):
     """Pipeline-specific hooks for streaming video handlers."""
@@ -119,6 +189,7 @@ class VideoStreamPipelineHooks(Protocol):
         message_history: list[dict[str, Any]],
         query_text: str,
         prewarmed_frames: dict[str, tuple[Any, str]],
+        media_events: list["_TurnMediaEvent"] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Build OpenAI-style messages and the current user message."""
         ...
@@ -142,10 +213,60 @@ class VideoStreamTurnTrigger:
     config: "StreamingVideoSessionConfig"
 
 
+@dataclass(frozen=True)
+class _TurnMediaEvent:
+    """One immutable, append-only media item in the current user turn."""
+
+    modality: str
+    payload: str | bytes
+
+
+@dataclass(frozen=True)
+class _ThinkerLineageTicket:
+    lineage_id: str
+    parent_revision: int
+    revision: int
+    prompt_token_ids: tuple[int, ...]
+    prefix_tokens: int
+
+
+@dataclass
+class _CanonicalPromptState:
+    """Application-owned, processed canonical history for one live session.
+
+    Blocks are ordinary renderer outputs, not engine requests or KV handles.
+    Keeping them here avoids decoding and processing every historical media
+    item again when the next finite request is constructed.
+    """
+
+    signature: tuple[Any, ...]
+    prefix_block: dict[str, Any]
+    turn_blocks: list[dict[str, Any]]
+    turn_message_ids: list[tuple[int, int]]
+    generation_suffix: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _CanonicalRenderTicket:
+    user_block: dict[str, Any]
+    history_turns: int
+
+
+_CANONICAL_RENDER_TICKET_KEY = "_vllm_omni_app_canonical_render_ticket"
+
+
 class StreamingVideoSessionConfig(BaseModel):
     """Application session policy; engine requests remain finite per turn."""
 
     model_config = ConfigDict(extra="forbid")
+
+    # Stable only for this application-session object.  It isolates Talker KV
+    # lineages without making the engine request itself session-aware.
+    _talker_cache_salt: str = PrivateAttr(default_factory=lambda: f"video-session:{uuid.uuid4().hex}")
+    _thinker_lineage_id: str = PrivateAttr(default_factory=lambda: f"thinker-session:{uuid.uuid4().hex}")
+    _thinker_lineage_revision: int = PrivateAttr(default=0)
+    _thinker_lineage_token_ids: list[int] = PrivateAttr(default_factory=list)
+    _canonical_prompt_state: _CanonicalPromptState | None = PrivateAttr(default=None)
 
     session_id: str | None = Field(default=None, min_length=1, max_length=128)
     model: str | None = None
@@ -160,6 +281,15 @@ class StreamingVideoSessionConfig(BaseModel):
             "Thinker-only finite requests as frames arrive."
         ),
     )
+    enable_audio_arrival_prefill_approximation: bool = Field(
+        default=False,
+        description=(
+            "Approximate streaming audio with immutable one-second chunks. "
+            "Arrival requests only populate Thinker caches; only video.query "
+            "may decode a response or invoke Talker. This is not bit-equivalent "
+            "to Qwen's full-utterance audio encoder."
+        ),
+    )
     system_prompt: str | None = Field(
         default=None,
         description="Custom system prompt.",
@@ -171,6 +301,14 @@ class StreamingVideoSessionConfig(BaseModel):
     sampling_params_list: list[dict[str, Any]] | None = Field(
         default=None,
         description="Per-stage sampling params [thinker, talker, code2wav].",
+    )
+    thinker_max_response_tokens: int = Field(
+        default=256,
+        ge=1,
+        description=(
+            "Hard cap for a normal Thinker response. Live voice turns must be "
+            "bounded even when the model ignores the short-answer system prompt."
+        ),
     )
     enable_frame_filter: bool = Field(
         default=True,
@@ -205,6 +343,14 @@ class StreamingVideoSessionConfig(BaseModel):
         ge=0,
         description="After compaction, retain newest complete turns within this prompt budget.",
     )
+    context_window_compaction_headroom_tokens: int = Field(
+        default=16384,
+        ge=0,
+        description=(
+            "Compact during post-response playback or an arrival warm-up when "
+            "the prompt is this close to the hard trigger; zero disables it."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_context_window(self) -> "StreamingVideoSessionConfig":
@@ -234,6 +380,7 @@ class OmniStreamingVideoHandler:
         message_history: list[dict[str, Any]],
         query_text: str,
         prewarmed_frames: dict[str, tuple[Any, str]],
+        media_events: list[_TurnMediaEvent] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         raise NotImplementedError
 
@@ -244,6 +391,20 @@ class OmniStreamingVideoHandler:
         response_text: str,
     ) -> None:
         raise NotImplementedError
+
+    def supports_incremental_canonical_prompt(self) -> bool:
+        """Whether processed chat-message blocks may be concatenated safely."""
+        return False
+
+    def _normalize_engine_prompt_for_messages(
+        self,
+        config: StreamingVideoSessionConfig,
+        messages: list[dict[str, Any]],
+        prompt: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Pipeline hook for semantics-preserving processed-prompt rewrites."""
+        del config, messages
+        return prompt
 
     def create_message_history(self, config: StreamingVideoSessionConfig) -> Any:
         """Per-session conversation state (default: empty OpenAI-style list)."""
@@ -270,6 +431,32 @@ class OmniStreamingVideoHandler:
         self._idle_timeout = idle_timeout
         self._config_timeout = config_timeout
         self._engine_client = engine_client
+        # Shared by every WebSocket served by this handler instance. Keep at
+        # most one low-priority cache-population request in flight so arrival
+        # prefill cannot form a multi-user prefill batch ahead of decode. A
+        # session's foreground query cancels only its own unfinished warm-up;
+        # globally suppressing warm-ups whenever any query is active starves
+        # prefix population under sustained multi-user load.
+        self._arrival_prefill_slots = asyncio.Semaphore(_ARRIVAL_PREFILL_MAX_CONCURRENCY)
+        self._arrival_prefill_admission_lock = asyncio.Lock()
+        self._active_arrival_prefills: dict[str, asyncio.Task[Any]] = {}
+
+    async def _admit_arrival_prefill(self, request_id: str) -> bool:
+        await self._arrival_prefill_slots.acquire()
+        task = asyncio.current_task()
+        assert task is not None
+        try:
+            async with self._arrival_prefill_admission_lock:
+                self._active_arrival_prefills[request_id] = task
+        except BaseException:
+            self._arrival_prefill_slots.release()
+            raise
+        return True
+
+    async def _release_arrival_prefill(self, request_id: str) -> None:
+        async with self._arrival_prefill_admission_lock:
+            self._active_arrival_prefills.pop(request_id, None)
+        self._arrival_prefill_slots.release()
 
     async def handle_session(self, websocket: WebSocket) -> None:
         """Main session loop for a single WebSocket connection."""
@@ -289,6 +476,8 @@ class OmniStreamingVideoHandler:
             )
             frames_since_retained = 0
             audio_buffer = bytearray()  # raw PCM16 16kHz mono
+            media_events: list[_TurnMediaEvent] = []
+            audio_sealed_bytes = 0
             message_history: Any = self.create_message_history(config)
             active_request_id: str | None = None
             prev_request_id: str | None = None  # abort target iff prev was interrupted
@@ -298,6 +487,7 @@ class OmniStreamingVideoHandler:
             query_task: asyncio.Task[Any] | None = None
             arrival_prefill_task: asyncio.Task[Any] | None = None
             arrival_prefill_dirty = False
+            arrival_prefill_request_id: str | None = None
 
             msg_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=_MAX_MSG_QUEUE)
 
@@ -359,13 +549,17 @@ class OmniStreamingVideoHandler:
                     query_task = None
 
             def _schedule_arrival_prefill() -> None:
-                """Coalesce accepted frames into serial finite warm-up requests."""
+                """Coalesce append-only media into serial finite warm-up requests."""
                 nonlocal arrival_prefill_task, arrival_prefill_dirty
+                video_ready = config.enable_video_arrival_prefill and bool(frame_buffer)
+                audio_ready = (
+                    config.enable_audio_arrival_prefill_approximation
+                    and audio_sealed_bytes > 0
+                )
                 if (
-                    not config.enable_video_arrival_prefill
-                    or self._engine_client is None
+                    self._engine_client is None
                     or active_request_id is not None
-                    or not frame_buffer
+                    or not (video_ready or audio_ready)
                 ):
                     return
                 arrival_prefill_dirty = True
@@ -373,42 +567,77 @@ class OmniStreamingVideoHandler:
                     return
 
                 async def _run() -> None:
-                    nonlocal arrival_prefill_dirty
-                    while arrival_prefill_dirty and active_request_id is None and frame_buffer:
+                    nonlocal arrival_prefill_dirty, arrival_prefill_request_id
+                    while arrival_prefill_dirty and active_request_id is None:
                         arrival_prefill_dirty = False
                         frames = list(frame_buffer)
+                        audio = bytearray(audio_buffer[:audio_sealed_bytes])
+                        events = list(media_events)
                         cached = {
                             frame: frame_pil_cache[frame]
                             for frame in frames
                             if frame in frame_pil_cache
                         }
                         request_id = f"video-warm-{uuid.uuid4().hex[:12]}"
-                        await self._process_video_arrival_prefill(
-                            config,
-                            frames,
-                            message_history,
-                            request_id,
-                            cached,
-                        )
+                        arrival_prefill_request_id = request_id
+                        try:
+                            kwargs: dict[str, Any] = {}
+                            if config.enable_audio_arrival_prefill_approximation:
+                                kwargs["audio_buffer"] = audio
+                                kwargs["media_events"] = events
+                            await self._process_video_arrival_prefill(
+                                config, frames, message_history, request_id, cached, **kwargs
+                            )
+                        finally:
+                            if arrival_prefill_request_id == request_id:
+                                arrival_prefill_request_id = None
 
                 arrival_prefill_task = asyncio.create_task(_run())
 
             async def _finish_arrival_prefill() -> None:
-                nonlocal arrival_prefill_task
-                # Every accepted frame schedules a warm-up immediately.  At
-                # query time only join that work; calling the scheduler again
-                # would mark an already-current snapshot dirty and submit the
-                # same cumulative prefix twice.
-                if arrival_prefill_task is None:
-                    _schedule_arrival_prefill()
+                """Yield the session's background prefill slot to its query.
+
+                A warm-up is optional: the final finite request always carries
+                the complete canonical prompt. Waiting for a cumulative warm-up
+                here turns background work into query-critical work and lets an
+                arrival backlog inflate TTFA. Cancel it instead; any prefix KV
+                materialized before the abort remains only an optional cache
+                optimization, never application state.
+                """
+                nonlocal arrival_prefill_task, arrival_prefill_dirty
+                started = _time.monotonic()
+                arrival_prefill_dirty = False
                 task = arrival_prefill_task
+                request_id = arrival_prefill_request_id
+                warmup_was_running = task is not None and not task.done()
+                aborted = False
                 if task is not None and not task.done():
+                    task.cancel()
+                    if request_id is not None and self._engine_client is not None:
+                        try:
+                            await self._engine_client.abort(request_id)
+                            aborted = True
+                        except Exception:
+                            logger.debug(
+                                "Abort failed for arrival prefill %s",
+                                request_id,
+                                exc_info=True,
+                            )
                     await asyncio.gather(task, return_exceptions=True)
                 arrival_prefill_task = None
+                logger.info(
+                    "[query-admission] session=%s warmup_running=%s "
+                    "warmup_aborted=%s handoff_ms=%.1f",
+                    config.session_id or "-",
+                    warmup_was_running,
+                    aborted,
+                    (_time.monotonic() - started) * 1000.0,
+                )
 
             async def _start_query_turn(*, query_text: str) -> None:
                 """Schedule a new inference turn from the current buffers."""
                 nonlocal active_request_id, prev_request_id, prev_was_interrupted, query_task
+                nonlocal audio_sealed_bytes
 
                 await _cancel_active_query()
 
@@ -416,8 +645,9 @@ class OmniStreamingVideoHandler:
                     await self._send_error(websocket, "No input buffered")
                     return
 
-                # Serialize the final response behind the latest cumulative
-                # frame warm-up so its prefix is visible to the cache lookup.
+                # The final request is complete and remains correct on a cache
+                # miss. Cancel only this session's unfinished optional warm-up;
+                # one low-priority warm-up from another session may continue.
                 await _finish_arrival_prefill()
 
                 if prev_was_interrupted and prev_request_id and self._engine_client:
@@ -440,6 +670,13 @@ class OmniStreamingVideoHandler:
                 frame_metadata.clear()
                 query_audio_buffer = bytearray(audio_buffer)
                 audio_buffer.clear()
+                query_media_events = list(media_events)
+                if config.enable_audio_arrival_prefill_approximation:
+                    tail = bytes(query_audio_buffer[audio_sealed_bytes:])
+                    if tail:
+                        query_media_events.append(_TurnMediaEvent("audio", tail))
+                media_events.clear()
+                audio_sealed_bytes = 0
                 query_prewarmed_frames = {
                     frame: frame_pil_cache.pop(frame)
                     for frame in query_frames
@@ -452,6 +689,8 @@ class OmniStreamingVideoHandler:
                         process_kwargs: dict[str, Any] = {}
                         if any(metadata.get("frame_id") for metadata in query_frame_metadata):
                             process_kwargs["frame_metadata"] = query_frame_metadata
+                        if config.enable_audio_arrival_prefill_approximation:
+                            process_kwargs["media_events"] = query_media_events
                         await self._process_query(
                             websocket,
                             config,
@@ -479,6 +718,7 @@ class OmniStreamingVideoHandler:
                 """Process enqueued messages."""
                 nonlocal active_request_id, prev_request_id, prev_was_interrupted, query_task
                 nonlocal frames_since_retained
+                nonlocal audio_sealed_bytes
 
                 while True:
                     msg = await msg_queue.get()
@@ -497,6 +737,11 @@ class OmniStreamingVideoHandler:
                             ]
                             frame_buffer[:] = [frame_buffer[index] for index in retained_indices]
                             frame_metadata[:] = [frame_metadata[index] for index in retained_indices]
+                            media_events[:] = [
+                                event
+                                for event in media_events
+                                if not (event.modality == "image" and event.payload == frame_data)
+                            ]
                         if frame_pil_cache.get(frame_data) is _BAD_FRAME:
                             frame_pil_cache.pop(frame_data, None)
                         if removed:
@@ -576,6 +821,8 @@ class OmniStreamingVideoHandler:
                         frames_since_retained = 0
                         mm_uuid = hashlib.md5(raw_bytes, usedforsecurity=False).hexdigest()
                         frame_buffer.append(frame_data)
+                        if config.enable_audio_arrival_prefill_approximation:
+                            media_events.append(_TurnMediaEvent("image", frame_data))
                         frame_metadata.append(
                             {
                                 "frame_id": msg.get("frame_id"),
@@ -653,8 +900,21 @@ class OmniStreamingVideoHandler:
                         if len(audio_buffer) + len(pcm_bytes) > _MAX_AUDIO_BUFFER_BYTES:
                             await self._send_error(websocket, "Audio buffer overflow")
                             audio_buffer.clear()
+                            audio_sealed_bytes = 0
+                            media_events[:] = [event for event in media_events if event.modality != "audio"]
                             continue
                         audio_buffer.extend(pcm_bytes)
+                        if config.enable_audio_arrival_prefill_approximation:
+                            sealed_new_chunk = False
+                            while len(audio_buffer) - audio_sealed_bytes >= _AUDIO_ARRIVAL_CHUNK_BYTES:
+                                stop = audio_sealed_bytes + _AUDIO_ARRIVAL_CHUNK_BYTES
+                                media_events.append(
+                                    _TurnMediaEvent("audio", bytes(audio_buffer[audio_sealed_bytes:stop]))
+                                )
+                                audio_sealed_bytes = stop
+                                sealed_new_chunk = True
+                            if sealed_new_chunk:
+                                _schedule_arrival_prefill()
 
                     elif msg_type == "video.query":
                         query_text = msg.get("text", "")
@@ -664,9 +924,23 @@ class OmniStreamingVideoHandler:
                                 decoded = base64.b64decode(audio_data_b64)
                                 if len(audio_buffer) + len(decoded) <= _MAX_AUDIO_BUFFER_BYTES:
                                     audio_buffer.extend(decoded)
+                                    if config.enable_audio_arrival_prefill_approximation:
+                                        while len(audio_buffer) - audio_sealed_bytes >= _AUDIO_ARRIVAL_CHUNK_BYTES:
+                                            stop = audio_sealed_bytes + _AUDIO_ARRIVAL_CHUNK_BYTES
+                                            media_events.append(
+                                                _TurnMediaEvent(
+                                                    "audio",
+                                                    bytes(audio_buffer[audio_sealed_bytes:stop]),
+                                                )
+                                            )
+                                            audio_sealed_bytes = stop
                                 else:
                                     await self._send_error(websocket, "Audio buffer overflow")
                                     audio_buffer.clear()
+                                    audio_sealed_bytes = 0
+                                    media_events[:] = [
+                                        event for event in media_events if event.modality != "audio"
+                                    ]
                             except Exception:
                                 pass
 
@@ -771,6 +1045,7 @@ class OmniStreamingVideoHandler:
         interrupt_event: asyncio.Event,
         prewarmed_frames: dict[str, tuple[Any, str]],
         frame_metadata: list[dict[str, Any]] | None = None,
+        media_events: list[_TurnMediaEvent] | None = None,
     ) -> None:
         """Build prompt, run inference, stream text + audio response."""
 
@@ -781,6 +1056,8 @@ class OmniStreamingVideoHandler:
         engine_kwargs: dict[str, Any] = {}
         if frame_metadata:
             engine_kwargs["frame_metadata"] = frame_metadata
+        if media_events is not None:
+            engine_kwargs["media_events"] = media_events
         await self._process_query_engine(
             websocket,
             config,
@@ -825,14 +1102,344 @@ class OmniStreamingVideoHandler:
         # each response.audio.delta contains only newly generated samples.
         params = coerce_param_message_types(params, is_streaming=True)
 
-        if thinker_max_tokens is not None:
+        effective_thinker_max_tokens = (
+            thinker_max_tokens
+            if thinker_max_tokens is not None
+            else config.thinker_max_response_tokens
+        )
+        if effective_thinker_max_tokens is not None:
             if not params:
                 from vllm import SamplingParams
 
                 params = [SamplingParams()]
-            params[0].max_tokens = thinker_max_tokens
+            params[0].max_tokens = effective_thinker_max_tokens
             params[0].min_tokens = 0
         return params or None
+
+    def _chat_request(
+        self,
+        config: StreamingVideoSessionConfig,
+        messages: list[dict[str, Any]],
+        *,
+        output_modalities: list[str],
+        add_generation_prompt: bool,
+    ) -> Any:
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionRequest,
+        )
+
+        request_kwargs: dict[str, Any] = {
+            "model": config.model or "default",
+            "messages": messages,
+            "stream": True,
+            "modalities": output_modalities,
+            "add_generation_prompt": add_generation_prompt,
+            "continue_final_message": False,
+            "add_special_tokens": False,
+        }
+        # Keep multimodal hashing identical between image-only warm-ups and
+        # the final request that appends audio. A changed processor kwarg is a
+        # different cache key even when the media UUID stays the same.
+        if config.use_audio_in_video:
+            request_kwargs["mm_processor_kwargs"] = {"use_audio_in_video": True}
+        if config.sampling_params_list:
+            request_kwargs["sampling_params_list"] = config.sampling_params_list
+        return ChatCompletionRequest(**request_kwargs)
+
+    async def _render_message_block(
+        self,
+        config: StreamingVideoSessionConfig,
+        messages: list[dict[str, Any]],
+        *,
+        output_modalities: list[str],
+        add_generation_prompt: bool,
+    ) -> dict[str, Any]:
+        prompt = await self._preprocess_to_engine_prompt(
+            self._chat_request(
+                config,
+                messages,
+                output_modalities=output_modalities,
+                add_generation_prompt=add_generation_prompt,
+            )
+        )
+        if not self._is_mergeable_engine_prompt(prompt):
+            raise ValueError("renderer did not return a mergeable token prompt")
+        return self._normalize_engine_prompt_for_messages(config, messages, prompt)
+
+    @staticmethod
+    def _is_mergeable_engine_prompt(prompt: Any) -> bool:
+        if not isinstance(prompt, dict) or prompt.get("type") not in {"token", "multimodal"}:
+            return False
+        token_ids = prompt.get("prompt_token_ids")
+        if not isinstance(token_ids, list) or not all(isinstance(token, int) for token in token_ids):
+            return False
+        if prompt.get("type") == "multimodal":
+            return all(key in prompt for key in ("mm_kwargs", "mm_hashes", "mm_placeholders"))
+        return True
+
+    @staticmethod
+    def _merge_engine_prompt_blocks(blocks: list[dict[str, Any]]) -> dict[str, Any]:
+        """Concatenate already processed message blocks into one engine input."""
+        from vllm.multimodal.inputs import MultiModalKwargsItems
+
+        prompt_token_ids: list[int] = []
+        kwargs_by_modality: dict[str, list[Any]] = {}
+        hashes_by_modality: dict[str, list[str]] = {}
+        placeholders_by_modality: dict[str, list[Any]] = {}
+        arrival_time: float | None = None
+
+        for block in blocks:
+            if not OmniStreamingVideoHandler._is_mergeable_engine_prompt(block):
+                raise ValueError("cannot merge an unsupported engine prompt block")
+            offset = len(prompt_token_ids)
+            prompt_token_ids.extend(block["prompt_token_ids"])
+            if isinstance(block.get("arrival_time"), (int, float)):
+                arrival_time = float(block["arrival_time"])
+            if block.get("type") != "multimodal":
+                continue
+            for modality, items in block["mm_kwargs"].items():
+                kwargs_by_modality.setdefault(modality, []).extend(items)
+            for modality, hashes in block["mm_hashes"].items():
+                hashes_by_modality.setdefault(modality, []).extend(hashes)
+            for modality, placeholders in block["mm_placeholders"].items():
+                target = placeholders_by_modality.setdefault(modality, [])
+                target.extend(replace(item, offset=item.offset + offset) for item in placeholders)
+
+        if kwargs_by_modality or hashes_by_modality or placeholders_by_modality:
+            merged: dict[str, Any] = {
+                "type": "multimodal",
+                "prompt_token_ids": prompt_token_ids,
+                "mm_kwargs": MultiModalKwargsItems(kwargs_by_modality),
+                "mm_hashes": hashes_by_modality,
+                "mm_placeholders": placeholders_by_modality,
+            }
+        else:
+            merged = {"type": "token", "prompt_token_ids": prompt_token_ids}
+        if arrival_time is not None:
+            merged["arrival_time"] = arrival_time
+        return merged
+
+    @staticmethod
+    def _strip_generation_suffix(
+        block: dict[str, Any],
+        generation_suffix: tuple[int, ...],
+    ) -> dict[str, Any]:
+        token_ids = block["prompt_token_ids"]
+        suffix_len = len(generation_suffix)
+        if suffix_len <= 0 or tuple(token_ids[-suffix_len:]) != generation_suffix:
+            raise ValueError("current turn does not end in the canonical generation suffix")
+        user_len = len(token_ids) - suffix_len
+        for placeholders in block.get("mm_placeholders", {}).values():
+            if any(item.offset + item.length > user_len for item in placeholders):
+                raise ValueError("generation suffix overlaps a multimodal placeholder")
+        user_block = dict(block)
+        user_block["prompt_token_ids"] = list(token_ids[:user_len])
+        assistant_mask = user_block.get("assistant_tokens_mask")
+        if isinstance(assistant_mask, list):
+            user_block["assistant_tokens_mask"] = assistant_mask[:user_len]
+        return user_block
+
+    @staticmethod
+    def _canonical_signature(config: StreamingVideoSessionConfig) -> tuple[Any, ...]:
+        return (
+            config.model or "default",
+            config.system_prompt,
+            bool(config.use_audio_in_video),
+            bool(config.enable_audio_arrival_prefill_approximation),
+        )
+
+    async def _initialize_canonical_prompt_state(
+        self,
+        config: StreamingVideoSessionConfig,
+        message_history: list[dict[str, Any]],
+        *,
+        output_modalities: list[str],
+    ) -> _CanonicalPromptState:
+        if config.system_prompt:
+            prefix_block = await self._render_message_block(
+                config,
+                [{"role": "system", "content": config.system_prompt}],
+                output_modalities=output_modalities,
+                add_generation_prompt=False,
+            )
+        else:
+            prefix_block = {"type": "token", "prompt_token_ids": []}
+
+        probe = [{"role": "user", "content": "canonical-boundary-probe"}]
+        probe_without_generation = await self._render_message_block(
+            config,
+            probe,
+            output_modalities=output_modalities,
+            add_generation_prompt=False,
+        )
+        probe_with_generation = await self._render_message_block(
+            config,
+            probe,
+            output_modalities=output_modalities,
+            add_generation_prompt=True,
+        )
+        probe_prefix = probe_without_generation["prompt_token_ids"]
+        probe_full = probe_with_generation["prompt_token_ids"]
+        if probe_full[: len(probe_prefix)] != probe_prefix:
+            raise ValueError("chat template is not append-only at a generation boundary")
+        generation_suffix = tuple(probe_full[len(probe_prefix) :])
+        if not generation_suffix:
+            raise ValueError("chat template produced an empty generation suffix")
+
+        if len(message_history) % 2:
+            raise ValueError("canonical history must contain complete user/assistant pairs")
+        turn_blocks: list[dict[str, Any]] = []
+        turn_message_ids: list[tuple[int, int]] = []
+        for index in range(0, len(message_history), 2):
+            user_message = message_history[index]
+            assistant_message = message_history[index + 1]
+            user_block = await self._render_message_block(
+                config,
+                [user_message],
+                output_modalities=output_modalities,
+                add_generation_prompt=False,
+            )
+            assistant_block = await self._render_message_block(
+                config,
+                [assistant_message],
+                output_modalities=output_modalities,
+                add_generation_prompt=False,
+            )
+            turn_blocks.append(self._merge_engine_prompt_blocks([user_block, assistant_block]))
+            turn_message_ids.append((id(user_message), id(assistant_message)))
+
+        state = _CanonicalPromptState(
+            signature=self._canonical_signature(config),
+            prefix_block=prefix_block,
+            turn_blocks=turn_blocks,
+            turn_message_ids=turn_message_ids,
+            generation_suffix=generation_suffix,
+        )
+        config._canonical_prompt_state = state
+        return state
+
+    @staticmethod
+    def _canonical_history_offset(
+        state: _CanonicalPromptState,
+        message_history: list[dict[str, Any]],
+    ) -> int | None:
+        if len(message_history) % 2:
+            return None
+        pairs = [
+            (id(message_history[index]), id(message_history[index + 1]))
+            for index in range(0, len(message_history), 2)
+        ]
+        offset = len(state.turn_message_ids) - len(pairs)
+        if offset < 0 or state.turn_message_ids[offset:] != pairs:
+            return None
+        return offset
+
+    async def _render_incremental_canonical_prompt(
+        self,
+        config: StreamingVideoSessionConfig,
+        message_history: list[dict[str, Any]],
+        current_user_message: dict[str, Any],
+        *,
+        output_modalities: list[str],
+    ) -> tuple[dict[str, Any], _CanonicalRenderTicket]:
+        state = config._canonical_prompt_state
+        if state is None or state.signature != self._canonical_signature(config):
+            state = await self._initialize_canonical_prompt_state(
+                config,
+                message_history,
+                output_modalities=output_modalities,
+            )
+        history_offset = self._canonical_history_offset(state, message_history)
+        if history_offset is None:
+            # External mutation or a failed prior commit: rebuild once from the
+            # application-owned messages, then resume incremental operation.
+            config._canonical_prompt_state = None
+            state = await self._initialize_canonical_prompt_state(
+                config,
+                message_history,
+                output_modalities=output_modalities,
+            )
+            history_offset = 0
+
+        current_block = await self._render_message_block(
+            config,
+            [current_user_message],
+            output_modalities=output_modalities,
+            add_generation_prompt=True,
+        )
+        user_block = self._strip_generation_suffix(current_block, state.generation_suffix)
+        prompt = self._merge_engine_prompt_blocks(
+            [state.prefix_block, *state.turn_blocks[history_offset:], current_block]
+        )
+        return prompt, _CanonicalRenderTicket(
+            user_block=user_block,
+            history_turns=len(message_history) // 2,
+        )
+
+    @staticmethod
+    def _pop_canonical_render_ticket(engine_prompt: Any) -> _CanonicalRenderTicket | None:
+        if not isinstance(engine_prompt, dict):
+            return None
+        ticket = engine_prompt.pop(_CANONICAL_RENDER_TICKET_KEY, None)
+        return ticket if isinstance(ticket, _CanonicalRenderTicket) else None
+
+    async def _commit_canonical_turn(
+        self,
+        config: StreamingVideoSessionConfig,
+        ticket: _CanonicalRenderTicket | None,
+        message_history: list[dict[str, Any]],
+        *,
+        output_modalities: list[str],
+    ) -> None:
+        state = config._canonical_prompt_state
+        if (
+            ticket is None
+            or state is None
+            or len(state.turn_blocks) != ticket.history_turns
+            or len(message_history) != 2 * (ticket.history_turns + 1)
+        ):
+            config._canonical_prompt_state = None
+            return
+
+        user_message = message_history[-2]
+        assistant_message = message_history[-1]
+        try:
+            assistant_block = await self._render_message_block(
+                config,
+                [assistant_message],
+                output_modalities=output_modalities,
+                add_generation_prompt=False,
+            )
+            state.turn_blocks.append(
+                self._merge_engine_prompt_blocks([ticket.user_block, assistant_block])
+            )
+            state.turn_message_ids.append((id(user_message), id(assistant_message)))
+            logger.info(
+                "[canonical-prompt] session=%s committed_turns=%d cached_tokens=%d",
+                config.session_id or "-",
+                len(state.turn_blocks),
+                sum(len(block["prompt_token_ids"]) for block in state.turn_blocks),
+            )
+        except Exception:
+            config._canonical_prompt_state = None
+            logger.warning(
+                "Failed to commit incremental canonical history; next turn will rebuild",
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _compact_canonical_prompt_state(
+        config: StreamingVideoSessionConfig,
+        dropped_turns: int,
+    ) -> None:
+        state = config._canonical_prompt_state
+        if state is None or dropped_turns <= 0:
+            return
+        if dropped_turns > len(state.turn_blocks):
+            config._canonical_prompt_state = None
+            return
+        del state.turn_blocks[:dropped_turns]
+        del state.turn_message_ids[:dropped_turns]
 
     async def _render_engine_prompt(
         self,
@@ -844,12 +1451,9 @@ class OmniStreamingVideoHandler:
         prewarmed_frames: dict[str, tuple[Any, str]],
         *,
         output_modalities: list[str],
+        media_events: list[_TurnMediaEvent] | None = None,
     ) -> tuple[Any, dict[str, Any]]:
-        from vllm.entrypoints.openai.chat_completion.protocol import (
-            ChatCompletionRequest,
-        )
-
-        messages, current_user_message = self.build_engine_prompt(
+        build_args = (
             config,
             frame_buffer,
             audio_buffer,
@@ -857,27 +1461,53 @@ class OmniStreamingVideoHandler:
             query_text,
             prewarmed_frames,
         )
-        request_kwargs: dict[str, Any] = {
-            "model": config.model or "default",
-            "messages": messages,
-            "stream": True,
-            "modalities": output_modalities,
-            "add_generation_prompt": True,
-            "continue_final_message": False,
-            "add_special_tokens": False,
-        }
-        # Keep multimodal hashing identical between image-only warm-ups and
-        # the final request that appends audio. A changed processor kwarg is a
-        # different cache key even when the image UUID stays the same.
-        if config.use_audio_in_video:
-            request_kwargs["mm_processor_kwargs"] = {"use_audio_in_video": True}
-        if config.sampling_params_list:
-            request_kwargs["sampling_params_list"] = config.sampling_params_list
-        chat_request = ChatCompletionRequest(**request_kwargs)
-        return (
-            await self._preprocess_to_engine_prompt(chat_request),
-            current_user_message,
-        )
+        if media_events is None:
+            messages, current_user_message = self.build_engine_prompt(*build_args)
+        else:
+            messages, current_user_message = self.build_engine_prompt(
+                *build_args, media_events
+            )
+        if self.supports_incremental_canonical_prompt():
+            try:
+                engine_prompt, ticket = await self._render_incremental_canonical_prompt(
+                    config,
+                    message_history,
+                    current_user_message,
+                    output_modalities=output_modalities,
+                )
+                engine_prompt[_CANONICAL_RENDER_TICKET_KEY] = ticket
+            except Exception:
+                config._canonical_prompt_state = None
+                logger.warning(
+                    "Incremental canonical prompt unavailable; falling back to full render",
+                    exc_info=True,
+                )
+                engine_prompt = await self._preprocess_to_engine_prompt(
+                    self._chat_request(
+                        config,
+                        messages,
+                        output_modalities=output_modalities,
+                        add_generation_prompt=True,
+                    )
+                )
+                engine_prompt = self._normalize_engine_prompt_for_messages(
+                    config, messages, engine_prompt
+                )
+        else:
+            engine_prompt = await self._preprocess_to_engine_prompt(
+                self._chat_request(
+                    config,
+                    messages,
+                    output_modalities=output_modalities,
+                    add_generation_prompt=True,
+                )
+            )
+            engine_prompt = self._normalize_engine_prompt_for_messages(
+                config, messages, engine_prompt
+            )
+        if isinstance(engine_prompt, dict):
+            engine_prompt["talker_cache_salt"] = config._talker_cache_salt
+        return engine_prompt, current_user_message
 
     async def _process_video_arrival_prefill(
         self,
@@ -886,26 +1516,47 @@ class OmniStreamingVideoHandler:
         message_history: list[dict[str, Any]],
         request_id: str,
         prewarmed_frames: dict[str, tuple[Any, str]],
+        audio_buffer: bytearray | None = None,
+        media_events: list[_TurnMediaEvent] | None = None,
     ) -> bool:
-        """Materialize one cumulative video prefix without invoking Talker."""
-        if self._engine_client is None or not frame_buffer:
+        """Materialize one cumulative media prefix without invoking Talker."""
+        arrival_audio = audio_buffer or bytearray()
+        if self._engine_client is None or (not frame_buffer and not arrival_audio):
+            return False
+        admitted = await self._admit_arrival_prefill(request_id)
+        if not admitted:
             return False
         try:
+            headroom = config.context_window_compaction_headroom_tokens
+            arrival_compaction_trigger = (
+                config.context_window_trigger_tokens - headroom if headroom > 0 else None
+            )
             engine_prompt, _ = await self._render_engine_prompt_with_compaction(
                 config,
                 frame_buffer,
-                bytearray(),
+                arrival_audio,
                 message_history,
                 "",
                 prewarmed_frames,
                 output_modalities=["text"],
+                compaction_trigger_tokens=arrival_compaction_trigger,
+                media_events=media_events,
             )
+            self._pop_canonical_render_ticket(engine_prompt)
+            lineage_ticket = _attach_thinker_lineage(config, engine_prompt)
+            if isinstance(engine_prompt, dict):
+                engine_prompt["prefill_only"] = True
             logger.info(
-                "[arrival-prefill] session=%s request=%s frames=%d prompt_tokens=%d",
+                "[arrival-prefill] session=%s request=%s frames=%d audio_bytes=%d "
+                "audio_chunks=%d prompt_tokens=%d "
+                "lineage_prefix_tokens=%d",
                 config.session_id or "-",
                 request_id,
                 len(frame_buffer),
+                len(arrival_audio),
+                sum(event.modality == "audio" for event in (media_events or ())),
                 _prompt_token_count(engine_prompt),
+                lineage_ticket.prefix_tokens if lineage_ticket is not None else 0,
             )
             outputs = self._engine_client.generate(
                 prompt=engine_prompt,
@@ -915,11 +1566,13 @@ class OmniStreamingVideoHandler:
                     thinker_max_tokens=1,
                 ),
                 output_modalities=["text"],
+                priority=_ARRIVAL_PREFILL_PRIORITY,
             )
-            # The single Thinker token is deliberately discarded. No response
-            # event is emitted and final_stage_id=0 keeps Talker/Code2Wav idle.
+            # The engine finishes after prompt prefill without committing the
+            # sampled next token. final_stage_id=0 keeps Talker/Code2Wav idle.
             async for _ in outputs:
                 pass
+            _commit_thinker_lineage(config, lineage_ticket)
             return True
         except asyncio.CancelledError:
             raise
@@ -933,6 +1586,8 @@ class OmniStreamingVideoHandler:
                 exc_info=True,
             )
             return False
+        finally:
+            await self._release_arrival_prefill(request_id)
 
     async def _render_engine_prompt_with_compaction(
         self,
@@ -944,6 +1599,8 @@ class OmniStreamingVideoHandler:
         prewarmed_frames: dict[str, tuple[Any, str]],
         *,
         output_modalities: list[str],
+        compaction_trigger_tokens: int | None = None,
+        media_events: list[_TurnMediaEvent] | None = None,
     ) -> tuple[Any, dict[str, Any]]:
         """Render one canonical prompt and compact history at turn boundaries.
 
@@ -964,29 +1621,62 @@ class OmniStreamingVideoHandler:
                 query_text,
                 prewarmed_frames,
                 output_modalities=output_modalities,
+                media_events=media_events,
             )
 
+        trigger_tokens = (
+            config.context_window_trigger_tokens
+            if compaction_trigger_tokens is None
+            else max(config.context_window_target_tokens + 1, compaction_trigger_tokens)
+        )
         engine_prompt, user_message = await _render(message_history)
         prompt_tokens = _prompt_token_count(engine_prompt)
-        if prompt_tokens < config.context_window_trigger_tokens or not message_history:
+        if prompt_tokens < trigger_tokens or not message_history:
             return engine_prompt, user_message
 
         before_turns = len(message_history) // 2
-        compacted_history = list(message_history)
-        while compacted_history and prompt_tokens > config.context_window_target_tokens:
-            del compacted_history[:2]
-            engine_prompt, user_message = await _render(compacted_history)
-            prompt_tokens = _prompt_token_count(engine_prompt)
+        total_turns = before_turns
+        rendered_by_dropped_turns: dict[int, tuple[Any, dict[str, Any], int]] = {
+            0: (engine_prompt, user_message, prompt_tokens)
+        }
+
+        async def _render_after_dropping(turns: int) -> tuple[Any, dict[str, Any], int]:
+            cached = rendered_by_dropped_turns.get(turns)
+            if cached is not None:
+                return cached
+            rendered_prompt, rendered_user = await _render(message_history[2 * turns :])
+            rendered = (rendered_prompt, rendered_user, _prompt_token_count(rendered_prompt))
+            rendered_by_dropped_turns[turns] = rendered
+            return rendered
+
+        # Prompt length is monotonic in the number of retained complete turns.
+        # Preserve the maximum recent history with O(log N) prompt renders.
+        low, high = 1, total_turns
+        while low < high:
+            middle = (low + high) // 2
+            _, _, middle_tokens = await _render_after_dropping(middle)
+            if middle_tokens > config.context_window_target_tokens:
+                low = middle + 1
+            else:
+                high = middle
+        dropped_turns = low
+        engine_prompt, user_message, prompt_tokens = await _render_after_dropping(dropped_turns)
+        compacted_history = list(message_history[2 * dropped_turns :])
 
         # The application owns canonical history. Commit the new lineage only
         # after every prompt rebuild succeeds; cache entries remain disposable.
         message_history[:] = compacted_history
+        self._compact_canonical_prompt_state(config, dropped_turns)
+        _reset_thinker_lineage(config)
         logger.info(
-            "[session-history] compact session=%s turns=%d->%d prompt_tokens=%d",
+            "[session-history] compact session=%s turns=%d->%d prompt_tokens=%d "
+            "trigger_tokens=%d renders=%d",
             config.session_id or "-",
             before_turns,
             len(message_history) // 2,
             prompt_tokens,
+            trigger_tokens,
+            len(rendered_by_dropped_turns),
         )
         return engine_prompt, user_message
 
@@ -1002,8 +1692,10 @@ class OmniStreamingVideoHandler:
         interrupt_event: asyncio.Event,
         prewarmed_frames: dict[str, tuple[Any, str]],
         frame_metadata: list[dict[str, Any]] | None = None,
+        media_events: list[_TurnMediaEvent] | None = None,
     ) -> None:
         """Direct engine_client.generate() path for async_chunk audio."""
+        request_start = _time.monotonic()
         try:
             engine_prompt, user_message = await self._render_engine_prompt_with_compaction(
                 config,
@@ -1013,10 +1705,14 @@ class OmniStreamingVideoHandler:
                 query_text,
                 prewarmed_frames,
                 output_modalities=config.modalities,
+                media_events=media_events,
             )
+            canonical_ticket = self._pop_canonical_render_ticket(engine_prompt)
+            lineage_ticket = _attach_thinker_lineage(config, engine_prompt)
         except Exception as e:
             await self._send_error(websocket, f"Prompt preprocessing failed: {e}")
             return
+        render_done = _time.monotonic()
         decoded_ready_ts_ms = _time.monotonic() * 1000
         selected_metadata = list(frame_metadata or [])
         model_selected_ts_ms = _time.monotonic() * 1000
@@ -1041,6 +1737,7 @@ class OmniStreamingVideoHandler:
         async_chunk_mode = video_stream_envs.VLLM_VIDEO_ASYNC_CHUNK
         streaming = async_chunk_mode == "on"
         audio_tail_tensors: list[Any] = []
+        thinker_output_token_ids: list[int] = []
 
         try:
             logger.info(
@@ -1059,9 +1756,19 @@ class OmniStreamingVideoHandler:
                 request_id=request_id,
                 sampling_params_list=self._sampling_params_for_request(config),
                 output_modalities=config.modalities,
+                priority=0,
             )
 
             async for output in result_gen:
+                if isinstance(output, OmniRequestOutput) and output.final_output_type == "text":
+                    request_output = getattr(output, "request_output", None)
+                    stage_outputs = getattr(request_output, "outputs", None)
+                    if isinstance(stage_outputs, list) and stage_outputs:
+                        cumulative_ids = getattr(stage_outputs[0], "cumulative_token_ids", None)
+                        if isinstance(cumulative_ids, list) and all(
+                            isinstance(token, int) for token in cumulative_ids
+                        ):
+                            thinker_output_token_ids = list(cumulative_ids)
                 # Soft interrupt: drain without sending
                 if interrupt_event.is_set():
                     if not interrupted:
@@ -1174,7 +1881,42 @@ class OmniStreamingVideoHandler:
                 await websocket.send_json({"type": "response.audio.done"})
 
             response_text = "".join(text_parts)
+            if not interrupted:
+                _commit_thinker_lineage(
+                    config,
+                    lineage_ticket,
+                    thinker_output_token_ids,
+                )
+            else:
+                _reset_thinker_lineage(config)
             self.on_turn_complete(message_history, user_message, response_text)
+            if not interrupted:
+                await self._commit_canonical_turn(
+                    config,
+                    canonical_ticket,
+                    message_history,
+                    output_modalities=config.modalities,
+                )
+            else:
+                config._canonical_prompt_state = None
+
+            headroom = config.context_window_compaction_headroom_tokens
+            if headroom > 0 and message_history:
+                proactive_trigger = config.context_window_trigger_tokens - headroom
+                if _prompt_token_count(engine_prompt) >= proactive_trigger:
+                    # Audio is already emitted, so this CPU-side work is hidden
+                    # behind client playback. The next arrival warm-up then
+                    # populates the compacted lineage before the next query.
+                    await self._render_engine_prompt_with_compaction(
+                        config,
+                        [],
+                        bytearray(),
+                        message_history,
+                        "",
+                        {},
+                        output_modalities=["text"],
+                        compaction_trigger_tokens=proactive_trigger,
+                    )
 
             t_end = _time.monotonic()
             logger.info(
@@ -1184,6 +1926,15 @@ class OmniStreamingVideoHandler:
                 (t_first_text - t_start) if t_first_text else -1,
                 (t_first_audio - t_start) if t_first_audio else -1,
                 audio_chunk_count,
+            )
+            logger.info(
+                "[QUERY-BREAKDOWN] session=%s request=%s render_ms=%.1f "
+                "engine_to_first_text_ms=%.1f engine_to_first_audio_ms=%.1f",
+                config.session_id or "-",
+                request_id,
+                (render_done - request_start) * 1000.0,
+                ((t_first_text - t_start) * 1000.0) if t_first_text else -1.0,
+                ((t_first_audio - t_start) * 1000.0) if t_first_audio else -1.0,
             )
 
         except Exception:

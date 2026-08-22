@@ -143,6 +143,120 @@ def test_streaming_input_prefill_flushes_with_next_decode_chunk() -> None:
     assert "rt-2" not in transfer_manager._pending_streaming_prefills
 
 
+def test_text_only_thinker_payload_filter_drops_aligned_multimodal_rows() -> None:
+    all_ids = [151644, 872, 10, 151655, 11, 151656, 12, 151675, 151645]
+    payload = q3.OmniPayloadStruct(
+        embed=q3.EmbeddingsStruct(prefill=torch.arange(18).reshape(9, 2)),
+        hidden_states=q3.HiddenStatesStruct(output=torch.arange(27).reshape(9, 3)),
+        ids=q3.IdsStruct(all=all_ids, prompt=all_ids[:-1]),
+    )
+
+    filtered = q3._filter_text_only_thinker_prefill_payload(payload)
+
+    assert filtered.ids.all == [151644, 872, 10, 11, 12, 151645]
+    assert filtered.ids.prompt == [151644, 872, 10, 11, 12]
+    assert filtered.embed.prefill[:, 0].tolist() == [0, 2, 4, 8, 12, 16]
+    assert filtered.hidden_states.output[:, 0].tolist() == [0, 3, 6, 12, 18, 24]
+
+
+def test_text_only_thinker_payload_filter_drops_ignored_chatml_spans() -> None:
+    all_ids = [
+        151644,
+        8948,
+        100,
+        151645,
+        151644,
+        872,
+        200,
+        151655,
+        151645,
+        151644,
+        77091,
+        300,
+        151645,
+        151644,
+        872,
+        400,
+        151645,
+        151644,
+        77091,
+        500,
+    ]
+    prompt_ids = all_ids[:-1]
+    payload = q3.OmniPayloadStruct(
+        embed=q3.EmbeddingsStruct(prefill=torch.arange(len(all_ids)).unsqueeze(1)),
+        hidden_states=q3.HiddenStatesStruct(output=torch.arange(len(all_ids)).unsqueeze(1)),
+        ids=q3.IdsStruct(all=all_ids, prompt=prompt_ids),
+    )
+
+    filtered = q3._filter_text_only_thinker_prefill_payload(payload)
+
+    assert filtered.ids.all == [151644, 872, 200, 151645, 151644, 872, 400, 151645, 151644, 77091, 500]
+    assert filtered.ids.prompt == filtered.ids.all[:-1]
+    assert filtered.embed.prefill[:, 0].tolist() == [4, 5, 6, 8, 13, 14, 15, 16, 17, 18, 19]
+
+
+def test_text_only_thinker_payload_filter_preserves_terminal_id_without_tensor_row() -> None:
+    all_ids = [151644, 872, 10, 151655, 151645, 151644, 77091, 20]
+    prompt_ids = all_ids[:-1]
+    payload = q3.OmniPayloadStruct(
+        embed=q3.EmbeddingsStruct(prefill=torch.arange(7).unsqueeze(1)),
+        hidden_states=q3.HiddenStatesStruct(output=torch.arange(7).unsqueeze(1)),
+        ids=q3.IdsStruct(all=all_ids, prompt=prompt_ids),
+    )
+
+    filtered = q3._filter_text_only_thinker_prefill_payload(payload)
+
+    assert filtered.ids.all == [151644, 872, 10, 151645, 151644, 77091, 20]
+    assert filtered.ids.prompt == filtered.ids.all[:-1]
+    assert filtered.embed.prefill[:, 0].tolist() == [0, 1, 2, 4, 5, 6]
+    assert filtered.hidden_states.output.shape[0] == len(filtered.ids.all) - 1
+
+
+def test_text_only_thinker_payload_filter_preserves_multiple_decode_suffix_ids() -> None:
+    all_ids = [151644, 872, 10, 151655, 151645, 151644, 77091, 20, 21]
+    prompt_ids = all_ids[:-2]
+    payload = q3.OmniPayloadStruct(
+        embed=q3.EmbeddingsStruct(prefill=torch.arange(7).unsqueeze(1)),
+        hidden_states=q3.HiddenStatesStruct(output=torch.arange(7).unsqueeze(1)),
+        ids=q3.IdsStruct(all=all_ids, prompt=prompt_ids),
+    )
+
+    filtered = q3._filter_text_only_thinker_prefill_payload(payload)
+
+    assert filtered.ids.all[-2:] == [20, 21]
+    assert filtered.ids.prompt == filtered.ids.all[:-2]
+    assert filtered.embed.prefill.shape[0] == len(filtered.ids.all) - 2
+
+
+def test_text_only_thinker_payload_filter_falls_back_on_misalignment() -> None:
+    payload = q3.OmniPayloadStruct(
+        embed=q3.EmbeddingsStruct(prefill=torch.ones(2, 2)),
+        hidden_states=q3.HiddenStatesStruct(output=torch.ones(2, 3)),
+        ids=q3.IdsStruct(all=[151644, 872, 151655], prompt=[151644, 872, 151655]),
+    )
+    original_emb = payload.embed.prefill
+
+    filtered = q3._filter_text_only_thinker_prefill_payload(payload)
+
+    assert filtered.embed.prefill is original_emb
+    assert filtered.ids.all == [151644, 872, 151655]
+
+
+def test_text_only_thinker_payload_filter_is_disabled_with_talker_filter(monkeypatch) -> None:
+    payload = q3.OmniPayloadStruct(
+        embed=q3.EmbeddingsStruct(prefill=torch.ones(3, 2)),
+        hidden_states=q3.HiddenStatesStruct(output=torch.ones(3, 3)),
+        ids=q3.IdsStruct(all=[151644, 872, 151655], prompt=[151644, 872, 151655]),
+    )
+    monkeypatch.setattr(q3, "TALKER_TEXT_ONLY", False)
+
+    filtered = q3._filter_text_only_thinker_prefill_payload(payload)
+
+    assert filtered.ids.all == [151644, 872, 151655]
+    assert filtered.embed.prefill.shape[0] == 3
+
+
 def test_talker2code2wav_full_payload_filters_by_output_token_ids() -> None:
     request = SimpleNamespace(
         request_id="codec",
@@ -267,6 +381,41 @@ def test_talker2code2wav_async_chunk_flushes_cached_tail_on_stop_token() -> None
     # 4 initial frames and one 25-frame chunk were already emitted. The final
     # payload contains 25 frames of left context plus the remaining 21 frames.
     assert payload.codes.audio.numel() == (25 + 21) * 2
+
+
+def test_talker2code2wav_async_chunk_supports_larger_initial_than_steady_chunk() -> None:
+    request_id = "codec_low_latency"
+    transfer_manager = SimpleNamespace(
+        code_prompt_token_ids=defaultdict(list),
+        put_req_chunk=defaultdict(int),
+        connector=SimpleNamespace(
+            config={
+                "extra": {
+                    "initial_codec_chunk_frames": 8,
+                    "codec_chunk_frames": 4,
+                    "codec_left_context_frames": 25,
+                }
+            }
+        ),
+    )
+    request = SimpleNamespace(
+        external_req_id=request_id,
+        sampling_params=SimpleNamespace(stop_token_ids=[], stop_token_id=None),
+    )
+    emitted = []
+
+    for frame in range(12):
+        payload = q3.talker2code2wav_async_chunk(
+            transfer_manager,
+            {"codes": {"audio": torch.tensor([[frame + 1, frame + 101]])}},
+            request,
+        )
+        if payload is not None:
+            emitted.append(payload)
+            transfer_manager.put_req_chunk[request_id] += 1
+
+    assert [payload.codes.audio.numel() for payload in emitted] == [8 * 2, 12 * 2]
+    assert emitted[1].meta.left_context_size == 8
 
 
 def test_thinker2talker_full_payload_packs_complete_tensors() -> None:

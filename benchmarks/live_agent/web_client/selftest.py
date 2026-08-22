@@ -76,6 +76,7 @@ def main() -> int:
     wanted = {
         "context_window_trigger_tokens",
         "context_window_target_tokens",
+        "context_window_compaction_headroom_tokens",
         "max_frame_width",
         "max_frame_height",
         "enable_frame_filter",
@@ -85,6 +86,7 @@ def main() -> int:
         "enable_video_arrival_prefill",
         "system_prompt",
         "modalities",
+        "thinker_max_response_tokens",
     }
     missing = sorted(wanted - set(sent))
     check(

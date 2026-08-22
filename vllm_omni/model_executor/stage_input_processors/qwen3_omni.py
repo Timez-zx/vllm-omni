@@ -21,6 +21,10 @@ from vllm_omni.data_entry_keys import (
     OmniPayloadStruct,
     to_dict,
 )
+from vllm_omni.distributed.omni_connectors.adapter import (
+    QWEN3_OMNI_MM_TOKEN_IDS,
+    TALKER_TEXT_ONLY,
+)
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
@@ -45,6 +49,11 @@ _QWEN3_CODEC_CODEBOOK_SIZE = 2048
 _QWEN3_CODEC_PAD_TOKEN_ID = 4196
 _QWEN3_CODEC_BOS_TOKEN_ID = 4197
 _QWEN3_CODEC_EOS_TOKEN_ID = 4198
+
+_QWEN3_IM_START_TOKEN_ID = 151644
+_QWEN3_SYSTEM_TOKEN_ID = 8948
+_QWEN3_USER_TOKEN_ID = 872
+_QWEN3_ASSISTANT_TOKEN_ID = 77091
 
 
 def _layer_tensor(layers: dict[Any, Any], key: str) -> torch.Tensor | None:
@@ -115,6 +124,99 @@ def _as_tensor_or_none(value: Any) -> torch.Tensor | None:
     if isinstance(value, list) and value and isinstance(value[0], torch.Tensor):
         return value[0].detach().cpu()
     return None
+
+
+def _text_only_talker_keep_positions(
+    all_token_ids: list[int],
+    prompt_token_ids: list[int],
+) -> list[int] | None:
+    """Return source rows consumed by the text-only Talker prefill."""
+    if len(prompt_token_ids) > len(all_token_ids) or all_token_ids[: len(prompt_token_ids)] != prompt_token_ids:
+        return None
+    starts = [i for i, token_id in enumerate(prompt_token_ids) if token_id == _QWEN3_IM_START_TOKEN_ID]
+    if not starts:
+        return None
+    starts.append(len(all_token_ids))
+
+    keep: list[int] = []
+    for index in range(len(starts) - 1):
+        start = starts[index]
+        end = starts[index + 1]
+        if start + 1 >= len(prompt_token_ids):
+            return None
+        role = prompt_token_ids[start + 1]
+        if role == _QWEN3_USER_TOKEN_ID:
+            keep.extend(
+                position for position in range(start, end) if all_token_ids[position] not in QWEN3_OMNI_MM_TOKEN_IDS
+            )
+        elif role == _QWEN3_ASSISTANT_TOKEN_ID and index == len(starts) - 2:
+            keep.extend(range(start, end))
+        elif role not in {_QWEN3_SYSTEM_TOKEN_ID, _QWEN3_ASSISTANT_TOKEN_ID}:
+            return None
+    return keep
+
+
+def _filter_text_only_thinker_prefill_payload(payload: OmniPayloadStruct) -> OmniPayloadStruct:
+    """Keep only source rows consumed by text-only Talker prefill.
+
+    The Talker ignores system and historical assistant spans and removes
+    multimodal rows from user spans. Applying the same selection before the
+    transfer preserves its result while avoiding CPU transfer, serialization,
+    and Talker-side GPU copies for unused rows.
+
+    Alignment is a hard safety condition. ``ids.all`` may end with sampled AR
+    tokens whose source embeddings will not exist until later decode steps.
+    Any missing rows are safe only when they form a strict suffix after the
+    complete prompt; every other mismatch falls back to the existing path.
+    """
+    if not TALKER_TEXT_ONLY:
+        return payload
+
+    thinker_emb = payload.embed.prefill
+    thinker_hid = payload.hidden_states.output
+    all_token_ids = payload.ids.all
+    prompt_token_ids = payload.ids.prompt
+    if (
+        not isinstance(thinker_emb, torch.Tensor)
+        or not isinstance(thinker_hid, torch.Tensor)
+        or not isinstance(all_token_ids, list)
+        or not isinstance(prompt_token_ids, list)
+        or thinker_emb.ndim == 0
+        or thinker_hid.ndim == 0
+        or thinker_emb.shape[0] != thinker_hid.shape[0]
+        or thinker_emb.shape[0] > len(all_token_ids)
+        or len(prompt_token_ids) > thinker_emb.shape[0]
+    ):
+        logger.warning(
+            "Cannot filter text-only Thinker payload safely; retaining full payload "
+            "(ids=%s embed_rows=%s hidden_rows=%s)",
+            len(all_token_ids) if isinstance(all_token_ids, list) else None,
+            thinker_emb.shape[0] if isinstance(thinker_emb, torch.Tensor) and thinker_emb.ndim else None,
+            thinker_hid.shape[0] if isinstance(thinker_hid, torch.Tensor) and thinker_hid.ndim else None,
+        )
+        return payload
+
+    keep_positions = _text_only_talker_keep_positions(all_token_ids, prompt_token_ids)
+    if keep_positions is None:
+        logger.warning("Cannot parse text-only Talker spans safely; retaining full Thinker payload")
+        return payload
+
+    tensor_keep_positions = [position for position in keep_positions if position < thinker_emb.shape[0]]
+    embed_positions = torch.tensor(tensor_keep_positions, dtype=torch.long, device=thinker_emb.device)
+    hidden_positions = embed_positions.to(thinker_hid.device)
+    payload.embed.prefill = thinker_emb.index_select(0, embed_positions)
+    payload.hidden_states.output = thinker_hid.index_select(0, hidden_positions)
+    payload.ids.all = [all_token_ids[position] for position in keep_positions]
+    payload.ids.prompt = [all_token_ids[position] for position in keep_positions if position < len(prompt_token_ids)]
+    logger.info(
+        "[talker-conditioning] source_ids=%d source_tensor_rows=%d "
+        "transferred_ids=%d transferred_tensor_rows=%d",
+        len(all_token_ids),
+        thinker_emb.shape[0],
+        len(payload.ids.all),
+        payload.embed.prefill.shape[0],
+    )
+    return payload
 
 
 def _is_valid_qwen3_codec_token_id(token_id: Any) -> bool:
@@ -475,12 +577,12 @@ def thinker2talker_async_chunk(
         prompt_token_ids = _ensure_list(request.prompt_token_ids)
         payload = OmniPayloadStruct(
             embed=EmbeddingsStruct(
-                prefill=thinker_emb.detach().cpu(),
+                prefill=thinker_emb.detach(),
                 tts_bos=_maybe_cpu(thinker_embed.get("tts_bos")),
                 tts_eos=_maybe_cpu(thinker_embed.get("tts_eos")),
                 tts_pad=_maybe_cpu(thinker_embed.get("tts_pad")),
             ),
-            hidden_states=HiddenStatesStruct(output=thinker_hid.detach().cpu()),
+            hidden_states=HiddenStatesStruct(output=thinker_hid.detach()),
             ids=IdsStruct(all=all_token_ids, prompt=prompt_token_ids),
             meta=MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool)),
             speaker=speaker,
@@ -488,20 +590,25 @@ def thinker2talker_async_chunk(
         )
         if transfer_manager.request_payload.get(request_id) is None:
             if not is_finished:
+                payload.embed.prefill = payload.embed.prefill.cpu()
+                payload.hidden_states.output = payload.hidden_states.output.cpu()
                 transfer_manager.request_payload[request_id] = to_dict(payload)
                 return None
         else:
             save_payload = transfer_manager.request_payload.pop(request_id)
             payload.embed.prefill = torch.cat(
-                (save_payload.get("embed", {}).get("prefill"), payload.embed.prefill), dim=0
+                (save_payload.get("embed", {}).get("prefill"), payload.embed.prefill.cpu()), dim=0
             )
             payload.hidden_states.output = torch.cat(
-                (save_payload.get("hidden_states", {}).get("output"), payload.hidden_states.output), dim=0
+                (save_payload.get("hidden_states", {}).get("output"), payload.hidden_states.output.cpu()), dim=0
             )
             prefill_shape = payload.embed.prefill.shape[0]
             if not is_finished and prefill_shape <= len(prompt_token_ids):
                 transfer_manager.request_payload[request_id] = to_dict(payload)
                 return None
+        payload = _filter_text_only_thinker_prefill_payload(payload)
+        payload.embed.prefill = payload.embed.prefill.cpu()
+        payload.hidden_states.output = payload.hidden_states.output.cpu()
     else:
         if request.resumable:
             return _construct_thinker2talker_streaming_input_async_chunk(

@@ -275,6 +275,48 @@ async def test_async_prewarm_skips_outgoing_only_stage() -> None:
 
 
 @pytest.mark.asyncio
+async def test_async_prewarm_uses_session_isolated_talker_cache_lineage() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    stage0 = FakePrewarmPool("sender")
+    stage1 = FakePrewarmPool("receiver")
+    orchestrator.stage_pools = [stage0, stage1]
+    orchestrator._emit_tx_edge = lambda **_kwargs: None
+    orchestrator._record_duplex_stage_submission = MagicMock()
+    im_start = 151644
+    user = 872
+    assistant = 77091
+    prompt_ids = [im_start, user, 20, 21, im_start, assistant]
+    req_state = OrchestratorRequestState(
+        request_id="req-talker-cache",
+        prompt={
+            "prompt_token_ids": prompt_ids,
+            "talker_cache_salt": "video-session:test",
+        },
+        sampling_params_list=[SamplingParams(max_tokens=1) for _ in range(2)],
+        final_stage_id=1,
+    )
+
+    await orchestrator._prewarm_async_chunk_stages(
+        "req-talker-cache",
+        SimpleNamespace(prompt_token_ids=prompt_ids, resumable=False),
+        req_state,
+    )
+
+    assert len(stage1.submitted) == 1
+    submitted = stage1.submitted[0]
+    assert submitted.prompt_token_ids == [0] * 13
+    assert submitted.cache_token_ids == [
+        im_start,
+        user,
+        20,
+        21,
+        *([151671] * 9),
+    ]
+    assert submitted.cache_salt == "video-session:test"
+    assert req_state.prompt["talker_cache_salt"] == "video-session:test"
+
+
+@pytest.mark.asyncio
 async def test_duplex_prewarm_runs_after_first_stage0_submission() -> None:
     port, stage_pools, request_states, prewarm, submission = _duplex_stage_port_submission()
 
@@ -344,3 +386,46 @@ async def test_streaming_segment_does_not_complete_final_output_stage() -> None:
     orchestrator._cleanup_request_ids.assert_not_awaited()
     routed = orchestrator.output_async_queue.get_nowait()
     assert routed.finished is False
+
+
+@pytest.mark.asyncio
+async def test_finite_final_output_aborts_residual_async_stage_work() -> None:
+    """A terminal-stage finish must stop upstream chunks before cleanup.
+
+    In an async-chunk pipeline the final stage may finish while an upstream
+    stage still has buffered output.  Keeping that request alive after the
+    frontend-visible response is complete wastes compute and races connector
+    cleanup.
+    """
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.async_chunk = True
+    orchestrator._pd_pair = None
+    orchestrator._cfg_tracker = SimpleNamespace(
+        is_companion=lambda _request_id: False,
+        has_companions=lambda _request_id: False,
+        cleanup_parent=lambda _request_id: [],
+    )
+    orchestrator.stage_pools = [
+        SimpleNamespace(final_output=False),
+        SimpleNamespace(final_output=False),
+        SimpleNamespace(final_output=True),
+    ]
+    orchestrator.output_async_queue = asyncio.Queue()
+    orchestrator._cleanup_request_ids = AsyncMock()
+
+    req_state = OrchestratorRequestState(
+        request_id="req-finite-final",
+        sampling_params_list=[SamplingParams(max_tokens=1) for _ in range(3)],
+        final_stage_id=2,
+        final_output_stage_ids={2},
+    )
+    output = SimpleNamespace(request_id=req_state.request_id, finished=True)
+
+    await orchestrator._route_output(2, 0, output, req_state, None)
+
+    orchestrator._cleanup_request_ids.assert_awaited_once_with(
+        [req_state.request_id],
+        abort=True,
+    )
+    routed = orchestrator.output_async_queue.get_nowait()
+    assert routed.finished is True

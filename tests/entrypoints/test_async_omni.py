@@ -93,6 +93,30 @@ def test_generate_submits_randomized_id_to_engine():
 
 
 @pytest.mark.cpu
+def test_generate_forwards_priority_to_engine():
+    async def run():
+        submitted: list[dict] = []
+
+        async def fake_add_request(**kwargs):
+            submitted.append(kwargs)
+
+        omni = get_async_omni_instance(fake_add_request=fake_add_request)
+        async for _ in omni.generate(
+            prompt={"prompt": "test"},
+            request_id="background",
+            sampling_params_list=[SimpleNamespace()],
+            output_modalities=["text"],
+            priority=10,
+        ):
+            pass
+
+        assert len(submitted) == 1
+        assert submitted[0]["priority"] == 10
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize(
     "req_ids,cancel_prefix,expected_cancel_count",
     [

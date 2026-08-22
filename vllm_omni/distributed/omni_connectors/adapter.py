@@ -223,16 +223,32 @@ TALKER_TEXT_ONLY = os.environ.get("VLLM_OMNI_TALKER_TEXT_ONLY", "1") not in ("0"
 # config to consult. A revision that renumbered these would silently stop filtering, which
 # is why `talker_preprocess_prefill` reports the built length instead of trusting this.
 QWEN3_OMNI_MM_TOKEN_IDS = frozenset({151655, 151656, 151675})
+QWEN3_OMNI_TTS_PAD_TOKEN_ID = 151671
+_QWEN3_OMNI_TALKER_ASSISTANT_PREFIX_LEN = 9
 
 
-def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:
-    """Compute the length of the talker prompt ids.
+def compute_talker_prompt_cache_ids(prompt_ids: list[int]) -> list[int]:
+    """Build deterministic ids for Qwen3-Omni Talker prefix caching.
+
+    The Talker worker receives conditioning embeddings from the Thinker, while
+    its scheduler is pre-submitted before those embeddings arrive.  An
+    all-zero placeholder has the right length but cannot identify the actual
+    conditioning, so it is unsafe for prefix caching.  In text-only Talker
+    mode, user conditioning is a deterministic projection of the source token
+    embeddings.  The corresponding source ids therefore form an exact cache
+    lineage.
+
+    System and historical assistant spans are omitted to match
+    ``_thinker_to_talker_prefill``.  The current assistant contributes nine
+    TTS pad ids.  Those terminal ids are intentionally not reusable after a
+    new user span is appended; only complete blocks in the preceding user
+    lineage can hit.
 
     Args:
         prompt_ids: The prompt ids tensor.
 
     Returns:
-        The length of the talker prompt ids.
+        Scheduler ids whose length and prefix identity match Talker prefill.
     """
     im_start_token_id = 151644
     system_token_id = 8948
@@ -240,11 +256,12 @@ def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:
     assistant_token_id = 77091
     im_start_indexes = [i for i in range(len(prompt_ids)) if prompt_ids[i] == im_start_token_id]
     im_start_indexes.append(len(prompt_ids))
-    sum_user_len = 0
-    assistant_len = 0
+    cache_ids: list[int] = []
     for i in range(len(im_start_indexes) - 1):
         s = im_start_indexes[i]
         e = im_start_indexes[i + 1]
+        if s + 1 >= len(prompt_ids):
+            raise ValueError("malformed ChatML span without a role token")
         role = prompt_ids[s + 1]
         if role == system_token_id:
             continue
@@ -254,15 +271,20 @@ def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:
                 # these positions from the embeddings. If the two disagree the worker's
                 # `seg_len = min(span_len, req_embeds.shape[0])` keeps a prefix of the
                 # conditioning and discards the rest -- no exception, wrong audio.
-                sum_user_len += sum(1 for t in prompt_ids[s:e] if t not in QWEN3_OMNI_MM_TOKEN_IDS)
+                cache_ids.extend(t for t in prompt_ids[s:e] if t not in QWEN3_OMNI_MM_TOKEN_IDS)
             else:
-                sum_user_len += e - s
+                cache_ids.extend(prompt_ids[s:e])
         elif role == assistant_token_id and i == len(im_start_indexes) - 2:
-            assistant_len += 9  # 3 + 4 + 1 + 1
+            cache_ids.extend([QWEN3_OMNI_TTS_PAD_TOKEN_ID] * _QWEN3_OMNI_TALKER_ASSISTANT_PREFIX_LEN)  # 3 + 4 + 1 + 1
         else:
             pass
 
-    return sum_user_len + assistant_len
+    return cache_ids
+
+
+def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:
+    """Compute the Talker scheduler prompt length from its cache lineage."""
+    return len(compute_talker_prompt_cache_ids(prompt_ids))
 
 
 def construct_next_stage_streaming_input_prompt(payload_data: dict[str, Any], request: Any) -> None:

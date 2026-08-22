@@ -155,6 +155,12 @@ def build_engine_core_request_from_tokens(
         resumable=resumable,
         additional_information=additional_info_payload,
         model_intermediate_buffer=model_intermediate_buffer if isinstance(model_intermediate_buffer, dict) else None,
+        cache_token_ids=prompt.get("cache_token_ids"),
+        prefill_only=prompt.get("prefill_only") is True,
+        kv_lineage_id=prompt.get("kv_lineage_id"),
+        kv_lineage_parent_revision=int(prompt.get("kv_lineage_parent_revision", 0)),
+        kv_lineage_revision=int(prompt.get("kv_lineage_revision", 0)),
+        kv_lineage_prefix_tokens=max(0, int(prompt.get("kv_lineage_prefix_tokens", 0))),
     )
 
 
@@ -1369,7 +1375,18 @@ class Orchestrator:
                     )
 
         if request_finished and not self._is_duplex_session_request(req_state):
-            await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
+            # The terminal stage can finish before an async-chunk upstream
+            # stage has drained every already-produced output.  Merely
+            # dropping request state here leaves that upstream request live:
+            # its late chunks consume compute, race connector cleanup, and are
+            # then discarded as outputs for an unknown request.  Once every
+            # client-visible final-output stage has finished, none of that
+            # residual work can contribute to the response, so stop it before
+            # releasing bindings and connector/request state.
+            await self._cleanup_request_ids(
+                [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+                abort=True,
+            )
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
@@ -2113,12 +2130,18 @@ class Orchestrator:
             else:
                 import copy
 
-                from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
+                from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_cache_ids
 
                 try:
-                    next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
+                    talker_cache_ids = compute_talker_prompt_cache_ids(prompt_token_ids)
                 except Exception:
-                    next_prompt_len = max(1, len(prompt_token_ids))
+                    logger.warning(
+                        "[Orchestrator] failed to build Talker cache lineage for req=%s; "
+                        "falling back to an isolated placeholder",
+                        request_id,
+                        exc_info=True,
+                    )
+                    talker_cache_ids = [0] * max(1, len(prompt_token_ids))
 
                 original_prompt = req_state.prompt
                 if isinstance(original_prompt, dict):
@@ -2126,7 +2149,21 @@ class Orchestrator:
                 else:
                     base_input = {}
 
-                base_input["prompt_token_ids"] = [0] * next_prompt_len
+                talker_prompt_len = max(1, len(talker_cache_ids))
+                base_input["prompt_token_ids"] = [0] * talker_prompt_len
+                base_input["cache_token_ids"] = talker_cache_ids or [0]
+                # Thinker and Talker have different token/KV spaces. Never
+                # leak the Thinker handle into the downstream stage.
+                base_input.pop("kv_lineage_id", None)
+                base_input.pop("kv_lineage_parent_revision", None)
+                base_input.pop("kv_lineage_revision", None)
+                base_input.pop("kv_lineage_prefix_tokens", None)
+                # This is application-session isolation for a disposable
+                # engine cache, not engine-owned session state.  A malformed
+                # or non-live prompt gets a request-local salt so placeholder
+                # fallbacks can never collide.
+                talker_cache_salt = base_input.pop("talker_cache_salt", None)
+                base_input["cache_salt"] = talker_cache_salt or f"talker-request:{request_id}"
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
                 downstream_resumable = bool(getattr(stage0_request, "resumable", req_state.streaming.enabled))

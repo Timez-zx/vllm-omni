@@ -67,21 +67,12 @@
   // benchmarks/live_agent/web_client/audio_timeline.py, and the right value depends
   // entirely on the server's `codec_chunk_frames`.
   //
-  // With steady-state codec_chunk_frames=4 (0.32 s granules, one every ~0.213 s):
-  //   delta 0  0.35 s  0.217 s of audio      delta 1+  every 0.213 s, 0.320 s each
-  //   Delivery outruns playback from the first boundary, so 60 ms is smooth AND early.
-  //
-  // The canonical deploy uses 25 (2.0 s granules). Under concurrency, 0.217 s of audio cannot
-  // cover the 1.34 s the next granule takes, so an early start stalls ~1.1 s one word
-  // in and the only alternative is to wait for delta 1 at 1.70 s. That is what `smooth`
-  // is for. Smooth is the default because audible continuity is the baseline SLO;
-  // fast remains available when measuring the raw first-granule tradeoff.
-  //
-  // The first boundary is TIGHT even at 4: 0.217 s of playable audio against 0.213 s to
-  // produce the next granule is a 4 ms margin, and one turn in nine showed exactly a
-  // 4 ms stall. Inaudible, but it is the reason not to shave this further. To widen it,
-  // raise `initial_codec_chunk_frames` server-side rather than this.
-  const PLAYBACK_PREBUFFER_MS = { fast: 60, smooth: 1400 };
+  // The canonical deploy emits eight codec frames first, leaving a little over
+  // 500 ms of playable audio after the causal-convolution edge is removed. It
+  // then emits four-frame (~320 ms) granules faster than real time. Smooth mode
+  // therefore starts on the first useful granule without buying continuity by
+  // waiting for a second multi-second chunk. Fast remains a raw-TTFA diagnostic.
+  const PLAYBACK_PREBUFFER_MS = { fast: 60, smooth: 500 };
   const ECHO_GUARD_MS = 300;         // keep mic paused this long after playback
 
   // Silence detection, used only when the trigger mode is 'auto'. These are
@@ -307,7 +298,9 @@
       // finite engine request over the canonical multimodal history; prefix KV
       // is an opportunistic engine cache, never a correctness dependency.
       context_window_trigger_tokens: 49152,
+      thinker_max_response_tokens: 256,
       context_window_target_tokens: 16384,
+      context_window_compaction_headroom_tokens: 16384,
     };
   }
 

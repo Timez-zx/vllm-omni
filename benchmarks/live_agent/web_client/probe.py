@@ -74,6 +74,7 @@ def session_config(system_prompt: str) -> dict:
         "type": "session.config",
         "system_prompt": system_prompt,
         "modalities": ["text", "audio"],
+        "thinker_max_response_tokens": 256,
         "enable_video_arrival_prefill": True,
         "max_frame_width": 640,
         "max_frame_height": 352,
@@ -85,6 +86,7 @@ def session_config(system_prompt: str) -> dict:
         "use_audio_in_video": True,
         "context_window_trigger_tokens": 49152,
         "context_window_target_tokens": 16384,
+        "context_window_compaction_headroom_tokens": 16384,
     }
 
 

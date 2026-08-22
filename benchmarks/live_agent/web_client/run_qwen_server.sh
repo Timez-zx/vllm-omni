@@ -59,6 +59,26 @@ for gpu in "${gpu_ids[@]}"; do
 done
 
 PYTHON_BIN=$(dirname -- "$VLLM_OMNI_BIN")/python
+if [ -z "${CUDA_HOME:-}" ]; then
+  cuda_home=$(
+    "$PYTHON_BIN" -c '
+from pathlib import Path
+import nvidia
+for root in nvidia.__path__:
+    candidate = Path(root) / "cu13"
+    if (candidate / "bin" / "nvcc").is_file():
+        print(candidate)
+        break
+' 2>/dev/null
+  )
+  if [ -n "$cuda_home" ]; then
+    export CUDA_HOME=$cuda_home
+  fi
+fi
+if [ -n "${CUDA_HOME:-}" ]; then
+  export PATH="$(dirname -- "$VLLM_OMNI_BIN"):$CUDA_HOME/bin:$PATH"
+  export LD_LIBRARY_PATH="$CUDA_HOME/lib:${LD_LIBRARY_PATH:-}"
+fi
 REPO_ROOT_ENV="$REPO_ROOT" PYTHONPATH="$REPO_ROOT" "$PYTHON_BIN" -c '
 import os
 from pathlib import Path
@@ -71,6 +91,7 @@ assert repo in loaded.parents, f"loaded {loaded}, expected checkout under {repo}
 required = {
     "context_window_trigger_tokens",
     "context_window_target_tokens",
+    "context_window_compaction_headroom_tokens",
     "max_frame_width",
     "frame_filter_min_gap",
 }
@@ -89,21 +110,28 @@ fi
 
 CUDA_VISIBLE_DEVICES="$GPU_IDS" PYTHONPATH="$REPO_ROOT" \
 VLLM_OMNI_TALKER_TEXT_ONLY="${VLLM_OMNI_TALKER_TEXT_ONLY:-1}" \
+VLLM_OMNI_SAFE_MM_PROCESSOR_CACHE="${VLLM_OMNI_SAFE_MM_PROCESSOR_CACHE:-1}" \
 setsid "$VLLM_OMNI_BIN" serve "$MODEL" \
   --omni --deploy-config "$DEPLOY" \
   --trust-remote-code --host 127.0.0.1 --port "$PORT" \
   --init-timeout 3000 --stage-init-timeout 1500 \
   "${extra_args[@]}" >> "$LOG" 2>&1 &
+server_pid=$!
 
 echo "waiting for engine health on port $PORT"
 for i in $(seq 1 200); do
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null)
   if [ "$code" = "200" ]; then
+    if ! grep -qE "StageEngineCoreProc_stage0.*FlashInfer resolved" "$LOG"; then
+      echo "Thinker did not select FlashInfer; refusing a non-comparable formal run" >&2
+      kill -TERM -- "-$server_pid" 2>/dev/null || true
+      exit 1
+    fi
     echo "engine ready after about $((i * 5)) s"
     nvidia-smi --id="$GPU_IDS" --query-gpu=index,memory.used --format=csv,noheader
     exit 0
   fi
-  if grep -qE "Engine core initialization failed|not enough GPU memory|ModuleNotFoundError|FileNotFoundError" "$LOG" 2>/dev/null; then
+  if grep -qE "Engine core initialization failed|not enough GPU memory|ModuleNotFoundError|FileNotFoundError|[Vv]alidation error" "$LOG" 2>/dev/null; then
     echo "engine startup failed; see $LOG" >&2
     tail -20 "$LOG" >&2
     exit 1

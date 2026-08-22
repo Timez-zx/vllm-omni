@@ -57,6 +57,35 @@ def _make_update(prompt_token_ids: list[int] | None = None) -> StreamingUpdate:
     )
 
 
+def test_scheduler_owned_kv_lineage_snapshot_is_explicit_and_disposable():
+    sched = _make_scheduler()
+    sched.kv_cache_manager = SimpleNamespace()
+    sched._store_kv_lineage_snapshot(
+        "session-a",
+        3,
+        [b"hash-1", b"hash-2"],
+        num_computed_tokens=8,
+        hash_block_size=4,
+    )
+    core_request = SimpleNamespace(
+        kv_lineage_id="session-a",
+        kv_lineage_parent_revision=3,
+    )
+
+    sched.prepare_kv_lineage_request(core_request)
+
+    assert core_request.kv_lineage_snapshot_block_hashes == [b"hash-1", b"hash-2"]
+    assert core_request.kv_lineage_snapshot_num_computed_tokens == 8
+    assert core_request.kv_lineage_snapshot_hash_block_size == 4
+
+    missing = SimpleNamespace(
+        kv_lineage_id="session-a",
+        kv_lineage_parent_revision=99,
+    )
+    sched.prepare_kv_lineage_request(missing)
+    assert not hasattr(missing, "kv_lineage_snapshot_block_hashes")
+
+
 def _run_resumable_segment_stop(
     session: Request,
     *,
@@ -72,6 +101,9 @@ def _run_resumable_segment_stop(
         return [42], True
 
     sched._update_request_with_output.side_effect = stop_request
+    sched._get_confirmed_num_computed_tokens.side_effect = (
+        lambda request: request.num_computed_tokens - request.num_output_placeholders
+    )
     sched._handle_stopped_request.return_value = session_finished
     # vLLM 0.26 returns (kv_xfer_params, ec_xfer_params); an unconfigured
     # MagicMock iterates empty and fails to unpack at the call site.
@@ -155,6 +187,21 @@ def test_update_from_output_settles_in_flight_tokens() -> None:
     _run_resumable_segment_stop(session)
 
     assert session.num_in_flight_tokens == 0
+
+
+def test_prefill_only_finishes_without_committing_sampled_token() -> None:
+    session = _make_request()
+    session.status = RequestStatus.RUNNING
+    session.prefill_only = True
+    session.num_computed_tokens = session.num_prompt_tokens
+    session.num_in_flight_tokens = 1
+
+    outputs = _run_resumable_segment_stop(session, session_finished=True)
+
+    output = outputs[session.client_index].outputs[0]
+    assert output.finish_reason is not None
+    assert output.new_token_ids == []
+    assert list(session.output_token_ids) == []
 
 
 def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> None:

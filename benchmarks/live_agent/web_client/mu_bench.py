@@ -57,10 +57,11 @@ LOG = pathlib.Path(os.environ.get("MU_ENGINE_LOG", "/tmp/vllm-omni-results/qwen_
 TURN_TIMEOUT_S = 180.0
 WARMUP_S = 4.0
 GIVE_UP_AFTER = 3
-# The canonical deploy emits a 217 ms initial granule and then 2 s granules.
-# Buffer through the second granule so the user does not hear a one-word start
-# followed by silence. This is the browser's default smooth mode.
-PLAYBACK_PREBUFFER_S = 1.400
+# Capacity is judged at one fixed amount of playable audio, independent of how
+# the server packetizes codec frames. Raw TTFA remains a transport diagnostic;
+# it is not comparable across different initial_codec_chunk_frames values.
+AUDIO_READY_THRESHOLD_MS = 500.0
+PLAYBACK_PREBUFFER_S = AUDIO_READY_THRESHOLD_MS / 1000.0
 WS_DEFLATE = False
 SYSTEM_PROMPT = (
     "You are a friendly voice assistant in a live video call. You can see the camera and hear the user. "
@@ -72,7 +73,9 @@ LOG_PROBES_BAD = {
     "torch_cat_error": r"expected a non-empty list of Tensors",
     "arrival_prefill_failed": r"\[arrival-prefill\] failed",
 }
-LOG_PROBES_WARN = {}
+LOG_PROBES_WARN = {
+    "late_stage_output": r"Dropping output for unknown req",
+}
 LOG_PROBES_INFO = {
     "finite_requests": r"\[finite-request\]",
     "arrival_prefills": r"\[arrival-prefill\].*frames=",
@@ -522,6 +525,10 @@ class User:
                 "wall_s": cur["t_done"] - queried_at,
                 "audio_s": audio_s,
                 "rtf_deliver": audio_s / deliver_s if deliver_s and deliver_s > 0 else None,
+                "audio_ready_500_ms": playback.start_s * 1000 if playback.start_s is not None else None,
+                # Compatibility alias for older analysis scripts. Its contract
+                # is now the fixed 500 ms threshold above, not a tunable client
+                # configuration.
                 "playback_start_ms": playback.start_s * 1000 if playback.start_s is not None else None,
                 "stall_count": len(playback.stalls_s),
                 "stall_total_ms": playback.stall_total_s * 1000,
@@ -630,7 +637,11 @@ def summarize(records: list[dict], users: list[User], meta: dict, log_slice: str
     ttfa = [record["ttfa_ms"] for record in ok if record.get("ttfa_ms") is not None]
     ttft = [record["ttft_ms"] for record in ok if record.get("ttft_ms") is not None]
     stalls = [record["stall_max_ms"] for record in ok]
-    playback_starts = [record["playback_start_ms"] for record in ok if record.get("playback_start_ms") is not None]
+    audio_ready = [
+        record.get("audio_ready_500_ms", record.get("playback_start_ms"))
+        for record in ok
+        if record.get("audio_ready_500_ms", record.get("playback_start_ms")) is not None
+    ]
     probes = {
         key: len(re.findall(pattern, log_slice))
         for key, pattern in {**LOG_PROBES_BAD, **LOG_PROBES_WARN, **LOG_PROBES_INFO}.items()
@@ -641,13 +652,13 @@ def summarize(records: list[dict], users: list[User], meta: dict, log_slice: str
     client_errors = sum(len(user.errors) for user in users)
     ttfa_p99 = pctl(ttfa, 0.99)
     stall_p99 = pctl(stalls, 0.99)
-    playback_start_p99 = pctl(playback_starts, 0.99)
+    audio_ready_p99 = pctl(audio_ready, 0.99)
     capacity_pass = bool(
         len(ok) == expected
         and len(ttfa) == expected
-        and len(playback_starts) == expected
-        and playback_start_p99 is not None
-        and playback_start_p99 < 1000
+        and len(audio_ready) == expected
+        and audio_ready_p99 is not None
+        and audio_ready_p99 < 1000
         and stall_p99 is not None
         and stall_p99 < 50
         and stray_audio_deltas == 0
@@ -666,9 +677,18 @@ def summarize(records: list[dict], users: list[User], meta: dict, log_slice: str
         "ttfa_p99_ms": ttfa_p99,
         "ttft_p50_ms": pctl(ttft, 0.50),
         "ttft_p99_ms": pctl(ttft, 0.99),
-        "playback_start_p50_ms": pctl(playback_starts, 0.50),
-        "playback_start_p95_ms": pctl(playback_starts, 0.95),
-        "playback_start_p99_ms": playback_start_p99,
+        "audio_ready_threshold_ms": AUDIO_READY_THRESHOLD_MS,
+        "audio_ready_500_p50_ms": pctl(audio_ready, 0.50),
+        "audio_ready_500_p95_ms": pctl(audio_ready, 0.95),
+        "audio_ready_500_p99_ms": audio_ready_p99,
+        # Compatibility aliases. New comparisons should use audio_ready_500.
+        "playback_start_p50_ms": pctl(audio_ready, 0.50),
+        "playback_start_p95_ms": pctl(audio_ready, 0.95),
+        "playback_start_p99_ms": audio_ready_p99,
+        "first_audio_chunk_ms_p50": pctl(
+            [record["deltas"][0][1] / 24.0 for record in ok if record.get("deltas")],
+            0.50,
+        ),
         "stall_max_ms_p50": pctl(stalls, 0.50),
         "stall_max_ms_p95": pctl(stalls, 0.95),
         "stall_max_ms_p99": stall_p99,
@@ -825,7 +845,7 @@ async def main() -> int:
         **benchmark_provenance(),
         **frame_meta,
         **audio_meta,
-        "workload_schema": 3,
+        "workload_schema": 4,
         "percentile_method": "nearest_rank",
         "scenario": "continuous_av_session",
         "users": args.users,
@@ -837,7 +857,7 @@ async def main() -> int:
         "audio_cadence_ms": AUDIO_CADENCE_MS,
         "endpoint_silence_ms": ENDPOINT_SILENCE_MS,
         "echo_guard_ms": ECHO_GUARD_MS,
-        "playback_prebuffer_ms": PLAYBACK_PREBUFFER_S * 1000,
+        "playback_prebuffer_ms": AUDIO_READY_THRESHOLD_MS,
         "query_transport": "audio; empty video.query is the client-side cut marker",
         "websocket_compression": WS_DEFLATE,
         "workload_plan_sha256": plan_sha256(plans),
@@ -856,7 +876,7 @@ async def main() -> int:
     )
     print(
         f"   service-ttfa p50/p99={summary['ttfa_p50_ms']}/{summary['ttfa_p99_ms']} ms "
-        f"playback-start p99={summary['playback_start_p99_ms']} ms "
+        f"audio-ready-500 p99={summary['audio_ready_500_p99_ms']} ms "
         f"stall-max p99={summary['stall_max_ms_p99']} ms pass={summary['capacity_pass']}"
     )
     if summary["capacity_pass"]:

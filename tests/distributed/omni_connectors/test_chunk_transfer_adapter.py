@@ -13,7 +13,12 @@ from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
-from vllm_omni.distributed.omni_connectors.adapter import construct_next_stage_streaming_input_prompt
+from vllm_omni.distributed.omni_connectors.adapter import (
+    QWEN3_OMNI_TTS_PAD_TOKEN_ID,
+    compute_talker_prompt_cache_ids,
+    compute_talker_prompt_ids_length,
+    construct_next_stage_streaming_input_prompt,
+)
 from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
@@ -21,6 +26,82 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_talker_cache_ids_match_text_only_conditioning_lineage() -> None:
+    im_start = 151644
+    system = 8948
+    user = 872
+    assistant = 77091
+    image = 151655
+    video = 151656
+    prompt_ids = [
+        im_start,
+        system,
+        10,
+        im_start,
+        user,
+        20,
+        image,
+        21,
+        im_start,
+        assistant,
+        30,  # historical assistant: ignored by Talker
+        im_start,
+        user,
+        40,
+        video,
+        41,
+        im_start,
+        assistant,
+    ]
+
+    cache_ids = compute_talker_prompt_cache_ids(prompt_ids)
+
+    assert cache_ids == [
+        im_start,
+        user,
+        20,
+        21,
+        im_start,
+        user,
+        40,
+        41,
+        *([QWEN3_OMNI_TTS_PAD_TOKEN_ID] * 9),
+    ]
+    assert compute_talker_prompt_ids_length(prompt_ids) == len(cache_ids)
+
+
+def test_talker_cache_ids_append_new_user_after_old_terminal_tail() -> None:
+    im_start = 151644
+    user = 872
+    assistant = 77091
+    first = [im_start, user, 20, 21, im_start, assistant]
+    second = [
+        im_start,
+        user,
+        20,
+        21,
+        im_start,
+        assistant,
+        30,
+        im_start,
+        user,
+        40,
+        41,
+        im_start,
+        assistant,
+    ]
+
+    first_ids = compute_talker_prompt_cache_ids(first)
+    second_ids = compute_talker_prompt_cache_ids(second)
+
+    # Historical assistant conditioning is discarded.  The next user span
+    # replaces the old request's terminal nine-pad assistant tail, so only
+    # complete blocks before that divergence are eligible for reuse.
+    assert first_ids[:4] == second_ids[:4]
+    assert first_ids[4:] == [QWEN3_OMNI_TTS_PAD_TOKEN_ID] * 9
+    assert second_ids[4:8] == [im_start, user, 40, 41]
 
 
 class DummyWaitingQueue(list):
