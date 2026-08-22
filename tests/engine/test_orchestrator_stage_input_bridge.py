@@ -354,6 +354,48 @@ async def test_async_route_forwards_to_outgoing_only_stage() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pd_prefill_only_route_stops_before_decode() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.async_chunk = True
+    orchestrator._pd_pair = (0, 1)
+    orchestrator._pd_kv_params = {}
+    orchestrator._cfg_tracker = SimpleNamespace(is_companion=lambda _request_id: False)
+    orchestrator.stage_pools = [
+        SimpleNamespace(final_output=False),
+        SimpleNamespace(
+            final_output=True,
+            stage_client=SimpleNamespace(final_output_type="text"),
+            _infer_audio_sample_rate=lambda: 24000,
+        ),
+    ]
+    orchestrator.output_async_queue = asyncio.Queue()
+    orchestrator._cleanup_request_ids = AsyncMock()
+    orchestrator._forward_to_next_stage = AsyncMock()
+    req_state = OrchestratorRequestState(
+        request_id="pd-warm",
+        prompt={"prompt_token_ids": [1, 2], "prefill_only": True},
+        sampling_params_list=[SamplingParams(max_tokens=1) for _ in range(2)],
+        final_stage_id=1,
+        final_output_stage_ids={1},
+    )
+    output = SimpleNamespace(
+        request_id=req_state.request_id,
+        finished=True,
+        kv_transfer_params={"remote_request_id": req_state.request_id},
+        multimodal_output={"hidden_states": {"layers": {}}},
+    )
+
+    await orchestrator._route_output(0, 0, output, req_state, None)
+
+    orchestrator._forward_to_next_stage.assert_not_awaited()
+    orchestrator._cleanup_request_ids.assert_awaited_once_with([req_state.request_id])
+    routed = orchestrator.output_async_queue.get_nowait()
+    assert routed.stage_id == 1
+    assert routed.finished is True
+    assert routed.engine_outputs.outputs[0].text == ""
+
+
+@pytest.mark.asyncio
 async def test_streaming_segment_does_not_complete_final_output_stage() -> None:
     orchestrator = object.__new__(Orchestrator)
     orchestrator.async_chunk = True

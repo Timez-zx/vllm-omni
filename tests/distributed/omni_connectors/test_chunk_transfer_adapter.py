@@ -357,6 +357,27 @@ def test_save_async_uses_confirmed_tokens_for_async_scheduler_watermark(build_ad
     assert len(adapter._pending_save_reqs) == 1
 
 
+def test_save_async_snapshots_output_tokens_for_background_processor(build_adapter):
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("req-snapshot", RequestStatus.WAITING, external_req_id="external-snapshot")
+    request._output_token_ids = [10]
+    request.output_token_ids = request._output_token_ids
+    seen_output_ids = []
+
+    def recording_processor(**kwargs):
+        seen_output_ids.append(list(kwargs["request"].output_token_ids))
+        return OmniPayloadStruct()
+
+    adapter.custom_process_next_stage_input_func = recording_processor
+    adapter.save_async(multimodal_output={}, request=request)
+    request._output_token_ids.append(11)
+
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    assert seen_output_ids == [[10]]
+    assert request.output_token_ids == [10, 11]
+
+
 def test_send_single_request_terminal_chunk_still_flushes_processor(build_adapter, monkeypatch):
     """A terminal stop is not a segment boundary (#5383), but the producer-side
     processor must still receive the flush signal on the terminal chunk.

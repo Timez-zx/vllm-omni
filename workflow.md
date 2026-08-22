@@ -139,12 +139,43 @@ Arrival saves only about 25 ms at the median and worsens p95/p99 because additio
 
 Results: `/home/ubuntu/data/results/audio_arrival_ab_baseline_20260822/u8_t6` and `/home/ubuntu/data/results/audio_arrival_approx_dev_20260822/u8_t6`.
 
-## Phase 7: next steps
+## Phase 7: Thinker P/D short run
 
-1. Add bounded semantic compaction at the application: a short text summary/seed plus a few recent complete turns. Do not use `32k -> 0` as the formal configuration.
-2. Freeze the compaction policy and context envelope, then restart the 8, 16, 32, ... capacity ladder.
-3. At the first SLO failure, split Thinker prefill, Thinker decode, post-first-text pipeline waiting, and GPU activity.
-4. If concurrent Thinker work still dominates tail latency, compare scheduling isolation and P/D separation rather than hiding the engine issue with application tuning.
+`thinker-talker-pd` keeps the same application protocol and finite requests while splitting Thinker onto GPU 0 for prefill and GPU 1 for decode. Talker and Code2Wav use GPUs 2 and 3. The application still owns session/history, and each engine request ends with its turn.
+
+The implementation fixes three bridge issues: D reuses P's media-position metadata instead of re-encoding media; Talker receives P's saved prompt hidden states; and the background sender snapshots tokens and tensors when enqueueing. P→D uses NIXL, while later stage edges use shared memory.
+
+Strict short runs use schema 4, seed 7, eight users × six turns, one warm-up turn, a 0–8 second stagger, complete query-time WAV, and video arrival prefill. Plan SHA256 is `b6160ec3d78a2126fb07830e5c1b75f9319ba579543555c8474852ad9f9ddf9b`. Each arm has 40 scored turns with no timeout or stall.
+
+| P→D connector | TTFA p50/p95/p99 | TTFT p50/p99 | D-stage p99 |
+|---|---:|---:|---:|
+| NIXL pull | 4164/13347/19656 ms | 2709/13223 ms | 12.77 s |
+| packed cross-layer pull | 4510/7783/9124 ms | 2999/8047 ms | 7.36 s |
+| packed cross-layer push, incorrectly serialized | 2146/3700/5034 ms | 671/1188 ms | 0.59 s |
+| packed cross-layer push, async pipeline fixed | 770/1083/1228 ms | 576/1081 ms | 0.52 s |
+
+The old ten-second D wait was a connector engineering failure, not an inherent cost of PCIe or P/D:
+
+- GPU 0↔1 is PCIe Gen5 x16; raw PyTorch P2P measures about `50 GiB/s`.
+- Pull sustains only about `0.55 GiB/s`; cross-layer packing alone does not improve sustained bandwidth.
+- Push issues background WRITE bursts. NIXL telemetry measures about `35 GiB/s` when warm; a 3,820-token prompt transfers exactly `187,957,248 B` in `4.922 ms`.
+- Thinker KV costs `48 KiB/token`. D prefix caching is disabled, so every final request still transfers its complete prompt KV; arrival warm-ups run only on P and do not transfer to D.
+- D prefix caching cannot simply be enabled: the current connector lacks a delta source offset/cache lineage, so P's complete block table cannot be safely aligned to only D's missing tail. Incremental transfer needs an explicit cache handle and block range.
+
+The first packed-push result still had an application confounder: stage P's local `async_chunk: false` was incorrectly used as the pipeline-wide switch. D therefore waited for complete text before starting Talker, and Code2Wav waited for the complete codec sequence. Its connector bandwidth result remains valid, but its 5.03-second TTFA cannot evaluate P/D.
+
+After the fix, the orchestrator enables async mode when any downstream stage uses chunks while P itself keeps its dedicated KV route. The eight-user short run completed 48/48 turns, scored 40, had no timeout or stall, and passed `verify_run.py`. Engine-side p99 progresses from P first output at 831 ms to D first text at 1044 ms, Talker first codec at 1102 ms, and first audio at 1191 ms. Talker-to-audio is now only 250 ms instead of 3881 ms, confirming Talker and Code2Wav overlap again.
+
+This validation uses the same workload parameters but remains a live closed loop. Its plan SHA256 is `fd9c7288bca42529d9f3117174890853f611b6e0af10b24d9ed78d0fc8e1301d`, not an exact replay of the old run, so the numbers validate the regression fix rather than a strict capacity A/B.
+
+Results: `/home/ubuntu/data/results/pd_finite_short_u8_v14_20260822`, `/home/ubuntu/data/results/pd_crosslayer_u8_t6_stagger8_20260822_v3`, `/home/ubuntu/data/results/pd_crosslayer_push_u8_t6_stagger8_20260822_v2`, and `/home/ubuntu/data/results/pd_async_fix_20260822_v1/pd_async_fix_seed7_u8`. The exact NIXL telemetry smoke is in `/home/ubuntu/data/results/pd_push_telemetry_smoke_u1_20260822_v1`.
+
+## Phase 8: next steps
+
+1. Freeze the fixed packed-push P/D baseline with a recorded input-trace replay.
+2. If work on the one-second SLO continues, analyze P first-output tail first; the speech path is streaming again and is no longer the multi-second cause.
+3. Delta-only P→D remains an engine research item: D may retain disposable prefix KV, but the interface must carry a cache handle, lineage version, and explicit block range.
+4. Resume the 16, 32, ... capacity ladder only after the eight-user target is met.
 
 ## Recovery map
 
@@ -157,5 +188,7 @@ Results: `/home/ubuntu/data/results/audio_arrival_ab_baseline_20260822/u8_t6` an
 | Workload plan and media loading | `benchmarks/live_agent/web_client/continuous_av_workload.py` |
 | Capacity ladder | `benchmarks/live_agent/web_client/run_av_session_ladder.sh` |
 | Formal deployment | `benchmarks/thinker_talker/origin_deploy_3gpu.yaml` |
+| P/D deployment | `benchmarks/thinker_talker/pd_deploy_4gpu.yaml` |
+| P/D capacity entry point | `benchmarks/live_agent/web_client/run_pd_av_session_ladder.sh` |
 | Run verification | `benchmarks/live_agent/analysis/verify_run.py` |
 | GPU sampling | `benchmarks/live_agent/harness/gpu_sampler.py` |

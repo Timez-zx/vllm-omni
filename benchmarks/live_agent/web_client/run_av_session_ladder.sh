@@ -17,6 +17,7 @@ RESULTS_DIR=${RESULTS_DIR:-/tmp/vllm-omni-results}
 ENGINE_LOG=${MU_ENGINE_LOG:-$RESULTS_DIR/qwen_live.log}
 PORT=${MU_PORT:-8091}
 MU_DEPLOY=${MU_DEPLOY:-$REPO_ROOT/benchmarks/thinker_talker/origin_deploy_3gpu.yaml}
+EXPECTED_DEPLOY_BASENAME=${MU_EXPECTED_DEPLOY_BASENAME:-origin_deploy_3gpu.yaml}
 
 : "${MU_FRAMES_DIR:?set MU_FRAMES_DIR to the ordered JPEG frame directory}"
 : "${MU_AUDIO_MANIFEST:?set MU_AUDIO_MANIFEST to the real-utterance JSONL manifest}"
@@ -25,8 +26,8 @@ MU_DEPLOY=${MU_DEPLOY:-$REPO_ROOT/benchmarks/thinker_talker/origin_deploy_3gpu.y
   echo "deploy YAML not found: $MU_DEPLOY" >&2
   exit 2
 }
-[ "${MU_DEPLOY##*/}" = "origin_deploy_3gpu.yaml" ] || {
-  echo "formal AV capacity runs are pinned to origin_deploy_3gpu.yaml: $MU_DEPLOY" >&2
+[ "${MU_DEPLOY##*/}" = "$EXPECTED_DEPLOY_BASENAME" ] || {
+  echo "AV capacity run is pinned to $EXPECTED_DEPLOY_BASENAME: $MU_DEPLOY" >&2
   exit 2
 }
 [ -d "$MU_FRAMES_DIR" ] || {

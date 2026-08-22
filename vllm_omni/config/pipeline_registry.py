@@ -90,7 +90,10 @@ from vllm_omni.model_executor.models.qwen2_5_omni.pipeline import (
     QWEN2_5_OMNI_PIPELINE,
     QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
 )
-from vllm_omni.model_executor.models.qwen3_omni.pipeline import resolve_qwen3_omni_pipeline
+from vllm_omni.model_executor.models.qwen3_omni.pipeline import (
+    QWEN3_OMNI_PD_PIPELINE,
+    resolve_qwen3_omni_pipeline,
+)
 from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_PIPELINE
 from vllm_omni.model_executor.models.soulx_singer.pipeline import (
     SOULXSINGER_SVC_PIPELINE,
@@ -114,6 +117,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,
     "qwen2_5_omni_thinker_only": QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
     "qwen3_omni_moe": resolve_qwen3_omni_pipeline,
+    "qwen3_omni_moe_pd": QWEN3_OMNI_PD_PIPELINE,
     "qwen3_tts": QWEN3_TTS_PIPELINE,
     "step_audio_2": STEP_AUDIO2_PIPELINE,
     "step_audio_2_asr": STEP_AUDIO2_ASR_PIPELINE,

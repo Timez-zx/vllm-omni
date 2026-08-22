@@ -12,6 +12,7 @@ from typing import Any
 
 import janus
 import pytest
+import torch
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError
@@ -209,6 +210,66 @@ def test_terminal_empty_audio_output_uses_stage_sample_rate() -> None:
     )
 
     assert terminal_output.outputs[0].multimodal_output["sr"] == 44100
+
+
+def test_pd_prefill_snapshot_accumulates_flat_wire_chunks() -> None:
+    first = {
+        "hidden_states.layer_0": torch.ones(2, 3),
+        "hidden_states.layer_24": torch.full((2, 3), 24.0),
+        "embed.tts_bos": torch.ones(1, 3),
+    }
+    second = {
+        "hidden_states.layer_0": torch.full((1, 3), 2.0),
+        "hidden_states.layer_24": torch.full((1, 3), 25.0),
+    }
+
+    accumulated = Orchestrator._accumulate_pd_prefill_output(None, first)
+    accumulated = Orchestrator._accumulate_pd_prefill_output(accumulated, second)
+
+    assert accumulated is not None
+    assert accumulated["hidden_states"]["layers"][0].shape == (3, 3)
+    assert accumulated["hidden_states"]["layers"][24].shape == (3, 3)
+    assert accumulated["hidden_states"]["layers"][0][-1].tolist() == [2.0, 2.0, 2.0]
+    assert accumulated["embed"]["tts_bos"].shape == (1, 3)
+
+
+def test_pd_mrope_metadata_rebuilds_without_media_tensors() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._pd_mrope_values_by_identifier = {}
+    feature = SimpleNamespace(
+        modality="image",
+        identifier="image-hash",
+        mm_position=SimpleNamespace(offset=22, length=220),
+        data={"image_grid_thw": SimpleNamespace(data=torch.tensor([1, 22, 40]))},
+    )
+
+    metadata = orchestrator._capture_pd_mrope_metadata([feature])
+    rebuilt = orchestrator._build_pd_mrope_features(metadata)
+
+    assert metadata == [
+        {
+            "modality": "image",
+            "identifier": "image-hash",
+            "offset": 22,
+            "length": 220,
+            "values": {"image_grid_thw": [1, 22, 40]},
+        }
+    ]
+    assert len(rebuilt) == 1
+    assert rebuilt[0].mm_position.offset == 22
+    assert rebuilt[0].mm_position.length == 220
+    assert rebuilt[0].data is not None
+    assert set(rebuilt[0].data) == {"image_grid_thw"}
+
+    cached_feature = SimpleNamespace(
+        modality="image",
+        identifier="image-hash",
+        mm_position=SimpleNamespace(offset=33, length=220),
+        data=None,
+    )
+    cached_metadata = orchestrator._capture_pd_mrope_metadata([cached_feature])
+    assert cached_metadata[0]["offset"] == 33
+    assert cached_metadata[0]["values"] == {"image_grid_thw": [1, 22, 40]}
 
 
 class FakeCollectiveRpcStageClient(FakeStageClient):

@@ -21,6 +21,13 @@ import janus
 import torch
 from vllm.config import ModelConfig
 from vllm.logger import init_logger
+from vllm.multimodal.inputs import (
+    MultiModalBatchedField,
+    MultiModalFeatureSpec,
+    MultiModalFieldElem,
+    MultiModalKwargsItem,
+    PlaceholderRange,
+)
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -29,8 +36,9 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.data_entry_keys import unflatten_payload
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
-from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine import OmniEngineCoreRequest, OmniPDPrefillPayload
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.messages import (
@@ -133,6 +141,7 @@ def build_engine_core_request_from_tokens(
     prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
     raw_additional_information = prompt.get("additional_information")
     model_intermediate_buffer = prompt.get("model_intermediate_buffer")
+    pd_prefill_payload = prompt.get("pd_prefill_payload")
     wire_payload: dict[str, Any] | None = None
     if isinstance(raw_additional_information, dict):
         wire_payload = dict(raw_additional_information)
@@ -155,6 +164,7 @@ def build_engine_core_request_from_tokens(
         resumable=resumable,
         additional_information=additional_info_payload,
         model_intermediate_buffer=model_intermediate_buffer if isinstance(model_intermediate_buffer, dict) else None,
+        pd_prefill_payload=pd_prefill_payload if isinstance(pd_prefill_payload, OmniPDPrefillPayload) else None,
         cache_token_ids=prompt.get("cache_token_ids"),
         prefill_only=prompt.get("prefill_only") is True,
         kv_lineage_id=prompt.get("kv_lineage_id"),
@@ -182,6 +192,7 @@ class OrchestratorRequestState:
     stage_submit_ts: dict[int, float] = field(default_factory=dict)
     mm_processor_kwargs: dict | None = None
     mm_features: list | None = None
+    pd_mrope_feature_metadata: list[dict[str, Any]] = field(default_factory=list)
     pd_prefill_multimodal_output: dict[str, Any] | None = None
 
     streaming: StreamingInputState = field(default_factory=lambda: StreamingInputState())
@@ -381,6 +392,10 @@ class Orchestrator:
         self._pd_bootstrap_addr: str | None = None
         self._pd_prefill_engine_id: str | None = None
         self._pd_kv_params: dict[str, Any] = {}
+        # Arrival-prefill requests may populate vLLM's sender-side media
+        # cache, leaving the final request with hash-only feature references.
+        # Retain only the tiny values needed to reconstruct M-RoPE on D.
+        self._pd_mrope_values_by_identifier: dict[str, dict[str, Any]] = {}
         if pd_config is not None:
             self._pd_pair = pd_config.get("pd_pair")
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
@@ -674,6 +689,8 @@ class Orchestrator:
             request_timestamp=float(msg.request_timestamp or _time.time()),
             mm_features=getattr(prompt, "mm_features", None),
         )
+        if self._pd_pair is not None:
+            req_state.pd_mrope_feature_metadata = self._capture_pd_mrope_metadata(req_state.mm_features)
         self.request_states[request_id] = req_state
         self._register_running_request(req_state)
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
@@ -922,7 +939,16 @@ class Orchestrator:
                             await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
                             for eco in raw_outputs.outputs:
                                 req_state = self.request_states.get(getattr(eco, "request_id", None))
-                                if req_state is None or not req_state.streaming.enabled:
+                                if req_state is None:
+                                    continue
+                                if self._pd_pair is not None and stage_id == self._pd_pair[0]:
+                                    raw_mm = self._completion_multimodal_output(eco, None)
+                                    if raw_mm:
+                                        req_state.pd_prefill_multimodal_output = self._accumulate_pd_prefill_output(
+                                            req_state.pd_prefill_multimodal_output,
+                                            raw_mm,
+                                        )
+                                if not req_state.streaming.enabled:
                                     continue
                                 req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
                                 req_state.streaming.segment_token_ids = (
@@ -1315,7 +1341,49 @@ class Orchestrator:
             kv_params = getattr(output, "kv_transfer_params", None)
             if kv_params is not None:
                 self._pd_kv_params[req_id] = kv_params if isinstance(kv_params, dict) else dict(kv_params)
-            req_state.pd_prefill_multimodal_output = getattr(output, "multimodal_output", None)
+            # Raw EngineCore outputs are accumulated above because a chunked
+            # prefill exposes only one hidden-state slice per engine step.  A
+            # processed-only backend may not expose those raw slices, so keep
+            # this final-output fallback without duplicating an accumulated
+            # snapshot.
+            if req_state.pd_prefill_multimodal_output is None:
+                processed_mm = self._completion_multimodal_output(output, None)
+                if processed_mm:
+                    req_state.pd_prefill_multimodal_output = self._accumulate_pd_prefill_output(
+                        None,
+                        processed_mm,
+                    )
+
+            # A cache-population request must stop at P.  In a non-split
+            # pipeline the Thinker itself is the text output stage; after a
+            # split, text belongs to D, so ordinary modality routing would
+            # accidentally submit this silent warm-up to D.
+            prompt = req_state.prompt
+            prefill_only = isinstance(prompt, dict) and prompt.get("prefill_only") is True
+            if prefill_only:
+                final_stage_id = req_state.final_stage_id
+                final_pool = self.stage_pools[final_stage_id]
+                terminal_output = _build_terminal_empty_output(
+                    req_id,
+                    final_output_type=getattr(final_pool.stage_client, "final_output_type", None),
+                    audio_sample_rate=final_pool._infer_audio_sample_rate(),
+                )
+                terminal_ts = _time.time()
+                req_state.stage_submit_ts[final_stage_id] = terminal_ts
+                logger.debug("[Orchestrator][PD] prefill-only req=%s stopped after stage-%s", req_id, stage_id)
+                await self.output_async_queue.put(
+                    OutputMessage(
+                        request_id=req_id,
+                        stage_id=final_stage_id,
+                        replica_id=replica_id,
+                        engine_outputs=terminal_output,
+                        metrics=None,
+                        finished=True,
+                        stage_submit_ts=terminal_ts,
+                    )
+                )
+                await self._cleanup_request_ids([req_id])
+                return
 
         duplex_output_decision = self._duplex_output_decision(stage_id, output, req_state)
         if duplex_output_decision is not None:
@@ -1565,6 +1633,117 @@ class Orchestrator:
             return mm_output
         mm_output = getattr(completion, "multimodal_output", None) if completion is not None else None
         return mm_output if isinstance(mm_output, dict) else {}
+
+    def _capture_pd_mrope_metadata(self, features: Any) -> list[dict[str, Any]]:
+        """Capture media layout without retaining media tensors for D."""
+        metadata: list[dict[str, Any]] = []
+        for feature in features or ():
+            mm_position = getattr(feature, "mm_position", None)
+            if mm_position is None:
+                continue
+            identifier = str(getattr(feature, "identifier", ""))
+            item = getattr(feature, "data", None)
+            values: dict[str, Any] = {}
+            if item is not None:
+                for key in (
+                    "image_grid_thw",
+                    "video_grid_thw",
+                    "second_per_grid_ts",
+                    "use_audio_in_video",
+                    "audio_feature_lengths",
+                ):
+                    elem = item.get(key)
+                    value = getattr(elem, "data", None)
+                    if value is None:
+                        continue
+                    if hasattr(value, "tolist"):
+                        value = value.tolist()
+                    values[key] = value
+                if values and identifier:
+                    self._pd_mrope_values_by_identifier[identifier] = values
+            elif identifier:
+                values = self._pd_mrope_values_by_identifier.get(identifier, {})
+            if values:
+                metadata.append(
+                    {
+                        "modality": str(feature.modality),
+                        "identifier": identifier,
+                        "offset": int(mm_position.offset),
+                        "length": int(mm_position.length),
+                        "values": values,
+                    }
+                )
+        return metadata
+
+    @staticmethod
+    def _build_pd_mrope_features(metadata: Any) -> list[MultiModalFeatureSpec]:
+        """Rebuild metadata-only features for D's Qwen3-Omni M-RoPE path."""
+        if not isinstance(metadata, list):
+            return []
+        features: list[MultiModalFeatureSpec] = []
+        for index, raw in enumerate(metadata):
+            if not isinstance(raw, dict):
+                continue
+            values = raw.get("values")
+            if not isinstance(values, dict):
+                continue
+            fields = {
+                key: MultiModalFieldElem(
+                    data=torch.as_tensor(value),
+                    field=MultiModalBatchedField(keep_on_cpu=True),
+                )
+                for key, value in values.items()
+            }
+            identifier = f"pd-mrope:{raw.get('identifier', index)}"
+            features.append(
+                MultiModalFeatureSpec(
+                    data=MultiModalKwargsItem(fields),
+                    modality=str(raw["modality"]),
+                    identifier=identifier,
+                    mm_position=PlaceholderRange(
+                        offset=int(raw["offset"]),
+                        length=int(raw["length"]),
+                    ),
+                    mm_hash=identifier,
+                )
+            )
+        return features
+
+    @staticmethod
+    def _accumulate_pd_prefill_output(
+        accumulated: dict[str, Any] | None,
+        current: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Accumulate only the P tensors required by the D-to-Talker edge."""
+        current = unflatten_payload(current)
+        hidden = current.get("hidden_states")
+        layers = hidden.get("layers") if isinstance(hidden, dict) else None
+        if not isinstance(layers, dict):
+            return accumulated
+
+        selected_layers: dict[int, torch.Tensor] = {}
+        for key in (0, 24, "0", "24"):
+            value = layers.get(key)
+            if isinstance(value, torch.Tensor):
+                selected_layers[int(key)] = value.detach().cpu()
+        if not selected_layers:
+            return accumulated
+
+        if accumulated is None:
+            accumulated = {"hidden_states": {"layers": {}}}
+        destination = accumulated.setdefault("hidden_states", {}).setdefault("layers", {})
+        for key, value in selected_layers.items():
+            previous = destination.get(key)
+            destination[key] = torch.cat((previous, value), dim=0) if isinstance(previous, torch.Tensor) else value
+
+        embeds = current.get("embed")
+        if isinstance(embeds, dict):
+            destination_embeds = accumulated.setdefault("embed", {})
+            for key in ("tts_bos", "tts_eos", "tts_pad"):
+                value = embeds.get(key)
+                if isinstance(value, torch.Tensor):
+                    destination_embeds.setdefault(key, value.detach().cpu())
+        return accumulated
 
     @classmethod
     def _coerce_int_list(cls, value: Any) -> list[int]:
@@ -1926,6 +2105,19 @@ class Orchestrator:
         if self._pd_pair is not None and (src_stage_id, next_logical) == self._pd_pair:
             params = self._build_pd_decode_params(req_id, params)
 
+            # This token-only D request bypasses the ordinary input processor,
+            # which normally installs tokenizer-derived EOS and stop metadata.
+            # Mirror that initialization so D terminates at Qwen's chat EOS
+            # instead of running to the configured max_tokens limit.
+            decode_processor = self.stage_pools[next_logical].output_processor
+            decode_tokenizer = getattr(decode_processor, "tokenizer", None)
+            if isinstance(params, SamplingParams) and decode_tokenizer is not None:
+                params.update_from_generation_config(
+                    {},
+                    getattr(decode_tokenizer, "eos_token_id", None),
+                )
+                params.update_from_tokenizer(decode_tokenizer)
+
             # Use the original user prompt for the decode stage (not processed embeddings)
             original_prompt = req_state.prompt
             raw_decode_inputs = [original_prompt] if not isinstance(original_prompt, list) else original_prompt
@@ -1943,13 +2135,72 @@ class Orchestrator:
                     )
                 decode_inputs.append({"prompt_token_ids": list(prompt_token_ids)})
 
+            pd_mrope_features = self._build_pd_mrope_features(req_state.pd_mrope_feature_metadata)
+            expected_mrope_features = sum(
+                getattr(feature, "modality", None) in ("image", "video", "audio")
+                for feature in (req_state.mm_features or ())
+            )
+            if len(pd_mrope_features) != expected_mrope_features:
+                raise RuntimeError(
+                    "[Orchestrator][PD] incomplete M-RoPE metadata for decode "
+                    f"req={req_id}: rebuilt={len(pd_mrope_features)} expected={expected_mrope_features}"
+                )
+
+            prefill_snapshot = req_state.pd_prefill_multimodal_output
+            if isinstance(prefill_snapshot, dict):
+                hidden_states = prefill_snapshot.get("hidden_states")
+                layers = hidden_states.get("layers") if isinstance(hidden_states, dict) else None
+                embeds = prefill_snapshot.get("embed")
+                embeds = embeds if isinstance(embeds, dict) else {}
+
+                def _layer(key: int) -> torch.Tensor | None:
+                    if not isinstance(layers, dict):
+                        return None
+                    value = layers.get(key, layers.get(str(key)))
+                    return value if isinstance(value, torch.Tensor) else None
+
+                layer_0 = _layer(0)
+                layer_24 = _layer(24)
+                if layer_0 is not None and layer_24 is not None:
+                    for decode_input in decode_inputs:
+                        prompt_ids = decode_input.get("prompt_token_ids") or []
+                        available_rows = min(int(layer_0.shape[0]), int(layer_24.shape[0]))
+                        if available_rows < len(prompt_ids):
+                            logger.warning(
+                                "[Orchestrator][PD] incomplete P snapshot req=%s rows=%d prompt_tokens=%d",
+                                req_id,
+                                available_rows,
+                                len(prompt_ids),
+                            )
+                            continue
+                        decode_input["pd_prefill_payload"] = OmniPDPrefillPayload(
+                            prompt_layer_0=layer_0[: len(prompt_ids)].detach().cpu(),
+                            prompt_layer_24=layer_24[: len(prompt_ids)].detach().cpu(),
+                            prompt_token_ids=list(prompt_ids),
+                            tts_bos=embeds.get("tts_bos"),
+                            tts_eos=embeds.get("tts_eos"),
+                            tts_pad=embeds.get("tts_pad"),
+                        )
+                        logger.info(
+                            "[Orchestrator][PD] attached P snapshot req=%s rows=%d prompt_tokens=%d",
+                            req_id,
+                            available_rows,
+                            len(prompt_ids),
+                        )
+                else:
+                    logger.warning(
+                        "[Orchestrator][PD] P output lacks Talker conditioning layers for req=%s; "
+                        "D can decode but audio handoff may be incomplete",
+                        req_id,
+                    )
+
             for decode_input in decode_inputs:
                 request = build_engine_core_request_from_tokens(
                     request_id=req_id,
                     prompt=decode_input,
                     params=params,
                     model_config=next_pool.stage_vllm_config.model_config,
-                    mm_features=req_state.mm_features,
+                    mm_features=pd_mrope_features,
                     resumable=next_stage_resumable,
                 )
                 request.external_req_id = request.request_id

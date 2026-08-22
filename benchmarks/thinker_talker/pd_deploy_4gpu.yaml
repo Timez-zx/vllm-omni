@@ -1,0 +1,114 @@
+# Qwen3-Omni continuous-AV deployment with a finite-request Thinker P/D pair.
+# GPU 0: Thinker prefill; GPU 1: Thinker decode; GPU 2: Talker; GPU 3: Code2Wav.
+# Apart from the split Thinker, parameters match origin_deploy_3gpu.yaml.
+pipeline: qwen3_omni_moe_pd
+async_chunk: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      initial_codec_chunk_frames: 8
+      codec_chunk_frames: 4
+      codec_left_context_frames: 25
+
+stages:
+  - stage_id: 0
+    max_num_batched_tokens: 32768
+    max_num_seqs: 64
+    scheduling_policy: priority
+    gpu_memory_utilization: 0.9
+    mm_processor_cache_gb: 16
+    trust_remote_code: true
+    quantization: fp8
+    kv_cache_dtype: fp8
+    enable_prefix_caching: true
+    devices: "0"
+    env:
+      VLLM_NIXL_SIDE_CHANNEL_PORT: "5600"
+    engine_extras:
+      # Stage-local only: P -> D uses the vLLM KV connector rather than an
+      # Omni chunk edge. The pipeline remains async for D -> Talker -> Code2Wav.
+      async_chunk: false
+      kv_transfer_config:
+        kv_connector: NixlPushConnector
+        kv_role: kv_producer
+        kv_rank: 0
+        kv_parallel_size: 2
+        kv_load_failure_policy: fail
+        kv_connector_extra_config:
+          # Pack every layer for the same KV block contiguously.  Without
+          # this, a long Qwen3-Omni prompt becomes roughly one NIXL
+          # descriptor per layer/KV/block and transfer setup dominates PCIe.
+          enable_cross_layers_blocks: true
+          kv_lease_duration: 300
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 2048
+
+  - stage_id: 1
+    max_num_batched_tokens: 32768
+    max_num_seqs: 64
+    scheduling_policy: priority
+    gpu_memory_utilization: 0.9
+    trust_remote_code: true
+    quantization: fp8
+    kv_cache_dtype: fp8
+    # D receives the authoritative request-scoped prompt KV from P. Keep its
+    # local prefix cache off until the connector has explicit delta offsets;
+    # matching only the destination tail is insufficient for safe alignment.
+    enable_prefix_caching: false
+    devices: "1"
+    env:
+      VLLM_NIXL_SIDE_CHANNEL_PORT: "5601"
+    engine_extras:
+      kv_transfer_config:
+        kv_connector: NixlPushConnector
+        kv_role: kv_consumer
+        kv_rank: 1
+        kv_parallel_size: 2
+        kv_load_failure_policy: fail
+        kv_connector_extra_config:
+          enable_cross_layers_blocks: true
+          kv_lease_duration: 300
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 2048
+
+  - stage_id: 2
+    max_num_batched_tokens: 32768
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.6
+    trust_remote_code: true
+    quantization: fp8
+    kv_cache_dtype: fp8
+    # Match the canonical three-GPU Talker: reuse token-exact historical
+    # conditioning blocks and stream codec output into Code2Wav.
+    enable_prefix_caching: true
+    devices: "2"
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      repetition_penalty: 1.05
+
+  - stage_id: 3
+    max_num_batched_tokens: 65536
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.6
+    enforce_eager: false
+    trust_remote_code: true
+    enable_prefix_caching: false
+    enable_chunked_prefill: false
+    async_scheduling: false
+    devices: "3"
+    input_connectors:
+      from_stage_2: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      repetition_penalty: 1.1

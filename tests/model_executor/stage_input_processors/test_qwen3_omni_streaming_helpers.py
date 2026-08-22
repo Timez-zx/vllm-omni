@@ -11,6 +11,7 @@ import pytest
 import torch
 
 import vllm_omni.model_executor.stage_input_processors.qwen3_omni as q3
+from vllm_omni.engine import OmniPDPrefillPayload
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -257,6 +258,128 @@ def test_text_only_thinker_payload_filter_is_disabled_with_talker_filter(monkeyp
     assert filtered.embed.prefill.shape[0] == 3
 
 
+def test_pd_first_decode_chunk_seeds_talker_from_prefill_snapshot() -> None:
+    request_id = "pd-first-decode"
+    prompt_ids = [151644, 872, 10, 151645, 151644, 77091]
+    transfer_manager = SimpleNamespace(
+        put_req_chunk=defaultdict(int),
+        request_payload={},
+    )
+    request = SimpleNamespace(
+        external_req_id=request_id,
+        output_token_ids=[20],
+        additional_information=None,
+        pd_prefill_payload=OmniPDPrefillPayload(
+            prompt_layer_0=torch.arange(12, dtype=torch.float32).reshape(6, 2),
+            prompt_layer_24=torch.arange(12, dtype=torch.float32).reshape(6, 2) + 100,
+            prompt_token_ids=prompt_ids,
+        ),
+    )
+    multimodal_output = {
+        "hidden_states": {
+            "layers": {
+                0: torch.tensor([[90.0, 91.0]]),
+                24: torch.tensor([[190.0, 191.0]]),
+            }
+        },
+        "embed": {},
+    }
+
+    payload = q3.thinker2talker_async_chunk(
+        transfer_manager,
+        multimodal_output,
+        request,
+    )
+
+    assert payload is not None
+    assert payload.ids.all == prompt_ids + [20]
+    assert payload.ids.prompt == prompt_ids
+    assert payload.embed.prefill.shape == (7, 2)
+    assert payload.hidden_states.output.shape == (7, 2)
+    assert payload.embed.prefill[-1].tolist() == [90.0, 91.0]
+    assert payload.hidden_states.output[-1].tolist() == [190.0, 191.0]
+
+
+def test_pd_first_batched_decode_chunk_seeds_talker_from_prefill_snapshot() -> None:
+    request_id = "pd-first-batched-decode"
+    prompt_ids = [151644, 872, 10, 151645, 151644, 77091]
+    transfer_manager = SimpleNamespace(
+        put_req_chunk=defaultdict(int),
+        request_payload={},
+    )
+    request = SimpleNamespace(
+        external_req_id=request_id,
+        output_token_ids=[20, 21, 22],
+        additional_information=None,
+        pd_prefill_payload=OmniPDPrefillPayload(
+            prompt_layer_0=torch.arange(12, dtype=torch.float32).reshape(6, 2),
+            prompt_layer_24=torch.arange(12, dtype=torch.float32).reshape(6, 2) + 100,
+            prompt_token_ids=prompt_ids,
+        ),
+    )
+    multimodal_output = {
+        "hidden_states": {
+            "layers": {
+                0: torch.tensor([[80.0, 81.0], [90.0, 91.0], [100.0, 101.0]]),
+                24: torch.tensor([[180.0, 181.0], [190.0, 191.0], [200.0, 201.0]]),
+            }
+        },
+        "embed": {},
+    }
+
+    payload = q3.thinker2talker_async_chunk(
+        transfer_manager,
+        multimodal_output,
+        request,
+    )
+
+    assert payload is not None
+    assert payload.ids.all == prompt_ids + [20, 21, 22]
+    assert payload.ids.prompt == prompt_ids
+    assert payload.embed.prefill.shape == (9, 2)
+    assert payload.hidden_states.output.shape == (9, 2)
+    assert payload.embed.prefill[-3:].tolist() == [[80.0, 81.0], [90.0, 91.0], [100.0, 101.0]]
+    assert payload.hidden_states.output[-3:].tolist() == [
+        [180.0, 181.0],
+        [190.0, 191.0],
+        [200.0, 201.0],
+    ]
+
+
+def test_pd_first_decode_chunk_rejects_async_token_sentinel() -> None:
+    request_id = "pd-unresolved-token"
+    transfer_manager = SimpleNamespace(
+        put_req_chunk=defaultdict(int),
+        request_payload={},
+    )
+    request = SimpleNamespace(
+        external_req_id=request_id,
+        output_token_ids=[-1],
+        additional_information=None,
+        pd_prefill_payload=OmniPDPrefillPayload(
+            prompt_layer_0=torch.ones(1, 2),
+            prompt_layer_24=torch.ones(1, 2),
+            prompt_token_ids=[10],
+        ),
+    )
+    multimodal_output = {
+        "hidden_states": {
+            "layers": {
+                0: torch.ones(1, 2),
+                24: torch.ones(1, 2),
+            }
+        },
+        "embed": {},
+    }
+
+    with pytest.raises(RuntimeError, match="disable async_scheduling"):
+        q3.thinker2talker_async_chunk(
+            transfer_manager,
+            multimodal_output,
+            request,
+        )
+
+
 def test_talker2code2wav_full_payload_filters_by_output_token_ids() -> None:
     request = SimpleNamespace(
         request_id="codec",
@@ -463,6 +586,30 @@ def test_thinker2talker_token_only_preserves_voice_metadata() -> None:
         "speaker": ["ethan"],
         "language": ["English"],
     }
+
+
+def test_thinker2talker_token_only_filters_multimodal_placeholder_length() -> None:
+    prompt_ids = [
+        151644,
+        872,
+        10,
+        *([151655] * 100),
+        151645,
+        151644,
+        77091,
+    ]
+    source_outputs = [
+        SimpleNamespace(
+            request_id="req-pd",
+            prompt_token_ids=prompt_ids,
+            outputs=[SimpleNamespace(cumulative_token_ids=[20])],
+        )
+    ]
+
+    [talker_prompt] = q3.thinker2talker_token_only(source_outputs)
+
+    # Four user text ids plus the fixed nine-row assistant bootstrap.
+    assert talker_prompt["prompt_token_ids"] == [0] * 13
 
 
 def test_accumulator_replaces_keys_in_replace_set() -> None:

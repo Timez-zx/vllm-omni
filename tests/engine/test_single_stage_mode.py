@@ -31,14 +31,14 @@ from vllm_omni.engine.stage_runtime import DistStageRuntime, StageRuntime
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _make_stage_cfg(stage_id: int, stage_type: str = "llm"):
+def _make_stage_cfg(stage_id: int, stage_type: str = "llm", *, async_chunk: bool = False):
     """Return a lightweight stage config mock."""
     return SimpleNamespace(
         stage_id=stage_id,
         stage_type=stage_type,
         runtime=SimpleNamespace(devices="0"),
         engine_args=SimpleNamespace(
-            async_chunk=False,
+            async_chunk=async_chunk,
             model_stage=None,
             engine_output_type=None,
         ),
@@ -426,6 +426,26 @@ class TestSingleStageModeDetection:
         engine = self._make_engine_no_thread(mocker)
         assert engine.single_stage_mode is False
         assert engine._single_stage_id_filter is None
+
+    def test_downstream_async_chunk_enables_pipeline_orchestrator(self, mocker: MockerFixture):
+        engine = self._make_engine_no_thread(
+            mocker,
+            stage_cfgs=[
+                _make_stage_cfg(0, async_chunk=False),
+                _make_stage_cfg(1, async_chunk=True),
+                _make_stage_cfg(2, async_chunk=True),
+            ],
+        )
+
+        assert engine.async_chunk is True
+
+    def test_all_sync_stages_disable_pipeline_orchestrator(self, mocker: MockerFixture):
+        engine = self._make_engine_no_thread(
+            mocker,
+            stage_cfgs=[_make_stage_cfg(0), _make_stage_cfg(1)],
+        )
+
+        assert engine.async_chunk is False
 
     def test_stage_configs_path_loads_duplex_runtime_config(self, mocker: MockerFixture):
         duplex_session = DuplexSessionRuntimeConfig(max_sessions=2)

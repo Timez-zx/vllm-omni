@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start the canonical three-GPU Qwen3-Omni engine and wait for health.
+# Start a pinned Qwen3-Omni benchmark deployment and wait for health.
 set -uo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -11,6 +11,8 @@ DEPLOY=${DEPLOY_CONFIG:-$REPO_ROOT/benchmarks/thinker_talker/origin_deploy_3gpu.
 MODEL=${QWEN_MODEL:-Qwen/Qwen3-Omni-30B-A3B-Instruct}
 VLLM_OMNI_BIN=${VLLM_OMNI_BIN:-$(command -v vllm-omni || true)}
 GPU_IDS=${MU_GPU_IDS:-0,1,2}
+EXPECTED_DEPLOY_BASENAME=${MU_EXPECTED_DEPLOY_BASENAME:-origin_deploy_3gpu.yaml}
+EXPECTED_GPU_COUNT=${MU_EXPECTED_GPU_COUNT:-3}
 MIN_FREE_MIB=${MU_MIN_FREE_MIB:-60000}
 
 [ -n "$VLLM_OMNI_BIN" ] && [ -x "$VLLM_OMNI_BIN" ] || {
@@ -22,12 +24,12 @@ MIN_FREE_MIB=${MU_MIN_FREE_MIB:-60000}
   exit 2
 }
 deploy_name=${DEPLOY##*/}
-[ "$deploy_name" = "origin_deploy_3gpu.yaml" ] || {
-  echo "formal runs are pinned to origin_deploy_3gpu.yaml: $DEPLOY" >&2
+[ "$deploy_name" = "$EXPECTED_DEPLOY_BASENAME" ] || {
+  echo "benchmark run is pinned to $EXPECTED_DEPLOY_BASENAME: $DEPLOY" >&2
   exit 2
 }
 [ -z "${VLLM_OMNI_COLOCATE_STAGES:-}" ] || {
-  echo "origin_deploy_3gpu.yaml requires three separate stage processes; unset VLLM_OMNI_COLOCATE_STAGES" >&2
+  echo "$EXPECTED_DEPLOY_BASENAME requires separate stage processes; unset VLLM_OMNI_COLOCATE_STAGES" >&2
   exit 2
 }
 
@@ -42,8 +44,8 @@ for variable in \
 done
 
 IFS=',' read -r -a gpu_ids <<< "$GPU_IDS"
-[ "${#gpu_ids[@]}" -eq 3 ] || {
-  echo "MU_GPU_IDS must contain exactly three GPU ids: $GPU_IDS" >&2
+[ "${#gpu_ids[@]}" -eq "$EXPECTED_GPU_COUNT" ] || {
+  echo "MU_GPU_IDS must contain exactly $EXPECTED_GPU_COUNT GPU ids: $GPU_IDS" >&2
   exit 2
 }
 for gpu in "${gpu_ids[@]}"; do
@@ -131,7 +133,7 @@ for i in $(seq 1 200); do
     nvidia-smi --id="$GPU_IDS" --query-gpu=index,memory.used --format=csv,noheader
     exit 0
   fi
-  if grep -qE "Engine core initialization failed|not enough GPU memory|ModuleNotFoundError|FileNotFoundError|[Vv]alidation error" "$LOG" 2>/dev/null; then
+  if grep -qE "Engine core initialization failed|EngineCore failed to start|not enough GPU memory|ModuleNotFoundError|FileNotFoundError|Could not find nvcc|[Vv]alidation error" "$LOG" 2>/dev/null; then
     echo "engine startup failed; see $LOG" >&2
     tail -20 "$LOG" >&2
     exit 1

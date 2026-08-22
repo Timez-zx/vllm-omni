@@ -243,8 +243,7 @@ class AsyncOmniEngine:
         )
 
         self.num_stages = len(self.stage_configs)
-        stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
-        self.async_chunk = bool(getattr(stage0_args, "async_chunk", False))
+        self.async_chunk = self._pipeline_uses_async_chunks(self.stage_configs)
         self.stage_pools: list[StagePool] = []
         self.stage_clients: list[StageClient] = []  # logical-stage view for external readers
         self.input_processor: InputProcessor | None = None
@@ -316,6 +315,22 @@ class AsyncOmniEngine:
         )
 
         logger.info(f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages")
+
+    @staticmethod
+    def _pipeline_uses_async_chunks(stage_configs: Sequence[Any]) -> bool:
+        """Return whether any pipeline edge uses the async chunk data plane.
+
+        ``async_chunk`` is materialized on every stage, but a stage-local
+        override may disable it for an edge that uses another transport.  In
+        particular, a P/D prefiller has no Omni payload edge while the later
+        D -> Talker -> Code2Wav edges still stream chunks.  Deriving the
+        orchestrator-wide switch from stage 0 alone serializes those later
+        edges, so aggregate the resolved stage settings instead.
+        """
+        return any(
+            bool(getattr(getattr(stage_config, "engine_args", None), "async_chunk", False))
+            for stage_config in stage_configs
+        )
 
     def get_diffusion_od_config(self) -> Any:
         """Expose the diffusion ``model_class_name`` to client-side model-extras.

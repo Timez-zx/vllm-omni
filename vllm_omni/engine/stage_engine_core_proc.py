@@ -61,8 +61,24 @@ class StageEngineCoreProc(EngineCoreProc):
         prepare_lineage = getattr(self.scheduler, "prepare_kv_lineage_request", None)
         if prepare_lineage is not None:
             prepare_lineage(request)
-        scheduler_request, current_wave = super().preprocess_add_request(request)
+        # D already receives the complete prompt KV from P. Its lightweight
+        # mm_features exist only so Qwen can reconstruct M-RoPE positions.
+        # Bypass upstream's D-local media-cache lookup, then restore the
+        # position metadata on the scheduler request for the model runner.
+        pd_mm_features = None
+        if getattr(request, "pd_prefill_payload", None) is not None and request.mm_features:
+            pd_mm_features = request.mm_features
+            request.mm_features = []
+        try:
+            scheduler_request, current_wave = super().preprocess_add_request(request)
+        finally:
+            if pd_mm_features is not None:
+                request.mm_features = pd_mm_features
+        if pd_mm_features is not None:
+            scheduler_request.mm_features = pd_mm_features
         scheduler_request.additional_information = request.additional_information
+        scheduler_request.model_intermediate_buffer = getattr(request, "model_intermediate_buffer", None)
+        scheduler_request.pd_prefill_payload = getattr(request, "pd_prefill_payload", None)
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
         return scheduler_request, current_wave
 

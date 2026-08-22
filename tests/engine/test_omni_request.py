@@ -40,6 +40,7 @@ def test_omni_params_are_keyword_only():
         "external_req_id",
         "additional_information",
         "model_intermediate_buffer",
+        "pd_prefill_payload",
         "cache_token_ids",
         "prefill_only",
     ):
@@ -118,6 +119,32 @@ def test_prefill_only_round_trips_from_engine_request():
     request = OmniRequest.from_engine_core_request(core_request, block_hasher=None)
 
     assert request.prefill_only is True
+
+
+def test_pd_prefill_payload_round_trips_from_engine_request():
+    from vllm_omni.engine import OmniEngineCoreRequest, OmniPDPrefillPayload
+
+    payload = OmniPDPrefillPayload(
+        prompt_layer_0=torch.ones(2, 3),
+        prompt_layer_24=torch.full((2, 3), 24.0),
+        prompt_token_ids=[1, 2],
+    )
+    core_request = OmniEngineCoreRequest(
+        request_id="pd-decode",
+        prompt_token_ids=[1, 2],
+        mm_features=None,
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        pd_prefill_payload=payload,
+    )
+
+    request = OmniRequest.from_engine_core_request(core_request, block_hasher=None)
+
+    assert request.pd_prefill_payload is payload
 
 
 def test_model_intermediate_buffer_round_trips_to_streaming_update():

@@ -95,7 +95,13 @@ def _compute_talker_prompt_ids_length(info: OmniPayload, device: torch.device | 
         if role == system_token_id:
             continue
         elif role == user_token_id:
-            sum_user_len += e - s
+            segment_ids = thinker_sequences[0, s:e]
+            if TALKER_TEXT_ONLY:
+                sum_user_len += int(
+                    sum(int(token_id) not in QWEN3_OMNI_MM_TOKEN_IDS for token_id in segment_ids.tolist())
+                )
+            else:
+                sum_user_len += e - s
         elif role == assistant_token_id and i == len(im_start_indexes) - 2:
             assistant_len += 9  # 3 + 4 + 1 + 1
         else:
@@ -209,8 +215,7 @@ def _filter_text_only_thinker_prefill_payload(payload: OmniPayloadStruct) -> Omn
     payload.ids.all = [all_token_ids[position] for position in keep_positions]
     payload.ids.prompt = [all_token_ids[position] for position in keep_positions if position < len(prompt_token_ids)]
     logger.info(
-        "[talker-conditioning] source_ids=%d source_tensor_rows=%d "
-        "transferred_ids=%d transferred_tensor_rows=%d",
+        "[talker-conditioning] source_ids=%d source_tensor_rows=%d transferred_ids=%d transferred_tensor_rows=%d",
         len(all_token_ids),
         thinker_emb.shape[0],
         len(payload.ids.all),
@@ -571,6 +576,70 @@ def thinker2talker_async_chunk(
 
     def _maybe_cpu(t: Any) -> torch.Tensor | None:
         return t.detach().cpu() if isinstance(t, torch.Tensor) else None
+
+    # Remote KV lets D continue Thinker generation, but it does not reproduce
+    # the prompt rows consumed by Talker.  Seed the first D->Talker chunk from
+    # the finite P snapshot, then append only D's newly generated row(s).
+    pd_prefill = getattr(request, "pd_prefill_payload", None)
+    output_token_ids = _ensure_list(request.output_token_ids)
+    if pd_prefill is not None and chunk_id == 0:
+        if not output_token_ids:
+            return None
+        if any(token_id < 0 for token_id in output_token_ids):
+            raise RuntimeError(
+                "P/D Thinker→Talker received an unresolved sampled-token sentinel; "
+                "disable async_scheduling on the decode stage"
+            )
+        prompt_ids = _ensure_list(pd_prefill.prompt_token_ids)
+        decode_rows = len(output_token_ids)
+        available_decode_rows = min(int(thinker_emb.shape[0]), int(thinker_hid.shape[0]))
+        if available_decode_rows < decode_rows:
+            raise RuntimeError(
+                "P/D Thinker→Talker first decode chunk is not row-aligned: "
+                f"output_tokens={decode_rows} embed_rows={thinker_emb.shape[0]} "
+                f"hidden_rows={thinker_hid.shape[0]}"
+            )
+
+        def _pd_tts_embedding(name: str) -> torch.Tensor | None:
+            value = getattr(pd_prefill, name, None)
+            if value is None:
+                value = thinker_embed.get(name)
+            return _maybe_cpu(value)
+
+        payload = OmniPayloadStruct(
+            embed=EmbeddingsStruct(
+                prefill=torch.cat(
+                    (pd_prefill.prompt_layer_0.detach().cpu(), thinker_emb[-decode_rows:].detach().cpu()),
+                    dim=0,
+                ),
+                tts_bos=_pd_tts_embedding("tts_bos"),
+                tts_eos=_pd_tts_embedding("tts_eos"),
+                tts_pad=_pd_tts_embedding("tts_pad"),
+            ),
+            hidden_states=HiddenStatesStruct(
+                output=torch.cat(
+                    (pd_prefill.prompt_layer_24.detach().cpu(), thinker_hid[-decode_rows:].detach().cpu()),
+                    dim=0,
+                )
+            ),
+            ids=IdsStruct(
+                all=list(prompt_ids) + list(output_token_ids),
+                prompt=list(prompt_ids),
+            ),
+            meta=MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool)),
+            speaker=speaker,
+            language=language,
+        )
+        payload = _filter_text_only_thinker_prefill_payload(payload)
+        payload.embed.prefill = payload.embed.prefill.cpu()
+        payload.hidden_states.output = payload.hidden_states.output.cpu()
+        logger.info(
+            "[PD] seeded Talker from P snapshot req=%s prompt_rows=%d decode_rows=%d",
+            request_id,
+            len(prompt_ids),
+            decode_rows,
+        )
+        return payload
 
     if chunk_id == 0:
         all_token_ids = _ensure_list(request.all_token_ids)

@@ -139,12 +139,43 @@ arrival 模式只改善约 25 ms 中位数，p95/p99 反而上升，因为新增
 
 结果：`/home/ubuntu/data/results/audio_arrival_ab_baseline_20260822/u8_t6`、`/home/ubuntu/data/results/audio_arrival_approx_dev_20260822/u8_t6`。
 
-## 阶段七：下一步
+## 阶段七：Thinker P/D 分离短测
 
-1. 在应用层实现有语义的有界压缩：短文本 summary/seed，加少量最近完整 turn；不要使用 `32k -> 0` 作为正式配置。
-2. 固定压缩策略和 context 包络后，重新从 8 用户开始跑 8、16、32……容量阶梯。
-3. 在首次 SLO 失败点拆分 Thinker prefill、Thinker decode、首文字后流水线等待和 GPU 活跃度。
-4. 若 tail 仍由并发 Thinker 工作主导，再对比调度隔离和 P/D 分离；不要继续用应用参数掩盖 engine 问题。
+`thinker-talker-pd` 保持同一应用协议和 finite request，仅将 Thinker 拆到 GPU 0 prefill 与 GPU 1 decode；Talker、Code2Wav 使用 GPU 2/3。应用仍管理 session/history，每轮结束后销毁 engine request。
+
+实现修复了三个桥接问题：D 复用 P 的媒体位置元数据而不重复编码；Talker 使用 P 保存的 prompt hidden states；后台 sender 在入队时快照 token 与 tensor。P→D 使用 NIXL，后续 stage 使用 shared memory。
+
+严格短测统一使用 schema 4、seed 7、8 用户×6 轮、前 1 轮预热、0–8 秒 stagger、完整 query-time WAV 与视频 arrival prefill。plan SHA256 为 `b6160ec3d78a2126fb07830e5c1b75f9319ba579543555c8474852ad9f9ddf9b`，每组 40 个计分 turn，均无 timeout 或 stall。
+
+| P→D connector | TTFA p50/p95/p99 | TTFT p50/p99 | D stage p99 |
+|---|---:|---:|---:|
+| NIXL pull | 4164/13347/19656 ms | 2709/13223 ms | 12.77 s |
+| packed cross-layer pull | 4510/7783/9124 ms | 2999/8047 ms | 7.36 s |
+| packed cross-layer push，错误串行 | 2146/3700/5034 ms | 671/1188 ms | 0.59 s |
+| packed cross-layer push，修复异步流水线 | 770/1083/1228 ms | 576/1081 ms | 0.52 s |
+
+结论：旧版 10 秒 D 等待是 connector 工程问题，不是 PCIe 或 P/D 架构的必然代价。
+
+- GPU 0↔1 为 PCIe Gen5 x16，PyTorch P2P 实测约 `50 GiB/s`。
+- pull 热态只有约 `0.55 GiB/s`；仅合并 cross-layer layout 没有提高持续带宽。
+- push 将搬运改为后台 WRITE burst。NIXL telemetry 显示热态约 `35 GiB/s`；3,820-token prompt 精确传输 `187,957,248 B`，耗时 `4.922 ms`。
+- Thinker KV 为 `48 KiB/token`。当前 D prefix cache 关闭，因此每个最终请求仍传完整 prompt KV；arrival warm-up 只运行 P，不触发 P→D。
+- 不能直接打开 D prefix cache：当前 connector 缺少 delta source offset/cache-lineage，P 的完整块表无法安全对齐到 D 的未命中尾块。增量复制需要显式 cache handle 与 block range。
+
+首个 packed-push 结果还有一个应用层混杂因素：P stage 的局部 `async_chunk: false` 被误作 pipeline 全局开关，使 D 等完整文本后才启动 Talker、Code2Wav 又等完整 codec 后才启动。其 connector 带宽结论仍成立，但 5.03 秒 TTFA 不能用于评价 P/D。
+
+修复后，pipeline 只要任一下游 stage 使用 async chunk 就启用异步 orchestrator；P stage 本身仍走专用 KV 路由。8 用户短测 48/48 turn 成功、40 个计分 turn、无 timeout/stall，`verify_run.py` 通过。engine-side p99 分解为：P 首输出 831 ms、D 首文字 1044 ms、Talker 首 codec 1102 ms、首音频 1191 ms；Talker→首音频仅 250 ms，而非修复前的 3881 ms。Talker 与 Code2Wav 已恢复重叠执行。
+
+修复验证使用相同 workload 参数但仍是 live closed-loop，plan SHA256 为 `fd9c7288bca42529d9f3117174890853f611b6e0af10b24d9ed78d0fc8e1301d`，并非旧结果的 exact replay，因此数值用于验证回归修复，不作为严格容量 A/B。
+
+结果：`/home/ubuntu/data/results/pd_finite_short_u8_v14_20260822`、`/home/ubuntu/data/results/pd_crosslayer_u8_t6_stagger8_20260822_v3`、`/home/ubuntu/data/results/pd_crosslayer_push_u8_t6_stagger8_20260822_v2`、`/home/ubuntu/data/results/pd_async_fix_20260822_v1/pd_async_fix_seed7_u8`。精确 NIXL telemetry smoke 位于 `/home/ubuntu/data/results/pd_push_telemetry_smoke_u1_20260822_v1`。
+
+## 阶段八：下一步
+
+1. 用固定 input trace replay 冻结修复后的 packed-push P/D 基线。
+2. 若继续追 1 秒 SLO，优先分析 P 首输出 tail；speech path 已恢复流式，不再是多秒级主因。
+3. delta-only P→D 是后续 engine 研究项：D 保留可淘汰 prefix KV，接口必须携带 cache handle、lineage version 和明确 block range。
+4. 8 用户达到目标后再继续 16、32……容量阶梯。
 
 ## 快速恢复入口
 
@@ -157,5 +188,7 @@ arrival 模式只改善约 25 ms 中位数，p95/p99 反而上升，因为新增
 | Workload 计划与媒体加载 | `benchmarks/live_agent/web_client/continuous_av_workload.py` |
 | 容量阶梯 | `benchmarks/live_agent/web_client/run_av_session_ladder.sh` |
 | 正式部署 | `benchmarks/thinker_talker/origin_deploy_3gpu.yaml` |
+| P/D 部署 | `benchmarks/thinker_talker/pd_deploy_4gpu.yaml` |
+| P/D 容量入口 | `benchmarks/live_agent/web_client/run_pd_av_session_ladder.sh` |
 | 运行验证 | `benchmarks/live_agent/analysis/verify_run.py` |
 | GPU 采样 | `benchmarks/live_agent/harness/gpu_sampler.py` |

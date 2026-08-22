@@ -853,9 +853,10 @@ def _build_engine_args(
                 continue
             engine_args[k] = v
         engine_args.update(ds.engine_extras)
-    # Materialize the resolved pipeline-wide async_chunk value into every
-    # stage so explicit False overrides do not get lost downstream.
-    engine_args["async_chunk"] = bool(deploy.async_chunk)
+    # Materialize the pipeline default while preserving an explicit per-stage
+    # override. A P/D prefiller has no Omni payload edge, while D -> Talker
+    # still uses async chunks.
+    engine_args.setdefault("async_chunk", bool(deploy.async_chunk))
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     return engine_args
