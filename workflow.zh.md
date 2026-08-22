@@ -1,80 +1,67 @@
 # vLLM-Omni 实时多用户 Serving 工作流
 
-## 目标与当前决定
+## 目标与边界
 
-目标是在 TTFA 和语音流畅度达标的前提下，用更少 GPU 服务更多持续音视频会话。研究对象是 engine 的容量、调度和尾延迟，不是模型质量。
+目标是在 TTFA 和语音连续性达标的前提下，用更少 GPU 服务更多持续音视频会话。研究重点是 engine 的容量、调度、KV cache 和尾延迟，不是模型质量。
 
-没有可本地部署、接口和 Seed Realtime 或 Gemini Live 等价的开源 realtime 模型。因此本分支用 Qwen3-Omni 的 Thinker → Talker → Code2Wav 流水线近似目标产品：客户端持续上传音视频，但模型仍按 turn 回答。该近似足以研究多模态 prefill、语音 decode、KV cache 和多租户竞争，但不代表模型原生全双工或语义级 barge-in。
+目前没有可本地部署、交互方式与 Seed Realtime 或 Gemini Live 等价的开源 realtime 模型。本分支使用 Qwen3-Omni 的 Thinker → Talker → Code2Wav 流水线近似目标场景：客户端持续上传音视频，模型按 turn 回答。它可以产生合理的多模态 prefill、语音 decode 和多用户竞争负载，但不代表原生全双工或语义级 barge-in。
 
-当前架构决定：
+## 阶段一：应用基线
 
-- WebSocket 应用维护 session、完整多模态对话和媒体接收状态。
-- 每个媒体 warm-up 和最终回答都创建新的、有限生命周期的普通 engine request。
-- Engine 在请求内维护 KV；请求结束后只允许保留可淘汰的 prefix/KV cache。
-- 每轮仍提交完整 canonical history；prefix cache 命中只减少计算，不影响语义正确性。
-- 不再把跨轮生命周期塞进同一个 resumable engine request。
+当前采用“应用有状态、engine request 有限生命周期”的设计：
 
-这比 engine 长期持有 session 更适合作为研究基线：它符合通用 engine 的 request 抽象，cache miss 只影响性能，并能直接接入 routing、replication 和 P/D 分离。应用缓存已处理的 canonical message blocks，每轮只 render 新消息，再拼出完整 prompt；prefix cache 淘汰后 engine 仍会重新 prefill，但不会迫使应用重复解码和处理全部历史媒体。
+```text
+持续音视频到达
+  → 视频帧触发静默 Thinker finite request，预热 prefix KV
+  → 用户说完，提交完整 canonical history + 完整 WAV
+  → Thinker → Talker → Code2Wav
+  → 回答结束，request 销毁
+  → 应用保存本轮，下一轮创建新 request ID
+```
 
-## 阶段一：应用层基线
+关键约束：
 
-当前实现位于 `vllm_omni/entrypoints/openai/video_stream_base.py` 和 `serving_video_stream.py`。
+- WebSocket 应用维护 session、媒体接收状态和完整 canonical 多模态历史。
+- 每个静默 warm-up 和最终回答都是新的普通 finite request；engine 不持有跨轮活 request。
+- 每轮向 engine 提交完整 canonical prompt。prefix/KV cache 可淘汰；cache miss 只增加 prefill，不影响正确性。
+- 应用缓存已处理的 canonical message blocks，每轮只 render 新 user/assistant block，再拼接完整 prompt，避免重复处理全部历史媒体。
+- 视频以 append-only 方式进入本轮；similarity/freshness filter 决定是否接受，接受后不再做 8 帧滑动淘汰或二次采样。
+- 新视频帧触发或合并进低优先级 `video-warm-<uuid>`。它只运行 Thinker、`max_tokens=1`、不返回文字、不进入 Talker。query 到达时立即取消未完成 warm-up，不等待 cache。
+- 用户音频默认在 query 时作为一个完整 WAV 输入，保持 Qwen 的整段音频语义。只有最终 query 会触发语音回答。
+- 回答期间新到达媒体归入下一轮；本轮媒体只消费一次。
+- 正常回答最多生成 256 个 Thinker tokens；视频不超过 640×352，JPEG 处理放在子进程池中。
+- history 硬阈值为 49,152 tokens；16,384-token headroom 使应用通常在约 32,768 tokens 提前按完整 turn 压缩到不超过 16,384 tokens，并更换 cache lineage。
 
-- 每个 `video.query` 生成唯一的 `video-<uuid>` 回答 request ID。
-- 应用保存已完成的 user/assistant turn；user history 保留原始文本、音频和选中视频，不退化为纯文本摘要。
-- 应用同时保存 renderer 已处理的 canonical blocks。每轮只处理当前 user block 和生成后的短 assistant block，再合并 token、媒体特征、hash 和修正后的 placeholder offset；engine 仍收到完整历史，而不是 delta request。
-- 本轮已接收的音视频只消费一次；生成期间到达的数据进入下一轮。
-- similarity/freshness filter 是唯一的视频选择策略；接受后的帧在当前轮全部按到达顺序保留，不再做最近 8 帧滑动或二次采样。
-- 每次接受新帧，应用触发或合并进 `video-warm-<uuid>`：完整历史加当前轮累计帧，`output_modalities=["text"]`、Thinker `max_tokens=1`。输出 token 被丢弃，Talker/Code2Wav 不运行，也不向客户端发送 response 事件。
-- 同一 session 的 warm-up 串行执行并合并积压快照。后一次请求通过 Thinker prefix cache 复用前一次的完整块，只计算新增帧和未满 block 尾部；cache miss 只增加计算。
-- warm-up 是可丢弃的后台优化；query 到达时立即取消本 session 尚未完成的 warm-up，不等待缓存填充。最终请求始终带完整 prompt，取消只影响命中率。
-- `video.query` 提交同一媒体前缀加完整 WAV，并正常运行 Thinker → Talker → Code2Wav。音频不做增量切块，保持当前 Qwen 输入语义。
-- 实验开关 `enable_audio_arrival_prefill_approximation` 默认关闭。开启后，应用按实际到达顺序保存本轮音视频，把音频封成不可变的 1 秒块；每个块只触发静默 Thinker finite request，query 补上尾块后才允许 decode 和 Talker。该路径只模拟 duplex engine 负载，不与 Qwen 整段音频推理等价。
-- 正常回答的 Thinker 上限为 256 tokens，防止模型忽略简短回答提示后生成分钟级语音；arrival warm-up 仍为 1 token。
-- 49,152 tokens 是硬压缩阈值；当 prompt 达到 32,768 tokens 时，应用会在回答播放后或 arrival warm-up 阶段提前按完整 turn 压到不超过 16,384 tokens，避免把压缩留到下一次 query 的关键路径。压缩后形成新的 cache lineage。
-- 视频分辨率不超过 640×352；通过 filter 的帧没有第二个数量上限或采样步骤。
-- similarity filter 阈值 0.95，freshness gap 为 `[0,4]`；相似帧可丢弃，但连续过滤 4 帧后强制保留一帧。
-- JPEG 解码、缩放和 thumbnail 生成在子进程池完成，避免阻塞 WebSocket event loop。
-- 流式音频 DELTA 逐块转发；客户端用播放时间线判断启动和卡顿。
+`enable_audio_arrival_prefill_approximation` 默认关闭。它把音频封成 1 秒块做静默 arrival prefill，只用于模拟 duplex engine 负载，不保证与 Qwen 整段音频推理语义等价。
 
-已删除的旧路径包括：跨轮 persistent request、向同一 resumable request 做 arrival append、Talker 45k rolling、Thinker shadow compression、session epoch/segment ledger，以及依赖这些机制的 benchmark 和诊断脚本。当前 arrival prefill 使用独立 finite request 和可淘汰 prefix cache，不使用 streaming/resumable engine state。
+旧的跨轮 persistent request、resumable append、Talker 45k rolling、Thinker shadow compression 和 session ledger 已删除。当前基线与通用 engine request 抽象兼容，也更容易接入 routing、replication 和 P/D 分离。
 
 ## 阶段二：固定部署
 
 正式实验只使用 `benchmarks/thinker_talker/origin_deploy_3gpu.yaml`：
 
-| Stage | GPU | 关键配置 |
+| Stage | GPU | 配置 |
 |---|---:|---|
-| Thinker | 0 | FP8 weight/KV，prefix caching 开启，priority scheduler |
-| Talker | 1 | FP8 weight/KV，按 session conditioning lineage 开启 prefix caching |
+| Thinker | 0 | FP8 weight/KV、prefix cache、priority scheduler |
+| Talker | 1 | FP8 weight/KV、session-isolated conditioning prefix cache |
 | Code2Wav | 2 | 独立进程 |
 
-三阶段独立进程，部署 YAML 在不同用户数之间保持不变。Talker request 仍是有限生命周期，只复用可淘汰的 conditioning prefix cache。当前树中与 request 生命周期无关的 mailbox、vocoder、Snake 和 code-predictor 优化继续保留。
+最终回答优先级为 0，静默 warm-up 为 10。部署 YAML 在不同用户数和 session-policy 对照之间保持不变。`run_qwen_server.sh` 自动定位 CUDA toolkit，并检查 Thinker 使用 FlashInfer。多模态 processor cache 使用 API-side `processor_only` 模式。
 
-最终回答使用 priority 0，静默 warm-up 使用 priority 10。`run_qwen_server.sh` 自动发现环境内 CUDA toolkit，并拒绝 Thinker 未选择 FlashInfer 的正式运行。多模态 processor cache 使用 API-side `processor_only` 兼容模式，避免 vLLM mirrored LRU 在并发请求下发生 sender/receiver 淘汰顺序分叉。
+## 阶段三：正式 workload
 
-启动：
+唯一正式 workload 是持续 AV session：
 
-```bash
-RESULTS_DIR=/home/ubuntu/data/results/finite_request_capacity_<commit> \
-VLLM_OMNI_BIN=/home/ubuntu/miniconda3/envs/omni/bin/vllm-omni \
-bash benchmarks/live_agent/web_client/run_qwen_server.sh
-```
-
-## 阶段三：唯一正式 workload
-
-容量测试只模拟持续 AV session。每个用户拥有一条长期 WebSocket：
-
-- 视频在整个 session 内以 2 FPS 上传。
-- 每个通过 filter 的帧立即触发或合并进静默 Thinker warm-up；当前轮累计帧保持 append-only。
+- 每个用户维持一条长期 WebSocket。
+- 视频全程以 2 FPS 上传；通过 filter 的帧立即触发或合并进静默 Thinker warm-up。
 - 麦克风以 5 Hz 上传 PCM16；assistant 播放期间暂停，并保留 300 ms echo guard。
-- 每轮使用一条真实 16 kHz mono 录音，末尾追加 700 ms endpoint silence；query 文本为空，问题语义来自音频。
-- 音频在 query 时作为一个完整 WAV 加到已 warm 的视频 prefix 后；只有该最终请求会触发 Talker 发声。
-- 同一 session 固定 speaker，录音不重复；视频使用固定序列和不同起点。
-- 下一轮在回复按 1× 速度播放完成后开始，属于 playback-paced closed loop。
+- 每轮使用一条不重复的真实 16 kHz mono SLURP 录音，末尾追加 700 ms endpoint silence；query 文本为空。
+- 音频在 query 时作为完整 WAV 加到已 warm 的视频 prefix 后，只有该请求触发 Talker。
+- 每个 session 固定 speaker；DAVIS 视频使用固定序列和不同起点。
+- 下一轮在上一轮语音按 1× 播放完成后开始，形成 playback-paced closed loop。
 - 用户启动时间在 0–40 秒内确定性错开。
 
-素材由 SLURP 语音和 DAVIS 视频构造。正式 cell 为 30 轮/用户，前 2 轮只预热；用户数按 8、16、32……增长，每个 seed 在首个 SLO 失败点停止。每个 cell 重启 engine。
+正式 cell 为 30 轮/用户，前 2 轮预热。用户数按 8、16、32……增长，每个 seed 在首个 SLO 失败点停止；每个 cell 重启 engine。`probe.py` 的合成媒体只验证协议，不能用于容量结论。
 
 ```bash
 MU_FRAMES_DIR=/home/ubuntu/data/workloads/continuous_av_v1/frames \
@@ -87,134 +74,69 @@ TURNS=30 WARMUP_TURNS=2 \
 bash benchmarks/live_agent/web_client/run_av_session_ladder.sh
 ```
 
-`probe.py` 的合成媒体只验证协议，不能产生容量结论。
+## 阶段四：指标与通过条件
 
-## 阶段四：指标与判定
+- **TTFA**：query 到第一块音频包。它受首包大小影响，只用于单次部署内定位。
+- **Audio-ready-500**：累计收到 500 ms 可播放音频的时间，是跨 packetization 的启动指标。
+- **Stall max**：按 1× 播放时最大的单次断流。
+- **RTF deliver**：生成音频时长 / 交付耗时，用于判断持续供给能力。
 
-- **TTFA**：发送 query 到第一块语音包到达。它受首包切块大小影响，只用于定位传输路径，不作为跨配置体验指标。
-- **Audio-ready-500**：客户端累计得到 500 ms 可播放音频的时间；短回复在 `audio.done` 时释放。这是固定的启动 SLO，不能由环境变量修改。
-- **Stall max**：按 1× 播放时，某块到达晚于已缓存音频耗尽时间所造成的最大单次断流。
-- **RTF deliver**：生成的音频时长 / 交付耗时；用于判断持续供给能力。
+容量通过必须同时满足：
 
-容量通过必须同时满足：预热后所有 turn 完成、audio-ready-500 p99 < 1 s、stall-max p99 < 50 ms、无 client/protocol/fatal engine error。TTFA、GPU 利用率、显存和 engine step 数据用于 root-cause，不替代体验 SLO。新结果使用 workload schema 4；验证脚本拒绝混入旧的可变 prebuffer 口径。
+- 预热后的所有 turn 完成；
+- Audio-ready-500 p99 < 1 s；
+- Stall-max p99 < 50 ms；
+- 无 client、protocol 或 fatal engine error。
 
-`analysis/verify_run.py` 还会检查：每个 turn 对应一个唯一回答 request、warm-up request 唯一且无失败、engine 最终处理帧数与客户端 consumed ledger 一致、Thinker prefix cache 已开启且出现实际命中、部署确为三阶段独立进程。
+结果必须使用 workload schema 4，并运行 `benchmarks/live_agent/analysis/verify_run.py`。验证器检查 finite request 唯一性、arrival warm-up、frame ledger、实际 prefix-cache 命中和三阶段独立进程。
 
-## 阶段五：8 用户 finite-request 定位结果
+## 阶段五：当前基线与关键结论
 
-2026-08-21 使用 FlashInfer、seed 7、30 轮/用户、前 2 轮预热定位当前 finite-request 路径。旧 persistent 结果只读取归档，不部署、不重跑。
-
-### 默认策略
-
-结果：`/home/ubuntu/data/results/finite_request_foreground_priority_cap256_cbf2226a_flashinfer_20260821/finite_foreground_priority_cap256_seed7_u8`
-
-- 224/224 个测量 turn 成功，无 timeout、client error、preemption 或 recompute。
-- TTFA p50/p95/p99：1.84/4.83/6.70 秒；playback-start：2.89/8.65/11.51 秒；不通过容量 SLO。
-- 2,958 个 Thinker-only warm-up、240 个回答 request；3,168/3,169 次 prefix-cache 观测命中。
-- query→warm-up 交接 p99 16 ms，render p99 767 ms，engine→首文字 p99 2.47 秒，engine→首音频 p99 6.16 秒。
-- warm-up 逻辑输入 7,496 万 tokens，但实际 prefix miss 111 万，命中率 98.5%。没有重新计算全部历史；长 context 仍增加 attention、KV 绑定和调度成本。
-
-取消 query 前的 warm-up barrier 后，TTFA p99 从 7.29 秒降至 6.41 秒；增加 foreground/background priority 后为 6.70 秒。单 seed live closed-loop 不能证明回退，但可以证明 priority 不能消除已经运行的 prefill 干扰。
-
-### 与旧归档的公平性
-
-两边 workload plan SHA256 都是 `99dc083388...`，但 engine 输入并不等价：
-
-- 旧 persistent 在约 27.0k–36.7k tokens 滚动，默认只携带 281–858 tokens 的文本 seed；最终 context p50/p95/p99/max 为 14.8k/30.9k/34.5k/36.8k。
-- 当前默认在 49,152 tokens 压缩到约 16,384，并保留最近完整多模态 turn；最终 context 为 26.6k/46.3k/48.1k/49.0k。
-- live closed-loop 会放大差异：默认当前运行发送 9,027 帧、消费 3,979 帧；旧归档发送 7,367 帧。相同 plan hash 不代表相同媒体轨迹。
-
-当前 TTFA 与逻辑 context 的相关系数为 0.66；`>=40k` context 的 TTFA p50/p95 为 3.15/6.69 秒。不能把默认结果与旧归档直接解释为 request 生命周期差异。
-
-### 当前方案的计算预算控制组
-
-只重跑当前 finite-request 方案，将压缩设为 `32k -> 0`，使 context 包络接近旧归档。该配置用于隔离计算量，不是生产语义策略，因为压缩时会丢弃旧 turn。
-
-修复后的结果：`/home/ubuntu/data/results/finite_request_old_budget_abort_cleanup_cbf2226a_20260821/finite_old_budget_abort_cleanup_seed7_u8`
-
-- 224/224 成功；TTFA p50/p95/p99：0.984/2.50/3.23 秒；playback-start：1.58/3.79/4.87 秒。
-- context p50/p95/p99/max：15.0k/29.4k/31.1k/32.0k，已接近旧归档；GPU 0/1/2 平均 SM 活跃度约 20.5%/6.8%/0.4%，也与旧归档 21.4%/7.0%/0.4% 接近。差距不是 GPU 饱和。
-- 旧归档 TTFA p50/p95/p99 为 0.244/0.392/0.479 秒，max 0.532 秒；预算对齐后仍有真实差距。
-
-剩余差距主要在 Talker：旧 persistent 跨轮保留 Talker KV；当前每轮创建新的 Talker request，stage 1 未启用 prefix cache，并从本轮完整 Thinker prompt 重建 placeholder/prefill。当前 `history_messages` 与 TTFT→TTFA gap 的相关系数为 0.81；history 从 0–4 条增到 16+ 条时，该 gap p50 从 226 ms 增至 1,111 ms。Thinker 侧也有普通 warm-up request 的 admission、KV 绑定和 chunked-prefill 开销，但不是全部差距。
-
-另修复一处 finite pipeline bug：最终 stage 完成后先 abort 残余上游工作，再清理 request。对齐组的 Talker late output 从 464 条降到 0，TTFA p50/p99 从 1.036/3.540 秒降到 0.984/3.225 秒。它是资源浪费和部分 tail 来源，不是主根因。
-
-### Disposable Thinker lineage handle
-
-实现：应用继续提交完整 canonical prompt，并携带 session lineage、父 revision 和 token LCP。KV cache manager 只保存已完成有限 request 的 block-hash snapshot，不持有活 request 或固定 GPU block；cache miss 自动回退完整 prefill。历史压缩会更换 lineage，Thinker handle 不传入 Talker。
-
-正式结果：`/home/ubuntu/data/results/finite_cache_handle_formal_20260821/cache_handle_formal_seed7_u8`
-
-- 224/224 成功，frame ledger 一致，无 timeout 或 stall。
-- TTFA p50/p95/p99：521/944/1265 ms；严格 finite v6 为 518/878/1051 ms，旧 persistent 为 244/392/479 ms。
-- 2,532 次 request 复用 hash snapshot，累计跳过约 4,919 万个 prefix token 的重复 hash；render p50 仍为 72.6 ms，Thinker→首文字 p50 仍为 224 ms。
-- 结论：hash handle 正确且减少控制面工作，但不是 TTFA 主解；普通 prefix cache 本来已命中绝大部分 GPU KV。
-
-### 消除重复 render 和测量混杂
-
-2026-08-22 将已完成历史保存为应用侧 processed canonical blocks。新一轮只 render 当前 user message；回答完成后只 render assistant message。应用随后拼出完整 token/media prompt，engine request 生命周期和 cache-miss 语义均未改变。Qwen ChatML 的完整 message boundary 是 append-only；其他模板默认回退完整 render。
-
-短验证：`/home/ubuntu/data/results/canonical_render_short_20260822`
-
-- u1×4：4/4 完成；prompt 从 1,261 增至 11,184 tokens，render 仅从 8.1 增至 10.2 ms，无 full-render fallback。
-- u8×4：预热后 24/24 完成；audio-ready-500 p50/p99 为 345/442 ms，stall p99 为 0；32 个回答 request 均提交并 commit canonical turn。
-- u8 各轮 render p50 为 9.7/11.6/10.7/16.6 ms；没有 arrival failure、multimodal cache error、query failure 或 late output。
-- 测量口径固定为 500 ms 可播放音频；当前首包约 537 ms，因此本部署的 TTFA 与 audio-ready-500 数值接近，但以后改变 codec 切块也不能改变 SLO 含义。
-
-结论：此前约 73 ms 的 full-history render 中位数是应用实现开销，现已基本消除。剩余 tail 才适合归因于 engine 的 prefill/decode 竞争、KV 行为和多阶段启动；以上只是正确性短测，不替代 30 轮正式容量实验。
-
-### 8 用户正式容量结果
-
-2026-08-22 使用 seed 7、30 轮/用户、前 2 轮预热运行 schema 4：`/home/ubuntu/data/results/canonical_render_formal_cbf2226a_20260822/canonical_render_formal_seed7_u8`。
-
-- 224/224 个测量 turn 完成，无 timeout、stall、client/protocol error；frame ledger 为 3,317，验证通过。
-- audio-ready-500 p50/p95/p99 为 456/854/1,107 ms。p99 超过 1 秒门槛 107 ms，因此 8 用户是当前容量边界；没有继续跑 16 用户。
-- TTFT p50/p99 为 239/707 ms；首文字到首音频 gap p50/p99 为 213/673 ms。
-- render p50/p95/p99 为 15/46/104 ms；无 full-render fallback。最慢三个 p99 turn 的 render 仅为 46/14/18 ms，应用 render 已不是主因。
-- p99 tail 相对中位数的额外延迟中，Thinker 占 72.4%，后续语音路径占 27.6%；p95 tail 分别占 57.2% 和 42.8%。GPU0 SM active p95 在整体窗口为 45%，在 tail 窗口升至 94%；GPU1/2 未同步饱和。
-- 2,929 个 finite arrival warm-up 全部成功；3,381/3,400 次 prefix-cache 观测命中，最大命中 32,704 tokens；发生 32 次完整 turn compaction。
-- 当前首音频包约 537 ms，已经超过固定 500 ms 阈值，因此本部署中 audio-ready-500 等于首包 TTFA；这不改变跨 packetization 使用固定阈值的测量定义。
-
-结论：8 用户已出现轻微启动 tail 超标，直接 root cause 是并发 Thinker 工作造成的首 token tail；语音流水线贡献部分延迟，但 Talker/Code2Wav 资源没有饱和。下一步应讨论 Thinker prefill/decode 隔离或调度，而不是继续调应用 render 参数。
-
-### 同提交 context 对齐控制
-
-2026-08-22 在提交 `854535bb` 上用同一 schema 4 workload、seed 7、8 用户×30 轮、前 2 轮预热做正式 A/B；两组 workload-plan SHA256 均为 `99dc083388...`。默认组不加 override；对齐组只把 history compaction 改为 `32k -> 0`。后者会丢弃已完成 turn，只用于对齐计算包络，不是生产语义策略。
-
-结果：`/home/ubuntu/data/results/current_default_854535bb_20260822/current_default_seed7_u8`、`/home/ubuntu/data/results/current_context_aligned_854535bb_20260822/context_aligned_seed7_u8`；persistent 归档：`/home/ubuntu/data/results/av_real_formal_4650f134/avreal_formal_seed7_u8`。
+最新正式对照使用实现提交 `854535bb`、`origin_deploy_3gpu.yaml`、seed 7、8 用户×30 轮、前 2 轮预热。两组当前实现的 workload-plan SHA256 均为 `99dc083388...`。
 
 | 路径 | context p50/p95/p99/max | Audio-ready-500 p50/p95/p99/max |
 |---|---:|---:|
-| 当前默认 `49k -> 16k`，16k headroom | 22.5k/32.0k/32.4k/32.8k | 478/723/1186/1215 ms |
-| 当前 `32k -> 0` 控制组 | 16.8k/30.6k/31.8k/31.9k | 410/635/796/883 ms |
+| 当前默认 history | 22.5k/32.0k/32.4k/32.8k | 478/723/1186/1215 ms |
+| 当前 `32k -> 0` 对齐控制 | 16.8k/30.6k/31.8k/31.9k | 410/635/796/883 ms |
 | 旧 persistent 归档 | 14.8k/30.9k/34.5k/36.8k | 515/740/824/900 ms |
 
-当前两组均为 224/224 成功、无 timeout、skip 或 stall，并通过 finite request、arrival request、frame ledger、prefix-cache 和三阶段进程验证。旧 persistent 首包只有约 217 ms 音频，原始 TTFA p50/p95/p99 为 244/392/479 ms，不能和当前约 537 ms 首包直接比较；表中旧值由 `turns.jsonl` 的音频 delta 按累计 500 ms PCM 重新计算。
+结果路径：
 
-同提交下缩短 context 后，p99 降低 389 ms。默认组的 p99-tail GPU0 SM-active p95 为 94.7%，对齐组为 52.4%；对齐组已回到 SLO 内。更关键的是，对齐后当前 finite-request 与旧 persistent 的 p99 只差 28 ms，且当前略低。这证明每轮销毁 engine request 不是旧方案更快的根本原因；应用维护 canonical session、engine 处理有限 request、通过可淘汰 prefix/KV cache 复用前缀的架构可以达到同等级 tail。
+- 默认：`/home/ubuntu/data/results/current_default_854535bb_20260822/current_default_seed7_u8`
+- 对齐：`/home/ubuntu/data/results/current_context_aligned_854535bb_20260822/context_aligned_seed7_u8`
+- persistent 归档：`/home/ubuntu/data/results/av_real_formal_4650f134/avreal_formal_seed7_u8`
 
-限制：这是单 seed live closed-loop 控制，不是 bit-identical replay；不同回答长度会改变后续媒体到达轨迹。`32k -> 0` 也会损失历史语义。生产策略应在应用层用短文本摘要/seed 加少量最近完整 turn 保留语义，同时把 context 包络固定后再研究更高并发下的 Thinker 调度或 P/D 隔离。
+三组比较得到以下结论：
 
-### 音频 arrival-prefill 近似实验
+1. **不能比较原始 TTFA。** persistent 首包只有约 217 ms 音频，其原始 TTFA p50/p95/p99 为 244/392/479 ms；表中按音频 delta 累计到固定 500 ms 后重算为 515/740/824 ms。
+2. **history policy 会显著影响 tail。** 同一提交中，对齐控制将 p99 从 1186 ms 降到 796 ms；默认组 p99-tail 的 GPU0 SM-active p95 为 94.7%，对齐组为 52.4%。差异来自 context 长度、保留的多模态内容、compaction/cache-lineage churn 和闭环轨迹，不能只解释成 token 数量。
+3. **finite-request 生命周期不是性能问题。** context 对齐后，当前 p99 为 796 ms，persistent 为 824 ms，已处于同一水平。应用维护 session、engine 每轮处理 finite request、依靠可淘汰 prefix/KV cache 的架构成立。
+4. **应用层重复工作已不再是主要 tail。** processed canonical blocks 消除了完整历史重复 render；warm-up 不阻塞 query，残余上游工作会在回答完成后清理。默认组 tail 同时包含 Thinker 延迟和首文字后的流水线等待，但 Talker/Code2Wav GPU 没有饱和。
+5. **`32k -> 0` 不是生产策略。** 它会丢失已完成 turn，只用于证明 request 生命周期和计算包络。单 seed live closed-loop 也不是 bit-identical replay。
 
-2026-08-22 实现了显式实验路径：PCM16 每满 1 秒形成稳定媒体 item，音视频按实际到达顺序 append-only；相邻音频块删除内部 `<audio_end><audio_start>`，保留独立媒体 hash 和连续 MRoPE。arrival request 仍是低优先级、Thinker-only、有限生命周期；query 补未满 1 秒的尾块并正常发声。Qwen audio encoder 在约 8 秒窗口内使用双向 attention，因此每块独立编码会改变模型语义；这是 workload approximation，不是等价推理。
+当前应用架构可以作为 engine research 的基线；尚未确定的是生产级 history compression，而不是 request 生命周期。
 
-单用户 8 轮验证：`/home/ubuntu/data/results/audio_arrival_approx_dev_20260822/u1_t8`
+## 阶段六：音频 arrival-prefill 实验臂
 
-- 7/7 个计量 turn 成功，无 processor error 或 stall；audio-ready-500 p50/p99 为 280/344 ms。
-- 旧实现的第 6 轮失败没有复现；processed canonical blocks 可以保存累计分块历史。
+Qwen audio encoder 在约 8 秒窗口内使用双向 attention，因此把音频独立切成 1 秒块会改变语义。该路径默认关闭，只用于研究 arrival prefill 负载。
 
-8 用户冷启动 A/B 均使用 schema 4、6 轮/用户、前 1 轮预热、seed 7、0–8 秒 stagger，workload plan SHA256 均为 `b6160ec3...`：
+8 用户×6 轮短 A/B：
 
-- query-time 完整 WAV：`/home/ubuntu/data/results/audio_arrival_ab_baseline_20260822/u8_t6`，40/40；audio-ready-500 p50/p95/p99 为 368/475/654 ms。
-- audio arrival：`/home/ubuntu/data/results/audio_arrival_approx_dev_20260822/u8_t6`，40/40；audio-ready-500 为 343/554/692 ms。
-- arrival 将 foreground prefix residual 的 p50 从 109 降至 23 tokens，TTFT p50 从 166 降至 156 ms；但 warm-up 从 614 增至 893，query 撞上并取消 warm-up 的次数从 6 增至 15。stage Thinker p99 从 294 增至 333 ms，stage audio TTFA p99 从 393 增至 429 ms。
-- 近似改变了回答分布：输出音频 p95 从 11.5 增至 18.2 秒，闭环 wall time 从 114 增至 137 秒。因此两组输入 plan 相同，但运行中的媒体轨迹不是严格 engine-only replay。
+| 输入方式 | Audio-ready-500 p50/p95/p99 |
+|---|---:|
+| query-time 完整 WAV | 368/475/654 ms |
+| 1 秒 audio arrival approximation | 343/554/692 ms |
 
-结论：该路径功能正确，并把一部分 query-time 音频工作移到 arrival，但在 8 用户下只有约 25 ms 中位数收益，tail 没有改善；新增 Thinker warm-up contention 抵消了 foreground 节省。它保留为默认关闭的研究 arm，不能替代正式 query-time 完整 WAV baseline。若要求语义等价且真正受益，需要原生 causal/streaming audio encoder 或模型提供的 streaming cache；当前 Qwen 最多只能在完整约 8 秒窗口后安全缓存，对本 workload 的短语音帮助很小。
+arrival 模式只改善约 25 ms 中位数，p95/p99 反而上升，因为新增 warm-up 与 foreground query 竞争。正式 workload 因此继续使用 query-time 完整 WAV；只有原生 causal/streaming audio encoder 才适合做语义等价的音频 arrival prefill。
 
-这也修正了此前的归因：短基线即使在 query 时处理完整 WAV，p99 仍只有 654 ms；30 轮正式结果的 1,107 ms tail 不能主要归因于 query-time 音频，而是长 context 下多用户 Thinker prefill/decode 与 arrival warm-up 竞争。
+结果：`/home/ubuntu/data/results/audio_arrival_ab_baseline_20260822/u8_t6`、`/home/ubuntu/data/results/audio_arrival_approx_dev_20260822/u8_t6`。
+
+## 阶段七：下一步
+
+1. 在应用层实现有语义的有界压缩：短文本 summary/seed，加少量最近完整 turn；不要使用 `32k -> 0` 作为正式配置。
+2. 固定压缩策略和 context 包络后，重新从 8 用户开始跑 8、16、32……容量阶梯。
+3. 在首次 SLO 失败点拆分 Thinker prefill、Thinker decode、首文字后流水线等待和 GPU 活跃度。
+4. 若 tail 仍由并发 Thinker 工作主导，再对比调度隔离和 P/D 分离；不要继续用应用参数掩盖 engine 问题。
 
 ## 快速恢复入口
 
