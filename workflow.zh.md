@@ -92,7 +92,13 @@ bash benchmarks/live_agent/web_client/run_av_session_ladder.sh
 
 ## 阶段五：当前基线与关键结论
 
-最新正式对照使用实现提交 `854535bb`、`origin_deploy_3gpu.yaml`、seed 7、8 用户×30 轮、前 2 轮预热。两组当前实现的 workload-plan SHA256 均为 `99dc083388...`。
+最新正式对照的精确 setup：
+
+- source：clean commit `854535bb85789a882ff5995362e5528a5f52f83d`；
+- deploy：`origin_deploy_3gpu.yaml`，SHA256 `ae7cbeb615b24ee8654cf6c867887b2920324fc81ec93be6aaaa8995c55e4e24`；
+- workload：schema 4、seed 7、8 用户×30 轮、前 2 轮预热，plan SHA256 `99dc083388931ffcbf9479a7f4344613229350546824371fec3744b548db0ed4`；
+- 默认组：不设置 `MU_SESSION_CFG_JSON`；
+- 对齐组：`MU_SESSION_CFG_JSON='{"context_window_trigger_tokens":32000,"context_window_target_tokens":0,"context_window_compaction_headroom_tokens":0}'`。
 
 | 路径 | context p50/p95/p99/max | Audio-ready-500 p50/p95/p99/max |
 |---|---:|---:|
@@ -119,6 +125,8 @@ bash benchmarks/live_agent/web_client/run_av_session_ladder.sh
 ## 阶段六：音频 arrival-prefill 实验臂
 
 Qwen audio encoder 在约 8 秒窗口内使用双向 attention，因此把音频独立切成 1 秒块会改变语义。该路径默认关闭，只用于研究 arrival prefill 负载。
+
+该短 A/B 使用 schema 4、seed 7、8 用户×6 轮、前 1 轮预热、0–8 秒 stagger，plan SHA256 为 `b6160ec3d78a2126fb07830e5c1b75f9319ba579543555c8474852ad9f9ddf9b`。baseline 不设置 override；arrival 组使用 `MU_SESSION_CFG_JSON='{"enable_audio_arrival_prefill_approximation":true}'`。结果 metadata 标记 source 为 dirty `cbf2226a`，因此它只能支持方向性结论，不能作为可由单个 commit 精确复现的正式结果。
 
 8 用户×6 轮短 A/B：
 

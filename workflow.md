@@ -92,7 +92,13 @@ Results must use workload schema 4 and pass `benchmarks/live_agent/analysis/veri
 
 ## Phase 5: current baseline and conclusions
 
-The latest formal control uses implementation commit `854535bb`, `origin_deploy_3gpu.yaml`, seed 7, eight users × 30 turns, and two warm-up turns. Both current arms have workload-plan SHA256 `99dc083388...`.
+Exact setup for the latest formal control:
+
+- source: clean commit `854535bb85789a882ff5995362e5528a5f52f83d`;
+- deploy: `origin_deploy_3gpu.yaml`, SHA256 `ae7cbeb615b24ee8654cf6c867887b2920324fc81ec93be6aaaa8995c55e4e24`;
+- workload: schema 4, seed 7, eight users × 30 turns, two warm-up turns, plan SHA256 `99dc083388931ffcbf9479a7f4344613229350546824371fec3744b548db0ed4`;
+- default arm: no `MU_SESSION_CFG_JSON`;
+- aligned arm: `MU_SESSION_CFG_JSON='{"context_window_trigger_tokens":32000,"context_window_target_tokens":0,"context_window_compaction_headroom_tokens":0}'`.
 
 | Path | Context p50/p95/p99/max | Audio-ready-500 p50/p95/p99/max |
 |---|---:|---:|
@@ -119,6 +125,8 @@ The application architecture is suitable as the engine-research baseline. The un
 ## Phase 6: audio arrival-prefill research arm
 
 Qwen's audio encoder uses bidirectional attention within an approximately eight-second window, so independently encoding one-second audio chunks changes semantics. This path is off by default and exists only to study arrival-prefill load.
+
+This short A/B used schema 4, seed 7, eight users × six turns, one warm-up turn, a 0–8 second stagger, and plan SHA256 `b6160ec3d78a2126fb07830e5c1b75f9319ba579543555c8474852ad9f9ddf9b`. The baseline had no override; the arrival arm used `MU_SESSION_CFG_JSON='{"enable_audio_arrival_prefill_approximation":true}'`. Result metadata reports dirty source `cbf2226a`, so this supports a directional conclusion only and is not a formal result reproducible from one commit.
 
 Short eight-user × six-turn A/B:
 
