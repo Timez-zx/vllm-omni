@@ -15,7 +15,7 @@
 ```text
 媒体持续到达
   → 通过 filter 的视频帧触发或合并进静默 Thinker warm-up
-  → 用户说完，提交完整 canonical history + 完整 WAV
+  → 用户说完，提交当前 canonical context + 完整 WAV
   → Thinker P → Thinker D → Talker → Code2Wav
   → 回答结束，request 销毁；应用保存本轮
 ```
@@ -23,14 +23,17 @@
 关键约束：
 
 - WebSocket 应用维护 session、媒体状态和 canonical 多模态历史；engine 不持有跨轮活 request。
-- 每个 warm-up 和最终回答都是新的 finite request。每轮提交完整 canonical prompt，engine 的 prefix/KV cache 只是可淘汰的加速层；cache miss 只增加计算，不影响正确性。
+- 每个 warm-up、summary 更新和最终回答都是新的 finite request。每轮提交完整的当前 canonical prompt，engine 的 prefix/KV cache 只是可淘汰的加速层；cache miss 只增加计算，不影响正确性。
 - 应用只 render 新增 message block，再拼出完整 prompt，避免重复处理历史媒体。
 - 视频经 similarity/freshness filter 后 append-only 地进入当前 turn；不再使用 8 帧滑动淘汰。
 - 视频 warm-up 优先级为 10，只运行 Thinker，`max_tokens=1`，不返回文字、不进入 Talker。最终 query 优先级为 0，并会取消尚未完成的 warm-up。
 - 音频在 query 时作为一个完整 WAV 输入。Qwen audio encoder 使用双向 attention，切成独立小段不能保证与整段推理语义等价。
-- 回答期间到达的媒体归入下一轮。history 通常在约 32k tokens 时按完整 turn 压缩到不超过 16k；硬阈值为 49,152 tokens。
+- 回答期间到达的媒体归入下一轮。约 32k tokens 时，应用用低优先级、text-only Thinker request 将已完成历史更新为文字 summary，并保留最近 2 个完整 AV turn；新 context 目标不超过 16k，硬阈值为 49,152 tokens。
+- summary request 在现有已完成历史后只追加总结指令，因此可复用旧 prefix KV；它不进入 Talker。只有 summary 生成和新 prompt render 都成功后才原子切换 lineage。旧媒体不再留在 hot session；如需审计，应由应用另行持久化。主动压缩失败时不丢历史，硬阈值下才回退到按完整 turn 删除。
 
 这一边界与常见的“无状态 API + prefix cache”计算语义接近，但 session 状态明确留在应用层。旧的跨轮 persistent request、resumable append、Talker rolling 和 shadow request 路径已经删除。当前应用可以独立于 engine lifecycle 接入 routing、replication 和 P/D 分离。
+
+实现验证（仅功能 smoke，不是性能基线）：`/home/ubuntu/data/results/pd_summary_smoke_20260823_v1` 使用临时 12k/6k 阈值强制触发两次 compaction，6/6 turn 完成、无 error。两个 summary request 都只经过 Thinker P/D（stage 0/1）；7,430-token request 复用 7,359-token lineage，3 个 AV turn 被原子改写为 259 字 summary + 最近 1 turn，新 prompt 为 3,590 tokens。该短测未排除服务启动后的首轮冷启动，不引用其 TTFA。
 
 ## 阶段三：固定部署与 workload
 
@@ -152,13 +155,40 @@ python benchmarks/live_agent/analysis/verify_run.py RESULT_DIR
 
 该运行记录 `source_commit=2a90a9e2` 且 `source_dirty=true`；这里的 “关闭诊断” 只表示关闭额外日志，不表示 git worktree clean。当前数据是开发基线，提交后应使用同一 trace 再回放一次，形成可由单个 commit 精确复现的正式基线。
 
+### 30 轮 long-session 验证
+
+当前 `summary + 最近 2 个完整 AV turn` 实现完成了 8 用户×30 轮长测；每用户前 2 轮预热，224/224 个计分 turn 成功，无 timeout、stall、replay slip 或 engine warning：
+
+| 指标 | 结果 |
+|---|---:|
+| TTFA / Audio-ready-500 p50/p95/p99 | **387/618/699 ms** |
+| Stall-max p99 | **0 ms** |
+| Thinker P p50/p95/p99 | 89/228/371 ms |
+| Thinker D 新增延迟 p50/p95/p99 | 85/175/231 ms |
+| Talker 新增延迟 p50/p95/p99 | 51/82/139 ms |
+| 首个 codec 输出→首个 WAV 新增延迟 p50/p95/p99 | 100/220/234 ms |
+
+23 次 compaction 全部将 8–12 个完整 turn 改写为 summary + 2 个最近 turn，没有重复提交或历史丢失。Summary request 输入中位数为 32,023 tokens，其中前缀复用 31,952，实际新增中位数仅 71 tokens；生成耗时 p50/p95 为 868/2,731 ms，压缩后 prompt 为 7,314/10,364 tokens。该耗时主要是 summary decode，不是重复 prefill。
+
+长 session 没有随轮次恶化：第 1–10、11–20、21–30 轮 TTFA p99 分别为 694、658、690 ms。与相同 deploy、seed 和 workload plan 的旧 drop-oldest 30 轮记录相比，TTFA 从 408/644/946 ms 降到 387/618/699 ms，P p99 从 532 ms 降到 371 ms，compaction 从 33 次降到 23 次。两次都是 live record，input trace 和视频账本约有 2% 差异，因此这是方向性对照，不是严格同 trace A/B。
+
+当前 tail 分解：
+
+- p95 tail 相对中位数的额外延迟约 74% 在 Thinker、26% 在语音启动侧。Thinker 中最明显的是 P 实际执行中位数从 65 ms 增至 201 ms，以及 D queue 从 12 ms 增至 55 ms；P scheduler queue p99 仅 0.03 ms。
+- tail turn 到达时，其他 foreground 首音未完成请求平均为 1.00，全集为 0.20。问题是瞬时请求重叠后的 P 批处理和 D 等待，不是持续拥塞。
+- 首个 codec 到首个 WAV 的 tail 主要是在等待 Talker 累积初始 codec chunk；tail 区间 Talker SM active p50/p95 为 19%/23%，Code2Wav 只有 4%/8%，因此不是 Code2Wav 饱和。
+- 全程 SM active p50/p95：P 24%/41%、D 0%/32%、Talker 0%/23%、Code2Wav 0%/6%。显存预留分别约 95%/93%/62%/5%，不能把高显存占用解释为计算饱和。
+
+还有一个独立实现问题：6/224 个计分请求在取消 speculative warm-up/summary 后退化为完整 P-conditioning snapshot。被取消的子 revision 已覆盖 orchestrator 的单条 lineage snapshot，但应用没有提交该 revision；下一请求虽命中 engine prefix KV，仍找不到已提交 parent snapshot。完整路径 TTFA p50 为 545 ms，正常 delta 路径为 385 ms；它放大部分 tail，但最高的 796 ms 请求仍走 delta，不能解释全部 tail。
+
+有效结果：`/home/ubuntu/data/results/pd_summary_recent_u8_t30_diag_20260823_v3/pd_summary_recent_diag_seed7_u8`。workload plan SHA256 为 `a2c69229a62dbc978a6a6ad0619bdfbdc12e3fcf7d7bd462c14dcad47d152c6c`，input trace SHA256 为 `d3da7a49ade87a1a86c7f8100f31d0881a6c73dec9ae4dd681af709ce15c0961`。结果记录的 base commit 为 `b69f44a2` 且 `source_dirty=true`，属于当前未提交实现的开发结果。v1/v2 暴露并用于修复同 session compaction 竞态和未 admission warm-up 竞态，不是有效性能结果。
+
 ## 阶段七：下一步
 
-1. 提交当前实现后，用固定 8 用户×12 轮 trace 做一次 diagnostics-off replay，固定正式基线。
-2. 在 stage 0 A/B 更小的 chunked-prefill 调度粒度、可抢占 warm-up，或在 compaction 后推迟 cold warm-up；目标是 foreground 最多等待一个小 chunk。
-3. 确认被 abort 的 warm-up 不再执行完整大 prefill，再运行 8、16、32……用户、30 轮/用户的容量阶梯。
-4. 到首个 SLO 失败点后重新分解 tail 和 GPU 有效利用率；在更高并发或跨节点条件下复测 Delta-KV 的容量收益。
-5. RCA 时开启控制面诊断；正式容量结果关闭诊断。
+1. 将 P-conditioning snapshot cache 按 `(lineage_id, revision)` 保留已提交 parent，避免被取消的 speculative child 覆盖；用上面的固定 trace 严格回放验证 full fallback 消失。
+2. 若 delta-only 路径仍受大 warm-up 影响，在 stage 0 A/B 更小的 chunked-prefill 调度粒度或可抢占 warm-up；目标是 foreground 最多等待一个小 chunk。
+3. 再运行 16、32……用户、30 轮/用户的容量阶梯；到首个 SLO 失败点后重新分解 tail 和 GPU 有效利用率。
+4. 在更高并发或跨节点条件下复测 Delta-KV 的容量收益。RCA 开启控制面诊断，正式容量结果关闭诊断。
 
 ## 快速恢复入口
 
@@ -176,4 +206,5 @@ python benchmarks/live_agent/analysis/verify_run.py RESULT_DIR
 | P/D 容量入口 | `benchmarks/live_agent/web_client/run_pd_av_session_ladder.sh` |
 | 运行验证 | `benchmarks/live_agent/analysis/verify_run.py` |
 | P/D 分阶段延迟 | `benchmarks/live_agent/analysis/stage_stats_v2.py` |
+| Tail 与 GPU 归因 | `benchmarks/live_agent/analysis/p99_attribution.py` |
 | GPU 采样 | `benchmarks/live_agent/harness/gpu_sampler.py` |

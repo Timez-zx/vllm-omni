@@ -15,7 +15,7 @@ The current design keeps the session in the application and gives the engine fin
 ```text
 media arrives continuously
   → filtered video frames trigger or coalesce into silent Thinker warm-ups
-  → at end of speech, submit full canonical history + one complete WAV
+  → at end of speech, submit the current canonical context + one complete WAV
   → Thinker P → Thinker D → Talker → Code2Wav
   → destroy the request after the answer; persist the turn in the application
 ```
@@ -23,14 +23,17 @@ media arrives continuously
 The invariants are:
 
 - The WebSocket application owns session state, media state, and canonical multimodal history. The engine holds no live cross-turn request.
-- Every warm-up and final answer is a new finite request. Each turn submits the full canonical prompt; engine prefix/KV caches are disposable accelerators. A cache miss costs compute but cannot affect correctness.
+- Every warm-up, summary update, and final answer is a new finite request. Each turn submits the complete current canonical prompt; engine prefix/KV caches are disposable accelerators. A cache miss costs compute but cannot affect correctness.
 - The application renders only new message blocks and assembles the full prompt without reprocessing historical media.
 - Video enters the current turn append-only after similarity/freshness filtering; the old eight-frame sliding eviction is gone.
 - Video warm-ups use priority 10, run Thinker only with `max_tokens=1`, return no text, and never enter Talker. The final query uses priority 0 and cancels unfinished warm-ups.
 - Audio is submitted as one complete WAV at query time. Qwen's audio encoder uses bidirectional attention, so independently encoded chunks are not guaranteed to preserve whole-audio semantics.
-- Media arriving during an answer belongs to the next turn. History is normally compacted by complete turns near 32k tokens to at most 16k; the hard limit is 49,152 tokens.
+- Media arriving during an answer belongs to the next turn. Near 32k tokens, a low-priority, text-only Thinker request updates durable textual memory and the application retains the newest two complete AV turns. The rewritten context targets 16k tokens; the hard limit is 49,152 tokens.
+- The summary request only appends a summarization instruction after the existing completed history, so it can reuse the old prefix KV and never enters Talker. The lineage changes atomically only after summary generation and rendering both succeed. Old media leaves the hot session; applications that require auditing should persist it separately. A failed proactive update preserves history; only the hard-limit path falls back to dropping complete turns.
 
 This boundary has compute semantics similar to a stateless API backed by prefix caching, while making application ownership of session state explicit. The old cross-turn persistent request, resumable append, Talker rolling, and shadow-request paths have been removed. The application can now use routing, replication, or P/D separation without coupling them to session lifecycle.
+
+Implementation check (functional smoke only, not a performance baseline): `/home/ubuntu/data/results/pd_summary_smoke_20260823_v1` forced two compactions with temporary 12k/6k thresholds. All 6/6 turns completed without errors. Both summary requests traversed Thinker P/D only (stages 0/1); a 7,430-token request reused a 7,359-token lineage, then atomically rewrote three AV turns into a 259-character summary plus the newest turn, producing a 3,590-token prompt. The run did not exclude the first post-startup cold turn, so its TTFA is not cited.
 
 ## Phase 3: fixed deployment and workload
 
@@ -152,13 +155,40 @@ Latest result directories:
 
 The run records `source_commit=2a90a9e2` and `source_dirty=true`. “Diagnostics off” means only that extra logging was disabled; it does not mean a clean git worktree. These numbers are a development baseline. After commit, replay the same trace once to create a formal baseline reproducible from one commit.
 
+### Thirty-turn long-session validation
+
+The current `summary + newest two complete AV turns` implementation completed an eight-user × 30-turn run. The first two turns per user were warm-up; all 224/224 scored turns succeeded with no timeout, stall, replay slip, or engine warning:
+
+| Metric | Result |
+|---|---:|
+| TTFA / Audio-ready-500 p50/p95/p99 | **387/618/699 ms** |
+| Stall-max p99 | **0 ms** |
+| Thinker P p50/p95/p99 | 89/228/371 ms |
+| Thinker D added latency p50/p95/p99 | 85/175/231 ms |
+| Talker added latency p50/p95/p99 | 51/82/139 ms |
+| First codec output→first WAV added latency p50/p95/p99 | 100/220/234 ms |
+
+All 23 compactions rewrote 8–12 complete turns into a summary plus two recent turns, with no duplicate commit or lost history. The median summary request had 32,023 input tokens and reused a 31,952-token prefix, so its median new prefill was only 71 tokens. Summary generation p50/p95 was 868/2,731 ms and the rewritten prompt was 7,314/10,364 tokens. This time is summary decode, not repeated full prefill.
+
+Long sessions no longer degrade with turn index: TTFA p99 for turns 1–10, 11–20, and 21–30 was 694, 658, and 690 ms. Against the old drop-oldest 30-turn run with the same deploy, seed, and workload plan, TTFA changed from 408/644/946 ms to 387/618/699 ms, P p99 from 532 to 371 ms, and compactions from 33 to 23. Both were live recordings; their input traces and video ledgers differ by about 2%, so this is a directional comparison rather than a strict same-trace A/B.
+
+Current tail decomposition:
+
+- About 74% of p95 tail excess is on Thinker and 26% on speech startup. Within Thinker, P execution median rises from 65 to 201 ms and D queue from 12 to 55 ms; P scheduler queue p99 is only 0.03 ms.
+- A tail turn sees 1.00 other foreground request awaiting first audio on average, versus 0.20 over all turns. This is transient overlapping P batches and D waiting, not sustained congestion.
+- The tail from first codec output to first WAV mainly waits for Talker to accumulate the initial codec chunk. Tail-window Talker SM active p50/p95 is 19%/23%, versus 4%/8% on Code2Wav, so Code2Wav is not saturated.
+- Overall SM-active p50/p95 is P 24%/41%, D 0%/32%, Talker 0%/23%, and Code2Wav 0%/6%. Reserved memory is about 95%/93%/62%/5%; high memory reservation is not compute saturation.
+
+One independent implementation issue remains. Six of 224 scored requests fall back to a full P-conditioning snapshot after a speculative warm-up/summary is cancelled. The cancelled child revision has replaced the orchestrator's single lineage snapshot, but the application never commits that revision; the next request still hits engine prefix KV but cannot find its committed parent snapshot. Full-path TTFA p50 is 545 ms versus 385 ms for the normal delta path. This amplifies part of the tail, but the 796 ms maximum still uses delta and therefore has a separate contention cause.
+
+Valid result: `/home/ubuntu/data/results/pd_summary_recent_u8_t30_diag_20260823_v3/pd_summary_recent_diag_seed7_u8`. Workload-plan SHA256 is `a2c69229a62dbc978a6a6ad0619bdfbdc12e3fcf7d7bd462c14dcad47d152c6c`; input-trace SHA256 is `d3da7a49ade87a1a86c7f8100f31d0881a6c73dec9ae4dd681af709ce15c0961`. It records base commit `b69f44a2` with `source_dirty=true`, so it is a development result for the current uncommitted implementation. v1/v2 exposed and were used to fix the same-session compaction race and the unadmitted-warm-up race; they are not valid performance results.
+
 ## Phase 7: next steps
 
-1. After committing the current implementation, run one diagnostics-off replay of the fixed eight-user × 12-turn trace and pin the formal baseline.
-2. On stage 0, A/B a smaller chunked-prefill scheduling quantum, preemptible warm-ups, or deferring cold warm-ups after compaction. A foreground query should wait for at most one small chunk.
-3. Verify that aborted warm-ups no longer execute a complete large prefill, then run the 8, 16, 32, ... user capacity ladder with 30 turns/user.
-4. At the first SLO failure, decompose tail latency and effective GPU utilization again. Re-evaluate Delta-KV capacity benefit under higher concurrency or cross-node transfer.
-5. Enable control-plane diagnostics only for RCA; keep them off in formal capacity runs.
+1. Preserve committed P-conditioning parents by `(lineage_id, revision)` so a cancelled speculative child cannot replace them; strictly replay the fixed trace and verify that full fallback disappears.
+2. If the delta-only path still suffers from large warm-ups, A/B a smaller stage-0 chunked-prefill quantum or preemptible warm-ups. A foreground query should wait for at most one small chunk.
+3. Run the 16, 32, ... user capacity ladder at 30 turns/user. At the first SLO failure, decompose tail latency and effective GPU utilization again.
+4. Re-evaluate Delta-KV capacity benefit at higher concurrency or across nodes. Enable control-plane diagnostics for RCA and disable them for formal capacity results.
 
 ## Recovery map
 
@@ -176,4 +206,5 @@ The run records `source_commit=2a90a9e2` and `source_dirty=true`. “Diagnostics
 | P/D capacity entry point | `benchmarks/live_agent/web_client/run_pd_av_session_ladder.sh` |
 | Run verification | `benchmarks/live_agent/analysis/verify_run.py` |
 | Per-stage P/D decomposition | `benchmarks/live_agent/analysis/stage_stats_v2.py` |
+| Tail and GPU attribution | `benchmarks/live_agent/analysis/p99_attribution.py` |
 | GPU sampling | `benchmarks/live_agent/harness/gpu_sampler.py` |

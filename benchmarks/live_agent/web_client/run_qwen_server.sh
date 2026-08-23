@@ -101,6 +101,9 @@ required = {
     "context_window_trigger_tokens",
     "context_window_target_tokens",
     "context_window_compaction_headroom_tokens",
+    "enable_history_summary",
+    "history_summary_recent_turns",
+    "history_summary_max_tokens",
     "max_frame_width",
     "frame_filter_min_gap",
 }

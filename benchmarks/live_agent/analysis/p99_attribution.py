@@ -40,7 +40,13 @@ import pathlib
 import re
 import statistics as st
 
-GPU_STAGES = {0: "thinker", 1: "talker", 2: "code2wav"}
+DEFAULT_GPU_STAGES = {0: "thinker", 1: "talker", 2: "code2wav"}
+PD_GPU_STAGES = {
+    0: "thinker-prefill",
+    1: "thinker-decode",
+    2: "talker",
+    3: "code2wav",
+}
 RESOURCE_METRICS = (
     "gpu_busy_pct",
     "sm_active_pct",
@@ -151,6 +157,8 @@ def resource_attribution(
         if record.get("playback_start_ms") is not None and record["playback_start_ms"] >= playback_p95
     ]
     device_meta = {device["index"]: device for device in cell["gpu_meta"].get("devices", [])}
+    deploy_name = pathlib.Path(str(cell["summary"].get("deploy_config") or "")).name
+    gpu_stages = PD_GPU_STAGES if deploy_name == "pd_deploy_4gpu.yaml" else DEFAULT_GPU_STAGES
     output = {}
     for gpu in sorted({sample["gpu"] for sample in samples}):
         meta = device_meta.get(gpu, {})
@@ -160,7 +168,7 @@ def resource_attribution(
             if sample["gpu"] == gpu and benchmark_start <= sample["monotonic_s"] <= benchmark_end
         ]
         output[str(gpu)] = {
-            "stage": GPU_STAGES.get(gpu, f"gpu{gpu}"),
+            "stage": gpu_stages.get(gpu, f"gpu{gpu}"),
             "overall": resource_summary(
                 gpu_samples,
                 total_memory_mib=meta.get("total_memory_mib"),

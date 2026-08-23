@@ -301,6 +301,12 @@
       thinker_max_response_tokens: 256,
       context_window_target_tokens: 16384,
       context_window_compaction_headroom_tokens: 16384,
+      // At compaction, replace old AV turns with durable text memory while
+      // keeping the newest two turns verbatim. The raw archive remains in the
+      // application and the engine still receives an ordinary finite request.
+      enable_history_summary: true,
+      history_summary_recent_turns: 2,
+      history_summary_max_tokens: 512,
     };
   }
 
