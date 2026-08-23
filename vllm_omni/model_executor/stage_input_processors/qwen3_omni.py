@@ -606,10 +606,30 @@ def thinker2talker_async_chunk(
                 value = thinker_embed.get(name)
             return _maybe_cpu(value)
 
+        def _pd_prompt_chunks(layer_name: str) -> tuple[torch.Tensor, ...]:
+            chunks = getattr(pd_prefill, f"{layer_name}_chunks", None)
+            if chunks:
+                return tuple(chunk.detach().cpu() for chunk in chunks)
+            layer = getattr(pd_prefill, layer_name, None)
+            if isinstance(layer, torch.Tensor):
+                return (layer.detach().cpu(),)
+            raise RuntimeError(f"P/D Thinker→Talker snapshot is missing {layer_name}")
+
+        prompt_layer_0_chunks = _pd_prompt_chunks("prompt_layer_0")
+        prompt_layer_24_chunks = _pd_prompt_chunks("prompt_layer_24")
+        prompt_layer_0_rows = sum(int(chunk.shape[0]) for chunk in prompt_layer_0_chunks)
+        prompt_layer_24_rows = sum(int(chunk.shape[0]) for chunk in prompt_layer_24_chunks)
+        if prompt_layer_0_rows != len(prompt_ids) or prompt_layer_24_rows != len(prompt_ids):
+            raise RuntimeError(
+                "P/D Thinker→Talker prompt snapshot is not row-aligned: "
+                f"prompt_tokens={len(prompt_ids)} embed_rows={prompt_layer_0_rows} "
+                f"hidden_rows={prompt_layer_24_rows}"
+            )
+
         payload = OmniPayloadStruct(
             embed=EmbeddingsStruct(
                 prefill=torch.cat(
-                    (pd_prefill.prompt_layer_0.detach().cpu(), thinker_emb[-decode_rows:].detach().cpu()),
+                    (*prompt_layer_0_chunks, thinker_emb[-decode_rows:].detach().cpu()),
                     dim=0,
                 ),
                 tts_bos=_pd_tts_embedding("tts_bos"),
@@ -618,7 +638,7 @@ def thinker2talker_async_chunk(
             ),
             hidden_states=HiddenStatesStruct(
                 output=torch.cat(
-                    (pd_prefill.prompt_layer_24.detach().cpu(), thinker_hid[-decode_rows:].detach().cpu()),
+                    (*prompt_layer_24_chunks, thinker_hid[-decode_rows:].detach().cpu()),
                     dim=0,
                 )
             ),

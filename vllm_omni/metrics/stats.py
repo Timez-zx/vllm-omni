@@ -58,6 +58,8 @@ class StageRequestStats:
     inter_output_latency_ms: float = 0.0
     inter_output_latencies_ms: list[float] | None = None
     vllm_ttft_ms: float = 0.0
+    vllm_queue_ms: float = 0.0
+    vllm_prefill_ms: float = 0.0
     vllm_tpot_ms: float = 0.0
     vllm_itl_ms: float = 0.0
     vllm_itls_ms: list[float] | None = None

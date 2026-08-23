@@ -709,6 +709,8 @@ class StagePool:
             inter_output_latency_ms=inter_output_latency_ms,
             inter_output_latencies_ms=inter_output_latencies_ms,
             vllm_ttft_ms=float(native_text_metrics.get("vllm_ttft_ms") or 0.0),
+            vllm_queue_ms=float(native_text_metrics.get("vllm_queue_ms") or 0.0),
+            vllm_prefill_ms=float(native_text_metrics.get("vllm_prefill_ms") or 0.0),
             vllm_tpot_ms=float(native_text_metrics.get("vllm_tpot_ms") or 0.0),
             vllm_itl_ms=float(native_text_metrics.get("vllm_itl_ms") or 0.0),
             vllm_itls_ms=list(native_text_metrics.get("vllm_itls_ms") or []),

@@ -1,235 +1,164 @@
 # vLLM-Omni 实时多用户 Serving 工作流
 
-## 目标与边界
+本文只记录当前可复现路径、支撑设计决策的对照实验和已确认的结论。研究分支为 `thinker-talker-pd`。
 
-目标是在 TTFA 和语音连续性达标的前提下，用更少 GPU 服务更多持续音视频会话。研究重点是 engine 的容量、调度、KV cache 和尾延迟，不是模型质量。
+## 阶段一：目标与模型边界
 
-目前没有可本地部署、交互方式与 Seed Realtime 或 Gemini Live 等价的开源 realtime 模型。本分支使用 Qwen3-Omni 的 Thinker → Talker → Code2Wav 流水线近似目标场景：客户端持续上传音视频，模型按 turn 回答。它可以产生合理的多模态 prefill、语音 decode 和多用户竞争负载，但不代表原生全双工或语义级 barge-in。
+目标是在语音启动延迟和连续性达标的前提下，用更少 GPU 服务更多长期音视频会话。研究对象是 engine 的调度、KV cache、数据传输、容量和尾延迟，不是模型质量。
 
-## 阶段一：应用基线
+当前没有可本地部署、交互方式与 Seed Realtime 或 Gemini Live 等价的开源模型。本项目用 Qwen3-Omni 的 Thinker → Talker → Code2Wav 流水线近似目标负载：客户端持续上传音视频，模型按 turn 回答。它能产生真实的多模态 prefill、语音 decode 和多用户竞争，但不是原生全双工模型，也不研究语义级 barge-in。
 
-当前采用“应用有状态、engine request 有限生命周期”的设计：
+## 阶段二：应用与 engine 边界
+
+当前设计是“应用维护 session，engine 处理有限生命周期 request”：
 
 ```text
-持续音视频到达
-  → 视频帧触发静默 Thinker finite request，预热 prefix KV
+媒体持续到达
+  → 通过 filter 的视频帧触发或合并进静默 Thinker warm-up
   → 用户说完，提交完整 canonical history + 完整 WAV
-  → Thinker → Talker → Code2Wav
-  → 回答结束，request 销毁
-  → 应用保存本轮，下一轮创建新 request ID
+  → Thinker P → Thinker D → Talker → Code2Wav
+  → 回答结束，request 销毁；应用保存本轮
 ```
 
 关键约束：
 
-- WebSocket 应用维护 session、媒体接收状态和完整 canonical 多模态历史。
-- 每个静默 warm-up 和最终回答都是新的普通 finite request；engine 不持有跨轮活 request。
-- 每轮向 engine 提交完整 canonical prompt。prefix/KV cache 可淘汰；cache miss 只增加 prefill，不影响正确性。
-- 应用缓存已处理的 canonical message blocks，每轮只 render 新 user/assistant block，再拼接完整 prompt，避免重复处理全部历史媒体。
-- 视频以 append-only 方式进入本轮；similarity/freshness filter 决定是否接受，接受后不再做 8 帧滑动淘汰或二次采样。
-- 新视频帧触发或合并进低优先级 `video-warm-<uuid>`。它只运行 Thinker、`max_tokens=1`、不返回文字、不进入 Talker。query 到达时立即取消未完成 warm-up，不等待 cache。
-- 用户音频默认在 query 时作为一个完整 WAV 输入，保持 Qwen 的整段音频语义。只有最终 query 会触发语音回答。
-- 回答期间新到达媒体归入下一轮；本轮媒体只消费一次。
-- 正常回答最多生成 256 个 Thinker tokens；视频不超过 640×352，JPEG 处理放在子进程池中。
-- history 硬阈值为 49,152 tokens；16,384-token headroom 使应用通常在约 32,768 tokens 提前按完整 turn 压缩到不超过 16,384 tokens，并更换 cache lineage。
+- WebSocket 应用维护 session、媒体状态和 canonical 多模态历史；engine 不持有跨轮活 request。
+- 每个 warm-up 和最终回答都是新的 finite request。每轮提交完整 canonical prompt，engine 的 prefix/KV cache 只是可淘汰的加速层；cache miss 只增加计算，不影响正确性。
+- 应用只 render 新增 message block，再拼出完整 prompt，避免重复处理历史媒体。
+- 视频经 similarity/freshness filter 后 append-only 地进入当前 turn；不再使用 8 帧滑动淘汰。
+- 视频 warm-up 优先级为 10，只运行 Thinker，`max_tokens=1`，不返回文字、不进入 Talker。最终 query 优先级为 0，并会取消尚未完成的 warm-up。
+- 音频在 query 时作为一个完整 WAV 输入。Qwen audio encoder 使用双向 attention，切成独立小段不能保证与整段推理语义等价。
+- 回答期间到达的媒体归入下一轮。history 通常在约 32k tokens 时按完整 turn 压缩到不超过 16k；硬阈值为 49,152 tokens。
 
-`enable_audio_arrival_prefill_approximation` 默认关闭。它把音频封成 1 秒块做静默 arrival prefill，只用于模拟 duplex engine 负载，不保证与 Qwen 整段音频推理语义等价。
+这一边界与常见的“无状态 API + prefix cache”计算语义接近，但 session 状态明确留在应用层。旧的跨轮 persistent request、resumable append、Talker rolling 和 shadow request 路径已经删除。当前应用可以独立于 engine lifecycle 接入 routing、replication 和 P/D 分离。
 
-旧的跨轮 persistent request、resumable append、Talker 45k rolling、Thinker shadow compression 和 session ledger 已删除。当前基线与通用 engine request 抽象兼容，也更容易接入 routing、replication 和 P/D 分离。
+## 阶段三：固定部署与 workload
 
-## 阶段二：固定部署
+### 部署
 
-正式实验只使用 `benchmarks/thinker_talker/origin_deploy_3gpu.yaml`：
+上游 vLLM-Omni 不能把同一个 Thinker 拆成独立 P/D stage，同时继续向 Talker 提供 conditioning states。本分支补齐了这条路径；应用协议和 finite-request 生命周期没有改变。
 
-| Stage | GPU | 配置 |
+正式 P/D 部署固定为 `benchmarks/thinker_talker/pd_deploy_4gpu.yaml`，当前 SHA256 为 `7bc4502494c19d07046a6ce5e2c272ebf4536108d1336831ea4294d78437ba24`。
+
+| Stage | GPU | 主要配置 |
 |---|---:|---|
-| Thinker | 0 | FP8 weight/KV、prefix cache、priority scheduler |
-| Talker | 1 | FP8 weight/KV、session-isolated conditioning prefix cache |
-| Code2Wav | 2 | 独立进程 |
+| Thinker P | 0 | FP8 weight/KV、prefix cache、priority、32k batched tokens |
+| Thinker D | 1 | FP8 weight/KV、prefix cache、priority、Delta-KV consumer |
+| Talker | 2 | FP8 weight/KV、prefix cache、流式 codec 输出 |
+| Code2Wav | 3 | 独立 stage，流式生成音频 |
 
-最终回答优先级为 0，静默 warm-up 为 10。部署 YAML 在不同用户数和 session-policy 对照之间保持不变。`run_qwen_server.sh` 自动定位 CUDA toolkit，并检查 Thinker 使用 FlashInfer。多模态 processor cache 使用 API-side `processor_only` 模式。
+P→D 使用 `NixlDeltaPushConnector`；D→Talker→Code2Wav 使用 shared-memory connector。正式实验只改变用户数、seed 或明确标注的实验变量，不改部署参数。
 
-## 阶段三：正式 workload
-
-唯一正式 workload 是持续 AV session：
+### 持续 AV session workload
 
 - 每个用户维持一条长期 WebSocket。
-- 视频全程以 2 FPS 上传；通过 filter 的帧立即触发或合并进静默 Thinker warm-up。
+- 视频全程以 2 FPS 上传；通过 filter 的帧触发或合并进 Thinker warm-up。
 - 麦克风以 5 Hz 上传 PCM16；assistant 播放期间暂停，并保留 300 ms echo guard。
-- 每轮使用一条不重复的真实 16 kHz mono SLURP 录音，末尾追加 700 ms endpoint silence；query 文本为空。
-- 音频在 query 时作为完整 WAV 加到已 warm 的视频 prefix 后，只有该请求触发 Talker。
-- 每个 session 固定 speaker；DAVIS 视频使用固定序列和不同起点。
-- 下一轮在上一轮语音按 1× 播放完成后开始，形成 playback-paced closed loop。
-- 用户启动时间在 0–40 秒内确定性错开。
+- 每轮使用一条不重复的真实 16 kHz mono SLURP 录音，末尾追加 700 ms endpoint silence；query 文本为空，完整 WAV 在 query 时提交。
+- 每个 session 固定 speaker；视频来自 DAVIS 固定序列，但起点不同。
+- 下一轮在上一轮音频按 1× 播放完成后开始，形成 playback-paced closed loop。
+- 用户启动时间确定性分布在 0–8 秒内。
 
-正式 cell 为 30 轮/用户，前 2 轮预热。用户数按 8、16、32……增长，每个 seed 在首个 SLO 失败点停止；每个 cell 重启 engine。`probe.py` 的合成媒体只验证协议，不能用于容量结论。
+协议 smoke test 使用 1–2 用户；固定性能 replay 使用 8 用户×12 轮、首轮预热；容量实验使用 30 轮/用户、前 2 轮预热，并按 8、16、32……增长。每个 capacity cell 重启 engine，在首个 SLO 失败点停止。
+
+固定 8 用户×12 轮 trace：
+
+- 文件：`/home/ubuntu/data/results/pd_deferred_free_fix_20260823_v1/u8_t12_seed7_u8/input_trace.jsonl.gz`
+- SHA256：`03591906c1dd356df55eaac3081dc2efc4f6357f900f3411919c97b55fecf33b`
+- workload plan SHA256：`7f08495fdc2b9a2ff565deb8f1923347124ae5f24527d2153167332749d5b1bd`
+- 固定账本：3005 帧发送、1323 帧接受、1278 帧消费、3606 个音频 chunk。
+
+复现命令：
 
 ```bash
 MU_FRAMES_DIR=/home/ubuntu/data/workloads/continuous_av_v1/frames \
 MU_AUDIO_MANIFEST=/home/ubuntu/data/workloads/continuous_av_v1/audio_manifest.jsonl \
 VLLM_OMNI_BIN=/home/ubuntu/miniconda3/envs/omni/bin/vllm-omni \
 MU_PYTHON=/home/ubuntu/miniconda3/envs/omni/bin/python \
-RESULTS_DIR=/home/ubuntu/data/results/finite_request_capacity_<commit> \
-RESULT_PREFIX=finite_request USERS="8 16 32" SEEDS="7 17" \
-TURNS=30 WARMUP_TURNS=2 \
-bash benchmarks/live_agent/web_client/run_av_session_ladder.sh
+MU_INPUT_TRACE_MODE=replay \
+MU_REPLAY_INPUT_TRACE=/home/ubuntu/data/results/pd_deferred_free_fix_20260823_v1/u8_t12_seed7_u8/input_trace.jsonl.gz \
+RESULTS_DIR=/home/ubuntu/data/results/pd_replay_<commit> \
+RESULT_PREFIX=pd_replay USERS=8 SEEDS=7 TURNS=12 WARMUP_TURNS=1 \
+bash benchmarks/live_agent/web_client/run_pd_av_session_ladder.sh
 ```
+
+做容量阶梯时移除 replay 变量，改为 `USERS="8 16 32" TURNS=30 WARMUP_TURNS=2`。`probe.py` 的合成媒体只验证协议，不能产生容量结论。
 
 ## 阶段四：指标与通过条件
 
-- **TTFA**：query 到第一块音频包。它受首包大小影响，只用于单次部署内定位。
-- **Audio-ready-500**：累计收到 500 ms 可播放音频的时间，是跨 packetization 的启动指标。
+- **TTFA**：query 到第一块音频包；受 packetization 影响，只在同一部署内比较。
+- **Audio-ready-500**：query 到累计获得 500 ms 可播放音频；作为正式启动延迟。
 - **Stall max**：按 1× 播放时最大的单次断流。
-- **RTF deliver**：生成音频时长 / 交付耗时，用于判断持续供给能力。
+- **RTF deliver**：输出音频时长 / 交付耗时；判断能否持续供给。
 
-容量通过必须同时满足：
+一个 capacity cell 必须同时满足：所有计分 turn 完成、Audio-ready-500 p99 < 1 s、Stall-max p99 < 50 ms，且无 client、protocol 或 fatal engine error。
 
-- 预热后的所有 turn 完成；
-- Audio-ready-500 p99 < 1 s；
-- Stall-max p99 < 50 ms；
-- 无 client、protocol 或 fatal engine error。
+结果必须使用 workload schema 4，并通过：
 
-结果必须使用 workload schema 4，并运行 `benchmarks/live_agent/analysis/verify_run.py`。验证器检查 finite request 唯一性、arrival warm-up、frame ledger、实际 prefix-cache 命中和三阶段独立进程。
+```bash
+MU_EXPECTED_DEPLOY_BASENAME=pd_deploy_4gpu.yaml \
+MU_EXPECTED_STAGE_IDS=0,1,2,3 \
+python benchmarks/live_agent/analysis/verify_run.py RESULT_DIR
+```
 
-## 阶段五：当前基线与关键结论
+验证器检查 finite request 唯一性、arrival warm-up、frame ledger、实际 prefix-cache 命中和四个独立 stage。
 
-最新正式对照的精确 setup：
+## 阶段五：已验证的设计决策
 
-- source：clean commit `854535bb85789a882ff5995362e5528a5f52f83d`；
-- deploy：`origin_deploy_3gpu.yaml`，SHA256 `ae7cbeb615b24ee8654cf6c867887b2920324fc81ec93be6aaaa8995c55e4e24`；
-- workload：schema 4、seed 7、8 用户×30 轮、前 2 轮预热，plan SHA256 `99dc083388931ffcbf9479a7f4344613229350546824371fec3744b548db0ed4`；
-- 默认组：不设置 `MU_SESSION_CFG_JSON`；
-- 对齐组：`MU_SESSION_CFG_JSON='{"context_window_trigger_tokens":32000,"context_window_target_tokens":0,"context_window_compaction_headroom_tokens":0}'`。
+以下结论只来自每一行内部的同配置或对齐对照，不能跨行直接比较绝对延迟。
 
-| 路径 | context p50/p95/p99/max | Audio-ready-500 p50/p95/p99/max |
-|---|---:|---:|
-| 当前默认 history | 22.5k/32.0k/32.4k/32.8k | 478/723/1186/1215 ms |
-| 当前 `32k -> 0` 对齐控制 | 16.8k/30.6k/31.8k/31.9k | 410/635/796/883 ms |
-| 旧 persistent 归档 | 14.8k/30.9k/34.5k/36.8k | 515/740/824/900 ms |
+| 问题 | 证据 | 决策 |
+|---|---|---|
+| finite request 是否天然更慢 | context 对齐后，当前 Audio-ready-500 p99 为 796 ms，旧 persistent 为 824 ms | session 放在应用层、engine 每轮 finite request 是合理基线 |
+| 音频是否应 arrival prefill | 8 用户短测：完整 WAV p99 654 ms；1 秒分段近似为 692 ms，且语义不等价 | 正式 workload 使用 query-time 完整 WAV |
+| P→D 是否天然需要秒级传输 | 旧 NIXL pull 最差约 19.7 s；异步 packed push 后约 1.2 s，链路实测约 35 GiB/s | 秒级等待来自 connector 实现，不是 PCIe/P-D 的必然代价 |
+| P 输入为何排队 | 完整历史媒体使 stage-0 wire p99 达 253 MiB；有序镜像 cache 后为 6.3 MiB，TTFA p99 977→714 ms | 保留完整 token 历史，只省略 receiver 已缓存的媒体 tensor |
+| P snapshot 为何变慢 | 每次重建并传完整 conditioning states；delta chunk chain 将同 trace p99 1326→988 ms | 只传 lineage delta，最终 query 前合并一次 |
+| 是否需要 Delta-KV | 88 turn 的理论 P→D payload 从约 72.5 GiB 降到 16.0 GiB，但 p99 为 1118 vs 1165/1085 ms | Delta-KV 解决重复传输；8 用户 tail 不是带宽问题，容量收益留到更高并发评估 |
 
-结果路径：
+当前 P/D 数据路径累计保留以下实现：
 
-- 默认：`/home/ubuntu/data/results/current_default_854535bb_20260822/current_default_seed7_u8`
-- 对齐：`/home/ubuntu/data/results/current_context_aligned_854535bb_20260822/context_aligned_seed7_u8`
-- persistent 归档：`/home/ubuntu/data/results/av_real_formal_4650f134/avreal_formal_seed7_u8`
+1. stage-0 有序镜像多模态 cache，避免重复发送历史媒体 tensor；
+2. Talker conditioning snapshot 使用可丢弃的 lineage-delta chunk chain；
+3. D 保留可丢弃 prefix KV，P 只 push block-aligned missing suffix；
+4. P runner 将 layer 0/layer 24 delta 直接写入 request-owned shared storage，控制面只传 handle；
+5. foreground gate 保护媒体 cache 顺序，但不被当作 GPU 抢占机制。
 
-三组比较得到以下结论：
+## 阶段六：当前 8 用户 P/D 基线与根因
 
-1. **不能比较原始 TTFA。** persistent 首包只有约 217 ms 音频，其原始 TTFA p50/p95/p99 为 244/392/479 ms；表中按音频 delta 累计到固定 500 ms 后重算为 515/740/824 ms。
-2. **history policy 会显著影响 tail。** 同一提交中，对齐控制将 p99 从 1186 ms 降到 796 ms；默认组 p99-tail 的 GPU0 SM-active p95 为 94.7%，对齐组为 52.4%。差异来自 context 长度、保留的多模态内容、compaction/cache-lineage churn 和闭环轨迹，不能只解释成 token 数量。
-3. **finite-request 生命周期不是性能问题。** context 对齐后，当前 p99 为 796 ms，persistent 为 824 ms，已处于同一水平。应用维护 session、engine 每轮处理 finite request、依靠可淘汰 prefix/KV cache 的架构成立。
-4. **应用层重复工作已不再是主要 tail。** processed canonical blocks 消除了完整历史重复 render；warm-up 不阻塞 query，残余上游工作会在回答完成后清理。默认组 tail 同时包含 Thinker 延迟和首文字后的流水线等待，但 Talker/Code2Wav GPU 没有饱和。
-5. **`32k -> 0` 不是生产策略。** 它会丢失已完成 turn，只用于证明 request 生命周期和计算包络。单 seed live closed-loop 也不是 bit-identical replay。
+最新同 trace 对比保持 88 个计分 turn 和全部媒体账本不变，无 timeout、stall 或 replay slip：
 
-当前应用架构可以作为 engine research 的基线；尚未确定的是生产级 history compression，而不是 request 生命周期。
-
-## 阶段六：音频 arrival-prefill 实验臂
-
-Qwen audio encoder 在约 8 秒窗口内使用双向 attention，因此把音频独立切成 1 秒块会改变语义。该路径默认关闭，只用于研究 arrival prefill 负载。
-
-该短 A/B 使用 schema 4、seed 7、8 用户×6 轮、前 1 轮预热、0–8 秒 stagger，plan SHA256 为 `b6160ec3d78a2126fb07830e5c1b75f9319ba579543555c8474852ad9f9ddf9b`。baseline 不设置 override；arrival 组使用 `MU_SESSION_CFG_JSON='{"enable_audio_arrival_prefill_approximation":true}'`。结果 metadata 标记 source 为 dirty `cbf2226a`，因此它只能支持方向性结论，不能作为可由单个 commit 精确复现的正式结果。
-
-8 用户×6 轮短 A/B：
-
-| 输入方式 | Audio-ready-500 p50/p95/p99 |
-|---|---:|
-| query-time 完整 WAV | 368/475/654 ms |
-| 1 秒 audio arrival approximation | 343/554/692 ms |
-
-arrival 模式只改善约 25 ms 中位数，p95/p99 反而上升，因为新增 warm-up 与 foreground query 竞争。正式 workload 因此继续使用 query-time 完整 WAV；只有原生 causal/streaming audio encoder 才适合做语义等价的音频 arrival prefill。
-
-结果：`/home/ubuntu/data/results/audio_arrival_ab_baseline_20260822/u8_t6`、`/home/ubuntu/data/results/audio_arrival_approx_dev_20260822/u8_t6`。
-
-## 阶段七：Thinker P/D 分离短测
-
-`thinker-talker-pd` 保持同一应用协议和 finite request，仅将 Thinker 拆到 GPU 0 prefill 与 GPU 1 decode；Talker、Code2Wav 使用 GPU 2/3。应用仍管理 session/history，每轮结束后销毁 engine request。
-
-实现修复了三个桥接问题：D 复用 P 的媒体位置元数据而不重复编码；Talker 使用 P 保存的 prompt hidden states；后台 sender 在入队时快照 token 与 tensor。P→D 使用 NIXL，后续 stage 使用 shared memory。
-
-严格短测统一使用 schema 4、seed 7、8 用户×6 轮、前 1 轮预热、0–8 秒 stagger、完整 query-time WAV 与视频 arrival prefill。plan SHA256 为 `b6160ec3d78a2126fb07830e5c1b75f9319ba579543555c8474852ad9f9ddf9b`，每组 40 个计分 turn，均无 timeout 或 stall。
-
-| P→D connector | TTFA p50/p95/p99 | TTFT p50/p99 | D stage p99 |
+| 实现 | TTFA p50/p95/p99 | P p50/p95/p99 | Core-ready→API p50/p95/p99 |
 |---|---:|---:|---:|
-| NIXL pull | 4164/13347/19656 ms | 2709/13223 ms | 12.77 s |
-| packed cross-layer pull | 4510/7783/9124 ms | 2999/8047 ms | 7.36 s |
-| packed cross-layer push，错误串行 | 2146/3700/5034 ms | 671/1188 ms | 0.59 s |
-| packed cross-layer push，修复异步流水线 | 770/1083/1228 ms | 576/1081 ms | 0.52 s |
+| 直接共享前，带诊断 | 443/681/1002 ms | 141/365/633 ms | 29/98/113 ms |
+| P 输出直接共享，带诊断 | 381/563/770 ms | 87/172/399 ms | 5/15/24 ms |
+| P 输出直接共享，关闭诊断 | **392/546/815 ms** | — | — |
 
-结论：旧版 10 秒 D 等待是 connector 工程问题，不是 PCIe 或 P/D 架构的必然代价。
+关闭诊断组的 TTFT p50/p99 为 189/512 ms；Audio-ready-500 p99 为 815 ms，Stall p99 为 0，因此通过当前 8 用户 SLO。输出编码 p99 为 1.8 ms，普通 fallback payload 约 0.012 MiB。直接共享已经消除 Core→API 的主要 tail。
 
-- GPU 0↔1 为 PCIe Gen5 x16，PyTorch P2P 实测约 `50 GiB/s`。
-- pull 热态只有约 `0.55 GiB/s`；仅合并 cross-layer layout 没有提高持续带宽。
-- push 将搬运改为后台 WRITE burst。NIXL telemetry 显示热态约 `35 GiB/s`；3,820-token prompt 精确传输 `187,957,248 B`，耗时 `4.922 ms`。
-- Thinker KV 为 `48 KiB/token`。当前 D prefix cache 关闭，因此每个最终请求仍传完整 prompt KV；arrival warm-up 只运行 P，不触发 P→D。
-- 不能直接打开 D prefix cache：当前 connector 缺少 delta source offset/cache-lineage，P 的完整块表无法安全对齐到 D 的未命中尾块。增量复制需要显式 cache handle 与 block range。
+剩余最慢 P 请求为 399 ms。foreground 自身 runner/Core→API 只有 77/5 ms，之前约 317 ms 在等待一个已经 abort、但已进入 GPU 的 arrival warm-up。该 warm-up 一次处理 13.3k tokens：runner 535 ms、CUDA event 441 ms，并写出约 105 MiB snapshot。
 
-首个 packed-push 结果还有一个应用层混杂因素：P stage 的局部 `async_chunk: false` 被误作 pipeline 全局开关，使 D 等完整文本后才启动 Talker、Code2Wav 又等完整 codec 后才启动。其 connector 带宽结论仍成立，但 5.03 秒 TTFA 不能用于评价 P/D。
+确切结论是：
 
-修复后，pipeline 只要任一下游 stage 使用 async chunk 就启用异步 orchestrator；P stage 本身仍走专用 KV 路由。8 用户短测 48/48 turn 成功、40 个计分 turn、无 timeout/stall，`verify_run.py` 通过。engine-side p99 分解为：P 首输出 831 ms、D 首文字 1044 ms、Talker 首 codec 1102 ms、首音频 1191 ms；Talker→首音频仅 250 ms，而非修复前的 3881 ms。Talker 与 Code2Wav 已恢复重叠执行。
+- 当前第一大头是 **Thinker P 上不可抢占的大 warm-up prefill**。低优先级请求一旦进入最大 32k-token 的 scheduler step，之后到达的 foreground query 只能等待。
+- Talker 和 Code2Wav 没有饱和；P→D Delta-KV 传输与 Core→API 共享内存也不是当前 p99 主因。
+- foreground gate 能保证 request/cache 顺序，但 asyncio abort 不能撤销已经启动的 GPU kernel。
+- 应用生命周期和 workload 已足够合理，可以把该问题作为 engine 调度研究对象，而不是继续修改应用语义。
 
-修复验证使用相同 workload 参数但仍是 live closed-loop，plan SHA256 为 `fd9c7288bca42529d9f3117174890853f611b6e0af10b24d9ed78d0fc8e1301d`，并非旧结果的 exact replay，因此数值用于验证回归修复，不作为严格容量 A/B。
+最新结果路径：
 
-结果：`/home/ubuntu/data/results/pd_finite_short_u8_v14_20260822`、`/home/ubuntu/data/results/pd_crosslayer_u8_t6_stagger8_20260822_v3`、`/home/ubuntu/data/results/pd_crosslayer_push_u8_t6_stagger8_20260822_v2`、`/home/ubuntu/data/results/pd_async_fix_20260822_v1/pd_async_fix_seed7_u8`。精确 NIXL telemetry smoke 位于 `/home/ubuntu/data/results/pd_push_telemetry_smoke_u1_20260822_v1`。
+- 诊断：`/home/ubuntu/data/results/pd_direct_shared_long_diag_20260823_v1/u8_t12_direct_shared_seed7_u8`
+- 关闭诊断：`/home/ubuntu/data/results/pd_direct_shared_long_clean_20260823_v1/u8_t12_direct_shared_clean_seed7_u8`
 
-### 固定 replay 与 P snapshot 优化
+该运行记录 `source_commit=2a90a9e2` 且 `source_dirty=true`；这里的 “关闭诊断” 只表示关闭额外日志，不表示 git worktree clean。当前数据是开发基线，提交后应使用同一 trace 再回放一次，形成可由单个 commit 精确复现的正式基线。
 
-容量脚本现在显式传入标准 `0–8 s` stagger，`verify_run.py` 会拒绝其他值。固定 trace 冻结全部媒体 arrival 与 query，SHA256 为 `198d956dda10d7f91ed9d932fa3d9abd1d546cb79063accf1dad0d9028fd0109`；每组都消费相同的 687 帧。
+## 阶段七：下一步
 
-旧 P 路径即使命中 prefix KV，也会在 CPU 重建 Talker 所需的两层完整 hidden states，并在每个 finite request 中经过控制面搬运。修复后，orchestrator 使用有界、可丢弃的 snapshot cache：
-
-- 实际 prefix hit 未超过精确 lineage parent 时，P 只返回未命中尾部，orchestrator 从 parent snapshot 补齐已验证前缀。
-- 全局 cache 命中超过 parent 时，P 只回传 `parent→hit` 的 gap 和未命中尾部，不再回退整段历史；仍不复用未经 lineage 验证的行。
-- arrival-prefill 只保存共享 tensor chunk，不反复拼接完整历史；最终 query 进入 D/Talker 前才合并一次。
-- cache 默认上限 8 GiB，可通过 `VLLM_OMNI_PD_SNAPSHOT_CACHE_BYTES` 配置。
-
-8 用户固定 replay：
-
-| P snapshot 路径 | TTFA p50/p95/p99 | Stage-0 首输出 p50/p95/p99 | 最终音频 stage p99 |
-|---|---:|---:|---:|
-| 完整 snapshot 基线 | 760/1275/1326 ms | 362/791/852 ms | 1290 ms |
-| P 只回传 delta，立即拼完整历史 | 661/1034/1116 ms | 284/582/692 ms | 1080 ms |
-| P 只回传 delta，延迟合并 chunk chain | 627/915/988 ms | 232/434/561 ms | 953 ms |
-
-最终组通过 1 秒 p99 SLO：40/40 个计分 turn 成功，无 timeout/stall，`verify_run.py` 通过。剩余 tail 仍以 Thinker 为主；D 自身 p99 约 216 ms，GPU 采样未显示持续饱和。后续应研究 P admission/scheduling 与 delta P→D KV transfer，不应继续调 Talker 或 Code2Wav 参数。
-
-固定 replay 结果：`/home/ubuntu/data/results/pd_async_0_8_record_20260822_v1/pd_async_0_8_record_seed7_u8`、`/home/ubuntu/data/results/pd_snapshot_delta_replay_20260822_v2/u8_t6`、`/home/ubuntu/data/results/pd_snapshot_chunk_replay_20260822_v1/u8_t6`。
-
-### P 输出控制面优化
-
-RCA 发现剩余的所谓 ingress 等待并非 P→D KV 传输：P runner 通常只需几十到一百多毫秒，但 EngineCore 会把约 50–255 MiB 的 Talker-conditioning hidden states 作为 ZMQ multipart 输出。序列化和内存复制占用同一进程的 CPU/GIL，同时拖慢输出交接和新请求接收。
-
-本地 stage 0 现在使用 vLLM tensor IPC 的反向共享内存队列：ZMQ 只传 tensor handle 和小型 metadata，tensor storage 不再复制进控制面。该优化只用于 EngineCore→orchestrator 输出；双向使用共享内存会给输入额外增加一次 staging copy，实测更慢，已撤销。
-
-在带诊断的同 trace A/B 中，P output-ready→orchestrator-receive 的 p50/p95/p99 从 `46/133/204 ms` 降到 `27/60/94 ms`，P submit→receive 从 `282/576/633 ms` 降到 `238/426/440 ms`。固定 8 用户 replay 的端到端结果为：
-
-| 实现 | TTFA p50/p95/p99 | 计分 turn | timeout/stall |
-|---|---:|---:|---:|
-| deferred snapshot，ZMQ tensor | 627/915/988 ms | 40/40 | 0/0 |
-| output tensor IPC | 592/849/931 ms | 40/40 | 0/0 |
-| output tensor IPC + relative gap | 577/923/977 ms | 40/40 | 0/0 |
-
-最终组通过 `verify_run.py`，trace SHA256、用户数、媒体 arrival 和消费的 687 帧均未改变。稳定结论仅限于控制面交接 tail 约减半；端到端 p99 从原基线 `988 ms` 到最终 `977 ms`，基本持平，不能据此声称整体 tail 已解决。逐 turn 对齐显示，旧版最慢的两轮改善约 215/254 ms，但新的并发碰撞又产生约 112/189 ms 回退。诊断已将剩余主项定位到 stage-0 EngineCore 的 pre-scheduler ingress：client send p99 `7.8 ms`、core request build p99 `3.8 ms`，但 send 完成到 core preprocess 开始 p99 为 `279 ms`；P runner p99 `152 ms`，输出交接 p99 `94 ms`。因此请求在进入 scheduler 前的 socket receive/deserialize/input-thread admission 是当前最大延迟段。结果：`/home/ubuntu/data/results/pd_output_shm_replay_20260822_v1/u8_t6_seed7_u8`、`/home/ubuntu/data/results/pd_gap_shm_replay_20260822_v1/u8_t6_seed7_u8`。
-
-### P 输入控制面修复
-
-新增 input-thread 打点后，pre-scheduler ingress 的根因已确定。旧 benchmark 强制设置 `VLLM_OMNI_SAFE_MM_PROCESSOR_CACHE=1`，将 vLLM 的镜像多模态 cache 降级成 `processor_only`；应用每轮发送完整 token 历史是正确的，但该 fallback 同时把全部历史媒体特征再次放进本地 ZMQ request，使 final request 输入达到 127–260 MiB。
-
-修复将 stage-0 的“input processor 更新 sender cache→进入 orchestrator 队列”串成一个原子有序操作，使 sender/EngineCore receiver 的 LRU 访问顺序一致；benchmark 默认不再启用旧 fallback。语义、完整历史、arrival prefill 和媒体账本均未改变，cache hit 只省略 EngineCore 已有的媒体 tensor。
-
-同 trace 诊断 A/B：
-
-| Stage-0 input | wire MiB p50/p95/p99 | send-complete→socket-ready p50/p95/p99 | P submit→receive p50/p95/p99 |
-|---|---:|---:|---:|
-| `processor_only` | 127/236/253 | 96/284/341 ms | 243/515/547 ms |
-| 有序镜像 cache | 0.8/5.7/6.3 | 1.0/5.0/5.9 ms | 148/240/263 ms |
-
-无诊断日志的最终 8 用户 replay：TTFT p50/p99 `311/473 ms`，TTFA p50/p95/p99 `476/693/714 ms`；40/40 个计分 turn 成功，无 timeout/stall，687 帧一致，`verify_run.py` 通过，且无 receiver cache miss。相比修复前同 trace 的 `577/923/977 ms`，TTFA p99 下降 263 ms。结果：`/home/ubuntu/data/results/pd_ingress_split_replay_20260822_v1/u8_t6_seed7_u8`、`/home/ubuntu/data/results/pd_mirrored_mm_cache_replay_20260822_v1/u8_t6_seed7_u8`、`/home/ubuntu/data/results/pd_mirrored_mm_cache_clean_replay_20260822_v1/u8_t6_seed7_u8`。
-
-## 阶段八：下一步
-
-1. 将有序镜像媒体 cache + output tensor IPC + relative-gap 固定 replay 作为 8 用户 P/D 基线。
-2. 继续 16、32……用户直到 SLO 失效，再定位新的容量边界。
-3. 保留 input/output 控制面打点，仅在 RCA 时开启，正式容量结果关闭。
-4. delta-only P→D 仍是 engine 研究项：D 可保留可丢弃 prefix KV，但接口必须携带 cache handle、lineage version 和明确 block range。
+1. 提交当前实现后，用固定 8 用户×12 轮 trace 做一次 diagnostics-off replay，固定正式基线。
+2. 在 stage 0 A/B 更小的 chunked-prefill 调度粒度、可抢占 warm-up，或在 compaction 后推迟 cold warm-up；目标是 foreground 最多等待一个小 chunk。
+3. 确认被 abort 的 warm-up 不再执行完整大 prefill，再运行 8、16、32……用户、30 轮/用户的容量阶梯。
+4. 到首个 SLO 失败点后重新分解 tail 和 GPU 有效利用率；在更高并发或跨节点条件下复测 Delta-KV 的容量收益。
+5. RCA 时开启控制面诊断；正式容量结果关闭诊断。
 
 ## 快速恢复入口
 
@@ -237,12 +166,14 @@ RCA 发现剩余的所谓 ingress 等待并非 P→D KV 传输：P runner 通常
 |---|---|
 | Session 与 finite-request 生命周期 | `vllm_omni/entrypoints/openai/video_stream_base.py` |
 | Canonical 多模态 history | `vllm_omni/entrypoints/openai/serving_video_stream.py` |
-| Prefix-cache 观测 | `vllm_omni/worker/gpu_model_runner.py` |
+| P/D orchestrator 与 snapshot | `vllm_omni/engine/orchestrator.py` |
+| P EngineCore IPC | `vllm_omni/engine/stage_engine_core_proc.py` |
+| Delta-KV connector | `vllm_omni/engine/nixl_delta_push_connector.py` |
+| Shared tensor storage | `vllm_omni/utils/mm_outputs.py` |
+| P/D 部署 | `benchmarks/thinker_talker/pd_deploy_4gpu.yaml` |
 | 多用户 workload | `benchmarks/live_agent/web_client/mu_bench.py` |
 | Workload 计划与媒体加载 | `benchmarks/live_agent/web_client/continuous_av_workload.py` |
-| 容量阶梯 | `benchmarks/live_agent/web_client/run_av_session_ladder.sh` |
-| 正式部署 | `benchmarks/thinker_talker/origin_deploy_3gpu.yaml` |
-| P/D 部署 | `benchmarks/thinker_talker/pd_deploy_4gpu.yaml` |
 | P/D 容量入口 | `benchmarks/live_agent/web_client/run_pd_av_session_ladder.sh` |
 | 运行验证 | `benchmarks/live_agent/analysis/verify_run.py` |
+| P/D 分阶段延迟 | `benchmarks/live_agent/analysis/stage_stats_v2.py` |
 | GPU 采样 | `benchmarks/live_agent/harness/gpu_sampler.py` |

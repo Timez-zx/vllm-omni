@@ -363,6 +363,7 @@ class AsyncOmniEngine:
             diffusion_batch_size=self.diffusion_batch_size,
             async_chunk=self.async_chunk,
             tokenizer=self.tokenizer,
+            log_stats=self._log_stats,
             single_stage_id_filter=self._single_stage_id_filter,
             omni_master_address=self._omni_master_address,
             omni_master_port=self._omni_master_port,

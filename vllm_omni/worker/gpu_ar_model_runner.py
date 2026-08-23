@@ -49,13 +49,25 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
     stage_sends_async_output,
 )
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
+from vllm_omni.utils.mm_outputs import (
+    build_mm_cpu,
+    partition_payload_list,
+    to_payload_element,
+    to_shared_cpu_tensor,
+)
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner, _span_begin, _span_end
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
 
 logger = init_logger(__name__)
+
+_PD_SHARED_OUTPUT_KEYS = frozenset(
+    {
+        "hidden_states.layer_0",
+        "hidden_states.layer_24",
+    }
+)
 
 # [GPU duty probe] How much of the wall clock does this stage's GPU actually
 # spend running kernels? nvidia-smi's utilization.gpu answers "was any kernel
@@ -1070,7 +1082,18 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             for key in ("hidden_states.layer_0", "hidden_states.layer_24"):
                 value = payload.get(key)
                 if isinstance(value, torch.Tensor) and value.shape[0] >= parent_rows:
-                    payload[key] = value[parent_rows:]
+                    # Materialize only the lineage delta.  A view would keep
+                    # the complete cached-prefix backing storage alive and
+                    # TensorIpcSender.share_memory_() would copy that full
+                    # storage after EngineCore marks the output ready.
+                    payload[key] = to_shared_cpu_tensor(value[parent_rows:])
+        elif self._model_supports_delta_prefix_multimodal_outputs():
+            # A zero-row parent is still a finite-request P snapshot.  Keep
+            # the same direct-shared contract as later delta requests.
+            for key in _PD_SHARED_OUTPUT_KEYS:
+                value = payload.get(key)
+                if isinstance(value, torch.Tensor):
+                    payload[key] = to_shared_cpu_tensor(value)
         return payload
 
     def _build_omni_mm_payload(
@@ -2049,7 +2072,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             if combined_multimodal_outputs is None:
                 with record_function_or_nullcontext("omni_output_builder:build_mm_cpu"):
                     mm_cpu = build_mm_cpu(
-                        flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
+                        flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
+                        shared_tensor_keys=(
+                            _PD_SHARED_OUTPUT_KEYS
+                            if self._model_supports_delta_prefix_multimodal_outputs()
+                            else None
+                        ),
                     )
 
             with record_function_or_nullcontext("omni_output_builder:process_additional_information"):

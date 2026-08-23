@@ -312,8 +312,16 @@ def test_pd_prefill_snapshot_uses_exact_lineage_parent_for_delta() -> None:
     orchestrator._prepare_pd_prefill_snapshot_request(final_request, final_state)
     orchestrator._materialize_pd_prefill_snapshot(final_state)
     final_layers = final_state.pd_prefill_multimodal_output["hidden_states"]["layers"]
-    assert final_layers[0].flatten().tolist() == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
-    assert final_layers[24].flatten().tolist() == [21.0, 22.0, 23.0, 24.0, 25.0, 26.0]
+    assert [chunk.flatten().tolist() for chunk in final_layers[0]] == [
+        [1.0, 2.0, 3.0],
+        [4.0, 5.0],
+        [6.0],
+    ]
+    assert [chunk.flatten().tolist() for chunk in final_layers[24]] == [
+        [21.0, 22.0, 23.0],
+        [24.0, 25.0],
+        [26.0],
+    ]
     cached_final_layers = orchestrator._pd_prefill_snapshots["session-1"].output["hidden_states"]["layers"]
     assert cached_final_layers[0] is final_layers[0]
     assert cached_final_layers[24] is final_layers[24]
@@ -370,6 +378,8 @@ def test_pd_prefill_snapshot_compacts_long_arrival_chunk_chain() -> None:
     assert isinstance(cached[0], torch.Tensor)
     assert cached[0].flatten().tolist() == [1.0, 2.0]
     assert cached[24].flatten().tolist() == [21.0, 22.0]
+    assert cached[0].is_shared()
+    assert cached[24].is_shared()
 
 
 def test_pd_mrope_metadata_rebuilds_without_media_tensors() -> None:
@@ -2145,7 +2155,11 @@ def test_stage_pool_metrics_use_resumable_segment_token_count() -> None:
     class SegmentMetricsOutputProcessor(FakeOutputProcessor):
         def pop_native_text_metrics(self, request_id: str) -> dict[str, Any]:
             assert request_id == "req-stream"
-            return {"num_generation_tokens": 3}
+            return {
+                "num_generation_tokens": 3,
+                "vllm_queue_ms": 12.5,
+                "vllm_prefill_ms": 34.5,
+            }
 
     stage0 = FakeStageClient(stage_type="llm", final_output=False)
     pool = StagePool(
@@ -2168,6 +2182,8 @@ def test_stage_pool_metrics_use_resumable_segment_token_count() -> None:
 
     assert metrics.num_tokens_out == 3
     assert metrics.output_unit_count == 3
+    assert metrics.vllm_queue_ms == 12.5
+    assert metrics.vllm_prefill_ms == 34.5
 
 
 @pytest.mark.asyncio

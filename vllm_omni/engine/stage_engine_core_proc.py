@@ -47,11 +47,53 @@ logger = init_logger(__name__)
 _SIGNAL_EXIT_BASE = 128
 _LOG_INGRESS_DIAG = os.environ.get("VLLM_OMNI_LOG_HANDOFF_DIAG", "0") not in ("0", "", "false", "False")
 _DIAG_STAGE = os.environ.get("VLLM_OMNI_DIAG_STAGE")
+_OUTPUT_IPC_FALLBACK_MIN_BYTES = 1 << 20
 
 
 def _signal_exit_code(signum: int) -> int:
     """Return the conventional process exit code for signal-driven exits."""
     return _SIGNAL_EXIT_BASE + signum
+
+
+class _SharedOutputTensorIpcSender(TensorIpcSender):
+    """Send request-owned shared outputs without an encoder-side copy.
+
+    Stage 0's model runner places the two large Thinker conditioning layers
+    directly in shared storage. Other small tensors remain in regular msgpack
+    frames. An unexpected large ordinary tensor retains the old copy-to-IPC
+    fallback so another latent model cannot silently regress to a huge ZMQ
+    frame; diagnostics expose any such fallback.
+    """
+
+    def __init__(self, queue: Any) -> None:
+        super().__init__(queue)
+        self._shared_bytes = 0
+        self._fallback_bytes = 0
+        self._send_ms = 0.0
+
+    def new_message(self) -> None:
+        super().new_message()
+        self._shared_bytes = 0
+        self._fallback_bytes = 0
+        self._send_ms = 0.0
+
+    def __call__(self, tensor: Any) -> dict[str, Any] | None:
+        already_shared = tensor.is_shared()
+        if not already_shared:
+            self._fallback_bytes += int(tensor.nbytes)
+            if tensor.nbytes < _OUTPUT_IPC_FALLBACK_MIN_BYTES:
+                return None
+        start = time.monotonic()
+        result = super().__call__(tensor)
+        self._send_ms += (time.monotonic() - start) * 1000.0
+        if result is not None and already_shared:
+            self._shared_bytes += int(tensor.nbytes)
+        elif result is None and already_shared:
+            self._fallback_bytes += int(tensor.nbytes)
+        return result
+
+    def message_stats(self) -> tuple[int, int, float]:
+        return self._shared_bytes, self._fallback_bytes, self._send_ms
 
 
 class StageEngineCoreProc(EngineCoreProc):
@@ -70,7 +112,9 @@ class StageEngineCoreProc(EngineCoreProc):
         # thread from admitting unrelated requests. Local stage processes get
         # a reverse torch-shm queue so ZMQ carries only small tensor handles.
         self._output_tensor_ipc_sender = (
-            TensorIpcSender(output_tensor_queue) if output_tensor_queue is not None else None
+            _SharedOutputTensorIpcSender(output_tensor_queue)
+            if output_tensor_queue is not None
+            else None
         )
         super().__init__(*args, **kwargs)
 
@@ -116,7 +160,36 @@ class StageEngineCoreProc(EngineCoreProc):
                     reuse_buffers.append(pending.pop()[2])
 
                 buffer = reuse_buffers.pop() if reuse_buffers else bytearray()
+                encode_start = time.monotonic()
                 buffers = encoder.encode_into(outputs, buffer)
+                encode_done = time.monotonic()
+                stage_id = getattr(self.vllm_config.model_config, "stage_id", "?")
+                if _LOG_INGRESS_DIAG and (_DIAG_STAGE is None or str(stage_id) == _DIAG_STAGE):
+                    req_ids = ",".join(
+                        str(getattr(item, "request_id", "?"))
+                        for item in getattr(outputs, "outputs", ())
+                    )
+                    shared_bytes = fallback_bytes = 0
+                    ipc_send_ms = 0.0
+                    if self._output_tensor_ipc_sender is not None:
+                        (
+                            shared_bytes,
+                            fallback_bytes,
+                            ipc_send_ms,
+                        ) = self._output_tensor_ipc_sender.message_stats()
+                    logger.info(
+                        "[HANDOFF-DIAG] event=core-output-encoded stage=%s wall=%.6f "
+                        "reqs=%s encode_ms=%.3f ipc_send_ms=%.3f shared_mib=%.3f "
+                        "fallback_mib=%.3f frames=%d",
+                        stage_id,
+                        time.time(),
+                        req_ids,
+                        (encode_done - encode_start) * 1000.0,
+                        ipc_send_ms,
+                        shared_bytes / float(1 << 20),
+                        fallback_bytes / float(1 << 20),
+                        len(buffers),
+                    )
                 tracker = sockets[client_index].send_multipart(buffers, copy=False, track=True)
                 if not tracker.done:
                     ref = outputs if len(buffers) > 1 else None

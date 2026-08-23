@@ -8,7 +8,11 @@ from vllm.v1.engine.tensor_ipc import TensorIpcReceiver, TensorIpcSender
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
-from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
+from vllm_omni.engine.stage_engine_core_client import _SharedTensorIpcSender
+from vllm_omni.engine.stage_engine_core_proc import (
+    StageEngineCoreProc,
+    _SharedOutputTensorIpcSender,
+)
 
 
 def test_preprocess_add_request_preserves_omni_fields():
@@ -95,6 +99,75 @@ def test_reverse_tensor_ipc_keeps_large_output_off_zmq_frames():
         received = decoded.outputs[0].multimodal_output["hidden"]
         assert received.is_shared()
         torch.testing.assert_close(received, tensor)
+    finally:
+        tensor_queue.close()
+        tensor_queue.join_thread()
+
+
+def test_shared_only_input_tensor_ipc_keeps_pd_snapshot_off_zmq_frames():
+    tensor_queue = get_mp_context().Queue()
+    try:
+        shared = torch.arange(4096, dtype=torch.float32).share_memory_()
+        regular = torch.arange(8, dtype=torch.float32)
+        outputs = OmniEngineCoreOutputs(
+            outputs=[
+                OmniEngineCoreOutput(
+                    request_id="pd-d",
+                    new_token_ids=[],
+                    multimodal_output={"snapshot": shared, "metadata": regular},
+                )
+            ]
+        )
+        frames = MsgpackEncoder(
+            oob_tensor_consumer=_SharedTensorIpcSender(tensor_queue),
+        ).encode(outputs)
+
+        # The large shared snapshot is represented by a compact handle.  The
+        # ordinary tensor remains on the standard wire path.
+        assert sum(len(frame) for frame in frames) < 2048
+
+        decoded = MsgpackDecoder(
+            OmniEngineCoreOutputs,
+            oob_tensor_provider=TensorIpcReceiver(tensor_queue),
+        ).decode(frames)
+        payload = decoded.outputs[0].multimodal_output
+        assert payload["snapshot"].is_shared()
+        torch.testing.assert_close(payload["snapshot"], shared)
+        torch.testing.assert_close(payload["metadata"], regular)
+    finally:
+        tensor_queue.close()
+        tensor_queue.join_thread()
+
+
+def test_shared_output_tensor_ipc_does_not_copy_small_regular_tensors():
+    tensor_queue = get_mp_context().Queue()
+    try:
+        sender = _SharedOutputTensorIpcSender(tensor_queue)
+        regular = torch.arange(8, dtype=torch.float32)
+        shared = torch.arange(16, dtype=torch.float32).share_memory_()
+
+        assert sender(regular) is None
+        assert not regular.is_shared()
+        assert sender(shared) is not None
+        shared_bytes, fallback_bytes, _ = sender.message_stats()
+        assert shared_bytes == shared.nbytes
+        assert fallback_bytes == regular.nbytes
+    finally:
+        tensor_queue.close()
+        tensor_queue.join_thread()
+
+
+def test_shared_output_tensor_ipc_preserves_large_fallback():
+    tensor_queue = get_mp_context().Queue()
+    try:
+        sender = _SharedOutputTensorIpcSender(tensor_queue)
+        regular = torch.zeros((1 << 20) // 4, dtype=torch.float32)
+
+        assert sender(regular) is not None
+        assert regular.is_shared()
+        shared_bytes, fallback_bytes, _ = sender.message_stats()
+        assert shared_bytes == 0
+        assert fallback_bytes == regular.nbytes
     finally:
         tensor_queue.close()
         tensor_queue.join_thread()

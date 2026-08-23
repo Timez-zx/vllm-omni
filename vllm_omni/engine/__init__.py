@@ -66,9 +66,14 @@ class OmniPDPrefillPayload(msgspec.Struct):
     preserved without making them durable engine or session state.
     """
 
-    prompt_layer_0: torch.Tensor
-    prompt_layer_24: torch.Tensor
     prompt_token_ids: list[int]
+    # Legacy contiguous form.  New local P/D requests use the chunk fields
+    # below so the orchestrator can forward P's already-shared output buffers
+    # without materializing another full-prompt copy.
+    prompt_layer_0: torch.Tensor | None = None
+    prompt_layer_24: torch.Tensor | None = None
+    prompt_layer_0_chunks: tuple[torch.Tensor, ...] | None = None
+    prompt_layer_24_chunks: tuple[torch.Tensor, ...] | None = None
     tts_bos: torch.Tensor | None = None
     tts_eos: torch.Tensor | None = None
     tts_pad: torch.Tensor | None = None

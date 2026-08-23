@@ -411,9 +411,7 @@ def test_stage_runtime_runs_plan_hook_before_replica_launch(monkeypatch):
 def test_stage0_shm_cache_switch_happens_before_input_processor(monkeypatch):
     engine = object.__new__(AsyncOmniEngine)
     mm_config = types.SimpleNamespace(mm_processor_cache_type="lru")
-    stage0_config = types.SimpleNamespace(
-        model_config=types.SimpleNamespace(get_multimodal_config=lambda: mm_config)
-    )
+    stage0_config = types.SimpleNamespace(model_config=types.SimpleNamespace(get_multimodal_config=lambda: mm_config))
     plan = _make_llm_plan(0, stage_id=0, vllm_config=stage0_config)
     observed: list[str] = []
 
@@ -421,8 +419,7 @@ def test_stage0_shm_cache_switch_happens_before_input_processor(monkeypatch):
     monkeypatch.setattr(
         async_omni_engine_module,
         "build_stage0_input_processor",
-        lambda config: observed.append(config.model_config.get_multimodal_config().mm_processor_cache_type)
-        or object(),
+        lambda config: observed.append(config.model_config.get_multimodal_config().mm_processor_cache_type) or object(),
     )
 
     engine._initialize_stage0_input_processor([plan])
@@ -629,11 +626,13 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
         stage_init_timeout=302,
         diffusion_batch_size=1,
         async_chunk=False,
+        log_stats=True,
     )
 
     fake_vllm_config = types.SimpleNamespace()
     fake_addresses = types.SimpleNamespace(inputs=["in"], outputs=["out"], frontend_stats_publish_address=None)
     captured_timeout: int | None = None
+    captured_launch_kwargs: dict[str, object] = {}
 
     plan = ReplicaInitPlan(
         replica_id=0,
@@ -663,6 +662,7 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
 
     @contextlib.contextmanager
     def _fake_launch_stage_replica(**_kwargs):
+        captured_launch_kwargs.update(_kwargs)
         yield StageReplicaResources(
             manager=types.SimpleNamespace(shutdown=lambda: None),
             addresses=fake_addresses,
@@ -684,6 +684,7 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
             os.environ[device_env_var] = prev_device_env
 
     assert captured_timeout == 302
+    assert captured_launch_kwargs["log_stats"] is True
 
 
 def test_build_engine_args_cli_tokenizer_overrides_inferred_base_tokenizer(tmp_path):

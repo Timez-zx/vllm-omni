@@ -317,11 +317,7 @@ async def test_audio_arrival_prefill_seals_one_second_and_leaves_query_tail():
             warm_snapshots.append(
                 (
                     len(audio_buffer or ()),
-                    [
-                        len(event.payload)
-                        for event in (media_events or ())
-                        if event.modality == "audio"
-                    ],
+                    [len(event.payload) for event in (media_events or ()) if event.modality == "audio"],
                 )
             )
             warm_done.set()
@@ -329,11 +325,7 @@ async def test_audio_arrival_prefill_seals_one_second_and_leaves_query_tail():
 
         async def _process_query(self, *args, media_events=None, **kwargs):
             del args, kwargs
-            query_chunks.extend(
-                len(event.payload)
-                for event in (media_events or ())
-                if event.modality == "audio"
-            )
+            query_chunks.extend(len(event.payload) for event in (media_events or ()) if event.modality == "audio")
             query_done.set()
 
     ws = TimedWebSocket()
@@ -404,16 +396,60 @@ async def test_arrival_prefill_admission_is_globally_bounded():
 
 
 @pytest.mark.asyncio
-async def test_arrival_prefill_is_not_globally_suppressed_by_foreground_work():
+async def test_arrival_prefill_waits_while_foreground_crosses_prefill():
     started = asyncio.Event()
+    release = asyncio.Event()
 
     class HoldingEngine:
+        def generate(self, **kwargs):
+            async def _gen():
+                started.set()
+                await release.wait()
+                yield _text_result("discarded")
+
+            return _gen()
+
+    class CapturingHandler(QwenOmniStreamingVideoHandler):
+        async def _render_engine_prompt_with_compaction(self, *args, **kwargs):
+            return {"prompt_token_ids": list(range(64))}, {}
+
+    handler = CapturingHandler(chat_service=object(), engine_client=HoldingEngine())
+    await handler._begin_foreground_prefill("foreground")
+    warmup = asyncio.create_task(
+        handler._process_video_arrival_prefill(
+            StreamingVideoSessionConfig(model="test"),
+            ["frame"],
+            [],
+            "warm-active",
+            {},
+        )
+    )
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not started.is_set()
+    assert not warmup.done()
+
+    await handler._finish_foreground_prefill("foreground")
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    release.set()
+    assert await warmup is True
+    assert handler._active_arrival_prefills == {}
+
+
+@pytest.mark.asyncio
+async def test_foreground_aborts_rendering_warmup_only_after_engine_admission():
+    generate_entered = asyncio.Event()
+    allow_admission = asyncio.Event()
+
+    class OrderedEngine:
         def __init__(self):
             self.aborted: list[str] = []
 
         def generate(self, **kwargs):
             async def _gen():
-                started.set()
+                generate_entered.set()
+                await allow_admission.wait()
+                kwargs["_request_admitted_event"].set()
                 await asyncio.Event().wait()
                 yield _text_result("unreachable")
 
@@ -426,24 +462,74 @@ async def test_arrival_prefill_is_not_globally_suppressed_by_foreground_work():
         async def _render_engine_prompt_with_compaction(self, *args, **kwargs):
             return {"prompt_token_ids": list(range(64))}, {}
 
-    engine = HoldingEngine()
+    engine = OrderedEngine()
     handler = CapturingHandler(chat_service=object(), engine_client=engine)
     warmup = asyncio.create_task(
         handler._process_video_arrival_prefill(
             StreamingVideoSessionConfig(model="test"),
             ["frame"],
             [],
-            "warm-active",
+            "warm-racing",
             {},
         )
     )
-    await started.wait()
+    await asyncio.wait_for(generate_entered.wait(), timeout=2.0)
 
-    # A foreground query in another session is not represented by a global
-    # admission gate. The single low-priority warm-up remains admitted until
-    # its owning session cancels it or it completes.
-    assert not warmup.done()
+    foreground = asyncio.create_task(handler._begin_foreground_prefill("foreground"))
+    await asyncio.sleep(0)
+    assert not foreground.done()
     assert engine.aborted == []
+
+    allow_admission.set()
+    await asyncio.wait_for(foreground, timeout=2.0)
+    await asyncio.gather(warmup, return_exceptions=True)
+    assert engine.aborted == ["warm-racing"]
+    assert handler._active_arrival_prefills == {}
+    await handler._finish_foreground_prefill("foreground")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_foreground_reopens_global_arrival_gate():
+    generate_entered = asyncio.Event()
+    allow_admission = asyncio.Event()
+
+    class DelayedEngine:
+        def generate(self, **kwargs):
+            async def _gen():
+                generate_entered.set()
+                await allow_admission.wait()
+                kwargs["_request_admitted_event"].set()
+                await asyncio.Event().wait()
+                yield _text_result("unreachable")
+
+            return _gen()
+
+        async def abort(self, request_id):
+            del request_id
+
+    class CapturingHandler(QwenOmniStreamingVideoHandler):
+        async def _render_engine_prompt_with_compaction(self, *args, **kwargs):
+            return {"prompt_token_ids": list(range(64))}, {}
+
+    handler = CapturingHandler(chat_service=object(), engine_client=DelayedEngine())
+    warmup = asyncio.create_task(
+        handler._process_video_arrival_prefill(
+            StreamingVideoSessionConfig(model="test"),
+            ["frame"],
+            [],
+            "warm-racing",
+            {},
+        )
+    )
+    await asyncio.wait_for(generate_entered.wait(), timeout=2.0)
+
+    foreground = asyncio.create_task(handler._begin_foreground_prefill("cancelled"))
+    await asyncio.sleep(0)
+    foreground.cancel()
+    await asyncio.gather(foreground, return_exceptions=True)
+
+    assert handler._foreground_prefill_requests == set()
+    allow_admission.set()
     warmup.cancel()
     await asyncio.gather(warmup, return_exceptions=True)
     assert handler._active_arrival_prefills == {}

@@ -197,6 +197,16 @@ class Qwen3OmniMoeForConditionalGeneration(
                 and getattr(model_config, "engine_output_type", None) == "latent"
                 and getattr(model_config, "custom_process_next_stage_input_func", None) is None
             )
+            if self.supports_delta_prefix_multimodal_outputs:
+                # The finite-request P/D bridge retains only captured layer 0
+                # and layer 24 for Talker conditioning.  The generic final
+                # Thinker hidden payload is neither consumed by D nor stored
+                # in the orchestrator snapshot; emitting it duplicated tens
+                # to hundreds of MiB per P result.  It also does not need its
+                # own CPU prefix cache when the two captured layers already
+                # carry the exact lineage-aware snapshot.
+                self.omni_pooler_payload_include_hidden = False
+                self.requires_full_prefix_cached_hidden_states = False
             # Initialize thinker model (multimodal processing + text generation)
             # Create a new vllm_config with thinker_config as the hf_config
             thinker_vllm_config = vllm_config.with_hf_config(

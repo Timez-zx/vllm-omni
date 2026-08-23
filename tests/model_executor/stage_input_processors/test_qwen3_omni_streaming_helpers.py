@@ -300,6 +300,49 @@ def test_pd_first_decode_chunk_seeds_talker_from_prefill_snapshot() -> None:
     assert payload.hidden_states.output[-1].tolist() == [190.0, 191.0]
 
 
+def test_pd_first_decode_chunk_concatenates_shared_prompt_chunks_once() -> None:
+    request_id = "pd-first-decode-chunks"
+    prompt_ids = [151644, 872, 10, 151645, 151644, 77091]
+    transfer_manager = SimpleNamespace(
+        put_req_chunk=defaultdict(int),
+        request_payload={},
+    )
+    layer_0 = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    layer_24 = layer_0 + 100
+    request = SimpleNamespace(
+        external_req_id=request_id,
+        output_token_ids=[20],
+        additional_information=None,
+        pd_prefill_payload=OmniPDPrefillPayload(
+            prompt_token_ids=prompt_ids,
+            prompt_layer_0_chunks=(layer_0[:2], layer_0[2:]),
+            prompt_layer_24_chunks=(layer_24[:2], layer_24[2:]),
+        ),
+    )
+    multimodal_output = {
+        "hidden_states": {
+            "layers": {
+                0: torch.tensor([[90.0, 91.0]]),
+                24: torch.tensor([[190.0, 191.0]]),
+            }
+        },
+        "embed": {},
+    }
+
+    payload = q3.thinker2talker_async_chunk(
+        transfer_manager,
+        multimodal_output,
+        request,
+    )
+
+    assert payload is not None
+    assert payload.ids.all == prompt_ids + [20]
+    assert payload.embed.prefill[:-1].tolist() == layer_0.tolist()
+    assert payload.hidden_states.output[:-1].tolist() == layer_24.tolist()
+    assert payload.embed.prefill[-1].tolist() == [90.0, 91.0]
+    assert payload.hidden_states.output[-1].tolist() == [190.0, 191.0]
+
+
 def test_pd_first_batched_decode_chunk_seeds_talker_from_prefill_snapshot() -> None:
     request_id = "pd-first-batched-decode"
     prompt_ids = [151644, 872, 10, 151645, 151644, 77091]

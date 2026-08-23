@@ -567,6 +567,7 @@ def test_build_omni_output_splits_mm_by_hidden_len_when_scheduled_is_padded(monk
     """Thinker mm rows align to hidden_states.shape[0], not padded scheduled count."""
     runner = _make_async_output_runner(engine_output_type="latent")
     runner.model.omni_pooler_payload_include_hidden = False
+    runner.model.supports_delta_prefix_multimodal_outputs = True
     runner._async_chunk = False
     runner.requests = {"r1": object(), "r2": object(), "r3": object()}
 
@@ -607,6 +608,10 @@ def test_build_omni_output_splits_mm_by_hidden_len_when_scheduled_is_padded(monk
     assert torch.equal(output.inter_stage_outputs[0]["hidden_states.layer_0"], layers[0:1])
     assert torch.equal(output.inter_stage_outputs[1]["hidden_states.layer_0"], layers[1:2])
     assert torch.equal(output.inter_stage_outputs[2]["hidden_states.layer_0"], layers[2:3])
+    assert all(
+        payload["hidden_states.layer_0"].is_shared()
+        for payload in output.inter_stage_outputs
+    )
 
 
 def test_async_snapshot_payload_omits_hidden_when_model_opts_out():
@@ -847,6 +852,8 @@ def test_pd_prefill_longer_global_hit_returns_only_gap_after_parent() -> None:
 
     torch.testing.assert_close(payload["hidden_states.layer_0"], layer_0[4:])
     torch.testing.assert_close(payload["hidden_states.layer_24"], layer_24[4:])
+    assert payload["hidden_states.layer_0"].is_shared()
+    assert payload["hidden_states.layer_24"].is_shared()
     assert payload["embed.tts_bos"] is tts
 
 

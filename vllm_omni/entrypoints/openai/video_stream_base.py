@@ -65,10 +65,15 @@ _ARRIVAL_PREFILL_MAX_CONCURRENCY = 1
 _AUDIO_INPUT_SAMPLE_RATE = 16000
 _AUDIO_INPUT_SAMPLE_WIDTH = 2
 _AUDIO_ARRIVAL_CHUNK_MS = 1000
-_AUDIO_ARRIVAL_CHUNK_BYTES = (
-    _AUDIO_INPUT_SAMPLE_RATE * _AUDIO_INPUT_SAMPLE_WIDTH * _AUDIO_ARRIVAL_CHUNK_MS // 1000
-)
+_AUDIO_ARRIVAL_CHUNK_BYTES = _AUDIO_INPUT_SAMPLE_RATE * _AUDIO_INPUT_SAMPLE_WIDTH * _AUDIO_ARRIVAL_CHUNK_MS // 1000
 _BAD_FRAME = object()
+
+
+@dataclass
+class _ArrivalPrefillAdmission:
+    request_id: str
+    task: asyncio.Task[Any]
+    engine_admitted: asyncio.Event
 
 
 # Keep JPEG decode/resize work outside the WebSocket process's GIL. This is
@@ -433,25 +438,95 @@ class OmniStreamingVideoHandler:
         self._engine_client = engine_client
         # Shared by every WebSocket served by this handler instance. Keep at
         # most one low-priority cache-population request in flight so arrival
-        # prefill cannot form a multi-user prefill batch ahead of decode. A
-        # session's foreground query cancels only its own unfinished warm-up;
-        # globally suppressing warm-ups whenever any query is active starves
-        # prefix population under sustained multi-user load.
+        # prefill cannot form a multi-user prefill batch ahead of decode.
         self._arrival_prefill_slots = asyncio.Semaphore(_ARRIVAL_PREFILL_MAX_CONCURRENCY)
         self._arrival_prefill_admission_lock = asyncio.Lock()
-        self._active_arrival_prefills: dict[str, asyncio.Task[Any]] = {}
+        self._active_arrival_prefills: dict[str, _ArrivalPrefillAdmission] = {}
+        # Do not admit fresh background P work while a foreground request is
+        # crossing P. Before admitting foreground work, order each existing
+        # warm-up's AddRequest and abort behind it. This preserves the mirrored
+        # media-cache transaction while removing background P overlap. The gate
+        # opens at the first foreground engine output, not after speech ends.
+        self._foreground_prefill_condition = asyncio.Condition()
+        self._foreground_prefill_requests: set[str] = set()
 
-    async def _admit_arrival_prefill(self, request_id: str) -> bool:
+    async def _begin_foreground_prefill(self, request_id: str) -> None:
+        started = _time.monotonic()
+        async with self._foreground_prefill_condition:
+            self._foreground_prefill_requests.add(request_id)
+        try:
+            async with self._arrival_prefill_admission_lock:
+                active = list(self._active_arrival_prefills.values())
+
+            aborted = 0
+            for admission in active:
+                if admission.task.done():
+                    continue
+                admitted_waiter = asyncio.create_task(admission.engine_admitted.wait())
+                done: set[asyncio.Future[Any]] = set()
+                try:
+                    done, _ = await asyncio.wait(
+                        {admission.task, admitted_waiter},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    if not admitted_waiter.done():
+                        admitted_waiter.cancel()
+                        await asyncio.gather(admitted_waiter, return_exceptions=True)
+                if admitted_waiter not in done:
+                    continue
+                if not admission.task.done() and self._engine_client is not None:
+                    # The warm-up AddRequest is now ordered ahead of this query,
+                    # so aborting cannot create a sender-only multimodal cache hit.
+                    try:
+                        await self._engine_client.abort(admission.request_id)
+                    except Exception:
+                        logger.warning(
+                            "Failed to abort arrival prefill %s during foreground handoff",
+                            admission.request_id,
+                            exc_info=True,
+                        )
+                    admission.task.cancel()
+                    await asyncio.gather(admission.task, return_exceptions=True)
+                    aborted += 1
+        except BaseException:
+            # A disconnected/cancelled foreground caller must not leave the
+            # handler-wide admission gate closed for every other session.
+            await self._finish_foreground_prefill(request_id)
+            raise
+        logger.info(
+            "[foreground-prefill-gate] request=%s active=%d aborted=%d handoff_ms=%.1f",
+            request_id,
+            len(active),
+            aborted,
+            (_time.monotonic() - started) * 1000.0,
+        )
+
+    async def _finish_foreground_prefill(self, request_id: str) -> None:
+        async with self._foreground_prefill_condition:
+            removed = request_id in self._foreground_prefill_requests
+            self._foreground_prefill_requests.discard(request_id)
+            if removed and not self._foreground_prefill_requests:
+                self._foreground_prefill_condition.notify_all()
+
+    async def _admit_arrival_prefill(self, request_id: str) -> _ArrivalPrefillAdmission:
         await self._arrival_prefill_slots.acquire()
         task = asyncio.current_task()
         assert task is not None
         try:
-            async with self._arrival_prefill_admission_lock:
-                self._active_arrival_prefills[request_id] = task
+            async with self._foreground_prefill_condition:
+                await self._foreground_prefill_condition.wait_for(lambda: not self._foreground_prefill_requests)
+                async with self._arrival_prefill_admission_lock:
+                    admission = _ArrivalPrefillAdmission(
+                        request_id=request_id,
+                        task=task,
+                        engine_admitted=asyncio.Event(),
+                    )
+                    self._active_arrival_prefills[request_id] = admission
         except BaseException:
             self._arrival_prefill_slots.release()
             raise
-        return True
+        return admission
 
     async def _release_arrival_prefill(self, request_id: str) -> None:
         async with self._arrival_prefill_admission_lock:
@@ -552,15 +627,8 @@ class OmniStreamingVideoHandler:
                 """Coalesce append-only media into serial finite warm-up requests."""
                 nonlocal arrival_prefill_task, arrival_prefill_dirty
                 video_ready = config.enable_video_arrival_prefill and bool(frame_buffer)
-                audio_ready = (
-                    config.enable_audio_arrival_prefill_approximation
-                    and audio_sealed_bytes > 0
-                )
-                if (
-                    self._engine_client is None
-                    or active_request_id is not None
-                    or not (video_ready or audio_ready)
-                ):
+                audio_ready = config.enable_audio_arrival_prefill_approximation and audio_sealed_bytes > 0
+                if self._engine_client is None or active_request_id is not None or not (video_ready or audio_ready):
                     return
                 arrival_prefill_dirty = True
                 if arrival_prefill_task is not None and not arrival_prefill_task.done():
@@ -573,11 +641,7 @@ class OmniStreamingVideoHandler:
                         frames = list(frame_buffer)
                         audio = bytearray(audio_buffer[:audio_sealed_bytes])
                         events = list(media_events)
-                        cached = {
-                            frame: frame_pil_cache[frame]
-                            for frame in frames
-                            if frame in frame_pil_cache
-                        }
+                        cached = {frame: frame_pil_cache[frame] for frame in frames if frame in frame_pil_cache}
                         request_id = f"video-warm-{uuid.uuid4().hex[:12]}"
                         arrival_prefill_request_id = request_id
                         try:
@@ -595,16 +659,12 @@ class OmniStreamingVideoHandler:
                 arrival_prefill_task = asyncio.create_task(_run())
 
             async def _finish_arrival_prefill() -> None:
-                """Yield the session's background prefill slot to its query.
+                """Clear this session's pending warm-up after global handoff.
 
-                A warm-up is optional: the final finite request always carries
-                the complete canonical prompt. Do not wait for an in-flight
-                warm-up, but also do not abort one that has already updated the
-                mirrored multimodal sender cache. Aborting between sender-cache
-                mutation and EngineCore admission can leave a hash-only hit for
-                data the receiver never observed. The detached warm-up keeps its
-                low priority and completes independently while the foreground
-                query is admitted immediately at priority zero.
+                ``_begin_foreground_prefill`` has already ordered and drained
+                every active warm-up safely. The final request remains correct
+                on a cache miss because it carries the complete canonical
+                prompt.
                 """
                 nonlocal arrival_prefill_task, arrival_prefill_dirty
                 started = _time.monotonic()
@@ -612,11 +672,9 @@ class OmniStreamingVideoHandler:
                 task = arrival_prefill_task
                 warmup_was_running = task is not None and not task.done()
                 logger.info(
-                    "[query-admission] session=%s warmup_running=%s "
-                    "warmup_aborted=%s handoff_ms=%.1f",
+                    "[query-admission] session=%s warmup_running=%s handoff_ms=%.1f",
                     config.session_id or "-",
                     warmup_was_running,
-                    False,
                     (_time.monotonic() - started) * 1000.0,
                 )
 
@@ -631,9 +689,14 @@ class OmniStreamingVideoHandler:
                     await self._send_error(websocket, "No input buffered")
                     return
 
+                request_id = f"video-{uuid.uuid4().hex[:12]}"
+                # Close background admission before any query-side await. An
+                # already-rendering warm-up is first submitted, then aborted
+                # in FIFO order so the mirrored media cache stays consistent.
+                await self._begin_foreground_prefill(request_id)
+
                 # The final request is complete and remains correct on a cache
-                # miss. Cancel only this session's unfinished optional warm-up;
-                # one low-priority warm-up from another session may continue.
+                # miss. Stop this session from scheduling another warm-up.
                 await _finish_arrival_prefill()
 
                 if prev_was_interrupted and prev_request_id and self._engine_client:
@@ -644,7 +707,6 @@ class OmniStreamingVideoHandler:
                     await asyncio.sleep(0.1)
                 prev_was_interrupted = False
 
-                request_id = f"video-{uuid.uuid4().hex[:12]}"
                 active_request_id = request_id
                 interrupt_event.clear()
                 query_frames = list(frame_buffer)
@@ -664,9 +726,7 @@ class OmniStreamingVideoHandler:
                 media_events.clear()
                 audio_sealed_bytes = 0
                 query_prewarmed_frames = {
-                    frame: frame_pil_cache.pop(frame)
-                    for frame in query_frames
-                    if frame in frame_pil_cache
+                    frame: frame_pil_cache.pop(frame) for frame in query_frames if frame in frame_pil_cache
                 }
 
                 async def _run_query() -> None:
@@ -690,6 +750,7 @@ class OmniStreamingVideoHandler:
                             **process_kwargs,
                         )
                     finally:
+                        await self._finish_foreground_prefill(request_id)
                         if active_request_id == request_id:
                             prev_request_id = request_id
                             active_request_id = None
@@ -924,9 +985,7 @@ class OmniStreamingVideoHandler:
                                     await self._send_error(websocket, "Audio buffer overflow")
                                     audio_buffer.clear()
                                     audio_sealed_bytes = 0
-                                    media_events[:] = [
-                                        event for event in media_events if event.modality != "audio"
-                                    ]
+                                    media_events[:] = [event for event in media_events if event.modality != "audio"]
                             except Exception:
                                 pass
 
@@ -1089,9 +1148,7 @@ class OmniStreamingVideoHandler:
         params = coerce_param_message_types(params, is_streaming=True)
 
         effective_thinker_max_tokens = (
-            thinker_max_tokens
-            if thinker_max_tokens is not None
-            else config.thinker_max_response_tokens
+            thinker_max_tokens if thinker_max_tokens is not None else config.thinker_max_response_tokens
         )
         if effective_thinker_max_tokens is not None:
             if not params:
@@ -1312,8 +1369,7 @@ class OmniStreamingVideoHandler:
         if len(message_history) % 2:
             return None
         pairs = [
-            (id(message_history[index]), id(message_history[index + 1]))
-            for index in range(0, len(message_history), 2)
+            (id(message_history[index]), id(message_history[index + 1])) for index in range(0, len(message_history), 2)
         ]
         offset = len(state.turn_message_ids) - len(pairs)
         if offset < 0 or state.turn_message_ids[offset:] != pairs:
@@ -1396,9 +1452,7 @@ class OmniStreamingVideoHandler:
                 output_modalities=output_modalities,
                 add_generation_prompt=False,
             )
-            state.turn_blocks.append(
-                self._merge_engine_prompt_blocks([ticket.user_block, assistant_block])
-            )
+            state.turn_blocks.append(self._merge_engine_prompt_blocks([ticket.user_block, assistant_block]))
             state.turn_message_ids.append((id(user_message), id(assistant_message)))
             logger.info(
                 "[canonical-prompt] session=%s committed_turns=%d cached_tokens=%d",
@@ -1450,9 +1504,7 @@ class OmniStreamingVideoHandler:
         if media_events is None:
             messages, current_user_message = self.build_engine_prompt(*build_args)
         else:
-            messages, current_user_message = self.build_engine_prompt(
-                *build_args, media_events
-            )
+            messages, current_user_message = self.build_engine_prompt(*build_args, media_events)
         if self.supports_incremental_canonical_prompt():
             try:
                 engine_prompt, ticket = await self._render_incremental_canonical_prompt(
@@ -1476,9 +1528,7 @@ class OmniStreamingVideoHandler:
                         add_generation_prompt=True,
                     )
                 )
-                engine_prompt = self._normalize_engine_prompt_for_messages(
-                    config, messages, engine_prompt
-                )
+                engine_prompt = self._normalize_engine_prompt_for_messages(config, messages, engine_prompt)
         else:
             engine_prompt = await self._preprocess_to_engine_prompt(
                 self._chat_request(
@@ -1488,9 +1538,7 @@ class OmniStreamingVideoHandler:
                     add_generation_prompt=True,
                 )
             )
-            engine_prompt = self._normalize_engine_prompt_for_messages(
-                config, messages, engine_prompt
-            )
+            engine_prompt = self._normalize_engine_prompt_for_messages(config, messages, engine_prompt)
         if isinstance(engine_prompt, dict):
             engine_prompt["talker_cache_salt"] = config._talker_cache_salt
         return engine_prompt, current_user_message
@@ -1509,14 +1557,10 @@ class OmniStreamingVideoHandler:
         arrival_audio = audio_buffer or bytearray()
         if self._engine_client is None or (not frame_buffer and not arrival_audio):
             return False
-        admitted = await self._admit_arrival_prefill(request_id)
-        if not admitted:
-            return False
+        admission = await self._admit_arrival_prefill(request_id)
         try:
             headroom = config.context_window_compaction_headroom_tokens
-            arrival_compaction_trigger = (
-                config.context_window_trigger_tokens - headroom if headroom > 0 else None
-            )
+            arrival_compaction_trigger = config.context_window_trigger_tokens - headroom if headroom > 0 else None
             engine_prompt, _ = await self._render_engine_prompt_with_compaction(
                 config,
                 frame_buffer,
@@ -1553,6 +1597,7 @@ class OmniStreamingVideoHandler:
                 ),
                 output_modalities=["text"],
                 priority=_ARRIVAL_PREFILL_PRIORITY,
+                _request_admitted_event=admission.engine_admitted,
             )
             # The engine finishes after prompt prefill without committing the
             # sampled next token. final_stage_id=0 keeps Talker/Code2Wav idle.
@@ -1655,8 +1700,7 @@ class OmniStreamingVideoHandler:
         self._compact_canonical_prompt_state(config, dropped_turns)
         _reset_thinker_lineage(config)
         logger.info(
-            "[session-history] compact session=%s turns=%d->%d prompt_tokens=%d "
-            "trigger_tokens=%d renders=%d",
+            "[session-history] compact session=%s turns=%d->%d prompt_tokens=%d trigger_tokens=%d renders=%d",
             config.session_id or "-",
             before_turns,
             len(message_history) // 2,
@@ -1716,6 +1760,7 @@ class OmniStreamingVideoHandler:
         t_start = _time.monotonic()
         t_first_text = None
         t_first_audio = None
+        foreground_prefill_released = False
 
         # Wire-level async-chunk switch. "off" means
         # buffer all deltas server-side and flush once at the end; the engine
@@ -1746,14 +1791,18 @@ class OmniStreamingVideoHandler:
             )
 
             async for output in result_gen:
+                # P has completed before the pipeline can expose its first
+                # output. Resume background arrival prefill immediately; do
+                # not hold the gate through Thinker/Talker generation.
+                if not foreground_prefill_released:
+                    await self._finish_foreground_prefill(request_id)
+                    foreground_prefill_released = True
                 if isinstance(output, OmniRequestOutput) and output.final_output_type == "text":
                     request_output = getattr(output, "request_output", None)
                     stage_outputs = getattr(request_output, "outputs", None)
                     if isinstance(stage_outputs, list) and stage_outputs:
                         cumulative_ids = getattr(stage_outputs[0], "cumulative_token_ids", None)
-                        if isinstance(cumulative_ids, list) and all(
-                            isinstance(token, int) for token in cumulative_ids
-                        ):
+                        if isinstance(cumulative_ids, list) and all(isinstance(token, int) for token in cumulative_ids):
                             thinker_output_token_ids = list(cumulative_ids)
                 # Soft interrupt: drain without sending
                 if interrupt_event.is_set():
@@ -2157,7 +2206,6 @@ class OmniStreamingVideoHandler:
     # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------
-
 
     async def _send_error(self, websocket: WebSocket, message: str) -> None:
         """Send an error message to the client."""

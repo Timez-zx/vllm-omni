@@ -1951,33 +1951,28 @@ class Orchestrator:
             cached_output["embed"] = embeds
 
         prefill_only = isinstance(req_state.prompt, dict) and req_state.prompt.get("prefill_only") is True
-        if not prefill_only:
-            full_layer_0 = self._materialize_pd_snapshot_layer(layer_0_chunks)
-            full_layer_24 = self._materialize_pd_snapshot_layer(layer_24_chunks)
-            materialized: dict[str, Any] = {
-                "hidden_states": {"layers": {0: full_layer_0, 24: full_layer_24}},
-            }
-            if isinstance(embeds, dict):
-                materialized["embed"] = embeds
-            req_state.pd_prefill_multimodal_output = materialized
-            # Reuse the final request's contiguous D payload as the next
-            # lineage parent. Otherwise every arrival delta remains a distinct
-            # shared-memory storage/FD for the lifetime of the session.
-            cached_output = materialized
-        else:
-            max_chunks = int(getattr(self, "_pd_prefill_snapshot_max_chunks", 16))
-            if max(len(layer_0_chunks), len(layer_24_chunks)) > max_chunks:
-                compacted: dict[str, Any] = {
-                    "hidden_states": {
-                        "layers": {
-                            0: self._materialize_pd_snapshot_layer(layer_0_chunks),
-                            24: self._materialize_pd_snapshot_layer(layer_24_chunks),
-                        }
+        max_chunks = int(getattr(self, "_pd_prefill_snapshot_max_chunks", 16))
+        if max(len(layer_0_chunks), len(layer_24_chunks)) > max_chunks:
+            # Bound the shared-buffer/FD chain.  Allocate the destination in
+            # shared storage first and concatenate exactly once; a later D
+            # request can forward this tensor as a handle without another
+            # full-prompt copy in the orchestrator.
+            compacted: dict[str, Any] = {
+                "hidden_states": {
+                    "layers": {
+                        0: self._materialize_pd_snapshot_layer(layer_0_chunks, shared=True),
+                        24: self._materialize_pd_snapshot_layer(layer_24_chunks, shared=True),
                     }
                 }
-                if isinstance(embeds, dict):
-                    compacted["embed"] = embeds
-                cached_output = compacted
+            }
+            if isinstance(embeds, dict):
+                compacted["embed"] = embeds
+            cached_output = compacted
+        if not prefill_only:
+            # Keep P's shared output chunks intact.  D already concatenates
+            # the prompt conditioning with its first decode rows for Talker,
+            # so materializing a contiguous copy here is redundant.
+            req_state.pd_prefill_multimodal_output = cached_output
         self._cache_pd_prefill_snapshot(req_state, cached_output)
         logger.info(
             "[Orchestrator][PD snapshot] req=%s assembled prefix_rows=%d delta_rows=%d "
@@ -1994,15 +1989,49 @@ class Orchestrator:
         )
 
     @staticmethod
-    def _materialize_pd_snapshot_layer(chunks: tuple[torch.Tensor, ...]) -> torch.Tensor:
+    def _materialize_pd_snapshot_layer(
+        chunks: tuple[torch.Tensor, ...],
+        *,
+        shared: bool = False,
+    ) -> torch.Tensor:
         """Coalesce a snapshot into one contiguous CPU tensor."""
         if len(chunks) == 1:
-            return chunks[0]
+            output = chunks[0]
+            if shared and output.device.type == "cpu" and not output.is_shared():
+                output.share_memory_()
+            return output
+
         first = chunks[0]
         shape = (sum(int(chunk.shape[0]) for chunk in chunks), *first.shape[1:])
-        output = torch.empty(shape, dtype=first.dtype, device=first.device)
+        if shared and first.device.type == "cpu":
+            # ``torch.empty(shape).share_memory_()`` first allocates ordinary
+            # storage and then copies it into shared storage.  Build the tensor
+            # directly on a shared storage instead, then fill it once via cat.
+            numel = 1
+            for dim in shape:
+                numel *= int(dim)
+            storage = torch.UntypedStorage._new_shared(
+                numel * first.element_size(),
+                device="cpu",
+            )
+            output = torch.empty(0, dtype=first.dtype, device="cpu").set_(storage, 0, shape)
+        else:
+            output = torch.empty(shape, dtype=first.dtype, device=first.device)
         torch.cat(chunks, dim=0, out=output)
         return output
+
+    @staticmethod
+    def _ensure_shared_pd_snapshot_chunks(
+        chunks: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, ...]:
+        """Ensure a local D request can encode every snapshot chunk by handle."""
+        shared_chunks: list[torch.Tensor] = []
+        for chunk in chunks:
+            chunk = chunk.detach().cpu()
+            if not chunk.is_shared():
+                chunk.share_memory_()
+            shared_chunks.append(chunk)
+        return tuple(shared_chunks)
 
     @staticmethod
     def _accumulate_pd_prefill_output(
@@ -2443,23 +2472,18 @@ class Orchestrator:
 
             prefill_snapshot = req_state.pd_prefill_multimodal_output
             if isinstance(prefill_snapshot, dict):
-                hidden_states = prefill_snapshot.get("hidden_states")
-                layers = hidden_states.get("layers") if isinstance(hidden_states, dict) else None
                 embeds = prefill_snapshot.get("embed")
                 embeds = embeds if isinstance(embeds, dict) else {}
 
-                def _layer(key: int) -> torch.Tensor | None:
-                    if not isinstance(layers, dict):
-                        return None
-                    value = layers.get(key, layers.get(str(key)))
-                    return value if isinstance(value, torch.Tensor) else None
-
-                layer_0 = _layer(0)
-                layer_24 = _layer(24)
-                if layer_0 is not None and layer_24 is not None:
+                layer_0_chunks = self._pd_snapshot_layer_chunks(prefill_snapshot, 0)
+                layer_24_chunks = self._pd_snapshot_layer_chunks(prefill_snapshot, 24)
+                if layer_0_chunks and layer_24_chunks:
                     for decode_input in decode_inputs:
                         prompt_ids = decode_input.get("prompt_token_ids") or []
-                        available_rows = min(int(layer_0.shape[0]), int(layer_24.shape[0]))
+                        available_rows = min(
+                            sum(int(chunk.shape[0]) for chunk in layer_0_chunks),
+                            sum(int(chunk.shape[0]) for chunk in layer_24_chunks),
+                        )
                         if available_rows < len(prompt_ids):
                             logger.warning(
                                 "[Orchestrator][PD] incomplete P snapshot req=%s rows=%d prompt_tokens=%d",
@@ -2468,10 +2492,12 @@ class Orchestrator:
                                 len(prompt_ids),
                             )
                             continue
+                        selected_layer_0 = self._slice_pd_snapshot_chunks(layer_0_chunks, len(prompt_ids))
+                        selected_layer_24 = self._slice_pd_snapshot_chunks(layer_24_chunks, len(prompt_ids))
                         decode_input["pd_prefill_payload"] = OmniPDPrefillPayload(
-                            prompt_layer_0=layer_0[: len(prompt_ids)].detach().cpu(),
-                            prompt_layer_24=layer_24[: len(prompt_ids)].detach().cpu(),
                             prompt_token_ids=list(prompt_ids),
+                            prompt_layer_0_chunks=self._ensure_shared_pd_snapshot_chunks(selected_layer_0),
+                            prompt_layer_24_chunks=self._ensure_shared_pd_snapshot_chunks(selected_layer_24),
                             tts_bos=embeds.get("tts_bos"),
                             tts_eos=embeds.get("tts_eos"),
                             tts_pad=embeds.get("tts_pad"),

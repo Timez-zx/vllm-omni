@@ -468,6 +468,7 @@ class AsyncOmni(EngineClient, OmniBase):
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         arrival_time: float | None = None,
+        _request_admitted_event: asyncio.Event | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -616,6 +617,8 @@ class AsyncOmni(EngineClient, OmniBase):
                     arrival_time=wall_start_ts,
                     priority=priority,
                 )
+            if _request_admitted_event is not None:
+                _request_admitted_event.set()
             submit_ts = time.time()
             req_state.metrics.stage_first_ts[0] = submit_ts
             req_start_ts[request_id] = submit_ts

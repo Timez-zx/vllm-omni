@@ -34,7 +34,8 @@ stages:
       # Omni chunk edge. The pipeline remains async for D -> Talker -> Code2Wav.
       async_chunk: false
       kv_transfer_config:
-        kv_connector: NixlPushConnector
+        kv_connector: NixlDeltaPushConnector
+        kv_connector_module_path: vllm_omni.engine.nixl_delta_push_connector
         kv_role: kv_producer
         kv_rank: 0
         kv_parallel_size: 2
@@ -57,16 +58,16 @@ stages:
     trust_remote_code: true
     quantization: fp8
     kv_cache_dtype: fp8
-    # D receives the authoritative request-scoped prompt KV from P. Keep its
-    # local prefix cache off until the connector has explicit delta offsets;
-    # matching only the destination tail is insufficient for safe alignment.
-    enable_prefix_caching: false
+    # Retain disposable request prefixes locally. The delta push connector
+    # sends only blocks after the exact block-aligned cache hit.
+    enable_prefix_caching: true
     devices: "1"
     env:
       VLLM_NIXL_SIDE_CHANNEL_PORT: "5601"
     engine_extras:
       kv_transfer_config:
-        kv_connector: NixlPushConnector
+        kv_connector: NixlDeltaPushConnector
+        kv_connector_module_path: vllm_omni.engine.nixl_delta_push_connector
         kv_role: kv_consumer
         kv_rank: 1
         kv_parallel_size: 2
