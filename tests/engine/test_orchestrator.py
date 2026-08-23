@@ -314,8 +314,62 @@ def test_pd_prefill_snapshot_uses_exact_lineage_parent_for_delta() -> None:
     final_layers = final_state.pd_prefill_multimodal_output["hidden_states"]["layers"]
     assert final_layers[0].flatten().tolist() == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
     assert final_layers[24].flatten().tolist() == [21.0, 22.0, 23.0, 24.0, 25.0, 26.0]
-    assert final_layers[0].is_shared()
-    assert final_layers[24].is_shared()
+    cached_final_layers = orchestrator._pd_prefill_snapshots["session-1"].output["hidden_states"]["layers"]
+    assert cached_final_layers[0] is final_layers[0]
+    assert cached_final_layers[24] is final_layers[24]
+
+
+def test_pd_prefill_snapshot_compacts_long_arrival_chunk_chain() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._pd_prefill_snapshots = OrderedDict()
+    orchestrator._pd_prefill_snapshot_bytes = 0
+    orchestrator._pd_prefill_snapshot_limit_bytes = 1 << 20
+    orchestrator._pd_prefill_snapshot_max_chunks = 1
+
+    parent_state = OrchestratorRequestState(
+        request_id="parent",
+        pd_prefill_lineage_id="session-1",
+        pd_prefill_revision=1,
+        pd_prefill_prompt_token_ids=(1,),
+        pd_prefill_multimodal_output={
+            "hidden_states": {
+                "layers": {
+                    0: torch.tensor([[1.0]]),
+                    24: torch.tensor([[21.0]]),
+                }
+            }
+        },
+    )
+    orchestrator._materialize_pd_prefill_snapshot(parent_state)
+
+    request = SimpleNamespace(
+        request_id="warmup",
+        prompt_token_ids=[1, 2],
+        kv_lineage_id="session-1",
+        kv_lineage_parent_revision=1,
+        kv_lineage_revision=2,
+        kv_lineage_prefix_tokens=1,
+        model_intermediate_buffer=None,
+    )
+    state = OrchestratorRequestState(
+        request_id="warmup",
+        prompt={"prefill_only": True},
+        pd_prefill_multimodal_output={
+            "hidden_states": {
+                "layers": {
+                    0: torch.tensor([[2.0]]),
+                    24: torch.tensor([[22.0]]),
+                }
+            }
+        },
+    )
+    orchestrator._prepare_pd_prefill_snapshot_request(request, state)
+    orchestrator._materialize_pd_prefill_snapshot(state)
+
+    cached = orchestrator._pd_prefill_snapshots["session-1"].output["hidden_states"]["layers"]
+    assert isinstance(cached[0], torch.Tensor)
+    assert cached[0].flatten().tolist() == [1.0, 2.0]
+    assert cached[24].flatten().tolist() == [21.0, 22.0]
 
 
 def test_pd_mrope_metadata_rebuilds_without_media_tensors() -> None:

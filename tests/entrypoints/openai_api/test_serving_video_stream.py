@@ -715,10 +715,11 @@ async def test_incremental_canonical_prompt_never_rerenders_completed_history():
 
 
 @pytest.mark.asyncio
-async def test_query_aborts_current_arrival_prefill_without_resubmitting_snapshot():
+async def test_query_detaches_current_arrival_prefill_without_aborting_it():
     warm_snapshots: list[int] = []
     warm_started = asyncio.Event()
-    warm_cancelled = asyncio.Event()
+    warm_release = asyncio.Event()
+    warm_completed = asyncio.Event()
     query_done = asyncio.Event()
 
     class AbortableEngine:
@@ -739,11 +740,8 @@ async def test_query_aborts_current_arrival_prefill_without_resubmitting_snapsho
         ):
             warm_snapshots.append(len(frame_buffer))
             warm_started.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                warm_cancelled.set()
-                raise
+            await warm_release.wait()
+            warm_completed.set()
 
         async def _process_query(self, *args, **kwargs):
             query_done.set()
@@ -764,13 +762,13 @@ async def test_query_aborts_current_arrival_prefill_without_resubmitting_snapsho
     await asyncio.wait_for(warm_started.wait(), timeout=2.0)
     ws.put({"type": "video.query", "text": "describe"})
     await asyncio.wait_for(query_done.wait(), timeout=2.0)
+    warm_release.set()
+    await asyncio.wait_for(warm_completed.wait(), timeout=2.0)
     ws.put({"type": "video.done"})
     await asyncio.wait_for(task, timeout=2.0)
 
     assert warm_snapshots == [1]
-    assert warm_cancelled.is_set()
-    assert len(engine.aborted) == 1
-    assert engine.aborted[0].startswith("video-warm-")
+    assert engine.aborted == []
 
 
 @pytest.mark.asyncio

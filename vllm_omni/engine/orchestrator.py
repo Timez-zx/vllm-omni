@@ -80,6 +80,15 @@ def _pd_snapshot_cache_bytes() -> int:
         return 8 << 30
 
 
+def _pd_snapshot_max_chunks() -> int:
+    raw = os.environ.get("VLLM_OMNI_PD_SNAPSHOT_MAX_CHUNKS", "16")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning("Invalid VLLM_OMNI_PD_SNAPSHOT_MAX_CHUNKS=%r; using 16", raw)
+        return 16
+
+
 if TYPE_CHECKING:
     from vllm_omni.experimental.fullduplex.engine.contracts import (
         DuplexControlPlanePort,
@@ -423,6 +432,7 @@ class Orchestrator:
         self._pd_prefill_snapshots: OrderedDict[str, _PDPrefillSnapshot] = OrderedDict()
         self._pd_prefill_snapshot_bytes = 0
         self._pd_prefill_snapshot_limit_bytes = _pd_snapshot_cache_bytes()
+        self._pd_prefill_snapshot_max_chunks = _pd_snapshot_max_chunks()
         # Arrival-prefill requests may populate vLLM's sender-side media
         # cache, leaving the final request with hash-only feature references.
         # Retain only the tiny values needed to reconstruct M-RoPE on D.
@@ -1939,7 +1949,6 @@ class Orchestrator:
         }
         if isinstance(embeds, dict):
             cached_output["embed"] = embeds
-        self._cache_pd_prefill_snapshot(req_state, cached_output)
 
         prefill_only = isinstance(req_state.prompt, dict) and req_state.prompt.get("prefill_only") is True
         if not prefill_only:
@@ -1951,25 +1960,47 @@ class Orchestrator:
             if isinstance(embeds, dict):
                 materialized["embed"] = embeds
             req_state.pd_prefill_multimodal_output = materialized
+            # Reuse the final request's contiguous D payload as the next
+            # lineage parent. Otherwise every arrival delta remains a distinct
+            # shared-memory storage/FD for the lifetime of the session.
+            cached_output = materialized
+        else:
+            max_chunks = int(getattr(self, "_pd_prefill_snapshot_max_chunks", 16))
+            if max(len(layer_0_chunks), len(layer_24_chunks)) > max_chunks:
+                compacted: dict[str, Any] = {
+                    "hidden_states": {
+                        "layers": {
+                            0: self._materialize_pd_snapshot_layer(layer_0_chunks),
+                            24: self._materialize_pd_snapshot_layer(layer_24_chunks),
+                        }
+                    }
+                }
+                if isinstance(embeds, dict):
+                    compacted["embed"] = embeds
+                cached_output = compacted
+        self._cache_pd_prefill_snapshot(req_state, cached_output)
         logger.info(
-            "[Orchestrator][PD snapshot] req=%s assembled prefix_rows=%d delta_rows=%d deferred=%s cache_mib=%.1f",
+            "[Orchestrator][PD snapshot] req=%s assembled prefix_rows=%d delta_rows=%d "
+            "deferred=%s cache_chunks=%d cache_mib=%.1f",
             req_state.request_id,
             prefix_rows,
             current_rows,
             prefill_only,
+            max(
+                len(self._pd_snapshot_layer_chunks(cached_output, 0)),
+                len(self._pd_snapshot_layer_chunks(cached_output, 24)),
+            ),
             float(getattr(self, "_pd_prefill_snapshot_bytes", 0)) / float(1 << 20),
         )
 
     @staticmethod
     def _materialize_pd_snapshot_layer(chunks: tuple[torch.Tensor, ...]) -> torch.Tensor:
-        """Materialize a contiguous snapshot directly into shared storage."""
+        """Coalesce a snapshot into one contiguous CPU tensor."""
         if len(chunks) == 1:
             return chunks[0]
         first = chunks[0]
         shape = (sum(int(chunk.shape[0]) for chunk in chunks), *first.shape[1:])
         output = torch.empty(shape, dtype=first.dtype, device=first.device)
-        if output.device.type == "cpu":
-            output.share_memory_()
         torch.cat(chunks, dim=0, out=output)
         return output
 

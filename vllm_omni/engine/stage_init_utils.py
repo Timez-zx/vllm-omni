@@ -19,6 +19,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
 
 from vllm.logger import init_logger
+from vllm.renderers import renderer_from_config
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.usage.usage_lib import UsageContext
@@ -952,10 +953,14 @@ def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
     """Build the shared stage-0 input processor."""
 
     patch_generation_config_if_needed(stage_vllm_config.model_config)
-    input_processor = InputProcessor(vllm_config=stage_vllm_config)
+    # Passing the renderer explicitly also makes InputProcessor pass the same
+    # instance to InputPreprocessor.  Its default path otherwise constructs a
+    # second renderer (and therefore a second multimodal cache sender).
+    renderer = renderer_from_config(stage_vllm_config)
+    input_processor = InputProcessor(vllm_config=stage_vllm_config, renderer=renderer)
     input_processor.input_preprocessor = OmniInputPreprocessor(
         vllm_config=stage_vllm_config,
-        renderer=input_processor.renderer,
+        renderer=renderer,
     )
     return input_processor
 

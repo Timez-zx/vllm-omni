@@ -114,6 +114,7 @@ def _run_resumable_segment_stop(
     sched.transfer_triggered_requests = set()
     sched.active_kv_transfers = set()
     sched.pending_stop_after_extraction = set()
+    sched.defer_block_free = False
     sched.connector = None
     sched.kv_cache_manager.take_events.return_value = None
     sched.finished_req_ids_dict = {}
@@ -121,6 +122,7 @@ def _run_resumable_segment_stop(
 
     scheduler_output = MagicMock(spec=SchedulerOutput)
     scheduler_output.num_scheduled_tokens = {session.request_id: 1}
+    scheduler_output.total_num_scheduled_tokens = 1
     scheduler_output.scheduled_spec_decode_tokens = {}
     scheduler_output.num_invalid_spec_tokens = 0
 
@@ -189,6 +191,55 @@ def test_update_from_output_settles_in_flight_tokens() -> None:
     assert session.num_in_flight_tokens == 0
 
 
+def test_update_from_output_advances_deferred_block_free_fence() -> None:
+    """The Omni override must retain vLLM's async block-free lifecycle."""
+    session = _make_request()
+    session.status = RequestStatus.RUNNING
+    session.num_in_flight_tokens = 1
+
+    sched = MagicMock()
+    sched.requests = {session.request_id: session}
+    sched.perf_metrics = None
+    sched.structured_output_manager.should_advance.return_value = False
+    sched._update_request_with_output.return_value = ([42], False)
+    sched._process_kv_transfer_trigger.return_value = False
+    sched.chunk_transfer_adapter = None
+    sched.running = [session]
+    sched.waiting_for_transfer_free = set()
+    sched.transfer_triggered_requests = set()
+    sched.active_kv_transfers = set()
+    sched.pending_stop_after_extraction = set()
+    sched.defer_block_free = True
+    sched.processed_step_seq = 9
+    sched.connector = None
+    sched.kv_cache_manager.take_events.return_value = None
+    sched.finished_req_ids_dict = {}
+    sched.make_stats.return_value = None
+
+    scheduler_output = MagicMock(spec=SchedulerOutput)
+    scheduler_output.num_scheduled_tokens = {session.request_id: 1}
+    scheduler_output.total_num_scheduled_tokens = 1
+    scheduler_output.scheduled_spec_decode_tokens = {}
+    scheduler_output.num_invalid_spec_tokens = 0
+
+    model_runner_output = MagicMock(spec=ModelRunnerOutput)
+    model_runner_output.sampled_token_ids = [[42]]
+    model_runner_output.logprobs = None
+    model_runner_output.prompt_logprobs_dict = {}
+    model_runner_output.pooler_output = None
+    model_runner_output.num_nans_in_logits = None
+    model_runner_output.kv_connector_output = None
+    model_runner_output.cudagraph_stats = None
+    model_runner_output.req_id_to_index = {session.request_id: 0}
+    model_runner_output.routed_experts = None
+    model_runner_output.inter_stage_outputs = None
+
+    OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
+
+    assert sched.processed_step_seq == 10
+    sched._drain_deferred_frees.assert_called_once_with()
+
+
 def test_prefill_only_finishes_without_committing_sampled_token() -> None:
     session = _make_request()
     session.status = RequestStatus.RUNNING
@@ -226,6 +277,7 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> Non
     sched.transfer_triggered_requests = set()
     sched.active_kv_transfers = set()
     sched.pending_stop_after_extraction = set()
+    sched.defer_block_free = False
     sched.connector = None
     sched.kv_cache_manager.take_events.return_value = None
     sched.finished_req_ids_dict = {}
@@ -233,6 +285,7 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> Non
 
     scheduler_output = MagicMock(spec=SchedulerOutput)
     scheduler_output.num_scheduled_tokens = {session.request_id: 1}
+    scheduler_output.total_num_scheduled_tokens = 1
     scheduler_output.scheduled_spec_decode_tokens = {}
     scheduler_output.num_invalid_spec_tokens = 0
 

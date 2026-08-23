@@ -382,6 +382,55 @@ def test_stage_runtime_initializes_stage_pools(monkeypatch):
     assert runtime.stage_pools[1].output_processor is stage1_output_processor
 
 
+def test_stage_runtime_runs_plan_hook_before_replica_launch(monkeypatch):
+    runtime = StageRuntime(
+        stage_configs=[],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=1,
+        diffusion_batch_size=1,
+        async_chunk=False,
+    )
+    plan = _make_llm_plan(0, stage_id=0, vllm_config=object())
+    events: list[str] = []
+
+    monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: [plan])
+    monkeypatch.setattr(
+        runtime,
+        "_initialize_stage_replicas",
+        lambda *_: events.append("launch") or {0: [object()]},
+    )
+    monkeypatch.setattr(runtime, "_finalize_initialized_stages", lambda *_: None)
+    runtime.set_stage_plans_ready_hook(lambda plans: events.append(f"hook-{plans[0].stage_id}"))
+
+    runtime.initialize()
+
+    assert events == ["hook-0", "launch"]
+
+
+def test_stage0_shm_cache_switch_happens_before_input_processor(monkeypatch):
+    engine = object.__new__(AsyncOmniEngine)
+    mm_config = types.SimpleNamespace(mm_processor_cache_type="lru")
+    stage0_config = types.SimpleNamespace(
+        model_config=types.SimpleNamespace(get_multimodal_config=lambda: mm_config)
+    )
+    plan = _make_llm_plan(0, stage_id=0, vllm_config=stage0_config)
+    observed: list[str] = []
+
+    monkeypatch.setenv("VLLM_OMNI_STAGE0_SHM_MM_CACHE", "1")
+    monkeypatch.setattr(
+        async_omni_engine_module,
+        "build_stage0_input_processor",
+        lambda config: observed.append(config.model_config.get_multimodal_config().mm_processor_cache_type)
+        or object(),
+    )
+
+    engine._initialize_stage0_input_processor([plan])
+
+    assert observed == ["shm"]
+    assert engine.input_processor is not None
+
+
 def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatch):
     import vllm_omni.engine.stage_runtime as runtime_mod
 
@@ -722,9 +771,9 @@ def test_build_stage0_input_processor_uses_omni_input_preprocessor(monkeypatch):
     import vllm_omni.engine.stage_init_utils as init_mod
 
     class DummyInputProcessor:
-        def __init__(self, vllm_config):
+        def __init__(self, vllm_config, renderer=None):
             self.vllm_config = vllm_config
-            self.renderer = object()
+            self.renderer = renderer
             self.input_preprocessor = None
 
     class DummyOmniInputPreprocessor:
@@ -734,13 +783,16 @@ def test_build_stage0_input_processor_uses_omni_input_preprocessor(monkeypatch):
 
     monkeypatch.setattr(init_mod, "InputProcessor", DummyInputProcessor)
     monkeypatch.setattr(init_mod, "OmniInputPreprocessor", DummyOmniInputPreprocessor)
+    renderer = object()
+    monkeypatch.setattr(init_mod, "renderer_from_config", lambda _config: renderer)
 
     input_processor = build_stage0_input_processor(
         types.SimpleNamespace(model_config=types.SimpleNamespace(try_get_generation_config=lambda: {}))
     )
 
     assert isinstance(input_processor.input_preprocessor, DummyOmniInputPreprocessor)
-    assert input_processor.input_preprocessor.renderer is input_processor.renderer
+    assert input_processor.input_preprocessor.renderer is renderer
+    assert input_processor.renderer is renderer
 
 
 def test_inject_kv_stage_info_infers_sender_tp_topology():

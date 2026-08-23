@@ -598,39 +598,25 @@ class OmniStreamingVideoHandler:
                 """Yield the session's background prefill slot to its query.
 
                 A warm-up is optional: the final finite request always carries
-                the complete canonical prompt. Waiting for a cumulative warm-up
-                here turns background work into query-critical work and lets an
-                arrival backlog inflate TTFA. Cancel it instead; any prefix KV
-                materialized before the abort remains only an optional cache
-                optimization, never application state.
+                the complete canonical prompt. Do not wait for an in-flight
+                warm-up, but also do not abort one that has already updated the
+                mirrored multimodal sender cache. Aborting between sender-cache
+                mutation and EngineCore admission can leave a hash-only hit for
+                data the receiver never observed. The detached warm-up keeps its
+                low priority and completes independently while the foreground
+                query is admitted immediately at priority zero.
                 """
                 nonlocal arrival_prefill_task, arrival_prefill_dirty
                 started = _time.monotonic()
                 arrival_prefill_dirty = False
                 task = arrival_prefill_task
-                request_id = arrival_prefill_request_id
                 warmup_was_running = task is not None and not task.done()
-                aborted = False
-                if task is not None and not task.done():
-                    task.cancel()
-                    if request_id is not None and self._engine_client is not None:
-                        try:
-                            await self._engine_client.abort(request_id)
-                            aborted = True
-                        except Exception:
-                            logger.debug(
-                                "Abort failed for arrival prefill %s",
-                                request_id,
-                                exc_info=True,
-                            )
-                    await asyncio.gather(task, return_exceptions=True)
-                arrival_prefill_task = None
                 logger.info(
                     "[query-admission] session=%s warmup_running=%s "
                     "warmup_aborted=%s handoff_ms=%.1f",
                     config.session_id or "-",
                     warmup_was_running,
-                    aborted,
+                    False,
                     (_time.monotonic() - started) * 1000.0,
                 )
 

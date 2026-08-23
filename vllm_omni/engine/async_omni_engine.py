@@ -371,6 +371,7 @@ class AsyncOmniEngine:
             omni_lb_policy=self._omni_lb_policy,
             request_queue=self.request_queue,
         )
+        self._runtime.set_stage_plans_ready_hook(self._initialize_stage0_input_processor)
         self._runtime.initialize()
 
         self.num_stages = len(self.stage_configs)
@@ -380,11 +381,12 @@ class AsyncOmniEngine:
         ]
         self.stage_vllm_configs = [pool.stage_vllm_config for pool in self.stage_pools]
         self.output_processors = [pool.output_processor for pool in self.stage_pools]
-        self.input_processor = (
-            build_stage0_input_processor(self.stage_vllm_configs[0])
-            if self.stage_vllm_configs and self.stage_vllm_configs[0] is not None
-            else None
-        )
+        if self.input_processor is None:
+            self.input_processor = (
+                build_stage0_input_processor(self.stage_vllm_configs[0])
+                if self.stage_vllm_configs and self.stage_vllm_configs[0] is not None
+                else None
+            )
         self.prompt_expand_func = next(
             (
                 getattr(client, "prompt_expand_func", None)
@@ -409,6 +411,24 @@ class AsyncOmniEngine:
         if any(meta.final_output_type == "audio" for meta in self.stage_metadata):
             supported_tasks.add("speech")
         self.supported_tasks = tuple(supported_tasks) if supported_tasks else ("generate",)
+
+    def _initialize_stage0_input_processor(self, stage_plans: Sequence[Any]) -> None:
+        """Create the stage-0 sender cache before its worker tries to attach."""
+        if not stage_plans or not stage_plans[0].replicas:
+            return
+        stage0_config = stage_plans[0].replicas[0].stage_vllm_config
+        if stage0_config is not None:
+            use_shm_cache = os.environ.get("VLLM_OMNI_STAGE0_SHM_MM_CACHE", "0").lower() not in {
+                "",
+                "0",
+                "false",
+                "no",
+                "off",
+            }
+            if use_shm_cache:
+                mm_config = stage0_config.model_config.get_multimodal_config()
+                mm_config.mm_processor_cache_type = "shm"
+            self.input_processor = build_stage0_input_processor(stage0_config)
 
     def _bootstrap_orchestrator(
         self,

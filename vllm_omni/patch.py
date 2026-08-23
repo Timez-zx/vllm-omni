@@ -90,6 +90,86 @@ def _patch_multimodal_processor_cache_type() -> None:
 
 _patch_multimodal_processor_cache_type()
 
+
+# =============================================================================
+# Preserve M-RoPE layout metadata on shared-memory multimodal cache handles
+# =============================================================================
+
+_MM_LAYOUT_KEYS = (
+    "image_grid_thw",
+    "video_grid_thw",
+    "second_per_grid_ts",
+    "use_audio_in_video",
+    "audio_feature_lengths",
+)
+
+
+def _extract_mm_layout_values(item) -> dict[str, object]:
+    values: dict[str, object] = {}
+    for key in _MM_LAYOUT_KEYS:
+        elem = item.get(key)
+        value = getattr(elem, "data", None)
+        if value is None:
+            continue
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        values[key] = value
+    return values
+
+
+def _patch_shm_mm_cache_layout_metadata() -> None:
+    """Keep tiny position metadata beside an otherwise opaque shm handle."""
+    try:
+        from vllm.multimodal.cache import ShmObjectStoreSenderCache
+        from vllm.multimodal.inputs import (
+            MultiModalBatchedField,
+            MultiModalFieldElem,
+            MultiModalKwargsItem,
+        )
+    except ImportError:
+        return
+
+    original = ShmObjectStoreSenderCache.get_and_update_item
+    if getattr(original, "_omni_mm_layout_patched", False):
+        return
+
+    def _patched_get_and_update_item(self, mm_item, mm_hash):
+        layout_by_hash = getattr(self, "_omni_mm_layout_by_hash", None)
+        if layout_by_hash is None:
+            layout_by_hash = self._omni_mm_layout_by_hash = {}
+        if mm_item is not None:
+            values = _extract_mm_layout_values(mm_item[0])
+            if values:
+                layout_by_hash[mm_hash] = values
+
+        data, prompt_updates = original(self, mm_item, mm_hash)
+        values = layout_by_hash.get(mm_hash)
+        if values and data is not None and "address" in data:
+            enriched = dict(data.items())
+            enriched.update(
+                {
+                    key: MultiModalFieldElem(
+                        data=torch.as_tensor(value),
+                        field=MultiModalBatchedField(keep_on_cpu=True),
+                    )
+                    for key, value in values.items()
+                }
+            )
+            data = MultiModalKwargsItem(enriched)
+
+        live_keys = getattr(self, "_shm_cache").key_index
+        if len(layout_by_hash) > max(1024, 2 * len(live_keys)):
+            self._omni_mm_layout_by_hash = {
+                key: value for key, value in layout_by_hash.items() if key in live_keys
+            }
+        return data, prompt_updates
+
+    _patched_get_and_update_item._omni_mm_layout_patched = True
+    ShmObjectStoreSenderCache.get_and_update_item = _patched_get_and_update_item
+
+
+_patch_shm_mm_cache_layout_metadata()
+
 # =============================================================================
 # Patch ModelConfig.is_mm_prefix_lm to support omni-specific models
 # =============================================================================

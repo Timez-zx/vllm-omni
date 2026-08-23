@@ -850,6 +850,48 @@ def test_pd_prefill_longer_global_hit_returns_only_gap_after_parent() -> None:
     assert payload["embed.tts_bos"] is tts
 
 
+def test_pd_prefix_output_decision_is_snapshotted_before_request_cleanup() -> None:
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = SimpleNamespace(supports_delta_prefix_multimodal_outputs=True)
+    runner.input_batch = SimpleNamespace(
+        req_ids=["r1"],
+        req_id_to_index={"r1": 0},
+        num_computed_tokens_cpu=torch.tensor([8]),
+    )
+    runner.model_intermediate_buffer = {
+        "r1": {
+            "meta": {
+                "pd_prefill_snapshot_mode": "delta",
+                "pd_prefill_snapshot_parent_rows": 4,
+            }
+        },
+    }
+
+    parent_rows, needs_full_prefix = (
+        runner._snapshot_pd_prefix_multimodal_requirements()
+    )
+    assert parent_rows == {"r1": 4}
+    assert needs_full_prefix == {"r1"}
+
+    # Model the async output-builder race: normal completion has already
+    # removed both the live batch entry and its per-request metadata.
+    runner.input_batch.req_ids = []
+    runner.input_batch.req_id_to_index = {}
+    runner.model_intermediate_buffer = {}
+
+    layer_0 = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    payload = runner._build_combined_prefix_cache_mm_payload(
+        {
+            "hidden_states.layer_0": {"r1": layer_0},
+            "hidden_states.layer_24": {"r1": layer_0 + 100},
+        },
+        rid="r1",
+        idx=0,
+        pd_parent_rows_by_req=parent_rows,
+    )
+    torch.testing.assert_close(payload["hidden_states.layer_0"], layer_0[4:])
+
+
 # --- builder gap-fill: contract corners not covered by the tests above ---
 def test_build_omni_output_never_leaks_internal_pooler_output_on_wire(monkeypatch):
     """The internal pooler_output feeds full-payload accumulation only; the wire

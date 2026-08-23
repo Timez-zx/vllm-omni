@@ -18,8 +18,8 @@ from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient
 from vllm.v1.engine.exceptions import EngineDeadError
-from vllm.v1.engine.tensor_ipc import TensorIpcReceiver, TensorIpcSender
-from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
+from vllm.v1.serial_utils import MsgpackDecoder
 
 from vllm_omni.distributed.omni_connectors.utils.config import (
     TRANSFER_ENGINE_CONNECTOR_NAMES,
@@ -38,22 +38,6 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniTokensPrompt
 
 logger = init_logger(__name__)
-
-
-class _SharedTensorIpcSender(TensorIpcSender):
-    """Send only tensors that already have shared backing storage.
-
-    ``TensorIpcSender`` calls ``share_memory_`` for ordinary tensors. That is
-    useful for generic multimodal input, but it would turn the P/D fix into a
-    large synchronous staging copy in the API process. P snapshots arrive from
-    the local P EngineCore in shared memory and are materialized into shared
-    storage explicitly, so this D-input path can remain strictly zero-copy.
-    """
-
-    def __call__(self, tensor: Any) -> dict[str, Any] | None:
-        if not tensor.is_shared():
-            return None
-        return super().__call__(tensor)
 
 
 def _default_process_engine_inputs(
@@ -105,7 +89,6 @@ class StageEngineCoreClientBase(StageClientBase):
         coordinator: Any = None,
         client_count: int = 1,
         client_index: int = 0,
-        input_tensor_queue: Any | None = None,
         output_tensor_queue: Any | None = None,
     ) -> StageEngineCoreClient | DPLBStageEngineCoreClient:
         """Create the appropriate stage async client for the DP mode."""
@@ -120,7 +103,6 @@ class StageEngineCoreClientBase(StageClientBase):
             coordinator=coordinator,
             client_count=client_count,
             client_index=client_index,
-            input_tensor_queue=input_tensor_queue,
             output_tensor_queue=output_tensor_queue,
         )
 
@@ -141,7 +123,6 @@ class StageEngineCoreClientBase(StageClientBase):
         metadata: StageMetadata | None = None,
         engine_manager: Any = None,
         coordinator: Any = None,
-        input_tensor_queue: Any | None = None,
         output_tensor_queue: Any | None = None,
     ):
         """Create an async EngineCore client for a single stage.
@@ -208,21 +189,6 @@ class StageEngineCoreClientBase(StageClientBase):
                 client_count=client_count,
                 client_index=client_index,
             )
-            if input_tensor_queue is not None:
-                # P snapshots received by the API server already use shared
-                # storage. Forward only those tensors out of band so the D
-                # request's ZMQ frame stays small without introducing a new
-                # share_memory_ staging copy for ordinary request tensors.
-                self._input_tensor_ipc_sender = _SharedTensorIpcSender(input_tensor_queue)
-                self.encoder = MsgpackEncoder(
-                    oob_tensor_consumer=self._input_tensor_ipc_sender,
-                )
-                logger.info(
-                    "[%s] stage-%s [rep-%s] shared-only input tensor IPC enabled",
-                    client_name,
-                    self.stage_id,
-                    self.replica_id,
-                )
             if output_tensor_queue is not None:
                 # AsyncMPClient starts its output task lazily, so replacing the
                 # decoder here is race-free. Tensor handles in the ZMQ frame

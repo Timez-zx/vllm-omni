@@ -150,6 +150,14 @@ class StageRuntime:
         # ``llm_stage_launch_lock`` for all replicas.
         self._replica_launch_lock = threading.Lock()
         self._init_visible_devices_baseline: str | None = None
+        self._stage_plans_ready_hook: Callable[[Sequence[LogicalStageInitPlan]], None] | None = None
+
+    def set_stage_plans_ready_hook(
+        self,
+        hook: Callable[[Sequence[LogicalStageInitPlan]], None] | None,
+    ) -> None:
+        """Run ``hook`` after configs are built but before replicas launch."""
+        self._stage_plans_ready_hook = hook
 
     @staticmethod
     def _client_addresses_from_zmq(addresses: Any) -> dict[str, str]:
@@ -236,6 +244,8 @@ class StageRuntime:
             plan.stage_idx: [None] * len(plan.replicas) for plan in stage_plans
         }
         try:
+            if self._stage_plans_ready_hook is not None:
+                self._stage_plans_ready_hook(stage_plans)
             self._before_initialize_stage_replicas(stage_plans)
             initialized_clients = self._initialize_stage_replicas(stage_plans, self._stage_init_timeout)
             initialized_clients_by_stage = initialized_clients
@@ -684,7 +694,6 @@ class StageRuntime:
                 client_addresses=self._client_addresses_from_zmq(resources.addresses),
                 engine_manager=resources.manager,
                 coordinator=resources.coordinator,
-                input_tensor_queue=resources.input_tensor_queue,
                 output_tensor_queue=resources.output_tensor_queue,
             )
 

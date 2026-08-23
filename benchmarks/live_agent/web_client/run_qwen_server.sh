@@ -81,6 +81,13 @@ if [ -n "${CUDA_HOME:-}" ]; then
   export PATH="$(dirname -- "$VLLM_OMNI_BIN"):$CUDA_HOME/bin:$PATH"
   export LD_LIBRARY_PATH="$CUDA_HOME/lib:${LD_LIBRARY_PATH:-}"
 fi
+# vLLM otherwise generates this name independently in spawned stage
+# processes.  A single explicit name lets the stage-0 worker attach to the
+# object store created by the API-side multimodal processor cache.
+if grep -qE '^[[:space:]]*VLLM_OMNI_STAGE0_SHM_MM_CACHE:' "$DEPLOY"; then
+  export VLLM_OMNI_STAGE0_SHM_MM_CACHE=1
+  export VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME=${VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME:-vllm_omni_mm_${BASHPID}_${RANDOM}}
+fi
 REPO_ROOT_ENV="$REPO_ROOT" PYTHONPATH="$REPO_ROOT" "$PYTHON_BIN" -c '
 import os
 from pathlib import Path

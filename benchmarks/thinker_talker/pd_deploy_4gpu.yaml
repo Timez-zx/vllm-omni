@@ -26,6 +26,9 @@ stages:
     devices: "0"
     env:
       VLLM_NIXL_SIDE_CHANNEL_PORT: "5600"
+      # Delay the shm-cache switch until stage plans exist, so the API creates
+      # exactly one sender before this worker attaches to it.
+      VLLM_OMNI_STAGE0_SHM_MM_CACHE: "1"
     engine_extras:
       # Stage-local only: P -> D uses the vLLM KV connector rather than an
       # Omni chunk edge. The pipeline remains async for D -> Talker -> Code2Wav.

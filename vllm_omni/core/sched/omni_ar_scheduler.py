@@ -473,6 +473,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats: CUDAGraphStat | None = model_runner_output.cudagraph_stats
 
+        # Keep the vLLM async-scheduler block-lifetime fence in sync.  This
+        # method replaces Scheduler.update_from_output(), so new upstream
+        # lifecycle steps must be mirrored here: without advancing the
+        # processed sequence, normal request completion only moves blocks into
+        # ``deferred_frees`` and they are never returned to the pool.
+        if self.defer_block_free and scheduler_output.total_num_scheduled_tokens > 0:
+            self.processed_step_seq += 1
+            self._drain_deferred_frees()
+
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
             perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
