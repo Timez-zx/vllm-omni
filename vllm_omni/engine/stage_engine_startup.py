@@ -130,6 +130,9 @@ class StageReplicaResources:
     manager: Any | None = None
     coordinator: Any | None = None
     addresses: EngineZmqAddresses | None = None
+    # Local API-server -> EngineCore tensor handles. Currently created only
+    # for the P/D decode stage's already-shared conditioning snapshots.
+    input_tensor_queue: Any | None = None
     # Local EngineCore -> API-server tensor IPC. Only the P/D prefill stage
     # currently creates this reverse queue; remote replicas leave it unset.
     output_tensor_queue: Any | None = None
@@ -1132,6 +1135,7 @@ def launch_stage_replica(
                 manager=engine_manager,
                 coordinator=coordinator,
                 addresses=addresses,
+                input_tensor_queue=getattr(engine_manager, "input_tensor_queue", None),
                 output_tensor_queue=getattr(engine_manager, "output_tensor_queue", None),
             )
         return
@@ -1198,6 +1202,7 @@ def launch_stage_replica(
         yield StageReplicaResources(
             manager=engine_manager,
             addresses=addresses,
+            input_tensor_queue=getattr(engine_manager, "input_tensor_queue", None),
             output_tensor_queue=getattr(engine_manager, "output_tensor_queue", None),
             sibling_addresses=sibling_addresses,
         )

@@ -1943,8 +1943,8 @@ class Orchestrator:
 
         prefill_only = isinstance(req_state.prompt, dict) and req_state.prompt.get("prefill_only") is True
         if not prefill_only:
-            full_layer_0 = layer_0_chunks[0] if len(layer_0_chunks) == 1 else torch.cat(layer_0_chunks, dim=0)
-            full_layer_24 = layer_24_chunks[0] if len(layer_24_chunks) == 1 else torch.cat(layer_24_chunks, dim=0)
+            full_layer_0 = self._materialize_pd_snapshot_layer(layer_0_chunks)
+            full_layer_24 = self._materialize_pd_snapshot_layer(layer_24_chunks)
             materialized: dict[str, Any] = {
                 "hidden_states": {"layers": {0: full_layer_0, 24: full_layer_24}},
             }
@@ -1959,6 +1959,19 @@ class Orchestrator:
             prefill_only,
             float(getattr(self, "_pd_prefill_snapshot_bytes", 0)) / float(1 << 20),
         )
+
+    @staticmethod
+    def _materialize_pd_snapshot_layer(chunks: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        """Materialize a contiguous snapshot directly into shared storage."""
+        if len(chunks) == 1:
+            return chunks[0]
+        first = chunks[0]
+        shape = (sum(int(chunk.shape[0]) for chunk in chunks), *first.shape[1:])
+        output = torch.empty(shape, dtype=first.dtype, device=first.device)
+        if output.device.type == "cpu":
+            output.share_memory_()
+        torch.cat(chunks, dim=0, out=output)
+        return output
 
     @staticmethod
     def _accumulate_pd_prefill_output(

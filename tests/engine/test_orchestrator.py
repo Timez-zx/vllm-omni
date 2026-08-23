@@ -314,6 +314,8 @@ def test_pd_prefill_snapshot_uses_exact_lineage_parent_for_delta() -> None:
     final_layers = final_state.pd_prefill_multimodal_output["hidden_states"]["layers"]
     assert final_layers[0].flatten().tolist() == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
     assert final_layers[24].flatten().tolist() == [21.0, 22.0, 23.0, 24.0, 25.0, 26.0]
+    assert final_layers[0].is_shared()
+    assert final_layers[24].is_shared()
 
 
 def test_pd_mrope_metadata_rebuilds_without_media_tensors() -> None:

@@ -684,6 +684,7 @@ class StageRuntime:
                 client_addresses=self._client_addresses_from_zmq(resources.addresses),
                 engine_manager=resources.manager,
                 coordinator=resources.coordinator,
+                input_tensor_queue=resources.input_tensor_queue,
                 output_tensor_queue=resources.output_tensor_queue,
             )
 
