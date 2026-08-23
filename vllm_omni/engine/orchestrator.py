@@ -12,7 +12,9 @@ handled by :class:`MembershipController`, which is injected optionally.
 from __future__ import annotations
 
 import asyncio
+import os
 import time as _time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -64,6 +66,19 @@ from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+_LOG_HANDOFF_DIAG = os.environ.get("VLLM_OMNI_LOG_HANDOFF_DIAG", "0") not in ("0", "", "false", "False")
+_DIAG_STAGE = os.environ.get("VLLM_OMNI_DIAG_STAGE")
+
+
+def _pd_snapshot_cache_bytes() -> int:
+    raw = os.environ.get("VLLM_OMNI_PD_SNAPSHOT_CACHE_BYTES", str(8 << 30))
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning("Invalid VLLM_OMNI_PD_SNAPSHOT_CACHE_BYTES=%r; using 8 GiB", raw)
+        return 8 << 30
+
 
 if TYPE_CHECKING:
     from vllm_omni.experimental.fullduplex.engine.contracts import (
@@ -175,6 +190,14 @@ def build_engine_core_request_from_tokens(
 
 
 @dataclass
+class _PDPrefillSnapshot:
+    revision: int
+    prompt_token_ids: tuple[int, ...]
+    output: dict[str, Any]
+    nbytes: int
+
+
+@dataclass
 class OrchestratorRequestState:
     """Per-request bookkeeping inside the Orchestrator."""
 
@@ -194,6 +217,11 @@ class OrchestratorRequestState:
     mm_features: list | None = None
     pd_mrope_feature_metadata: list[dict[str, Any]] = field(default_factory=list)
     pd_prefill_multimodal_output: dict[str, Any] | None = None
+    pd_prefill_parent_snapshot: _PDPrefillSnapshot | None = None
+    pd_prefill_lineage_id: str | None = None
+    pd_prefill_revision: int = 0
+    pd_prefill_max_parent_rows: int = 0
+    pd_prefill_prompt_token_ids: tuple[int, ...] = ()
 
     streaming: StreamingInputState = field(default_factory=lambda: StreamingInputState())
 
@@ -392,6 +420,9 @@ class Orchestrator:
         self._pd_bootstrap_addr: str | None = None
         self._pd_prefill_engine_id: str | None = None
         self._pd_kv_params: dict[str, Any] = {}
+        self._pd_prefill_snapshots: OrderedDict[str, _PDPrefillSnapshot] = OrderedDict()
+        self._pd_prefill_snapshot_bytes = 0
+        self._pd_prefill_snapshot_limit_bytes = _pd_snapshot_cache_bytes()
         # Arrival-prefill requests may populate vLLM's sender-side media
         # cache, leaving the final request with hash-only feature references.
         # Retain only the tiny values needed to reconstruct M-RoPE on D.
@@ -691,6 +722,7 @@ class Orchestrator:
         )
         if self._pd_pair is not None:
             req_state.pd_mrope_feature_metadata = self._capture_pd_mrope_metadata(req_state.mm_features)
+            self._prepare_pd_prefill_snapshot_request(prompt, req_state)
         self.request_states[request_id] = req_state
         self._register_running_request(req_state)
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
@@ -935,6 +967,25 @@ class Orchestrator:
                             raw_outputs = await pool.poll_llm_raw_output(replica_id, timeout_s=0.001)
                             if raw_outputs is None:
                                 continue
+
+                            if _LOG_HANDOFF_DIAG and (_DIAG_STAGE is None or str(stage_id) == _DIAG_STAGE):
+                                recv_wall = _time.time()
+                                for diagnostic_output in raw_outputs.outputs:
+                                    diagnostic_req_id = getattr(diagnostic_output, "request_id", None)
+                                    diagnostic_state = self.request_states.get(diagnostic_req_id)
+                                    submit_wall = (
+                                        diagnostic_state.stage_submit_ts.get(stage_id)
+                                        if diagnostic_state is not None
+                                        else None
+                                    )
+                                    logger.info(
+                                        "[HANDOFF-DIAG] event=orchestrator-raw-recv stage=%s wall=%.6f "
+                                        "req=%s since_submit_ms=%.3f",
+                                        stage_id,
+                                        recv_wall,
+                                        diagnostic_req_id,
+                                        (recv_wall - submit_wall) * 1000.0 if submit_wall is not None else -1.0,
+                                    )
 
                             await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
                             for eco in raw_outputs.outputs:
@@ -1353,6 +1404,7 @@ class Orchestrator:
                         None,
                         processed_mm,
                     )
+            self._materialize_pd_prefill_snapshot(req_state)
 
             # A cache-population request must stop at P.  In a non-split
             # pipeline the Thinker itself is the text output stage; after a
@@ -1708,6 +1760,205 @@ class Orchestrator:
                 )
             )
         return features
+
+    @staticmethod
+    def _pd_snapshot_nbytes(output: dict[str, Any]) -> int:
+        total = 0
+        stack: list[Any] = [output]
+        seen: set[int] = set()
+        while stack:
+            value = stack.pop()
+            if isinstance(value, torch.Tensor):
+                identity = id(value)
+                if identity not in seen:
+                    seen.add(identity)
+                    total += int(value.nbytes)
+            elif isinstance(value, dict):
+                stack.extend(value.values())
+            elif isinstance(value, (list, tuple)):
+                stack.extend(value)
+        return total
+
+    def _prepare_pd_prefill_snapshot_request(
+        self,
+        stage0_request: Any,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        """Select full or delta P output before submitting a finite request."""
+        lineage_id = getattr(stage0_request, "kv_lineage_id", None)
+        parent_revision = int(getattr(stage0_request, "kv_lineage_parent_revision", 0))
+        revision = int(getattr(stage0_request, "kv_lineage_revision", 0))
+        prefix_tokens = max(0, int(getattr(stage0_request, "kv_lineage_prefix_tokens", 0)))
+        prompt_ids = tuple(int(token) for token in (getattr(stage0_request, "prompt_token_ids", None) or ()))
+
+        req_state.pd_prefill_lineage_id = lineage_id if isinstance(lineage_id, str) else None
+        req_state.pd_prefill_revision = revision
+        req_state.pd_prefill_prompt_token_ids = prompt_ids
+
+        parent = self._pd_prefill_snapshots.get(lineage_id) if isinstance(lineage_id, str) else None
+        usable_parent_rows = 0
+        if parent is not None and parent.revision == parent_revision and prefix_tokens > 0:
+            usable_parent_rows = min(prefix_tokens, len(parent.prompt_token_ids))
+            if parent.prompt_token_ids[:usable_parent_rows] != prompt_ids[:usable_parent_rows]:
+                usable_parent_rows = 0
+
+        if usable_parent_rows > 0 and parent is not None:
+            req_state.pd_prefill_parent_snapshot = parent
+            req_state.pd_prefill_max_parent_rows = usable_parent_rows
+            self._pd_prefill_snapshots.move_to_end(lineage_id)
+            snapshot_mode = "delta"
+        else:
+            snapshot_mode = "full"
+
+        buffer = getattr(stage0_request, "model_intermediate_buffer", None)
+        buffer = dict(buffer) if isinstance(buffer, dict) else {}
+        meta = buffer.get("meta")
+        meta = dict(meta) if isinstance(meta, dict) else {}
+        meta["pd_prefill_snapshot_mode"] = snapshot_mode
+        meta["pd_prefill_snapshot_parent_rows"] = usable_parent_rows
+        buffer["meta"] = meta
+        stage0_request.model_intermediate_buffer = buffer
+        logger.info(
+            "[Orchestrator][PD snapshot] req=%s mode=%s prompt_rows=%d reusable_parent_rows=%d",
+            req_state.request_id,
+            snapshot_mode,
+            len(prompt_ids),
+            usable_parent_rows,
+        )
+
+    def _cache_pd_prefill_snapshot(
+        self,
+        req_state: OrchestratorRequestState,
+        output: dict[str, Any],
+    ) -> None:
+        lineage_id = req_state.pd_prefill_lineage_id
+        prompt_ids = req_state.pd_prefill_prompt_token_ids
+        limit_bytes = int(getattr(self, "_pd_prefill_snapshot_limit_bytes", 0))
+        if not lineage_id or not prompt_ids or limit_bytes <= 0:
+            return
+
+        nbytes = self._pd_snapshot_nbytes(output)
+        if nbytes <= 0 or nbytes > limit_bytes:
+            return
+        if not hasattr(self, "_pd_prefill_snapshots"):
+            self._pd_prefill_snapshots = OrderedDict()
+            self._pd_prefill_snapshot_bytes = 0
+        previous = self._pd_prefill_snapshots.pop(lineage_id, None)
+        if previous is not None:
+            self._pd_prefill_snapshot_bytes -= previous.nbytes
+        self._pd_prefill_snapshots[lineage_id] = _PDPrefillSnapshot(
+            revision=req_state.pd_prefill_revision,
+            prompt_token_ids=prompt_ids,
+            output=output,
+            nbytes=nbytes,
+        )
+        self._pd_prefill_snapshot_bytes += nbytes
+
+        while self._pd_prefill_snapshots and self._pd_prefill_snapshot_bytes > limit_bytes:
+            _, evicted = self._pd_prefill_snapshots.popitem(last=False)
+            self._pd_prefill_snapshot_bytes -= evicted.nbytes
+
+    @staticmethod
+    def _pd_snapshot_layer_chunks(output: dict[str, Any], layer: int) -> tuple[torch.Tensor, ...]:
+        hidden = output.get("hidden_states")
+        layers = hidden.get("layers") if isinstance(hidden, dict) else None
+        value = layers.get(layer, layers.get(str(layer))) if isinstance(layers, dict) else None
+        if isinstance(value, torch.Tensor):
+            return (value,)
+        if isinstance(value, (list, tuple)) and all(isinstance(chunk, torch.Tensor) for chunk in value):
+            return tuple(value)
+        return ()
+
+    @staticmethod
+    def _slice_pd_snapshot_chunks(chunks: tuple[torch.Tensor, ...], rows: int) -> tuple[torch.Tensor, ...]:
+        remaining = rows
+        selected: list[torch.Tensor] = []
+        for chunk in chunks:
+            if remaining <= 0:
+                break
+            take = min(remaining, int(chunk.shape[0]))
+            if take > 0:
+                selected.append(chunk[:take])
+                remaining -= take
+        if remaining > 0:
+            return ()
+        return tuple(selected)
+
+    def _materialize_pd_prefill_snapshot(self, req_state: OrchestratorRequestState) -> None:
+        """Merge a P cache-hit tail with its pinned lineage snapshot."""
+        current = req_state.pd_prefill_multimodal_output
+        if not isinstance(current, dict):
+            return
+        hidden = current.get("hidden_states")
+        layers = hidden.get("layers") if isinstance(hidden, dict) else None
+        if not isinstance(layers, dict):
+            return
+
+        layer_0 = layers.get(0, layers.get("0"))
+        layer_24 = layers.get(24, layers.get("24"))
+        if not isinstance(layer_0, torch.Tensor) or not isinstance(layer_24, torch.Tensor):
+            return
+        prompt_rows = len(req_state.pd_prefill_prompt_token_ids)
+        current_rows = min(int(layer_0.shape[0]), int(layer_24.shape[0]))
+        if current_rows > prompt_rows:
+            raise RuntimeError(
+                f"[Orchestrator][PD] P snapshot has {current_rows} rows for a {prompt_rows}-token prompt"
+            )
+
+        if current_rows < prompt_rows:
+            prefix_rows = prompt_rows - current_rows
+            parent = req_state.pd_prefill_parent_snapshot
+            if parent is None or prefix_rows > req_state.pd_prefill_max_parent_rows:
+                raise RuntimeError(
+                    "[Orchestrator][PD] delta P snapshot lacks an exact parent: "
+                    f"req={req_state.request_id} prefix_rows={prefix_rows} "
+                    f"available={req_state.pd_prefill_max_parent_rows}"
+                )
+            parent_0_chunks = self._slice_pd_snapshot_chunks(
+                self._pd_snapshot_layer_chunks(parent.output, 0),
+                prefix_rows,
+            )
+            parent_24_chunks = self._slice_pd_snapshot_chunks(
+                self._pd_snapshot_layer_chunks(parent.output, 24),
+                prefix_rows,
+            )
+            if not parent_0_chunks or not parent_24_chunks:
+                raise RuntimeError(f"[Orchestrator][PD] parent P snapshot is incomplete for req={req_state.request_id}")
+            layer_0_chunks = (*parent_0_chunks, layer_0[:current_rows])
+            layer_24_chunks = (*parent_24_chunks, layer_24[:current_rows])
+        else:
+            prefix_rows = 0
+            layer_0_chunks = (layer_0[:current_rows],)
+            layer_24_chunks = (layer_24[:current_rows],)
+
+        embeds = current.get("embed")
+        if not isinstance(embeds, dict) and req_state.pd_prefill_parent_snapshot is not None:
+            embeds = req_state.pd_prefill_parent_snapshot.output.get("embed")
+        cached_output: dict[str, Any] = {
+            "hidden_states": {"layers": {0: layer_0_chunks, 24: layer_24_chunks}},
+        }
+        if isinstance(embeds, dict):
+            cached_output["embed"] = embeds
+        self._cache_pd_prefill_snapshot(req_state, cached_output)
+
+        prefill_only = isinstance(req_state.prompt, dict) and req_state.prompt.get("prefill_only") is True
+        if not prefill_only:
+            full_layer_0 = layer_0_chunks[0] if len(layer_0_chunks) == 1 else torch.cat(layer_0_chunks, dim=0)
+            full_layer_24 = layer_24_chunks[0] if len(layer_24_chunks) == 1 else torch.cat(layer_24_chunks, dim=0)
+            materialized: dict[str, Any] = {
+                "hidden_states": {"layers": {0: full_layer_0, 24: full_layer_24}},
+            }
+            if isinstance(embeds, dict):
+                materialized["embed"] = embeds
+            req_state.pd_prefill_multimodal_output = materialized
+        logger.info(
+            "[Orchestrator][PD snapshot] req=%s assembled prefix_rows=%d delta_rows=%d deferred=%s cache_mib=%.1f",
+            req_state.request_id,
+            prefix_rows,
+            current_rows,
+            prefill_only,
+            float(getattr(self, "_pd_prefill_snapshot_bytes", 0)) / float(1 << 20),
+        )
 
     @staticmethod
     def _accumulate_pd_prefill_output(

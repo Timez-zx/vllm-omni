@@ -47,6 +47,8 @@ logger = init_logger(__name__)
 # Per-audio-chunk emit logging, see
 # record_output_timestamps. Read once at import; the launcher exports it.
 _LOG_AUDIO_CHUNKS = _os.environ.get("VLLM_OMNI_LOG_AUDIO_CHUNKS", "0") not in ("0", "", "false", "False")
+_LOG_INGRESS_DIAG = _os.environ.get("VLLM_OMNI_LOG_HANDOFF_DIAG", "0") not in ("0", "", "false", "False")
+_DIAG_STAGE = _os.environ.get("VLLM_OMNI_DIAG_STAGE")
 
 
 @dataclass
@@ -964,6 +966,8 @@ class StagePool:
         params_override: Any = None,
     ) -> int:
         """Submit a stage-entry request into this pool."""
+        ingress_diag = _LOG_INGRESS_DIAG and (_DIAG_STAGE is None or str(self.stage_id) == _DIAG_STAGE)
+        ingress_start = _time.monotonic() if ingress_diag else 0.0
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
         # Direct engine callers may provide plain vLLM SamplingParams.
         if self.stage_type == "diffusion":
@@ -987,6 +991,7 @@ class StagePool:
             request_id,
             affinity_request_id=affinity_request_id,
         )
+        ingress_selected = _time.monotonic() if ingress_diag else 0.0
         client = self.clients[replica_id]
         if client is None:
             raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
@@ -1001,6 +1006,7 @@ class StagePool:
         except Exception:
             self.release_binding(request_id)
             raise
+        ingress_registered = _time.monotonic() if ingress_diag else 0.0
 
         try:
             await self._llm_client(replica_id).add_request_async(request, **submit_kwargs)
@@ -1018,6 +1024,20 @@ class StagePool:
                         rollback_error,
                     )
             raise
+        if ingress_diag:
+            ingress_sent = _time.monotonic()
+            logger.info(
+                "[INGRESS-DIAG] stage=%s wall=%.6f req=%s replica=%s "
+                "select_ms=%.3f register_ms=%.3f send_ms=%.3f total_ms=%.3f",
+                self.stage_id,
+                _time.time(),
+                request_id,
+                replica_id,
+                (ingress_selected - ingress_start) * 1000.0,
+                (ingress_registered - ingress_selected) * 1000.0,
+                (ingress_sent - ingress_registered) * 1000.0,
+                (ingress_sent - ingress_start) * 1000.0,
+            )
         return replica_id
 
     async def submit_update(

@@ -18,6 +18,8 @@ from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
+from vllm.v1.serial_utils import MsgpackDecoder
 
 from vllm_omni.distributed.omni_connectors.utils.config import (
     TRANSFER_ENGINE_CONNECTOR_NAMES,
@@ -87,6 +89,7 @@ class StageEngineCoreClientBase(StageClientBase):
         coordinator: Any = None,
         client_count: int = 1,
         client_index: int = 0,
+        output_tensor_queue: Any | None = None,
     ) -> StageEngineCoreClient | DPLBStageEngineCoreClient:
         """Create the appropriate stage async client for the DP mode."""
         parallel_config = vllm_config.parallel_config
@@ -100,6 +103,7 @@ class StageEngineCoreClientBase(StageClientBase):
             coordinator=coordinator,
             client_count=client_count,
             client_index=client_index,
+            output_tensor_queue=output_tensor_queue,
         )
 
         if parallel_config.data_parallel_size > 1 and not parallel_config.data_parallel_external_lb:
@@ -119,6 +123,7 @@ class StageEngineCoreClientBase(StageClientBase):
         metadata: StageMetadata | None = None,
         engine_manager: Any = None,
         coordinator: Any = None,
+        output_tensor_queue: Any | None = None,
     ):
         """Create an async EngineCore client for a single stage.
 
@@ -184,6 +189,21 @@ class StageEngineCoreClientBase(StageClientBase):
                 client_count=client_count,
                 client_index=client_index,
             )
+            if output_tensor_queue is not None:
+                # AsyncMPClient starts its output task lazily, so replacing the
+                # decoder here is race-free. Tensor handles in the ZMQ frame
+                # are resolved through the reverse torch-shm queue.
+                self._output_tensor_ipc_receiver = TensorIpcReceiver(output_tensor_queue)
+                self.decoder = MsgpackDecoder(
+                    OmniEngineCoreOutputs,
+                    oob_tensor_provider=self._output_tensor_ipc_receiver,
+                )
+                logger.info(
+                    "[%s] stage-%s [rep-%s] reverse tensor IPC enabled",
+                    client_name,
+                    self.stage_id,
+                    self.replica_id,
+                )
             if engine_manager is not None:
                 self.resources.engine_manager = engine_manager
                 self.start_engine_core_monitor()

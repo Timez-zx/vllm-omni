@@ -58,6 +58,9 @@ def check(result_dir: Path) -> int:
     if summary.get("audio_ready_threshold_ms") != 500.0:
         print(f"   !! audio-ready threshold is not the canonical 500 ms: {summary.get('audio_ready_threshold_ms')}")
         bad += 1
+    if summary.get("stagger_s") != [0.0, 8.0]:
+        print(f"   !! user-start stagger is not the canonical 0-8 s: {summary.get('stagger_s')}")
+        bad += 1
 
     for flag, (pattern, label) in TRACES.items():
         value = DEFAULTS.get(flag, "0")

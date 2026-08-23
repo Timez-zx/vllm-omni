@@ -10,23 +10,27 @@ from __future__ import annotations
 import contextlib
 import os
 import signal
+import threading
+import time
+from collections import deque
+from contextlib import ExitStack
 from typing import Any
 
+import msgspec
 import vllm.v1.engine.core as _vllm_engine_core_module
+import zmq
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value,
 )
-from vllm.utils.system_utils import (
-    decorate_logs,
-    set_process_title,
-)
-from vllm.v1.engine import EngineCoreRequestType
+from vllm.utils.network_utils import make_zmq_socket
+from vllm.utils.system_utils import decorate_logs, set_process_title
+from vllm.v1.engine import EngineCoreReadyResponse, EngineCoreRequestType
 from vllm.v1.engine.core import EngineCoreProc, EngineShutdownState
-from vllm.v1.engine.utils import (
-    EngineZmqAddresses,
-    SignalCallback,
-)
+from vllm.v1.engine.tensor_ipc import TensorIpcSender
+from vllm.v1.engine.utils import EngineZmqAddresses, SignalCallback
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+from vllm.version import __version__ as VLLM_VERSION
 
 from vllm_omni.distributed.omni_coordinator import create_stage_coord_client
 from vllm_omni.engine import OmniEngineCoreRequest
@@ -41,6 +45,8 @@ logger = init_logger(__name__)
 
 
 _SIGNAL_EXIT_BASE = 128
+_LOG_INGRESS_DIAG = os.environ.get("VLLM_OMNI_LOG_HANDOFF_DIAG", "0") not in ("0", "", "false", "False")
+_DIAG_STAGE = os.environ.get("VLLM_OMNI_DIAG_STAGE")
 
 
 def _signal_exit_code(signum: int) -> int:
@@ -56,11 +62,194 @@ class StageEngineCoreProc(EngineCoreProc):
     ``EngineCoreProc.run_engine_core()``.
     """
 
+    def __init__(self, *args: Any, output_tensor_queue: Any | None = None, **kwargs: Any) -> None:
+        # vLLM's stock EngineCore output path sends tensor backing buffers as
+        # ZMQ multipart frames. P/D prefilling can return hundreds of MiB of
+        # Talker-conditioning hidden states in one output; msgpack walking
+        # those buffers monopolizes the output thread/GIL and delays the input
+        # thread from admitting unrelated requests. Local stage processes get
+        # a reverse torch-shm queue so ZMQ carries only small tensor handles.
+        self._output_tensor_ipc_sender = (
+            TensorIpcSender(output_tensor_queue) if output_tensor_queue is not None else None
+        )
+        super().__init__(*args, **kwargs)
+
+    def process_output_sockets(
+        self,
+        output_paths: list[str],
+        coord_output_path: str | None,
+        engine_index: int,
+    ) -> None:
+        """Send outputs with out-of-band local tensor IPC when available."""
+        encoder = MsgpackEncoder(oob_tensor_consumer=self._output_tensor_ipc_sender)
+        reuse_buffers: list[bytearray] = []
+        pending = deque()
+
+        with ExitStack() as stack, zmq.Context() as ctx:
+            sockets = [
+                stack.enter_context(make_zmq_socket(ctx, output_path, zmq.PUSH, linger=4000))
+                for output_path in output_paths
+            ]
+            coord_socket = (
+                stack.enter_context(make_zmq_socket(ctx, coord_output_path, zmq.PUSH, bind=False, linger=4000))
+                if coord_output_path is not None
+                else None
+            )
+            max_reuse_bufs = len(sockets) + 1
+
+            while True:
+                output = self.output_queue.get()
+                if output == EngineCoreProc.ENGINE_CORE_DEAD:
+                    for socket in sockets:
+                        socket.send(output)
+                    break
+                assert not isinstance(output, bytes)
+                client_index, outputs = output
+                outputs.engine_index = engine_index
+
+                if client_index == -1:
+                    assert coord_socket is not None
+                    coord_socket.send_multipart(encoder.encode(outputs))
+                    continue
+
+                while pending and pending[-1][0].done:
+                    reuse_buffers.append(pending.pop()[2])
+
+                buffer = reuse_buffers.pop() if reuse_buffers else bytearray()
+                buffers = encoder.encode_into(outputs, buffer)
+                tracker = sockets[client_index].send_multipart(buffers, copy=False, track=True)
+                if not tracker.done:
+                    ref = outputs if len(buffers) > 1 else None
+                    pending.appendleft((tracker, ref, buffer))
+                elif len(reuse_buffers) < max_reuse_bufs:
+                    reuse_buffers.append(buffer)
+
+    def process_input_sockets(
+        self,
+        input_addresses: list[str],
+        coord_input_address: str | None,
+        identity: bytes,
+        ready_event: threading.Event,
+    ) -> None:
+        """Receive requests and split socket receive from request decoding.
+
+        This mirrors vLLM's input thread. The only behavioral difference is
+        optional timing around ``recv_multipart`` and ``MsgpackDecoder`` so a
+        pre-scheduler ingress tail is not incorrectly attributed to GPU queue
+        time. The diagnostic path only walks frame descriptors; it does not
+        copy tensor payloads.
+        """
+        add_request_decoder = MsgpackDecoder(
+            OmniEngineCoreRequest,
+            oob_tensor_provider=self.tensor_ipc_receiver,
+        )
+        generic_decoder = MsgpackDecoder(oob_tensor_provider=self.tensor_ipc_receiver)
+
+        with ExitStack() as stack, zmq.Context() as ctx:
+            input_sockets = [
+                stack.enter_context(
+                    make_zmq_socket(
+                        ctx,
+                        input_address,
+                        zmq.DEALER,
+                        identity=identity,
+                        bind=False,
+                    )
+                )
+                for input_address in input_addresses
+            ]
+            coord_socket = (
+                stack.enter_context(
+                    make_zmq_socket(
+                        ctx,
+                        coord_input_address,
+                        zmq.XSUB,
+                        identity=identity,
+                        bind=False,
+                    )
+                )
+                if coord_input_address is not None
+                else None
+            )
+            if coord_socket is not None:
+                coord_socket.send(b"\x01")
+
+            poller = zmq.Poller()
+            ready_response = EngineCoreReadyResponse(
+                max_model_len=self.vllm_config.model_config.max_model_len,
+                num_gpu_blocks=self.vllm_config.cache_config.num_gpu_blocks or 0,
+                block_size=self.vllm_config.cache_config.block_size,
+                dp_stats_address=self.frontend_stats_publish_address,
+                dtype=str(self.vllm_config.model_config.dtype).removeprefix("torch."),
+                vllm_version=VLLM_VERSION,
+                world_size=self.vllm_config.parallel_config.world_size,
+                data_parallel_size=self.vllm_config.parallel_config.data_parallel_size,
+                kv_cache_size_tokens=self.vllm_config.cache_config.kv_cache_size_tokens,
+                kv_cache_max_concurrency=self.vllm_config.cache_config.kv_cache_max_concurrency,
+            )
+            ready_payload = msgspec.msgpack.encode(ready_response)
+            for input_socket in input_sockets:
+                input_socket.send(ready_payload)
+                poller.register(input_socket, zmq.POLLIN)
+
+            if coord_socket is not None:
+                assert coord_socket.recv() == b"READY"
+                poller.register(coord_socket, zmq.POLLIN)
+
+            ready_event.set()
+            del ready_event
+            while True:
+                for input_socket, _ in poller.poll():
+                    recv_start = time.monotonic()
+                    type_frame, *data_frames = input_socket.recv_multipart(copy=False)
+                    recv_done = time.monotonic()
+                    if type_frame.buffer == b"READY":
+                        assert input_socket == coord_socket
+                        continue
+                    request_type = EngineCoreRequestType(bytes(type_frame.buffer))
+
+                    if request_type == EngineCoreRequestType.ADD:
+                        req = add_request_decoder.decode(data_frames)
+                        decode_done = time.monotonic()
+                        stage_id = getattr(self.vllm_config.model_config, "stage_id", "?")
+                        if _LOG_INGRESS_DIAG and (_DIAG_STAGE is None or str(stage_id) == _DIAG_STAGE):
+                            wire_bytes = sum(frame.buffer.nbytes for frame in data_frames)
+                            logger.info(
+                                "[INGRESS-DIAG] event=core-receive-decode stage=%s wall=%.6f req=%s "
+                                "recv_ms=%.3f decode_ms=%.3f frames=%d wire_mib=%.3f",
+                                stage_id,
+                                time.time(),
+                                req.request_id,
+                                (recv_done - recv_start) * 1000.0,
+                                (decode_done - recv_done) * 1000.0,
+                                len(data_frames),
+                                wire_bytes / float(1 << 20),
+                            )
+                        try:
+                            request = self.preprocess_add_request(req)
+                        except Exception:
+                            self._handle_request_preproc_error(req)
+                            continue
+                    else:
+                        request = generic_decoder.decode(data_frames)
+                        if request_type == EngineCoreRequestType.ABORT:
+                            self.aborts_queue.put_nowait(request)
+
+                    self.input_queue.put_nowait((request_type, request))
+
     def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
         """Preserve omni payloads when vLLM builds its scheduler request."""
+        stage_id = getattr(
+            getattr(getattr(self, "vllm_config", None), "model_config", None),
+            "stage_id",
+            "?",
+        )
+        ingress_diag = _LOG_INGRESS_DIAG and (_DIAG_STAGE is None or str(stage_id) == _DIAG_STAGE)
+        ingress_start = time.monotonic() if ingress_diag else 0.0
         prepare_lineage = getattr(self.scheduler, "prepare_kv_lineage_request", None)
         if prepare_lineage is not None:
             prepare_lineage(request)
+        lineage_done = time.monotonic() if ingress_diag else 0.0
         # D already receives the complete prompt KV from P. Its lightweight
         # mm_features exist only so Qwen can reconstruct M-RoPE positions.
         # Bypass upstream's D-local media-cache lookup, then restore the
@@ -80,6 +269,19 @@ class StageEngineCoreProc(EngineCoreProc):
         scheduler_request.model_intermediate_buffer = getattr(request, "model_intermediate_buffer", None)
         scheduler_request.pd_prefill_payload = getattr(request, "pd_prefill_payload", None)
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
+        if ingress_diag:
+            ingress_done = time.monotonic()
+            logger.info(
+                "[INGRESS-DIAG] event=core-preprocess stage=%s wall=%.6f req=%s "
+                "prompt=%d lineage_ms=%.3f request_build_ms=%.3f total_ms=%.3f",
+                stage_id,
+                time.time(),
+                request.request_id,
+                len(request.prompt_token_ids),
+                (lineage_done - ingress_start) * 1000.0,
+                (ingress_done - lineage_done) * 1000.0,
+                (ingress_done - ingress_start) * 1000.0,
+            )
         return scheduler_request, current_wave
 
     def run_stage_core(
@@ -238,7 +440,8 @@ class StageEngineCoreProc(EngineCoreProc):
                     maybe_apply_audex_cfg_patches(sib.get("vllm_config"))
                     logger.info(
                         "[colocate] building sibling stage %s core inside stage %s process",
-                        sib_stage_id, omni_stage_id,
+                        sib_stage_id,
+                        omni_stage_id,
                     )
                     # Each sibling lives on its OWN CUDA stream so its kernels
                     # can overlap the others' instead of queueing behind them
@@ -255,7 +458,8 @@ class StageEngineCoreProc(EngineCoreProc):
                     sibling_cores.append((sib_stage_id, sib_core, sib_stream))
                     logger.info(
                         "[colocate] sibling stage %s core built (replica %s)",
-                        sib_stage_id, sib_replica_id,
+                        sib_stage_id,
+                        sib_replica_id,
                     )
 
                 # PHASE 2 -- start every guest's busy loop thread.
@@ -272,9 +476,7 @@ class StageEngineCoreProc(EngineCoreProc):
                                 loop_stage_id,
                             )
                         except SystemExit:
-                            logger.warning(
-                                "[colocate] sibling stage %s busy loop exited via SystemExit", loop_stage_id
-                            )
+                            logger.warning("[colocate] sibling stage %s busy loop exited via SystemExit", loop_stage_id)
                         except Exception:
                             logger.exception(
                                 "[colocate] sibling stage %s busy loop DIED; notifying its client",

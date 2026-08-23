@@ -807,6 +807,49 @@ def test_build_omni_output_falls_back_to_mm_cpu_without_prefix_merge(monkeypatch
     assert output.multimodal_outputs is None
 
 
+def test_pd_prefill_delta_mode_skips_full_prefix_multimodal_merge() -> None:
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = SimpleNamespace(supports_delta_prefix_multimodal_outputs=True)
+    runner.input_batch = SimpleNamespace(
+        req_ids=["r1", "r2"],
+        req_id_to_index={"r1": 0, "r2": 1},
+        num_computed_tokens_cpu=torch.tensor([256, 256]),
+    )
+    runner.model_intermediate_buffer = {
+        "r1": {"meta": {"pd_prefill_snapshot_mode": "delta", "pd_prefill_snapshot_parent_rows": 512}},
+        "r2": {"meta": {"pd_prefill_snapshot_mode": "delta", "pd_prefill_snapshot_parent_rows": 512}},
+    }
+
+    assert runner._batch_needs_full_prefix_multimodal_outputs() is False
+    runner.input_batch.num_computed_tokens_cpu[1] = 528
+    assert runner._batch_needs_full_prefix_multimodal_outputs() is True
+
+
+def test_pd_prefill_longer_global_hit_returns_only_gap_after_parent() -> None:
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = SimpleNamespace(supports_delta_prefix_multimodal_outputs=True)
+    runner.model_intermediate_buffer = {
+        "r1": {"meta": {"pd_prefill_snapshot_mode": "delta", "pd_prefill_snapshot_parent_rows": 4}},
+    }
+    layer_0 = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    layer_24 = layer_0 + 100
+    tts = torch.ones((1, 4))
+
+    payload = runner._build_combined_prefix_cache_mm_payload(
+        {
+            "hidden_states.layer_0": {"r1": layer_0},
+            "hidden_states.layer_24": {"r1": layer_24},
+            "embed.tts_bos": {"r1": tts},
+        },
+        rid="r1",
+        idx=0,
+    )
+
+    torch.testing.assert_close(payload["hidden_states.layer_0"], layer_0[4:])
+    torch.testing.assert_close(payload["hidden_states.layer_24"], layer_24[4:])
+    assert payload["embed.tts_bos"] is tts
+
+
 # --- builder gap-fill: contract corners not covered by the tests above ---
 def test_build_omni_output_never_leaks_internal_pooler_output_on_wire(monkeypatch):
     """The internal pooler_output feeds full-payload accumulation only; the wire

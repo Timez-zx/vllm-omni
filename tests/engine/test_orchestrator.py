@@ -6,6 +6,7 @@ import logging
 import queue
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -231,6 +232,88 @@ def test_pd_prefill_snapshot_accumulates_flat_wire_chunks() -> None:
     assert accumulated["hidden_states"]["layers"][24].shape == (3, 3)
     assert accumulated["hidden_states"]["layers"][0][-1].tolist() == [2.0, 2.0, 2.0]
     assert accumulated["embed"]["tts_bos"].shape == (1, 3)
+
+
+def test_pd_prefill_snapshot_uses_exact_lineage_parent_for_delta() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._pd_prefill_snapshots = OrderedDict()
+    orchestrator._pd_prefill_snapshot_bytes = 0
+    orchestrator._pd_prefill_snapshot_limit_bytes = 1 << 20
+
+    parent_state = OrchestratorRequestState(
+        request_id="parent",
+        pd_prefill_lineage_id="session-1",
+        pd_prefill_revision=1,
+        pd_prefill_prompt_token_ids=(1, 2, 3),
+        pd_prefill_multimodal_output={
+            "hidden_states": {
+                "layers": {
+                    0: torch.tensor([[1.0], [2.0], [3.0]]),
+                    24: torch.tensor([[21.0], [22.0], [23.0]]),
+                }
+            }
+        },
+    )
+    orchestrator._materialize_pd_prefill_snapshot(parent_state)
+
+    request = SimpleNamespace(
+        request_id="child",
+        prompt_token_ids=[1, 2, 3, 4, 5],
+        kv_lineage_id="session-1",
+        kv_lineage_parent_revision=1,
+        kv_lineage_revision=2,
+        kv_lineage_prefix_tokens=3,
+        model_intermediate_buffer=None,
+    )
+    child_state = OrchestratorRequestState(
+        request_id="child",
+        prompt={"prefill_only": True},
+        pd_prefill_multimodal_output={
+            "hidden_states": {
+                "layers": {
+                    0: torch.tensor([[4.0], [5.0]]),
+                    24: torch.tensor([[24.0], [25.0]]),
+                }
+            }
+        },
+    )
+    orchestrator._prepare_pd_prefill_snapshot_request(request, child_state)
+
+    assert request.model_intermediate_buffer["meta"]["pd_prefill_snapshot_mode"] == "delta"
+    orchestrator._materialize_pd_prefill_snapshot(child_state)
+    # Arrival prefill keeps only the received tail in the request state and
+    # records a zero-copy chunk chain for its next finite request.
+    layers = child_state.pd_prefill_multimodal_output["hidden_states"]["layers"]
+    assert layers[0].flatten().tolist() == [4.0, 5.0]
+    cached_layers = orchestrator._pd_prefill_snapshots["session-1"].output["hidden_states"]["layers"]
+    assert [chunk.flatten().tolist() for chunk in cached_layers[0]] == [[1.0, 2.0, 3.0], [4.0, 5.0]]
+    assert orchestrator._pd_prefill_snapshots["session-1"].revision == 2
+
+    final_request = SimpleNamespace(
+        request_id="final",
+        prompt_token_ids=[1, 2, 3, 4, 5, 6],
+        kv_lineage_id="session-1",
+        kv_lineage_parent_revision=2,
+        kv_lineage_revision=3,
+        kv_lineage_prefix_tokens=5,
+        model_intermediate_buffer=None,
+    )
+    final_state = OrchestratorRequestState(
+        request_id="final",
+        pd_prefill_multimodal_output={
+            "hidden_states": {
+                "layers": {
+                    0: torch.tensor([[6.0]]),
+                    24: torch.tensor([[26.0]]),
+                }
+            }
+        },
+    )
+    orchestrator._prepare_pd_prefill_snapshot_request(final_request, final_state)
+    orchestrator._materialize_pd_prefill_snapshot(final_state)
+    final_layers = final_state.pd_prefill_multimodal_output["hidden_states"]["layers"]
+    assert final_layers[0].flatten().tolist() == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    assert final_layers[24].flatten().tolist() == [21.0, 22.0, 23.0, 24.0, 25.0, 26.0]
 
 
 def test_pd_mrope_metadata_rebuilds_without_media_tensors() -> None:

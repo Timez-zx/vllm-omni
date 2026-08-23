@@ -684,6 +684,7 @@ class StageRuntime:
                 client_addresses=self._client_addresses_from_zmq(resources.addresses),
                 engine_manager=resources.manager,
                 coordinator=resources.coordinator,
+                output_tensor_queue=resources.output_tensor_queue,
             )
 
             logger.info("[StageRuntime] Stage %s initialized", plan.metadata.stage_id)

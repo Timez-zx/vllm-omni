@@ -2,6 +2,7 @@ import concurrent.futures
 import contextlib
 import importlib
 import os
+import threading
 import time
 import types
 
@@ -19,6 +20,45 @@ from vllm_omni.engine.stage_init_utils import (
 from vllm_omni.engine.stage_runtime import StageRuntime
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_stage0_input_cache_update_and_enqueue_are_ordered() -> None:
+    engine = object.__new__(AsyncOmniEngine)
+    engine._stage0_input_submission_lock = threading.Lock()
+    engine.prompt_expand_func = None
+    entered = threading.Event()
+    release = threading.Event()
+    events: list[str] = []
+
+    def build(**kwargs):
+        request_id = kwargs["request_id"]
+        events.append(f"build-{request_id}")
+        if request_id == "a":
+            entered.set()
+            assert release.wait(timeout=2)
+        return types.SimpleNamespace(
+            request_id=request_id,
+            original_prompt=kwargs["prompt"],
+            sampling_params_list=[],
+        )
+
+    engine._build_add_request_message = build
+    engine.request_queue = types.SimpleNamespace(
+        sync_q=types.SimpleNamespace(put=lambda msg: events.append(f"put-{msg.request_id}")),
+    )
+
+    first = threading.Thread(target=engine.add_request, args=("a", {}))
+    second = threading.Thread(target=engine.add_request, args=("b", {}))
+    first.start()
+    assert entered.wait(timeout=2)
+    second.start()
+    release.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert events == ["build-a", "put-a", "build-b", "put-b"]
 
 
 def test_orchestrator_startup_timeout_warns_how_to_raise_limits(monkeypatch):

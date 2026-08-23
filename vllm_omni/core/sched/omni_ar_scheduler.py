@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import os
 import threading
 from collections import OrderedDict, defaultdict
 from collections.abc import Iterable
-from time import time
+from time import monotonic, time
 from typing import Any
 
 import numpy as np
@@ -37,6 +38,22 @@ from vllm_omni.outputs import OmniConnectorOutput
 
 logger = init_logger(__name__)
 _MAX_KV_LINEAGE_SNAPSHOTS = 4096
+_LOG_SCHED_DIAG = os.environ.get("VLLM_OMNI_LOG_SCHED_DIAG", "0") not in ("0", "", "false", "False")
+_LOG_HANDOFF_DIAG = os.environ.get("VLLM_OMNI_LOG_HANDOFF_DIAG", "0") not in ("0", "", "false", "False")
+_DIAG_STAGE = os.environ.get("VLLM_OMNI_DIAG_STAGE")
+
+
+def _diagnostic_tensor_bytes(value: Any) -> int:
+    if hasattr(value, "numel") and hasattr(value, "element_size"):
+        try:
+            return int(value.numel()) * int(value.element_size())
+        except Exception:
+            return 0
+    if isinstance(value, dict):
+        return sum(_diagnostic_tensor_bytes(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_diagnostic_tensor_bytes(item) for item in value)
+    return 0
 
 
 class SampledLogprobContractError(RuntimeError):
@@ -99,6 +116,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Track requests waiting for KV transfer (blocks not freed yet)
         self.waiting_for_transfer_free: set[str] = set()
 
+        # Diagnostic-only scheduler admission timestamps. Request.arrival_time
+        # starts before the request reaches EngineCore, so it cannot isolate
+        # time spent in the scheduler's own waiting queue.
+        self._diag_scheduler_admit_mono: dict[str, float] = {}
+
         # Track ACTIVE transfers (submitted to runner but not yet acked via kv_extracted_req_ids)
         self.active_kv_transfers: set[str] = set()
 
@@ -138,9 +160,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self,
     ) -> tuple[
         threading.Lock,
-        OrderedDict[
-            tuple[str, int], tuple[tuple[object, ...], int, int]
-        ],
+        OrderedDict[tuple[str, int], tuple[tuple[object, ...], int, int]],
     ]:
         manager = self.kv_cache_manager
         # Some unit tests construct the scheduler with __new__.
@@ -303,6 +323,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return False
 
+    def add_request(self, request: Request) -> None:
+        if _LOG_SCHED_DIAG:
+            self._diag_scheduler_admit_mono[request.request_id] = monotonic()
+        super().add_request(request)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
@@ -341,6 +366,49 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 )
             if self.input_coordinator:
                 self.input_coordinator.restore_queues(self.waiting)
+
+        if _LOG_SCHED_DIAG:
+            stage_id = getattr(self.vllm_config.model_config, "stage_id", "?")
+            diag_stage_matches = _DIAG_STAGE is None or str(stage_id) == _DIAG_STAGE
+        else:
+            diag_stage_matches = False
+        if diag_stage_matches:
+            now = monotonic()
+            for scheduled in scheduler_output.scheduled_new_reqs:
+                req_id = scheduled.req_id
+                request = self.requests.get(req_id)
+                queued_ts = None
+                scheduled_ts = None
+                if request is not None:
+                    for event in request.events:
+                        if event.type == EngineCoreEventType.QUEUED and queued_ts is None:
+                            queued_ts = event.timestamp
+                        elif event.type == EngineCoreEventType.SCHEDULED and scheduled_ts is None:
+                            scheduled_ts = event.timestamp
+                queue_ms = (
+                    (scheduled_ts - queued_ts) * 1000.0
+                    if queued_ts is not None and scheduled_ts is not None
+                    else (time() - request.arrival_time) * 1000.0
+                    if request is not None
+                    else -1.0
+                )
+                scheduler_admit_mono = self._diag_scheduler_admit_mono.pop(req_id, None)
+                scheduler_queue_ms = (now - scheduler_admit_mono) * 1000.0 if scheduler_admit_mono is not None else -1.0
+                logger.info(
+                    "[SCHED-DIAG] stage=%s mono=%.6f req=%s queue_ms=%.3f "
+                    "scheduler_queue_ms=%.3f "
+                    "prompt=%d cached=%d scheduled=%d waiting=%d running=%d",
+                    stage_id,
+                    now,
+                    req_id,
+                    queue_ms,
+                    scheduler_queue_ms,
+                    len(scheduled.prompt_token_ids),
+                    int(scheduled.num_computed_tokens),
+                    int(scheduler_output.num_scheduled_tokens.get(req_id, 0)),
+                    len(self.waiting),
+                    len(self.running),
+                )
         try:
             # Late import to avoid circulars in some launch modes
             from .output import OmniNewRequestData
@@ -393,6 +461,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        handoff_diag_start = monotonic()
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -787,6 +856,27 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 except Exception:
                     init_logger(__name__).exception("Failed to free blocks for %s after transfer", req_id)
 
+        if _LOG_HANDOFF_DIAG:
+            stage_id = getattr(self.vllm_config.model_config, "stage_id", "?")
+            diag_stage_matches = _DIAG_STAGE is None or str(stage_id) == _DIAG_STAGE
+        else:
+            diag_stage_matches = False
+        if diag_stage_matches:
+            req_ids = [
+                output.request_id
+                for client_outputs in engine_core_outputs.values()
+                for output in client_outputs.outputs
+            ]
+            logger.info(
+                "[HANDOFF-DIAG] event=core-output-ready stage=%s wall=%.6f reqs=%s "
+                "payload_mib=%.3f scheduler_update_ms=%.3f",
+                stage_id,
+                time(),
+                ",".join(req_ids),
+                _diagnostic_tensor_bytes(mm_outputs) / float(1 << 20),
+                (monotonic() - handoff_diag_start) * 1000.0,
+            )
+
         return engine_core_outputs
 
     def finish_requests(self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus) -> list[Request]:
@@ -904,11 +994,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         lineage_id = getattr(request, "kv_lineage_id", None)
         lineage_revision = int(getattr(request, "kv_lineage_revision", 0))
-        if (
-            lineage_id
-            and lineage_revision > 0
-            and request.status != RequestStatus.FINISHED_ABORTED
-        ):
+        if lineage_id and lineage_revision > 0 and request.status != RequestStatus.FINISHED_ABORTED:
             confirmed_computed = self._get_confirmed_num_computed_tokens(request)
             hash_block_size = int(getattr(self.kv_cache_manager.block_pool, "hash_block_size", 0))
             self._store_kv_lineage_snapshot(
@@ -919,8 +1005,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 hash_block_size,
             )
             logger.debug(
-                "[kv-lineage] store id=%s parent=%d revision=%d computed=%d "
-                "hashes=%d snapshot_found=%s seeded=%d",
+                "[kv-lineage] store id=%s parent=%d revision=%d computed=%d hashes=%d snapshot_found=%s seeded=%d",
                 lineage_id,
                 int(getattr(request, "kv_lineage_parent_revision", 0)),
                 lineage_revision,

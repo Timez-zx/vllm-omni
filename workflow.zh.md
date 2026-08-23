@@ -170,12 +170,66 @@ arrival 模式只改善约 25 ms 中位数，p95/p99 反而上升，因为新增
 
 结果：`/home/ubuntu/data/results/pd_finite_short_u8_v14_20260822`、`/home/ubuntu/data/results/pd_crosslayer_u8_t6_stagger8_20260822_v3`、`/home/ubuntu/data/results/pd_crosslayer_push_u8_t6_stagger8_20260822_v2`、`/home/ubuntu/data/results/pd_async_fix_20260822_v1/pd_async_fix_seed7_u8`。精确 NIXL telemetry smoke 位于 `/home/ubuntu/data/results/pd_push_telemetry_smoke_u1_20260822_v1`。
 
+### 固定 replay 与 P snapshot 优化
+
+容量脚本现在显式传入标准 `0–8 s` stagger，`verify_run.py` 会拒绝其他值。固定 trace 冻结全部媒体 arrival 与 query，SHA256 为 `198d956dda10d7f91ed9d932fa3d9abd1d546cb79063accf1dad0d9028fd0109`；每组都消费相同的 687 帧。
+
+旧 P 路径即使命中 prefix KV，也会在 CPU 重建 Talker 所需的两层完整 hidden states，并在每个 finite request 中经过控制面搬运。修复后，orchestrator 使用有界、可丢弃的 snapshot cache：
+
+- 实际 prefix hit 未超过精确 lineage parent 时，P 只返回未命中尾部，orchestrator 从 parent snapshot 补齐已验证前缀。
+- 全局 cache 命中超过 parent 时，P 只回传 `parent→hit` 的 gap 和未命中尾部，不再回退整段历史；仍不复用未经 lineage 验证的行。
+- arrival-prefill 只保存共享 tensor chunk，不反复拼接完整历史；最终 query 进入 D/Talker 前才合并一次。
+- cache 默认上限 8 GiB，可通过 `VLLM_OMNI_PD_SNAPSHOT_CACHE_BYTES` 配置。
+
+8 用户固定 replay：
+
+| P snapshot 路径 | TTFA p50/p95/p99 | Stage-0 首输出 p50/p95/p99 | 最终音频 stage p99 |
+|---|---:|---:|---:|
+| 完整 snapshot 基线 | 760/1275/1326 ms | 362/791/852 ms | 1290 ms |
+| P 只回传 delta，立即拼完整历史 | 661/1034/1116 ms | 284/582/692 ms | 1080 ms |
+| P 只回传 delta，延迟合并 chunk chain | 627/915/988 ms | 232/434/561 ms | 953 ms |
+
+最终组通过 1 秒 p99 SLO：40/40 个计分 turn 成功，无 timeout/stall，`verify_run.py` 通过。剩余 tail 仍以 Thinker 为主；D 自身 p99 约 216 ms，GPU 采样未显示持续饱和。后续应研究 P admission/scheduling 与 delta P→D KV transfer，不应继续调 Talker 或 Code2Wav 参数。
+
+固定 replay 结果：`/home/ubuntu/data/results/pd_async_0_8_record_20260822_v1/pd_async_0_8_record_seed7_u8`、`/home/ubuntu/data/results/pd_snapshot_delta_replay_20260822_v2/u8_t6`、`/home/ubuntu/data/results/pd_snapshot_chunk_replay_20260822_v1/u8_t6`。
+
+### P 输出控制面优化
+
+RCA 发现剩余的所谓 ingress 等待并非 P→D KV 传输：P runner 通常只需几十到一百多毫秒，但 EngineCore 会把约 50–255 MiB 的 Talker-conditioning hidden states 作为 ZMQ multipart 输出。序列化和内存复制占用同一进程的 CPU/GIL，同时拖慢输出交接和新请求接收。
+
+本地 stage 0 现在使用 vLLM tensor IPC 的反向共享内存队列：ZMQ 只传 tensor handle 和小型 metadata，tensor storage 不再复制进控制面。该优化只用于 EngineCore→orchestrator 输出；双向使用共享内存会给输入额外增加一次 staging copy，实测更慢，已撤销。
+
+在带诊断的同 trace A/B 中，P output-ready→orchestrator-receive 的 p50/p95/p99 从 `46/133/204 ms` 降到 `27/60/94 ms`，P submit→receive 从 `282/576/633 ms` 降到 `238/426/440 ms`。固定 8 用户 replay 的端到端结果为：
+
+| 实现 | TTFA p50/p95/p99 | 计分 turn | timeout/stall |
+|---|---:|---:|---:|
+| deferred snapshot，ZMQ tensor | 627/915/988 ms | 40/40 | 0/0 |
+| output tensor IPC | 592/849/931 ms | 40/40 | 0/0 |
+| output tensor IPC + relative gap | 577/923/977 ms | 40/40 | 0/0 |
+
+最终组通过 `verify_run.py`，trace SHA256、用户数、媒体 arrival 和消费的 687 帧均未改变。稳定结论仅限于控制面交接 tail 约减半；端到端 p99 从原基线 `988 ms` 到最终 `977 ms`，基本持平，不能据此声称整体 tail 已解决。逐 turn 对齐显示，旧版最慢的两轮改善约 215/254 ms，但新的并发碰撞又产生约 112/189 ms 回退。诊断已将剩余主项定位到 stage-0 EngineCore 的 pre-scheduler ingress：client send p99 `7.8 ms`、core request build p99 `3.8 ms`，但 send 完成到 core preprocess 开始 p99 为 `279 ms`；P runner p99 `152 ms`，输出交接 p99 `94 ms`。因此请求在进入 scheduler 前的 socket receive/deserialize/input-thread admission 是当前最大延迟段。结果：`/home/ubuntu/data/results/pd_output_shm_replay_20260822_v1/u8_t6_seed7_u8`、`/home/ubuntu/data/results/pd_gap_shm_replay_20260822_v1/u8_t6_seed7_u8`。
+
+### P 输入控制面修复
+
+新增 input-thread 打点后，pre-scheduler ingress 的根因已确定。旧 benchmark 强制设置 `VLLM_OMNI_SAFE_MM_PROCESSOR_CACHE=1`，将 vLLM 的镜像多模态 cache 降级成 `processor_only`；应用每轮发送完整 token 历史是正确的，但该 fallback 同时把全部历史媒体特征再次放进本地 ZMQ request，使 final request 输入达到 127–260 MiB。
+
+修复将 stage-0 的“input processor 更新 sender cache→进入 orchestrator 队列”串成一个原子有序操作，使 sender/EngineCore receiver 的 LRU 访问顺序一致；benchmark 默认不再启用旧 fallback。语义、完整历史、arrival prefill 和媒体账本均未改变，cache hit 只省略 EngineCore 已有的媒体 tensor。
+
+同 trace 诊断 A/B：
+
+| Stage-0 input | wire MiB p50/p95/p99 | send-complete→socket-ready p50/p95/p99 | P submit→receive p50/p95/p99 |
+|---|---:|---:|---:|
+| `processor_only` | 127/236/253 | 96/284/341 ms | 243/515/547 ms |
+| 有序镜像 cache | 0.8/5.7/6.3 | 1.0/5.0/5.9 ms | 148/240/263 ms |
+
+无诊断日志的最终 8 用户 replay：TTFT p50/p99 `311/473 ms`，TTFA p50/p95/p99 `476/693/714 ms`；40/40 个计分 turn 成功，无 timeout/stall，687 帧一致，`verify_run.py` 通过，且无 receiver cache miss。相比修复前同 trace 的 `577/923/977 ms`，TTFA p99 下降 263 ms。结果：`/home/ubuntu/data/results/pd_ingress_split_replay_20260822_v1/u8_t6_seed7_u8`、`/home/ubuntu/data/results/pd_mirrored_mm_cache_replay_20260822_v1/u8_t6_seed7_u8`、`/home/ubuntu/data/results/pd_mirrored_mm_cache_clean_replay_20260822_v1/u8_t6_seed7_u8`。
+
 ## 阶段八：下一步
 
-1. 用固定 input trace replay 冻结修复后的 packed-push P/D 基线。
-2. 若继续追 1 秒 SLO，优先分析 P 首输出 tail；speech path 已恢复流式，不再是多秒级主因。
-3. delta-only P→D 是后续 engine 研究项：D 保留可淘汰 prefix KV，接口必须携带 cache handle、lineage version 和明确 block range。
-4. 8 用户达到目标后再继续 16、32……容量阶梯。
+1. 将有序镜像媒体 cache + output tensor IPC + relative-gap 固定 replay 作为 8 用户 P/D 基线。
+2. 继续 16、32……用户直到 SLO 失效，再定位新的容量边界。
+3. 保留 input/output 控制面打点，仅在 RCA 时开启，正式容量结果关闭。
+4. delta-only P→D 仍是 engine 研究项：D 可保留可丢弃 prefix KV，但接口必须携带 cache handle、lineage version 和明确 block range。
 
 ## 快速恢复入口
 

@@ -43,6 +43,7 @@ USERS=${USERS:-"8 16 32 48 64 96 128 160"}
 SEEDS=${SEEDS:-"7"}
 TURNS=${TURNS:-30}
 WARMUP_TURNS=${WARMUP_TURNS:-2}
+STAGGER=${MU_STAGGER_S:-0,8}
 RESULT_PREFIX=${RESULT_PREFIX:-avsession}
 SKIP_DONE=${SKIP_DONE:-1}
 CELL_TIMEOUT_S=${CELL_TIMEOUT_S:-14400}
@@ -94,6 +95,7 @@ run_cell() {
     timeout "$CELL_TIMEOUT_S" "$PYBIN" "$SCRIPT_DIR/mu_bench.py" \
       --users "$users" --turns "$TURNS" --repeat-sessions "$reps" \
       --warmup-turns "$WARMUP_TURNS" --seed "$seed" \
+      --stagger "$STAGGER" \
       --frames-dir "$MU_FRAMES_DIR" --audio-manifest "$MU_AUDIO_MANIFEST" \
       --out "$out" "${trace_args[@]}" 2>&1 | tee "$out/driver.log"
   rc=${PIPESTATUS[0]}

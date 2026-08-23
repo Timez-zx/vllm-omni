@@ -170,12 +170,66 @@ This validation uses the same workload parameters but remains a live closed loop
 
 Results: `/home/ubuntu/data/results/pd_finite_short_u8_v14_20260822`, `/home/ubuntu/data/results/pd_crosslayer_u8_t6_stagger8_20260822_v3`, `/home/ubuntu/data/results/pd_crosslayer_push_u8_t6_stagger8_20260822_v2`, and `/home/ubuntu/data/results/pd_async_fix_20260822_v1/pd_async_fix_seed7_u8`. The exact NIXL telemetry smoke is in `/home/ubuntu/data/results/pd_push_telemetry_smoke_u1_20260822_v1`.
 
+### Exact replay and P snapshot optimization
+
+The ladder now passes the canonical `0–8 s` stagger explicitly, and `verify_run.py` rejects any other value. The recorded trace fixes all media arrivals and queries: trace SHA256 `198d956dda10d7f91ed9d932fa3d9abd1d546cb79063accf1dad0d9028fd0109`. Every arm consumes the same 687 frames.
+
+Prefix KV reuse did not make the old P path fully incremental: P rebuilt both complete Talker-conditioning hidden layers on CPU and transported them through the control plane for every finite request. The fix keeps a bounded, disposable snapshot cache in the orchestrator:
+
+- When the actual prefix hit does not exceed the exact lineage parent, P returns only the miss tail and the orchestrator fills the verified prefix from the parent snapshot.
+- When a global cache hit extends past the parent, P returns only the `parent→hit` gap plus the miss tail instead of falling back to the complete history. Unverified lineage rows are still never reused.
+- Arrival-prefill stores shared tensor chunks without concatenating the complete history. Only a final query materializes one complete tensor for D/Talker.
+- The cache defaults to 8 GiB and is configurable through `VLLM_OMNI_PD_SNAPSHOT_CACHE_BYTES`.
+
+Exact eight-user replay:
+
+| P snapshot path | TTFA p50/p95/p99 | Stage-0 first-output p50/p95/p99 | Final audio stage p99 |
+|---|---:|---:|---:|
+| Full snapshot baseline | 760/1275/1326 ms | 362/791/852 ms | 1290 ms |
+| Delta P output, eager full concat | 661/1034/1116 ms | 284/582/692 ms | 1080 ms |
+| Delta P output, deferred chunk chain | 627/915/988 ms | 232/434/561 ms | 953 ms |
+
+The final arm passes the one-second p99 SLO: 40/40 scored turns, no timeout or stall, and `verify_run.py` passes. The remaining tail is still Thinker-dominated; D's own p99 is about 216 ms, while GPU samples show no sustained saturation. Further work should therefore study P admission/scheduling and delta P→D KV transfer rather than tune Talker or Code2Wav.
+
+Exact replay results: `/home/ubuntu/data/results/pd_async_0_8_record_20260822_v1/pd_async_0_8_record_seed7_u8`, `/home/ubuntu/data/results/pd_snapshot_delta_replay_20260822_v2/u8_t6`, and `/home/ubuntu/data/results/pd_snapshot_chunk_replay_20260822_v1/u8_t6`.
+
+### P-output control-plane optimization
+
+RCA showed that the remaining apparent ingress wait was not P→D KV transfer. P runner work was usually only tens to roughly one hundred milliseconds, but EngineCore emitted about 50–255 MiB of Talker-conditioning hidden states as ZMQ multipart output. Serialization and memory copies occupied CPU/GIL time in the same process, delaying both output handoff and admission of new requests.
+
+Local stage 0 now uses vLLM tensor IPC through a reverse shared-memory queue. ZMQ carries only tensor handles and small metadata; tensor storage is no longer copied through the control plane. This is output-only: using the same mechanism in both directions added an input staging copy and regressed latency, so that experiment was reverted.
+
+In a diagnostic same-trace A/B, P output-ready→orchestrator-receive p50/p95/p99 fell from `46/133/204 ms` to `27/60/94 ms`; P submit→receive fell from `282/576/633 ms` to `238/426/440 ms`. End-to-end exact eight-user replay results are:
+
+| Implementation | TTFA p50/p95/p99 | Scored turns | timeout/stall |
+|---|---:|---:|---:|
+| Deferred snapshot, ZMQ tensor | 627/915/988 ms | 40/40 | 0/0 |
+| Output tensor IPC | 592/849/931 ms | 40/40 | 0/0 |
+| Output tensor IPC + relative gap | 577/923/977 ms | 40/40 | 0/0 |
+
+The final arm passes `verify_run.py`; trace SHA256, users, media arrivals, and all 687 consumed frames remain unchanged. The stable conclusion is limited to the approximately halved control-plane handoff tail. End-to-end p99 moves only from the original `988 ms` baseline to `977 ms`, effectively flat, so this does not show that overall tail is solved. Paired turns show the old two slowest turns improving by about 215/254 ms while new concurrency collisions regress other turns by about 112/189 ms. Diagnostics locate the remaining dominant interval before the stage-0 EngineCore scheduler: client send p99 is `7.8 ms` and core request build p99 is `3.8 ms`, but send-complete→core-preprocess-start p99 is `279 ms`; P runner p99 is `152 ms` and output handoff p99 is `94 ms`. Socket receive/deserialize/input-thread admission before scheduler entry is therefore the largest current interval. Results: `/home/ubuntu/data/results/pd_output_shm_replay_20260822_v1/u8_t6_seed7_u8` and `/home/ubuntu/data/results/pd_gap_shm_replay_20260822_v1/u8_t6_seed7_u8`.
+
+### P-input control-plane fix
+
+The added input-thread timestamps identify the pre-scheduler ingress root cause. The old benchmark forced `VLLM_OMNI_SAFE_MM_PROCESSOR_CACHE=1`, downgrading vLLM's mirrored multimodal cache to `processor_only`. Sending the complete token history each turn is correct, but this fallback also put every historical media feature back into the local ZMQ request, making each final input 127–260 MiB.
+
+The fix makes “stage-0 input processor updates sender cache→orchestrator enqueue” one atomic ordered operation, keeping sender and EngineCore receiver LRU access order identical. The benchmark no longer enables the old fallback by default. Semantics, complete history, arrival prefill, and the media ledger are unchanged; a cache hit only omits media tensors already owned by EngineCore.
+
+Diagnostic same-trace A/B:
+
+| Stage-0 input | wire MiB p50/p95/p99 | send-complete→socket-ready p50/p95/p99 | P submit→receive p50/p95/p99 |
+|---|---:|---:|---:|
+| `processor_only` | 127/236/253 | 96/284/341 ms | 243/515/547 ms |
+| Ordered mirrored cache | 0.8/5.7/6.3 | 1.0/5.0/5.9 ms | 148/240/263 ms |
+
+The final eight-user replay without diagnostic logging records TTFT p50/p99 `311/473 ms` and TTFA p50/p95/p99 `476/693/714 ms`. All 40 scored turns succeed, with no timeout/stall, the same 687 consumed frames, a passing `verify_run.py`, and no receiver-cache miss. Relative to the same-trace pre-fix `577/923/977 ms`, TTFA p99 falls by 263 ms. Results: `/home/ubuntu/data/results/pd_ingress_split_replay_20260822_v1/u8_t6_seed7_u8`, `/home/ubuntu/data/results/pd_mirrored_mm_cache_replay_20260822_v1/u8_t6_seed7_u8`, and `/home/ubuntu/data/results/pd_mirrored_mm_cache_clean_replay_20260822_v1/u8_t6_seed7_u8`.
+
 ## Phase 8: next steps
 
-1. Freeze the fixed packed-push P/D baseline with a recorded input-trace replay.
-2. If work on the one-second SLO continues, analyze P first-output tail first; the speech path is streaming again and is no longer the multi-second cause.
-3. Delta-only P→D remains an engine research item: D may retain disposable prefix KV, but the interface must carry a cache handle, lineage version, and explicit block range.
-4. Resume the 16, 32, ... capacity ladder only after the eight-user target is met.
+1. Use ordered mirrored media cache plus output tensor IPC and relative-gap replay as the eight-user P/D baseline.
+2. Continue at 16, 32, ... users until the SLO fails, then attribute the new capacity boundary.
+3. Keep input/output control-plane diagnostics available for RCA but disabled in formal capacity runs.
+4. Delta-only P→D remains an engine research item: D may retain disposable prefix KV, but the interface must carry a cache handle, lineage version, and explicit block range.
 
 ## Recovery map
 

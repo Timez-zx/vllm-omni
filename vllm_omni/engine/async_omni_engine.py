@@ -272,10 +272,16 @@ class AsyncOmniEngine:
         except ValueError:
             _n_inp = 4
         self._input_executor = (
-            concurrent.futures.ThreadPoolExecutor(
-                max_workers=_n_inp, thread_name_prefix="omni-input")
-            if _n_inp > 0 else None
+            concurrent.futures.ThreadPoolExecutor(max_workers=_n_inp, thread_name_prefix="omni-input")
+            if _n_inp > 0
+            else None
         )
+        # vLLM's mirrored multimodal sender/receiver caches require requests
+        # to reach EngineCore in the same order in which the sender cache was
+        # updated. Input preprocessing may run on several worker threads, so
+        # make cache mutation plus orchestrator enqueue one ordered operation.
+        # Expensive prompt rendering remains outside this lock.
+        self._stage0_input_submission_lock = threading.Lock()
         self._shutdown_called = False
         self._weak_finalizer: weakref.finalize | None = None
         self._correlated_rpc_client: CorrelatedRpcClient | None = None
@@ -471,8 +477,7 @@ class AsyncOmniEngine:
                     lags.append(max(0.0, (_loop.time() - _t0 - 0.1) * 1000.0))
                     if len(lags) >= 100:
                         lags.sort()
-                        logger.info("[orch-lag] p50=%.1fms p99=%.1fms max=%.1fms",
-                                    lags[50], lags[99], lags[-1])
+                        logger.info("[orch-lag] p50=%.1fms p99=%.1fms max=%.1fms", lags[50], lags[99], lags[-1])
                         lags = []
 
             asyncio.get_running_loop().create_task(_orch_lag_probe())
@@ -1370,32 +1375,33 @@ class AsyncOmniEngine:
         a queue + coroutine-switch round-trip.  The Orchestrator receives a
         ready-to-submit OmniEngineCoreRequest.
         """
-        msg = self._build_add_request_message(
-            request_id=request_id,
-            prompt=prompt,
-            prompt_text=prompt_text,
-            sampling_params_list=sampling_params_list,
-            final_stage_id=final_stage_id,
-            final_output_stage_ids=final_output_stage_ids,
-            arrival_time=arrival_time,
-            lora_request=lora_request,
-            tokenization_kwargs=tokenization_kwargs,
-            trace_headers=trace_headers,
-            priority=priority,
-            data_parallel_rank=data_parallel_rank,
-            reasoning_ended=reasoning_ended,
-            resumable=resumable,
-        )
-        self.request_queue.sync_q.put(msg)
+        with self._stage0_input_submission_lock:
+            msg = self._build_add_request_message(
+                request_id=request_id,
+                prompt=prompt,
+                prompt_text=prompt_text,
+                sampling_params_list=sampling_params_list,
+                final_stage_id=final_stage_id,
+                final_output_stage_ids=final_output_stage_ids,
+                arrival_time=arrival_time,
+                lora_request=lora_request,
+                tokenization_kwargs=tokenization_kwargs,
+                trace_headers=trace_headers,
+                priority=priority,
+                data_parallel_rank=data_parallel_rank,
+                reasoning_ended=reasoning_ended,
+                resumable=resumable,
+            )
+            self.request_queue.sync_q.put(msg)
 
-        # CFG companion expansion: create and enqueue companion requests
-        # so the AR stage also generates their KV caches.
-        if self.prompt_expand_func is not None and final_stage_id > 0:
-            original_prompt = msg.original_prompt
-            effective_spl = msg.sampling_params_list
-            stage0_params = effective_spl[0] if effective_spl else None
-            if stage0_params is not None:
-                self._enqueue_cfg_companions(request_id, original_prompt, stage0_params, effective_spl)
+            # CFG companions use the same input processor/cache and must stay
+            # adjacent to their parent in the mirrored-cache order.
+            if self.prompt_expand_func is not None and final_stage_id > 0:
+                original_prompt = msg.original_prompt
+                effective_spl = msg.sampling_params_list
+                stage0_params = effective_spl[0] if effective_spl else None
+                if stage0_params is not None:
+                    self._enqueue_cfg_companions(request_id, original_prompt, stage0_params, effective_spl)
 
     async def add_request_async(
         self,
@@ -1423,27 +1429,29 @@ class AsyncOmniEngine:
         awaited before any update is submitted (handle_inputs awaits each
         chunk in turn), so per-request ordering is preserved.
         """
-        _submit = lambda: self.add_request(
-            request_id=request_id,
-            prompt=prompt,
-            prompt_text=prompt_text,
-            sampling_params_list=sampling_params_list,
-            final_stage_id=final_stage_id,
-            final_output_stage_ids=final_output_stage_ids,
-            arrival_time=arrival_time,
-            lora_request=lora_request,
-            tokenization_kwargs=tokenization_kwargs,
-            trace_headers=trace_headers,
-            priority=priority,
-            data_parallel_rank=data_parallel_rank,
-            reasoning_ended=reasoning_ended,
-            resumable=resumable,
-        )
+
+        def _submit() -> None:
+            self.add_request(
+                request_id=request_id,
+                prompt=prompt,
+                prompt_text=prompt_text,
+                sampling_params_list=sampling_params_list,
+                final_stage_id=final_stage_id,
+                final_output_stage_ids=final_output_stage_ids,
+                arrival_time=arrival_time,
+                lora_request=lora_request,
+                tokenization_kwargs=tokenization_kwargs,
+                trace_headers=trace_headers,
+                priority=priority,
+                data_parallel_rank=data_parallel_rank,
+                reasoning_ended=reasoning_ended,
+                resumable=resumable,
+            )
+
         if self._input_executor is None:
             _submit()
         else:
-            await asyncio.get_running_loop().run_in_executor(
-                self._input_executor, _submit)
+            await asyncio.get_running_loop().run_in_executor(self._input_executor, _submit)
 
     def add_streaming_update(
         self,
@@ -1458,18 +1466,19 @@ class AsyncOmniEngine:
         resumable: bool = True,
     ) -> None:
         """Send an incremental streaming update for an existing request."""
-        msg = self._build_add_request_message(
-            request_id=request_id,
-            prompt=prompt,
-            prompt_text=prompt_text,
-            sampling_params_list=sampling_params_list,
-            final_stage_id=final_stage_id,
-            final_output_stage_ids=final_output_stage_ids,
-            arrival_time=arrival_time,
-            resumable=resumable,
-            message_type="streaming_update",
-        )
-        self.request_queue.sync_q.put(msg)
+        with self._stage0_input_submission_lock:
+            msg = self._build_add_request_message(
+                request_id=request_id,
+                prompt=prompt,
+                prompt_text=prompt_text,
+                sampling_params_list=sampling_params_list,
+                final_stage_id=final_stage_id,
+                final_output_stage_ids=final_output_stage_ids,
+                arrival_time=arrival_time,
+                resumable=resumable,
+                message_type="streaming_update",
+            )
+            self.request_queue.sync_q.put(msg)
 
     async def add_streaming_update_async(
         self,
@@ -1490,21 +1499,23 @@ class AsyncOmniEngine:
         sequentially, and cross-thread put order into janus.sync_q follows
         the executor submission the await serializes).
         """
-        _submit = lambda: self.add_streaming_update(
-            request_id=request_id,
-            prompt=prompt,
-            prompt_text=prompt_text,
-            sampling_params_list=sampling_params_list,
-            final_stage_id=final_stage_id,
-            final_output_stage_ids=final_output_stage_ids,
-            arrival_time=arrival_time,
-            resumable=resumable,
-        )
+
+        def _submit() -> None:
+            self.add_streaming_update(
+                request_id=request_id,
+                prompt=prompt,
+                prompt_text=prompt_text,
+                sampling_params_list=sampling_params_list,
+                final_stage_id=final_stage_id,
+                final_output_stage_ids=final_output_stage_ids,
+                arrival_time=arrival_time,
+                resumable=resumable,
+            )
+
         if self._input_executor is None:
             _submit()
         else:
-            await asyncio.get_running_loop().run_in_executor(
-                self._input_executor, _submit)
+            await asyncio.get_running_loop().run_in_executor(self._input_executor, _submit)
 
     def open_duplex_session(
         self,

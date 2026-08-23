@@ -68,8 +68,17 @@ logger = init_logger(__name__)
 # cannot create the idleness it is meant to measure. Enable with
 # VLLM_OMNI_LOG_STEP_GPU=1.
 _LOG_STEP_GPU = os.environ.get("VLLM_OMNI_LOG_STEP_GPU", "0") not in ("0", "", "false", "False")
-_STEP_GPU_LAG = 8          # read an event pair this many steps after recording
-_STEP_GPU_EVERY = 1        # record every Nth step
+_LOG_RUNNER_DIAG = os.environ.get("VLLM_OMNI_LOG_RUNNER_DIAG", "0") not in ("0", "", "false", "False")
+_DIAG_STAGE = os.environ.get("VLLM_OMNI_DIAG_STAGE")
+_STEP_GPU_LAG = 8  # read an event pair this many steps after recording
+_STEP_GPU_EVERY = 1  # record every Nth step
+
+
+def _runner_diag_enabled(runner: Any) -> bool:
+    if not _LOG_RUNNER_DIAG:
+        return False
+    stage_id = getattr(runner.vllm_config.model_config, "stage_id", "?")
+    return _DIAG_STAGE is None or str(stage_id) == _DIAG_STAGE
 
 
 def _step_gpu_probe_begin(runner: Any):
@@ -95,7 +104,7 @@ def _step_gpu_probe_end(runner: Any, start_event: Any, num_reqs: int, num_tokens
     if len(state["pending"]) <= _STEP_GPU_LAG:
         return
     s, e, t_mono, nreq, ntok = state["pending"].popleft()
-    if not e.query():          # not finished yet: put it back, never block
+    if not e.query():  # not finished yet: put it back, never block
         state["pending"].appendleft((s, e, t_mono, nreq, ntok))
         return
     try:
@@ -105,7 +114,10 @@ def _step_gpu_probe_end(runner: Any, start_event: Any, num_reqs: int, num_tokens
     logger.info(
         "[STEP-GPU] stage=%s mono=%.6f gpu_ms=%.3f nreq=%d ntok=%d",
         getattr(runner.vllm_config.model_config, "stage_id", "?"),
-        t_mono, dur_ms, nreq, ntok,
+        t_mono,
+        dur_ms,
+        nreq,
+        ntok,
     )
 
 
@@ -736,6 +748,48 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         model = getattr(self, "model", None)
         return bool(getattr(model, "requires_full_prefix_cached_hidden_states", True))
 
+    def _model_supports_delta_prefix_multimodal_outputs(self) -> bool:
+        """Whether a model can emit only the newly scheduled MM rows.
+
+        Most Omni stages require the runner to reconstruct cached-prefix plus
+        new-tail tensors before their output is routed downstream.  A P/D
+        prefill stage may instead keep that disposable snapshot in the
+        orchestrator and ask for only the new rows on cache hits.
+        """
+        return self._runner_model_omni_flag(
+            "supports_delta_prefix_multimodal_outputs",
+            default=False,
+        )
+
+    def _request_needs_full_prefix_multimodal_output(self, req_id: str) -> bool:
+        parent_rows = self._pd_snapshot_parent_rows(req_id)
+        if parent_rows is None:
+            return True
+
+        # Build the merged prefix only when vLLM found more cached rows than
+        # the snapshot selected by the orchestrator. The payload builder then
+        # slices the merged result at parent_rows, returning just the missing
+        # cached gap plus the newly scheduled tail instead of the full prompt.
+        req_to_index = getattr(self.input_batch, "req_id_to_index", {})
+        req_idx = req_to_index.get(req_id) if isinstance(req_to_index, dict) else None
+        computed = getattr(self.input_batch, "num_computed_tokens_cpu", None)
+        if req_idx is None or computed is None:
+            return parent_rows <= 0
+        return int(computed[req_idx]) > parent_rows
+
+    def _pd_snapshot_parent_rows(self, req_id: str) -> int | None:
+        if not self._model_supports_delta_prefix_multimodal_outputs():
+            return None
+        buffers = getattr(self, "model_intermediate_buffer", {})
+        info = buffers.get(req_id, {}) if isinstance(buffers, dict) else {}
+        meta = info.get("meta") if isinstance(info, dict) else None
+        if not isinstance(meta, dict) or meta.get("pd_prefill_snapshot_mode") != "delta":
+            return None
+        return max(0, int(meta.get("pd_prefill_snapshot_parent_rows", 0)))
+
+    def _batch_needs_full_prefix_multimodal_outputs(self) -> bool:
+        return any(self._request_needs_full_prefix_multimodal_output(req_id) for req_id in self.input_batch.req_ids)
+
     def _get_runner_assisted_full_attention_metadata_request(
         self,
         *,
@@ -897,12 +951,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     hidden_states_cpu=hidden_states_cpu,
                     num_scheduled_tokens=num_scheduled_tokens,
                 )
-            combined_multimodal_outputs = self.omni_prefix_cache.get_merged_multimodal_states(
-                query_start_loc=self.query_start_loc.cpu,
-                input_batch=self.input_batch,
-                multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
-                num_scheduled_tokens=num_scheduled_tokens,
-            )
+            if self._batch_needs_full_prefix_multimodal_outputs():
+                combined_multimodal_outputs = self.omni_prefix_cache.get_merged_multimodal_states(
+                    query_start_loc=self.query_start_loc.cpu,
+                    input_batch=self.input_batch,
+                    multimodal_outputs=(
+                        flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
+                    ),
+                    num_scheduled_tokens=num_scheduled_tokens,
+                )
         return combined_hidden_states, combined_multimodal_outputs
 
     def _stage_deferred_prefix_cache_mm_outputs(
@@ -950,8 +1007,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         )
         return hidden_states_cpu, combined_hidden_states, combined_multimodal_outputs
 
-    @staticmethod
     def _build_combined_prefix_cache_mm_payload(
+        self,
         combined_multimodal_outputs: dict,
         *,
         rid: str,
@@ -964,10 +1021,20 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 return {k: _unwrap_lists(sv) for k, sv in v.items()}
             return v
 
-        return {
+        payload = {
             mm_key: _unwrap_lists(combined_multimodal_outputs[mm_key][rid])
             for mm_key in combined_multimodal_outputs.keys()
         }
+        parent_rows = self._pd_snapshot_parent_rows(rid)
+        if parent_rows is not None and parent_rows > 0:
+            # The two captured Thinker layers are row-aligned with the prompt.
+            # Other entries (for example the three TTS embeddings) are small
+            # request metadata and must remain intact.
+            for key in ("hidden_states.layer_0", "hidden_states.layer_24"):
+                value = payload.get(key)
+                if isinstance(value, torch.Tensor) and value.shape[0] >= parent_rows:
+                    payload[key] = value[parent_rows:]
+        return payload
 
     def _build_omni_mm_payload(
         self,
@@ -1076,6 +1143,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         scheduler_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        diag_enabled = _runner_diag_enabled(self)
+        diag_start = time.monotonic() if diag_enabled else 0.0
+        diag_req_ids = list(scheduler_output.num_scheduled_tokens) if diag_enabled else []
+        diag_scheduled = (
+            [int(scheduler_output.num_scheduled_tokens[req_id]) for req_id in diag_req_ids] if diag_enabled else []
+        )
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
@@ -1390,6 +1463,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        diag_forward_start = time.monotonic() if diag_enabled else 0.0
+        diag_gpu_start = None
+        diag_gpu_end = None
+        if diag_enabled:
+            diag_gpu_start = torch.cuda.Event(enable_timing=True)
+            diag_gpu_start.record()
         try:
             with (
                 nullcontext(),
@@ -1420,6 +1499,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     logits_index=logits_indices,
                     sampler=self.sampler,
                 )
+                if diag_enabled:
+                    diag_gpu_end = torch.cuda.Event(enable_timing=True)
+                    diag_gpu_end.record()
                 if _gpu_probe is not None:
                     _step_gpu_probe_end(self, _gpu_probe, num_reqs, num_tokens_padded)
 
@@ -1430,6 +1512,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         finally:
             if runner_assisted_context_enabled:
                 self._set_runner_assisted_full_attention_metadata_context(enabled=False)
+        diag_forward_end = time.monotonic() if diag_enabled else 0.0
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -1547,6 +1630,21 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         if self._should_return_omni_routed_experts() and hasattr(self, "_positions_cpu"):
             self._omni_routed_experts_d2h(scheduler_output)
+
+        if diag_enabled:
+            computed = [int(value) for value in num_computed_tokens_cpu[:num_reqs]]
+            self._runner_diag_state = {
+                "mono": diag_start,
+                "req_ids": diag_req_ids,
+                "scheduled": diag_scheduled,
+                "computed": computed,
+                "execute_start": diag_start,
+                "forward_start": diag_forward_start,
+                "forward_end": diag_forward_end,
+                "execute_end": time.monotonic(),
+                "gpu_start": diag_gpu_start,
+                "gpu_end": diag_gpu_end,
+            }
 
         return None
 
@@ -2001,6 +2099,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self,
         grammar_output: GrammarOutput | None,
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        diag_state = getattr(self, "_runner_diag_state", None)
+        if diag_state is not None:
+            self._runner_diag_state = None
+        diag_sample_start = time.monotonic() if diag_state is not None else 0.0
         kv_extracted_req_ids = getattr(self, "kv_extracted_req_ids", None)
         self.kv_extracted_req_ids = None
 
@@ -2130,6 +2232,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
             )
+        diag_bookkeep_end = time.monotonic() if diag_state is not None else 0.0
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
@@ -2180,12 +2283,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 req_ids_output_copy=req_ids_output_copy,
                 query_start_loc_cpu=query_start_loc_cpu,
             )
+        diag_snapshot_start = time.monotonic() if diag_state is not None else 0.0
         output_tensor_snapshot = self._snapshot_omni_output_tensors_for_async_output(
             use_async_omni_output=use_async_omni_output,
             hidden_states=hidden_states,
             staged_hidden_states_cpu=staged_hidden_states_cpu,
             multimodal_outputs=multimodal_outputs,
         )
+        diag_snapshot_end = time.monotonic() if diag_state is not None else 0.0
 
         def output_builder() -> OmniModelRunnerOutput:
             if output_tensor_snapshot.async_payload is not None:
@@ -2213,7 +2318,42 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 )
 
         if not use_async_omni_output:
+            diag_build_start = time.monotonic() if diag_state is not None else 0.0
             output = output_builder()
+            diag_build_end = time.monotonic() if diag_state is not None else 0.0
+
+            if diag_state is not None:
+                gpu_ms = -1.0
+                gpu_start = diag_state.get("gpu_start")
+                gpu_end = diag_state.get("gpu_end")
+                if gpu_start is not None and gpu_end is not None and gpu_end.query():
+                    try:
+                        gpu_ms = float(gpu_start.elapsed_time(gpu_end))
+                    except Exception:
+                        gpu_ms = -1.0
+                execute_start = float(diag_state["execute_start"])
+                forward_start = float(diag_state["forward_start"])
+                forward_end = float(diag_state["forward_end"])
+                execute_end = float(diag_state["execute_end"])
+                logger.info(
+                    "[RUNNER-DIAG] stage=%s mono=%.6f reqs=%s computed=%s scheduled=%s "
+                    "prepare_ms=%.3f forward_wall_ms=%.3f forward_gpu_ms=%.3f "
+                    "execute_post_ms=%.3f sample_pre_snapshot_ms=%.3f "
+                    "snapshot_ms=%.3f output_build_ms=%.3f total_ms=%.3f",
+                    getattr(self.vllm_config.model_config, "stage_id", "?"),
+                    execute_start,
+                    ",".join(diag_state["req_ids"]),
+                    ",".join(str(value) for value in diag_state["computed"]),
+                    ",".join(str(value) for value in diag_state["scheduled"]),
+                    (forward_start - execute_start) * 1000.0,
+                    (forward_end - forward_start) * 1000.0,
+                    gpu_ms,
+                    (execute_end - forward_end) * 1000.0,
+                    (diag_bookkeep_end - diag_sample_start) * 1000.0,
+                    (diag_snapshot_end - diag_snapshot_start) * 1000.0,
+                    (diag_build_end - diag_build_start) * 1000.0,
+                    (diag_build_end - execute_start) * 1000.0,
+                )
 
             if not self.use_async_scheduling:
                 return output

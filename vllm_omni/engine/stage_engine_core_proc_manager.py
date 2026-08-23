@@ -84,6 +84,14 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
             raise ValueError(f"local_engine_count must be > 0, got {local_engine_count}")
 
         context = get_mp_context()
+        model_config = getattr(vllm_config, "model_config", None)
+        # Only the local P stage emits the large latent prompt snapshots that
+        # need a reverse tensor channel. Remote/headless engines cannot share
+        # a multiprocessing queue with the API server.
+        output_tensor_queue = None
+        if local_client and int(omni_stage_id) == 0 and getattr(model_config, "engine_output_type", None) == "latent":
+            output_tensor_queue = context.Queue()
+        self.output_tensor_queue = output_tensor_queue
         common_kwargs: dict[str, object] = {
             "vllm_config": vllm_config,
             "local_client": local_client,
@@ -93,6 +101,7 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
             "tensor_queue": tensor_queue,
             "omni_stage_id": int(omni_stage_id),
             "omni_coordinator_address": omni_coordinator_address,
+            "output_tensor_queue": output_tensor_queue,
         }
 
         if client_handshake_address:
@@ -104,9 +113,7 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
             # meaningful for a one-process replica -- a DP mesh hosting
             # siblings is undefined.
             if local_engine_count != 1:
-                raise ValueError(
-                    f"sibling_kwargs requires local_engine_count == 1, got {local_engine_count}"
-                )
+                raise ValueError(f"sibling_kwargs requires local_engine_count == 1, got {local_engine_count}")
             common_kwargs["sibling_stage_kwargs"] = list(sibling_kwargs)
 
         # Intra-replica vLLM DP mesh (i.e. ``data_parallel_size`` ranks sharing

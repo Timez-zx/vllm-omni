@@ -1,8 +1,13 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+from vllm.utils.system_utils import get_mp_context
 from vllm.v1.engine.core import EngineCoreProc
+from vllm.v1.engine.tensor_ipc import TensorIpcReceiver, TensorIpcSender
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
+from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
 from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
 
 
@@ -59,3 +64,37 @@ def test_pd_decode_preserves_mrope_features_without_media_cache_lookup():
     assert request.mm_features is mm_features
     assert result.mm_features is mm_features
     assert result.pd_prefill_payload is pd_payload
+
+
+def test_reverse_tensor_ipc_keeps_large_output_off_zmq_frames():
+    tensor_queue = get_mp_context().Queue()
+    try:
+        tensor = torch.arange(1024, dtype=torch.float32).reshape(256, 4)
+        outputs = OmniEngineCoreOutputs(
+            outputs=[
+                OmniEngineCoreOutput(
+                    request_id="pd-p",
+                    new_token_ids=[],
+                    multimodal_output={"hidden": tensor},
+                )
+            ]
+        )
+        frames = MsgpackEncoder(
+            oob_tensor_consumer=TensorIpcSender(tensor_queue),
+        ).encode(outputs)
+
+        # Only the compact msgpack control frame goes over ZMQ; the tensor is
+        # shared through torch multiprocessing IPC.
+        assert len(frames) == 1
+        assert len(frames[0]) < 1024
+
+        decoded = MsgpackDecoder(
+            OmniEngineCoreOutputs,
+            oob_tensor_provider=TensorIpcReceiver(tensor_queue),
+        ).decode(frames)
+        received = decoded.outputs[0].multimodal_output["hidden"]
+        assert received.is_shared()
+        torch.testing.assert_close(received, tensor)
+    finally:
+        tensor_queue.close()
+        tensor_queue.join_thread()
