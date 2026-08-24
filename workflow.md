@@ -26,11 +26,12 @@ Key constraints:
 - Every turn submits the complete canonical prompt. Prefix/KV cache entries are disposable; a miss adds prefill work but cannot change correctness.
 - The application stores processed canonical message blocks. It renders only the new user and assistant blocks, then assembles the full prompt without reprocessing all historical media.
 - Video is append-only within a turn. The similarity/freshness filter decides admission; accepted frames are not subjected to an eight-frame sliding window or another sampling pass.
-- New frames launch or coalesce into low-priority `video-warm-<uuid>` requests. They run Thinker only with `max_tokens=1`, emit no text, and never enter Talker. A query immediately cancels unfinished warm-ups instead of waiting for cache fill.
+- New frames launch or coalesce into low-priority `video-warm-<uuid>` requests. They run Thinker only with `max_tokens=1`, emit no text, and never enter Talker. At most one arrival warm-up is admitted globally. A query closes background admission and immediately cancels registered and same-session pending warm-ups instead of waiting for cache fill.
+- The foreground gate reopens after the first engine output. New media may then resume arrival prefill and contend with ongoing Thinker decode. This is intentional engine pressure from the target realtime workload, not a cross-turn persistent request.
 - User audio is a single complete WAV at query time, preserving Qwen's whole-audio semantics. Only the final query may produce speech.
 - Media arriving during a response belongs to the next turn, and each media item is consumed once.
 - A normal response is capped at 256 Thinker tokens. Video is bounded to 640×352, and JPEG work runs in subprocesses.
-- The hard history threshold is 49,152 tokens. A 16,384-token headroom normally causes proactive complete-turn compaction near 32,768 tokens to a target below 16,384, rotating the cache lineage.
+- The hard history threshold is 49,152 tokens, and a 16,384-token headroom normally triggers proactive compaction near 32,768 tokens. Compaction generates at most 512 tokens of durable text memory, retains the newest two complete turns, and targets a prompt near 16,384 tokens. A summary or rewrite failure leaves history unchanged during proactive maintenance; only the hard limit enables complete-turn dropping as a safe fallback. Compaction and turn commit share one session lock and rotate the cache lineage.
 
 `enable_audio_arrival_prefill_approximation` is off by default. It seals audio into one-second chunks for silent arrival prefill and exists only to emulate duplex engine load; it is not semantically equivalent to Qwen whole-audio inference.
 
@@ -92,35 +93,48 @@ Results must use workload schema 4 and pass `benchmarks/live_agent/analysis/veri
 
 ## Phase 5: current baseline and conclusions
 
-Exact setup for the latest formal control:
+### Archived architecture control
 
-- source: clean commit `854535bb85789a882ff5995362e5528a5f52f83d`;
+The context-aligned eight-user experiment established that finite request lifetime is not the performance problem. Audio-ready-500 p99 was 796 ms for the current finite-request path and 824 ms for the archived persistent path after recomputing both at a fixed 500 ms audio threshold. Application-owned sessions, finite engine requests, and disposable prefix/KV reuse are a valid architecture. Results:
+
+- `/home/ubuntu/data/results/current_context_aligned_854535bb_20260822/context_aligned_seed7_u8`
+- `/home/ubuntu/data/results/av_real_formal_4650f134/avreal_formal_seed7_u8`
+
+### 16-user summary + recent diagnostic
+
+Setup:
+
+- source: dirty working tree on `3b661ed19ae343b90576eec39575baf1e1c27a5e`; this is a pre-commit diagnostic, not a clean-commit archive;
 - deploy: `origin_deploy_3gpu.yaml`, SHA256 `ae7cbeb615b24ee8654cf6c867887b2920324fc81ec93be6aaaa8995c55e4e24`;
-- workload: schema 4, seed 7, eight users × 30 turns, two warm-up turns, plan SHA256 `99dc083388931ffcbf9479a7f4344613229350546824371fec3744b548db0ed4`;
-- default arm: no `MU_SESSION_CFG_JSON`;
-- aligned arm: `MU_SESSION_CFG_JSON='{"context_window_trigger_tokens":32000,"context_window_target_tokens":0,"context_window_compaction_headroom_tokens":0}'`.
+- workload: schema 4, seed 7, 16 users × 30 turns, two warm-up turns, with no `MU_SESSION_CFG_JSON`;
+- plan SHA256: `bdaa528c57ba688b3c0d6889d0877029a595a5f249ef81b631e0b8e13b597aa7`;
+- input-trace SHA256: `f217432fa3fdc7362f4926f9a7c2c4c9219bc0dd453901d0d93de8f2245fe561`;
+- result: `/home/ubuntu/data/results/nonpd_summary_recent_u16_t30_diag_20260823_v2/nonpd_summary_recent_diag_seed7_u16`.
 
-| Path | Context p50/p95/p99/max | Audio-ready-500 p50/p95/p99/max |
-|---|---:|---:|
-| Current default history | 22.5k/32.0k/32.4k/32.8k | 478/723/1186/1215 ms |
-| Current `32k -> 0` aligned control | 16.8k/30.6k/31.8k/31.9k | 410/635/796/883 ms |
-| Archived persistent path | 14.8k/30.9k/34.5k/36.8k | 515/740/824/900 ms |
+Results:
 
-Result paths:
+| Metric | Result |
+|---|---:|
+| Completion | 448/448, zero timeouts, zero client errors |
+| TTFT p50/p99 | 297/914 ms |
+| TTFA p50/p95/p99 | 554/1111/1412 ms |
+| Audio-ready-500 p99 | 1412 ms |
+| Stall-max p99 | 0 ms |
+| Prompt tokens p50/p95/p99/max | 20.4k/33.5k/35.4k/37.1k |
 
-- default: `/home/ubuntu/data/results/current_default_854535bb_20260822/current_default_seed7_u8`
-- aligned: `/home/ubuntu/data/results/current_context_aligned_854535bb_20260822/context_aligned_seed7_u8`
-- persistent archive: `/home/ubuntu/data/results/av_real_formal_4650f134/avreal_formal_seed7_u8`
+The cell failed because Audio-ready-500 p99 exceeded one second, but playback had no stalls after startup. `verify_run.py` confirmed 480 unique finite requests, 2,613 arrival-prefill requests, 6,228 consumed frame occurrences, 3,508/3,538 prefix-cache hits, and three independent stage processes.
 
-The comparison establishes:
+An invalid v1 run exposed a P/D admission handshake that had been incorrectly carried into the non-P/D path, producing up to 13.843 seconds of foreground waiting. The non-P/D path now directly cancels the background task and lets local AsyncOmni clean up the request. In v2, query-gate p50/p95/p99/max was 0.2/1.3/2.4/2.9 ms, removing this application-level confounder.
 
-1. **Raw TTFA is not comparable.** The persistent first packet held only about 217 ms of audio, producing raw TTFA p50/p95/p99 of 244/392/479 ms. Recomputing its audio deltas at a fixed cumulative 500 ms gives the table's 515/740/824 ms.
-2. **History policy materially affects tail latency.** At the same commit, the aligned control reduced p99 from 1186 to 796 ms. GPU0 SM-active p95 in p99-tail windows was 94.7% for default and 52.4% when aligned. The difference includes context length, retained multimodal content, compaction/cache-lineage churn, and closed-loop trajectory; it is not a token-count-only result.
-3. **Finite request lifetime is not the performance problem.** After context alignment, current p99 is 796 ms versus 824 ms for persistent, which is the same performance class. Application-owned sessions, finite engine requests, and disposable prefix/KV reuse are a valid architecture.
-4. **Repeated application work is no longer the primary tail source.** Processed canonical blocks remove full-history re-rendering, warm-ups do not block queries, and residual upstream work is cleaned after completion. Default tail contains both Thinker delay and post-first-text pipeline waiting, while Talker and Code2Wav GPUs are not saturated.
-5. **`32k -> 0` is not a production policy.** It discards completed turns and exists only to isolate request lifetime and compute envelope. A single-seed live closed loop is also not a bit-identical replay.
+Tail attribution:
 
-The application architecture is suitable as the engine-research baseline. The unresolved application decision is production-grade history compression, not request lifetime.
+1. **Concurrent prefill/decode work on the Thinker GPU is the primary source.** About 63% of tail95 excess is on the Thinker side and 37% is after first text. Thinker TTFT p99 is 914 ms, while median Thinker inter-token latency rises from 18.8 ms overall to 37.8 ms in tail95.
+2. **Concurrency explains more than one request's prompt length.** Mean per-request new prefill tokens rise only from 850 overall to 1,025 in tail95. Foreground prefill tokens admitted while waiting for first text rise from 1,135 to 2,612, or 2.3×. When 1/2/3/4 queries arrive within 250 ms, TTFT p50 is 254/369/418/642 ms.
+3. **GPU0 is materially busier during tail windows.** Thinker SM-active p50/p95 rises from 38%/66% overall to 53%/87% in tail95. Tail-window values are 14%/24% for Talker and 3%/7% for Code2Wav, so neither downstream GPU is saturated. Allocated memory is not compute utilization.
+4. **Queue depth rises with latency.** The mean number of other sessions waiting for first audio at query arrival rises from 0.54 overall to 1.13 in tail95. With 0/1/2/3 such sessions, TTFA p50 is 505/595/696/867 ms.
+5. **Summary maintenance is a secondary amplifier.** There were 42 summaries. Using approximate second-resolution server overlap, summaries intersected 72/448 measured turns and 9/23 tail95 turns. TTFA p95 remains about 1,018 ms without summary overlap, so summaries do not explain the primary tail. Forty-five SHM mailbox fallbacks covered only 2/23 tail95 turns and are also not the main cause.
+
+Conclusion: the application is now adequate as the engine-research baseline. At 16 users the dominant delay is not full-history rendering, foreground admission, Talker, or Code2Wav saturation. It is foreground and arrival prefill on GPU0 interfering with Thinker decode; summary maintenance amplifies a minority of tail events.
 
 ## Phase 6: audio arrival-prefill research arm
 
@@ -141,10 +155,9 @@ Results: `/home/ubuntu/data/results/audio_arrival_ab_baseline_20260822/u8_t6` an
 
 ## Phase 7: next steps
 
-1. Add bounded semantic compaction at the application: a short text summary/seed plus a few recent complete turns. Do not use `32k -> 0` as the formal configuration.
-2. Freeze the compaction policy and context envelope, then restart the 8, 16, 32, ... capacity ladder.
-3. At the first SLO failure, split Thinker prefill, Thinker decode, post-first-text pipeline waiting, and GPU activity.
-4. If concurrent Thinker work still dominates tail latency, compare scheduling isolation and P/D separation rather than hiding the engine issue with application tuning.
+1. Commit the current application baseline, then replay the recorded input trace on that clean commit for a formal 16-user archive.
+2. If the first capacity boundary must be stated rigorously, add an eight-user cell at the same commit and seed; this task intentionally ran only 16 users.
+3. Engine experiments should first isolate foreground decode from arrival and foreground prefill, then compare P/D separation on its dedicated branch. Do not hide the contention with more application tuning.
 
 ## Recovery map
 
@@ -158,4 +171,5 @@ Results: `/home/ubuntu/data/results/audio_arrival_ab_baseline_20260822/u8_t6` an
 | Capacity ladder | `benchmarks/live_agent/web_client/run_av_session_ladder.sh` |
 | Formal deployment | `benchmarks/thinker_talker/origin_deploy_3gpu.yaml` |
 | Run verification | `benchmarks/live_agent/analysis/verify_run.py` |
+| Tail attribution | `benchmarks/live_agent/analysis/p99_attribution.py`, `benchmarks/live_agent/analysis/stage_stats_v2.py` |
 | GPU sampling | `benchmarks/live_agent/harness/gpu_sampler.py` |

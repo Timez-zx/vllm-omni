@@ -301,6 +301,11 @@
       thinker_max_response_tokens: 256,
       context_window_target_tokens: 16384,
       context_window_compaction_headroom_tokens: 16384,
+      // Replace old AV turns with durable text memory while retaining the
+      // newest two complete turns verbatim.
+      enable_history_summary: true,
+      history_summary_recent_turns: 2,
+      history_summary_max_tokens: 512,
     };
   }
 

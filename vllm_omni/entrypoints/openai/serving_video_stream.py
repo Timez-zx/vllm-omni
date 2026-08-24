@@ -214,9 +214,7 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
 
         user_message: dict[str, Any] = {"role": "user", "content": user_content}
 
-        messages: list[dict[str, Any]] = []
-        if config.system_prompt:
-            messages.append({"role": "system", "content": config.system_prompt})
+        messages = self._history_prefix_messages(config)
 
         # The application owns the canonical conversation. Reuse the exact
         # accepted multimodal messages on every finite engine request so vLLM

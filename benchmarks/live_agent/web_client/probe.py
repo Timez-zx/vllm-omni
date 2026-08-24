@@ -87,6 +87,9 @@ def session_config(system_prompt: str) -> dict:
         "context_window_trigger_tokens": 49152,
         "context_window_target_tokens": 16384,
         "context_window_compaction_headroom_tokens": 16384,
+        "enable_history_summary": True,
+        "history_summary_recent_turns": 2,
+        "history_summary_max_tokens": 512,
     }
 
 

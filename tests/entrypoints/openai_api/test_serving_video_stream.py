@@ -404,16 +404,57 @@ async def test_arrival_prefill_admission_is_globally_bounded():
 
 
 @pytest.mark.asyncio
-async def test_arrival_prefill_is_not_globally_suppressed_by_foreground_work():
+async def test_arrival_prefill_waits_while_foreground_crosses_prefill():
     started = asyncio.Event()
+    release = asyncio.Event()
 
     class HoldingEngine:
+        def generate(self, **_kwargs):
+            async def _gen():
+                started.set()
+                await release.wait()
+                yield _text_result("discarded")
+
+            return _gen()
+
+    class CapturingHandler(QwenOmniStreamingVideoHandler):
+        async def _render_engine_prompt_with_compaction(self, *args, **kwargs):
+            return {"prompt_token_ids": list(range(64))}, {}
+
+    handler = CapturingHandler(chat_service=object(), engine_client=HoldingEngine())
+    await handler._begin_foreground_prefill("foreground")
+    warmup = asyncio.create_task(
+        handler._process_video_arrival_prefill(
+            StreamingVideoSessionConfig(model="test"),
+            ["frame"],
+            [],
+            "warm-active",
+            {},
+        )
+    )
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not started.is_set()
+    assert not warmup.done()
+
+    await handler._finish_foreground_prefill("foreground")
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    release.set()
+    assert await warmup is True
+    assert handler._active_arrival_prefills == {}
+
+
+@pytest.mark.asyncio
+async def test_foreground_immediately_cancels_active_arrival_prefill():
+    generate_entered = asyncio.Event()
+
+    class OrderedEngine:
         def __init__(self):
             self.aborted: list[str] = []
 
-        def generate(self, **kwargs):
+        def generate(self, **_kwargs):
             async def _gen():
-                started.set()
+                generate_entered.set()
                 await asyncio.Event().wait()
                 yield _text_result("unreachable")
 
@@ -426,24 +467,68 @@ async def test_arrival_prefill_is_not_globally_suppressed_by_foreground_work():
         async def _render_engine_prompt_with_compaction(self, *args, **kwargs):
             return {"prompt_token_ids": list(range(64))}, {}
 
-    engine = HoldingEngine()
+    engine = OrderedEngine()
     handler = CapturingHandler(chat_service=object(), engine_client=engine)
     warmup = asyncio.create_task(
         handler._process_video_arrival_prefill(
             StreamingVideoSessionConfig(model="test"),
             ["frame"],
             [],
-            "warm-active",
+            "warm-racing",
             {},
         )
     )
-    await started.wait()
+    await asyncio.wait_for(generate_entered.wait(), timeout=2.0)
 
-    # A foreground query in another session is not represented by a global
-    # admission gate. The single low-priority warm-up remains admitted until
-    # its owning session cancels it or it completes.
-    assert not warmup.done()
+    await asyncio.wait_for(handler._begin_foreground_prefill("foreground"), timeout=2.0)
+    await asyncio.gather(warmup, return_exceptions=True)
+    assert warmup.cancelled()
     assert engine.aborted == []
+    assert handler._active_arrival_prefills == {}
+    await handler._finish_foreground_prefill("foreground")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_foreground_reopens_global_arrival_gate():
+    generate_entered = asyncio.Event()
+    allow_admission = asyncio.Event()
+
+    class DelayedEngine:
+        def generate(self, **_kwargs):
+            async def _gen():
+                generate_entered.set()
+                await allow_admission.wait()
+                await asyncio.Event().wait()
+                yield _text_result("unreachable")
+
+            return _gen()
+
+        async def abort(self, request_id):
+            del request_id
+
+    class CapturingHandler(QwenOmniStreamingVideoHandler):
+        async def _render_engine_prompt_with_compaction(self, *args, **kwargs):
+            return {"prompt_token_ids": list(range(64))}, {}
+
+    handler = CapturingHandler(chat_service=object(), engine_client=DelayedEngine())
+    warmup = asyncio.create_task(
+        handler._process_video_arrival_prefill(
+            StreamingVideoSessionConfig(model="test"),
+            ["frame"],
+            [],
+            "warm-racing",
+            {},
+        )
+    )
+    await asyncio.wait_for(generate_entered.wait(), timeout=2.0)
+
+    foreground = asyncio.create_task(handler._begin_foreground_prefill("cancelled"))
+    await asyncio.sleep(0)
+    foreground.cancel()
+    await asyncio.gather(foreground, return_exceptions=True)
+
+    assert handler._foreground_prefill_requests == set()
+    allow_admission.set()
     warmup.cancel()
     await asyncio.gather(warmup, return_exceptions=True)
     assert handler._active_arrival_prefills == {}
@@ -715,7 +800,7 @@ async def test_incremental_canonical_prompt_never_rerenders_completed_history():
 
 
 @pytest.mark.asyncio
-async def test_query_aborts_current_arrival_prefill_without_resubmitting_snapshot():
+async def test_query_cancels_current_unadmitted_arrival_prefill():
     warm_snapshots: list[int] = []
     warm_started = asyncio.Event()
     warm_cancelled = asyncio.Event()
@@ -769,8 +854,7 @@ async def test_query_aborts_current_arrival_prefill_without_resubmitting_snapsho
 
     assert warm_snapshots == [1]
     assert warm_cancelled.is_set()
-    assert len(engine.aborted) == 1
-    assert engine.aborted[0].startswith("video-warm-")
+    assert engine.aborted == []
 
 
 @pytest.mark.asyncio
@@ -1399,6 +1483,7 @@ async def test_context_compaction_drops_only_complete_oldest_turns():
             context_window_trigger_tokens=3000,
             context_window_target_tokens=1500,
             context_window_compaction_headroom_tokens=0,
+            enable_history_summary=False,
         ),
         [],
         bytearray(),
@@ -1452,6 +1537,7 @@ async def test_arrival_prefill_compacts_the_application_owned_history():
             context_window_trigger_tokens=3000,
             context_window_target_tokens=1500,
             context_window_compaction_headroom_tokens=0,
+            enable_history_summary=False,
         ),
         [_b64(_make_jpeg())],
         history,
@@ -1495,6 +1581,7 @@ async def test_arrival_prefill_uses_compaction_headroom():
             context_window_trigger_tokens=5_000,
             context_window_target_tokens=1_500,
             context_window_compaction_headroom_tokens=2_000,
+            enable_history_summary=False,
         ),
         [_b64(_make_jpeg())],
         history,
@@ -1548,6 +1635,237 @@ async def test_context_compaction_uses_logarithmic_prompt_renders():
 
 
 @pytest.mark.asyncio
+async def test_context_compaction_replaces_old_turns_with_summary_and_recent_turns():
+    rendered_requests: list[Any] = []
+    generated_calls: list[dict[str, Any]] = []
+
+    class SummaryEngine:
+        def generate(self, **kwargs):
+            generated_calls.append(kwargs)
+
+            async def _gen():
+                if kwargs["request_id"].endswith("-summary"):
+                    yield _text_result("The user chose the blue prototype; deployment remains unresolved.")
+
+            return _gen()
+
+    class CountingHandler(QwenOmniStreamingVideoHandler):
+        async def _preprocess_to_engine_prompt(self, request):
+            rendered_requests.append(request)
+            return {"prompt_token_ids": list(range(1000 * len(request.messages)))}
+
+    history: list[dict[str, Any]] = []
+    for turn in range(4):
+        history.extend(
+            [
+                {"role": "user", "content": f"question {turn}"},
+                {"role": "assistant", "content": f"answer {turn}"},
+            ]
+        )
+    config = StreamingVideoSessionConfig(
+        model="test",
+        modalities=["text"],
+        context_window_trigger_tokens=7_000,
+        context_window_target_tokens=6_500,
+        context_window_compaction_headroom_tokens=0,
+        history_summary_recent_turns=2,
+        history_summary_max_tokens=128,
+    )
+    handler = CountingHandler(chat_service=object(), engine_client=SummaryEngine())
+
+    ok = await handler._process_video_arrival_prefill(
+        config,
+        [_b64(_make_jpeg())],
+        history,
+        "video-warm-summary",
+        {},
+    )
+
+    assert ok is True
+    assert [call["request_id"] for call in generated_calls] == [
+        "video-warm-summary-summary",
+        "video-warm-summary",
+    ]
+    assert generated_calls[0]["output_modalities"] == ["text"]
+    assert len(history) == 4
+    assert history[0] == {"role": "user", "content": "question 2"}
+    assert config._history_summary == "The user chose the blue prototype; deployment remains unresolved."
+    candidate = rendered_requests[-1]
+    assert candidate.messages[0]["role"] == "system"
+    assert "Durable memory from earlier conversation turns" in candidate.messages[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_failed_proactive_summary_keeps_history_for_a_later_retry():
+    class EmptyEngine:
+        def generate(self, **_kwargs):
+            async def _gen():
+                if False:
+                    yield None
+
+            return _gen()
+
+    class CountingHandler(QwenOmniStreamingVideoHandler):
+        async def _preprocess_to_engine_prompt(self, request):
+            return {"prompt_token_ids": list(range(1000 * len(request.messages)))}
+
+    history = [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    handler = CountingHandler(chat_service=object(), engine_client=EmptyEngine())
+
+    await handler._render_engine_prompt_with_compaction(
+        StreamingVideoSessionConfig(
+            model="test",
+            context_window_trigger_tokens=5_000,
+            context_window_target_tokens=1_500,
+            context_window_compaction_headroom_tokens=2_000,
+        ),
+        [],
+        bytearray(),
+        history,
+        "current",
+        {},
+        output_modalities=["text"],
+        compaction_trigger_tokens=3_000,
+    )
+
+    assert len(history) == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_compactions_recheck_history_after_serialized_commit():
+    summary_started = asyncio.Event()
+    release_summary = asyncio.Event()
+    summary_requests: list[str] = []
+
+    class HoldingSummaryEngine:
+        def generate(self, **kwargs):
+            summary_requests.append(kwargs["request_id"])
+
+            async def _gen():
+                summary_started.set()
+                await release_summary.wait()
+                yield _text_result("durable memory")
+
+            return _gen()
+
+    class CountingHandler(QwenOmniStreamingVideoHandler):
+        async def _preprocess_to_engine_prompt(self, request):
+            return {"prompt_token_ids": list(range(1000 * len(request.messages)))}
+
+    history: list[dict[str, Any]] = []
+    for turn in range(4):
+        history.extend(
+            [
+                {"role": "user", "content": f"question {turn}"},
+                {"role": "assistant", "content": f"answer {turn}"},
+            ]
+        )
+    config = StreamingVideoSessionConfig(
+        model="test",
+        context_window_trigger_tokens=6_000,
+        context_window_target_tokens=4_500,
+        context_window_compaction_headroom_tokens=0,
+        history_summary_recent_turns=2,
+    )
+    handler = CountingHandler(chat_service=object(), engine_client=HoldingSummaryEngine())
+
+    first = asyncio.create_task(
+        handler._render_engine_prompt_with_compaction(
+            config,
+            [],
+            bytearray(),
+            history,
+            "current",
+            {},
+            output_modalities=["text"],
+            summary_request_id="summary-first",
+        )
+    )
+    await asyncio.wait_for(summary_started.wait(), timeout=2.0)
+    second = asyncio.create_task(
+        handler._render_engine_prompt_with_compaction(
+            config,
+            [],
+            bytearray(),
+            history,
+            "current",
+            {},
+            output_modalities=["text"],
+            summary_request_id="summary-second",
+        )
+    )
+    await asyncio.sleep(0)
+    assert summary_requests == ["summary-first"]
+
+    release_summary.set()
+    await asyncio.gather(first, second)
+
+    assert summary_requests == ["summary-first"]
+    assert config._history_summary_revision == 1
+    assert config._history_summary == "durable memory"
+    assert history == [
+        {"role": "user", "content": "question 3"},
+        {"role": "assistant", "content": "answer 3"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_completed_turn_append_waits_for_context_rewrite_transaction():
+    generation_started = asyncio.Event()
+    release_generation = asyncio.Event()
+
+    class PausingEngine:
+        def generate(self, **_kwargs):
+            async def _gen():
+                generation_started.set()
+                await release_generation.wait()
+                yield _text_result("answer")
+
+            return _gen()
+
+    class CountingHandler(QwenOmniStreamingVideoHandler):
+        async def _preprocess_to_engine_prompt(self, request):
+            return {"prompt_token_ids": list(range(100 * len(request.messages)))}
+
+    config = StreamingVideoSessionConfig(model="test", modalities=["text"])
+    history: list[dict[str, Any]] = []
+    websocket = MockWebSocket()
+    handler = CountingHandler(chat_service=object(), engine_client=PausingEngine())
+    query = asyncio.create_task(
+        handler._process_query_engine(
+            websocket,
+            config,
+            [],
+            bytearray(),
+            history,
+            "question",
+            "query-waits-for-history-lock",
+            asyncio.Event(),
+            {},
+        )
+    )
+    await asyncio.wait_for(generation_started.wait(), timeout=2.0)
+    await config._history_compaction_lock.acquire()
+    release_generation.set()
+    for _ in range(20):
+        if any(message.get("type") == "response.text.done" for message in websocket.sent):
+            break
+        await asyncio.sleep(0)
+
+    assert history == []
+    assert not query.done()
+    config._history_compaction_lock.release()
+    await asyncio.wait_for(query, timeout=2.0)
+    assert history == [
+        {"role": "user", "content": [{"type": "text", "text": "question"}]},
+        {"role": "assistant", "content": "answer"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_post_response_headroom_compacts_before_next_turn():
     rendered_message_counts: list[int] = []
 
@@ -1577,6 +1895,7 @@ async def test_post_response_headroom_compacts_before_next_turn():
             context_window_trigger_tokens=5_000,
             context_window_target_tokens=3_500,
             context_window_compaction_headroom_tokens=2_000,
+            enable_history_summary=False,
         ),
         [],
         bytearray(),
