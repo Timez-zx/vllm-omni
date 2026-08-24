@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 import pathlib
 import re
 import statistics as st
@@ -66,11 +67,7 @@ def pct(xs: list[float], q: float) -> float:
     if not xs:
         return float("nan")
     xs = sorted(xs)
-    if len(xs) == 1:
-        return xs[0]
-    k = (len(xs) - 1) * q / 100.0
-    lo, hi = int(k), min(int(k) + 1, len(xs) - 1)
-    return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
+    return xs[min(len(xs) - 1, max(0, math.ceil(q / 100.0 * len(xs)) - 1))]
 
 
 def load_cell(d: pathlib.Path) -> dict:
@@ -157,7 +154,7 @@ def resource_attribution(
         if record.get("playback_start_ms") is not None and record["playback_start_ms"] >= playback_p95
     ]
     device_meta = {device["index"]: device for device in cell["gpu_meta"].get("devices", [])}
-    deploy_name = pathlib.Path(str(cell["summary"].get("deploy_config") or "")).name
+    deploy_name = pathlib.Path(str((cell.get("summary") or {}).get("deploy_config") or "")).name
     gpu_stages = PD_GPU_STAGES if deploy_name == "pd_deploy_4gpu.yaml" else DEFAULT_GPU_STAGES
     output = {}
     for gpu in sorted({sample["gpu"] for sample in samples}):

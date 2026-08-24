@@ -127,7 +127,7 @@ python benchmarks/live_agent/analysis/verify_run.py RESULT_DIR
 4. P runner 将 layer 0/layer 24 delta 直接写入 request-owned shared storage，控制面只传 handle；
 5. foreground gate 保护媒体 cache 顺序，但不被当作 GPU 抢占机制。
 
-## 阶段六：当前 8 用户 P/D 基线与根因
+## 阶段六：8 用户基线与 16 用户容量边界
 
 最新同 trace 对比保持 88 个计分 turn 和全部媒体账本不变，无 timeout、stall 或 replay slip：
 
@@ -183,12 +183,37 @@ python benchmarks/live_agent/analysis/verify_run.py RESULT_DIR
 
 有效结果：`/home/ubuntu/data/results/pd_summary_recent_u8_t30_diag_20260823_v3/pd_summary_recent_diag_seed7_u8`。workload plan SHA256 为 `a2c69229a62dbc978a6a6ad0619bdfbdc12e3fcf7d7bd462c14dcad47d152c6c`，input trace SHA256 为 `d3da7a49ade87a1a86c7f8100f31d0881a6c73dec9ae4dd681af709ce15c0961`。结果记录的 base commit 为 `b69f44a2` 且 `source_dirty=true`，属于当前未提交实现的开发结果。v1/v2 暴露并用于修复同 session compaction 竞态和未 admission warm-up 竞态，不是有效性能结果。
 
+### 16 用户容量边界
+
+旧 16 用户长测暴露了一个应用层 admission 生命周期错误：arrival admission 引用了整个循环 coalescing task，而不是单次 warm-up iteration。当前 iteration 在 engine 提交前退出后，同一 task 可以因 dirty 进入下一轮并等待 foreground 清空；foreground 却仍在等整个 task 结束，形成循环：
+
+`foreground 等 coalescing task 结束 → task 等 foreground 清空`
+
+修复后，每个 admission 都有独立的 `iteration_finished` handshake。Foreground 只等待它观察到的 iteration；如果该 iteration 已进入 engine，仍按 P/D 媒体 cache 顺序 abort；如果它在提交前结束，foreground 立即继续，不再等待可能重新循环的外层 task。回归测试显式复现“第一轮结束、同一 task 进入第二轮并等待 foreground”的旧循环，并验证 foreground 能结束而外层 task 仍存活。
+
+修复后的正式 live capacity cell 使用同一 P/D deploy、seed 7、workload plan、16 用户×30 轮和前 2 轮预热。448/448 个计分 turn 完成，无 timeout、skip、stall、client/protocol/engine error；验证器确认 480 个唯一 foreground request、3,349 个唯一 arrival warm-up、四个独立 stage、6,799 个已消费帧以及 4,883/4,913 次 prefix-cache hit。
+
+| 指标 | 修复前 | 修复后 |
+|---|---:|---:|
+| TTFA / Audio-ready-500 p50/p95/p99 | 588/1,443/12,386 ms | **544/1,083/1,790 ms** |
+| TTFT p50/p95/p99 | 329/1,196/11,980 ms | **295/812/1,452 ms** |
+| Stall-max p99 | 0 ms | **0 ms** |
+| Foreground gate p50/p95/p99/max | 0.2/3.1/9,775/17,521 ms | **0.3/2.0/8.0/14.0 ms** |
+
+两次都是 closed-loop live record，旧 tail 会改变后续媒体到达时序，因此 input trace 不同，TTFA 只能作方向性对比；但 480 次 gate 的直接测量和确定性回归测试足以证明 admission bug 已消失。新运行 gate >50 ms 为 0，arrival warm-up 持续到测试结束，server 也能正常退出。
+
+修复后的 p99 仍超过 1 s，但现在是 engine tail。p95/p99 超出中位数的额外延迟中，Thinker 路径分别占 97%/95%。最慢 5 个 turn 的 gate 都是 0 ms，prompt 为 33.0k–34.9k tokens；Thinker P time-to-output 为 1.07–1.53 s，其中 P execute 为 0.52–1.19 s，Thinker D 再增加 0.16–0.41 s。它们集中在同一约 0.6 s 的 query burst；P scheduler queue 仍近似为 0，说明 tail 在已调度的大 P batch/执行步骤中，而不是 API ingress 或 scheduler queue。
+
+结论：应用层 head-of-line blocking 已修复，16 用户仍不能通过 Audio-ready-500 p99 <1 s 的容量 SLO；当前容量边界可以归因于并发大 prompt 下不可抢占的 Thinker-P prefill/批处理 tail，D 是次要项，Talker、Code2Wav、P→D 传输和应用 gate 都不是主因。
+
+修复后结果：`/home/ubuntu/data/results/pd_gate_fix_u16_t30_capacity_6b34a168_20260824_v1/pd_gate_fix_capacity_seed7_u16`。workload plan SHA256 为 `9f807d41b63a9b76fe7d2e0e30b7a1ae2dd350a02fba2998a32ff6786d194514`，input trace SHA256 为 `f66465698abc764466a71b08ab0ba5f212e764a68255b1fe41f8a675001ca5f8`。结果记录 `source_commit=6b34a168` 且 `source_dirty=true`，包含本节尚未提交的 bug fix。修复前有效对照保留在 `/home/ubuntu/data/results/pd_summary_recent_u16_t30_capacity_6b34a168_20260824_v2/pd_summary_recent_capacity_seed7_u16`。
+
 ## 阶段七：下一步
 
-1. 将 P-conditioning snapshot cache 按 `(lineage_id, revision)` 保留已提交 parent，避免被取消的 speculative child 覆盖；用上面的固定 trace 严格回放验证 full fallback 消失。
-2. 若 delta-only 路径仍受大 warm-up 影响，在 stage 0 A/B 更小的 chunked-prefill 调度粒度或可抢占 warm-up；目标是 foreground 最多等待一个小 chunk。
-3. 再运行 16、32……用户、30 轮/用户的容量阶梯；到首个 SLO 失败点后重新分解 tail 和 GPU 有效利用率。
-4. 在更高并发或跨节点条件下复测 Delta-KV 的容量收益。RCA 开启控制面诊断，正式容量结果关闭诊断。
+1. 保持应用协议和 session 生命周期不变，在 stage 0 A/B 更小的 chunked-prefill quantum 或可抢占/分级的 prefill 调度；目标是 foreground 不被一个大 P batch 长时间占住。
+2. 每个调度改动先做短测；确认机制和分解正确后，再用同一 16 用户×30 轮 live capacity workload 复测。只有 16 用户通过后才继续 32 用户。
+3. 将 P-conditioning snapshot cache 按 `(lineage_id, revision)` 保留已提交 parent，消除少量 full fallback；该项与当前 p99 主因分开评估。
+4. 跨节点测试只用于评估 Delta-KV 网络容量，不再把本机 Thinker-P 执行 tail 归因于传输。
 
 ## 快速恢复入口
 

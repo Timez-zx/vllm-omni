@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from benchmarks.live_agent.analysis.p99_attribution import resource_attribution
+from benchmarks.live_agent.analysis.p99_attribution import pct, resource_attribution
+
+
+def test_percentile_uses_workload_nearest_rank_method() -> None:
+    assert pct(list(range(1, 449)), 99) == 444
 
 
 def test_resource_samples_align_with_ttfa_and_stall_tail_windows() -> None:
@@ -49,7 +53,7 @@ def test_resource_samples_align_with_ttfa_and_stall_tail_windows() -> None:
     assert result["2"]["stage"] == "code2wav"
     assert result["0"]["overall"]["n"] == 3
     assert result["0"]["ttfa_tail95"]["sm_active_pct"]["p50"] == 90.0
-    assert result["0"]["playback_tail95"]["sm_active_pct"]["p50"] == 80.0
+    assert result["0"]["playback_tail95"]["sm_active_pct"]["p50"] == 70.0
     assert result["0"]["stall_tail95"]["sm_active_pct"]["p50"] == 70.0
     assert result["0"]["overall"]["power_limit_pct_p95"] == 50.0
     assert result["0"]["overall"]["memory_used_pct_p95"] == 50.0

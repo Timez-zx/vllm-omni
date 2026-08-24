@@ -459,6 +459,58 @@ async def test_arrival_prefill_waits_while_foreground_crosses_prefill():
 
 
 @pytest.mark.asyncio
+async def test_foreground_waits_for_one_arrival_iteration_not_coalescing_task():
+    """A dirty outer warm-up task must not deadlock with foreground admission."""
+
+    first_registered = asyncio.Event()
+    finish_first = asyncio.Event()
+    second_iteration_started = asyncio.Event()
+    second_registered = asyncio.Event()
+
+    handler = QwenOmniStreamingVideoHandler(chat_service=object(), engine_client=object())
+
+    async def _coalescing_task():
+        first = await handler._admit_arrival_prefill("warm-first")
+        first_registered.set()
+        await finish_first.wait()
+        try:
+            assert await handler._begin_arrival_engine_phase(first, "warm-first") is None
+        finally:
+            await handler._release_arrival_prefill("warm-first", first)
+
+        # This is the next pass through the real ``while arrival_prefill_dirty``
+        # loop. It waits for foreground to clear but is still the same Task.
+        second_iteration_started.set()
+        second = await handler._admit_arrival_prefill("warm-second")
+        second_registered.set()
+        await handler._release_arrival_prefill("warm-second", second)
+
+    warmup = asyncio.create_task(_coalescing_task())
+    await asyncio.wait_for(first_registered.wait(), timeout=2.0)
+
+    foreground = asyncio.create_task(handler._begin_foreground_prefill("foreground"))
+    for _ in range(20):
+        if handler._foreground_prefill_requests:
+            break
+        await asyncio.sleep(0)
+    assert handler._foreground_prefill_requests == {"foreground"}
+
+    finish_first.set()
+    await asyncio.wait_for(second_iteration_started.wait(), timeout=2.0)
+    await asyncio.wait_for(foreground, timeout=2.0)
+
+    # The outer task is blocked on its next iteration, but foreground no longer
+    # waits for that task's lifetime.
+    assert not warmup.done()
+    assert not second_registered.is_set()
+
+    await handler._finish_foreground_prefill("foreground")
+    await asyncio.wait_for(second_registered.wait(), timeout=2.0)
+    await asyncio.wait_for(warmup, timeout=2.0)
+    assert handler._active_arrival_prefills == {}
+
+
+@pytest.mark.asyncio
 async def test_query_cancels_session_warmup_that_has_not_reached_admission():
     warmup_started = asyncio.Event()
     warmup_cancelled = asyncio.Event()

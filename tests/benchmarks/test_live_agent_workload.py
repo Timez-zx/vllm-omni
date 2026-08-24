@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 import hashlib
 import json
 import wave
@@ -23,6 +24,7 @@ from benchmarks.live_agent.web_client.continuous_av_workload import (
 )
 from benchmarks.live_agent.web_client.mu_bench import (
     PLAYBACK_PREBUFFER_S,
+    User,
     load_input_trace,
     summarize,
     write_input_trace,
@@ -147,6 +149,26 @@ def test_workload_constants_match_the_browser_client() -> None:
     assert ENDPOINT_SILENCE_MS == 700
     assert ECHO_GUARD_MS == 300
     assert PLAYBACK_PREBUFFER_S == 0.5
+
+
+def test_live_turn_loop_propagates_a_failed_media_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    user = object.__new__(User)
+    user.name = "u0"
+
+    async def stalled_turn_loop(_ws) -> None:
+        await asyncio.Event().wait()
+
+    async def failed_pump() -> None:
+        raise ConnectionError("socket closed")
+
+    monkeypatch.setattr(user, "_turn_loop", stalled_turn_loop)
+
+    async def exercise() -> None:
+        pump = asyncio.create_task(failed_pump(), name="u0-microphone-pump")
+        with pytest.raises(RuntimeError, match="u0-microphone-pump failed"):
+            await user._run_turn_loop_with_background(object(), [pump])
+
+    asyncio.run(exercise())
 
 
 def test_input_trace_round_trip_uses_frame_references(tmp_path: Path) -> None:

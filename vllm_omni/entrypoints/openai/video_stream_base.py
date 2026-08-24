@@ -83,6 +83,7 @@ class _ArrivalPrefillAdmission:
     request_id: str
     task: asyncio.Task[Any]
     engine_admitted: asyncio.Event
+    iteration_finished: asyncio.Event
 
 
 # Keep JPEG decode/resize work outside the WebSocket process's GIL. This is
@@ -509,20 +510,28 @@ class OmniStreamingVideoHandler:
 
             aborted = 0
             for admission in active:
-                if admission.task.done():
+                if admission.iteration_finished.is_set():
                     continue
+                # ``task`` owns the coalescing loop and may immediately start
+                # another dirty iteration. Foreground waits only for the
+                # admitted iteration it observed, never for that outer loop.
+                finished_waiter = asyncio.create_task(admission.iteration_finished.wait())
                 admitted_waiter = asyncio.create_task(admission.engine_admitted.wait())
                 done: set[asyncio.Future[Any]] = set()
                 try:
                     done, _ = await asyncio.wait(
-                        {admission.task, admitted_waiter},
+                        {finished_waiter, admitted_waiter},
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                 finally:
-                    if not admitted_waiter.done():
-                        admitted_waiter.cancel()
-                        await asyncio.gather(admitted_waiter, return_exceptions=True)
-                if admitted_waiter not in done:
+                    pending_waiters = [
+                        waiter for waiter in (finished_waiter, admitted_waiter) if not waiter.done()
+                    ]
+                    for waiter in pending_waiters:
+                        waiter.cancel()
+                    if pending_waiters:
+                        await asyncio.gather(*pending_waiters, return_exceptions=True)
+                if admitted_waiter not in done or admission.iteration_finished.is_set():
                     continue
                 if not admission.task.done() and self._engine_client is not None:
                     # The warm-up AddRequest is now ordered ahead of this query,
@@ -570,6 +579,7 @@ class OmniStreamingVideoHandler:
                         request_id=request_id,
                         task=task,
                         engine_admitted=asyncio.Event(),
+                        iteration_finished=asyncio.Event(),
                     )
                     self._active_arrival_prefills[request_id] = admission
         except BaseException:
@@ -598,9 +608,15 @@ class OmniStreamingVideoHandler:
                 admission.engine_admitted = asyncio.Event()
                 return admission.engine_admitted
 
-    async def _release_arrival_prefill(self, request_id: str) -> None:
+    async def _release_arrival_prefill(
+        self,
+        request_id: str,
+        admission: _ArrivalPrefillAdmission,
+    ) -> None:
         async with self._arrival_prefill_admission_lock:
-            self._active_arrival_prefills.pop(request_id, None)
+            admission.iteration_finished.set()
+            if self._active_arrival_prefills.get(request_id) is admission:
+                self._active_arrival_prefills.pop(request_id)
         self._arrival_prefill_slots.release()
 
     async def handle_session(self, websocket: WebSocket) -> None:
@@ -1803,7 +1819,7 @@ class OmniStreamingVideoHandler:
             )
             return False
         finally:
-            await self._release_arrival_prefill(request_id)
+            await self._release_arrival_prefill(request_id, admission)
 
     async def _render_engine_prompt_with_compaction(
         self,

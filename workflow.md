@@ -127,7 +127,7 @@ The current P/D data path cumulatively retains:
 4. P-runner writes of layer-0/layer-24 deltas directly into request-owned shared storage, with handles only on the control plane;
 5. a foreground gate that protects media-cache ordering but is not treated as GPU preemption.
 
-## Phase 6: current eight-user P/D baseline and root cause
+## Phase 6: eight-user baseline and sixteen-user capacity boundary
 
 The latest same-trace comparison preserves all 88 scored turns and the complete media ledger, with no timeout, stall, or replay slip:
 
@@ -183,12 +183,37 @@ One independent implementation issue remains. Six of 224 scored requests fall ba
 
 Valid result: `/home/ubuntu/data/results/pd_summary_recent_u8_t30_diag_20260823_v3/pd_summary_recent_diag_seed7_u8`. Workload-plan SHA256 is `a2c69229a62dbc978a6a6ad0619bdfbdc12e3fcf7d7bd462c14dcad47d152c6c`; input-trace SHA256 is `d3da7a49ade87a1a86c7f8100f31d0881a6c73dec9ae4dd681af709ce15c0961`. It records base commit `b69f44a2` with `source_dirty=true`, so it is a development result for the current uncommitted implementation. v1/v2 exposed and were used to fix the same-session compaction race and the unadmitted-warm-up race; they are not valid performance results.
 
+### Sixteen-user capacity boundary
+
+The old sixteen-user run exposed an application admission-lifecycle bug. An arrival admission referenced the entire looping coalescing task rather than one warm-up iteration. After the current iteration exited before engine submission, the same dirty task could enter its next pass and wait for foreground to clear, while foreground was still waiting for the whole task to end:
+
+`foreground waits for coalescing task → task waits for foreground to clear`
+
+The fix gives every admission an independent `iteration_finished` handshake. Foreground now waits only for the iteration it observed. If that iteration entered the engine, it is still aborted in P/D media-cache order; if it ended before submission, foreground proceeds immediately instead of waiting for an outer task that may loop again. A deterministic regression test recreates “first iteration ends, same task enters a second iteration and waits for foreground,” then verifies that foreground completes while the outer task remains alive.
+
+The fixed formal live cell used the same P/D deployment, seed 7, workload plan, sixteen users × thirty turns, and two warm-up turns per user. All 448/448 scored turns completed with no timeout, skip, stall, client/protocol error, or engine error. The verifier confirmed 480 unique foreground requests, 3,349 unique arrival warm-ups, four independent stages, 6,799 consumed frames, and 4,883/4,913 prefix-cache hits.
+
+| Metric | Before fix | After fix |
+|---|---:|---:|
+| TTFA / Audio-ready-500 p50/p95/p99 | 588/1,443/12,386 ms | **544/1,083/1,790 ms** |
+| TTFT p50/p95/p99 | 329/1,196/11,980 ms | **295/812/1,452 ms** |
+| Stall-max p99 | 0 ms | **0 ms** |
+| Foreground gate p50/p95/p99/max | 0.2/3.1/9,775/17,521 ms | **0.3/2.0/8.0/14.0 ms** |
+
+Both are closed-loop live recordings. The old tail changes later media-arrival timing, so their input traces differ and TTFA is only a directional comparison. The 480 direct gate observations plus the deterministic regression test are sufficient to establish that the admission bug is gone. The new run has no gate above 50 ms, arrival warm-ups continue through the end, and the server shuts down cleanly.
+
+The fixed p99 still exceeds one second, but it is now an engine tail. The Thinker path accounts for 97%/95% of p95/p99 excess above the median. The five slowest turns all have a zero-millisecond gate and 33.0k–34.9k-token prompts. Thinker-P time-to-output is 1.07–1.53 s, including 0.52–1.19 s of P execution; Thinker D adds another 0.16–0.41 s. They arrive in the same roughly 0.6-second query burst. P scheduler queue remains effectively zero, placing the tail inside an already scheduled large P batch/execution step rather than API ingress or scheduler queue.
+
+Conclusion: the application head-of-line block is fixed, but sixteen users still fail the Audio-ready-500 p99 <1 s capacity SLO. The clean capacity cause is non-preemptible Thinker-P prefill/batching tail under concurrent large prompts, with D secondary. Talker, Code2Wav, P→D transfer, and the application gate are not the dominant cause.
+
+Fixed result: `/home/ubuntu/data/results/pd_gate_fix_u16_t30_capacity_6b34a168_20260824_v1/pd_gate_fix_capacity_seed7_u16`. Workload-plan SHA256 is `9f807d41b63a9b76fe7d2e0e30b7a1ae2dd350a02fba2998a32ff6786d194514`; input-trace SHA256 is `f66465698abc764466a71b08ab0ba5f212e764a68255b1fe41f8a675001ca5f8`. It records `source_commit=6b34a168` and `source_dirty=true`, including the uncommitted bug fix in this section. The valid pre-fix control remains at `/home/ubuntu/data/results/pd_summary_recent_u16_t30_capacity_6b34a168_20260824_v2/pd_summary_recent_capacity_seed7_u16`.
+
 ## Phase 7: next steps
 
-1. Preserve committed P-conditioning parents by `(lineage_id, revision)` so a cancelled speculative child cannot replace them; strictly replay the fixed trace and verify that full fallback disappears.
-2. If the delta-only path still suffers from large warm-ups, A/B a smaller stage-0 chunked-prefill quantum or preemptible warm-ups. A foreground query should wait for at most one small chunk.
-3. Run the 16, 32, ... user capacity ladder at 30 turns/user. At the first SLO failure, decompose tail latency and effective GPU utilization again.
-4. Re-evaluate Delta-KV capacity benefit at higher concurrency or across nodes. Enable control-plane diagnostics for RCA and disable them for formal capacity results.
+1. Keep the application protocol and session lifecycle fixed. At stage 0, A/B a smaller chunked-prefill quantum or preemptible/tiered prefill scheduling so foreground is not held behind one large P batch.
+2. Use short runs to validate each scheduling mechanism and decomposition, then rerun the same sixteen-user × thirty-turn live capacity workload. Do not proceed to 32 users until sixteen passes.
+3. Retain committed P-conditioning snapshot parents by `(lineage_id, revision)` to eliminate the small number of full fallbacks; evaluate this separately from the current p99 cause.
+4. Use cross-node tests only to measure Delta-KV network capacity; do not attribute the local Thinker-P execution tail to transfer.
 
 ## Recovery map
 
