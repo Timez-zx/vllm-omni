@@ -44,6 +44,11 @@ stages:
         kv_parallel_size: 2
         kv_load_failure_policy: fail
         kv_connector_extra_config:
+          # The orchestrator uses the same endpoint to pre-register D's
+          # destination blocks while P is still computing.  Keep this equal
+          # to VLLM_NIXL_SIDE_CHANNEL_PORT above.
+          orchestrator_remote_host: 127.0.0.1
+          orchestrator_remote_port: 5600
           # Pack every layer for the same KV block contiguously.  Without
           # this, a long Qwen3-Omni prompt becomes roughly one NIXL
           # descriptor per layer/KV/block and transfer setup dominates PCIe.

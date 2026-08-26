@@ -920,6 +920,113 @@ async def test_pd_prefill_only_uses_decode_cache_control_path(orchestrator_facto
 
 
 @pytest.mark.asyncio
+async def test_pd_formal_query_does_not_wait_for_early_cache_utility_result(
+    orchestrator_factory,
+) -> None:
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True)
+    p_output = SimpleNamespace(
+        request_id="query-1",
+        finished=True,
+        kv_transfer_params={"remote_request_id": "query-1"},
+    )
+    processors = [
+        FakeOutputProcessor(request_outputs=[p_output]),
+        FakeOutputProcessor(),
+    ]
+    orchestrator_fixture = orchestrator_factory(
+        [stage0, stage1],
+        output_processors=processors,
+        pd_config={
+            "pd_pair": (0, 1),
+            "prefill_engine_id": "p-engine",
+            "prefill_remote": {
+                "remote_engine_id": "p-engine",
+                "remote_host": "127.0.0.1",
+                "remote_port": 5600,
+                "tp_size": 1,
+                "pp_size": 1,
+            },
+        },
+    )
+    processed_prompt = SimpleNamespace(
+        request_id="query-1",
+        prompt_token_ids=[1, 2, 3],
+        kv_lineage_id="session-1",
+        kv_lineage_parent_revision=0,
+        kv_lineage_revision=1,
+        kv_lineage_prefix_tokens=0,
+        model_intermediate_buffer=None,
+        mm_features=None,
+    )
+    original_prompt = {
+        "prompt_token_ids": [1, 2, 3],
+        "kv_lineage_id": "session-1",
+        "kv_lineage_parent_revision": 0,
+        "kv_lineage_revision": 1,
+        "kv_lineage_prefix_tokens": 0,
+    }
+    cache_sync_started = asyncio.Event()
+    cache_sync_release = asyncio.Event()
+
+    async def delayed_cache_sync(request) -> dict[str, Any]:
+        stage1.pd_cache_sync_calls.append(request)
+        cache_sync_started.set()
+        await cache_sync_release.wait()
+        return {
+            "request_id": request.request_id,
+            "cache_sync_ms": 1.0,
+            "full_hit": False,
+        }
+
+    stage1.pd_cache_sync_async = delayed_cache_sync
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="query-1",
+            prompt=processed_prompt,
+            original_prompt=original_prompt,
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+        await asyncio.wait_for(cache_sync_started.wait(), timeout=1.0)
+        assert stage0.add_request_calls
+        assert stage1.add_request_calls == []
+        early_request = stage1.pd_cache_sync_calls[0]
+        assert early_request.pd_cache_sync_retain is True
+        early_kv = early_request.sampling_params.extra_args["kv_transfer_params"]
+        assert early_kv["remote_request_id"] == "query-1"
+        assert early_kv["do_remote_prefill"] is True
+
+        req_state = orchestrator_fixture.orchestrator.request_states["query-1"]
+        req_state.pd_prefill_multimodal_output = {
+            "hidden_states": {
+                "layers": {
+                    0: torch.ones(3, 2),
+                    24: torch.full((3, 2), 24.0),
+                }
+            }
+        }
+        stage0.push_engine_core_outputs(_engine_core_outputs("stage0-raw", 1.0))
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+
+        decode_request = stage1.add_request_calls[0][0]
+        assert decode_request.request_id == "query-1"
+        assert decode_request.pd_prefill_payload is not None
+        # Until D resolves the local import, this request keeps ordinary P/D
+        # parameters as a safe fallback. D Core strips them on early success.
+        assert decode_request.sampling_params.extra_args[
+            "kv_transfer_params"
+        ]["do_remote_prefill"] is True
+        assert not cache_sync_release.is_set()
+        cache_sync_release.set()
+    finally:
+        cache_sync_release.set()
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
 async def test_run_single_stage_diffusion(orchestrator_factory) -> None:
     stage0 = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
     orchestrator_fixture = orchestrator_factory([stage0])

@@ -66,7 +66,11 @@ class OmniPDPrefillPayload(msgspec.Struct):
     preserved without making them durable engine or session state.
     """
 
-    prompt_token_ids: list[int]
+    # The outer EngineCoreRequest already carries the identical canonical
+    # prompt. New P/D requests omit this duplicate list and the Talker bridge
+    # falls back to request.prompt_token_ids; keep the field for wire
+    # compatibility with older callers.
+    prompt_token_ids: list[int] | None = None
     # Legacy contiguous form.  New local P/D requests use the chunk fields
     # below so the orchestrator can forward P's already-shared output buffers
     # without materializing another full-prompt copy.
@@ -123,6 +127,10 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     kv_lineage_snapshot_block_hashes: list[bytes] | None = None
     kv_lineage_snapshot_num_computed_tokens: int = 0
     kv_lineage_snapshot_hash_block_size: int = 0
+    # Keep a completed cache-only D import referenced until the paired finite
+    # decode request reaches D's Core.  This closes the eviction window
+    # between early P->D transfer completion and ordinary scheduler admission.
+    pd_cache_sync_retain: bool = False
 
     @classmethod
     def from_request(
@@ -193,6 +201,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             kv_lineage_snapshot_block_hashes=getattr(request, "kv_lineage_snapshot_block_hashes", None),
             kv_lineage_snapshot_num_computed_tokens=getattr(request, "kv_lineage_snapshot_num_computed_tokens", 0),
             kv_lineage_snapshot_hash_block_size=getattr(request, "kv_lineage_snapshot_hash_block_size", 0),
+            pd_cache_sync_retain=bool(getattr(request, "pd_cache_sync_retain", False)),
         )
 
 

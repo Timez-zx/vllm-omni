@@ -1,4 +1,4 @@
-from threading import Lock
+from threading import Event, Lock
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -14,9 +14,22 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
 from vllm_omni.engine.nixl_delta_push_connector import (
     NixlDeltaPushConnectorScheduler,
     NixlDeltaPushConnectorWorker,
+    _TimestampedNotifQueue,
     _delta_registration_fields,
     _select_delta_source_blocks,
 )
+
+
+def test_completion_wake_is_published_after_notification_is_drainable():
+    observed_sizes = []
+    notifications = _TimestampedNotifQueue(
+        lambda _item: observed_sizes.append(notifications.qsize())
+    )
+
+    notifications.put(b"request:1")
+
+    assert observed_sizes == [1]
+    assert notifications.get_nowait() == b"request:1"
 
 
 def test_delta_registration_fields_encode_block_offset():
@@ -114,6 +127,33 @@ def test_direct_cache_sync_completion_is_hidden_from_inference_scheduler(monkeyp
 
     assert worker.get_finished() == ({"sent"}, {"decode"})
     assert worker.poll_direct_cache_sync() == {"cache-only"}
+
+
+def test_direct_cache_sync_retries_writer_wake_race_in_same_poll(monkeypatch):
+    worker = object.__new__(NixlDeltaPushConnectorWorker)
+    worker.shutdown = lambda: None
+    worker._delta_load_started = {}
+    worker._direct_cache_sync_req_ids = {"cache-only"}
+    worker._direct_cache_sync_finished = set()
+    worker._deferred_regular_finished_sending = set()
+    worker._deferred_regular_finished_recving = set()
+    worker._completion_notif_seen = {}
+    worker._completion_notif_lock = Lock()
+    worker._completion_notif_available = Event()
+    calls = 0
+
+    def parent_finished(_worker):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            worker._completion_notif_available.set()
+            return set(), set()
+        return set(), {"cache-only"}
+
+    monkeypatch.setattr(NixlPushConnectorWorker, "get_finished", parent_finished)
+
+    assert worker.poll_direct_cache_sync() == {"cache-only"}
+    assert calls == 2
 
 
 def test_scheduler_attaches_delta_offset_to_registration(monkeypatch):

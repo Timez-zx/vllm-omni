@@ -208,6 +208,11 @@ class StageEngineCoreProc(EngineCoreProc):
         # Cache-only D imports are deliberately kept outside Scheduler.requests:
         # they allocate/cache KV blocks but never enter model execution.
         self._pd_cache_sync_jobs: dict[str, dict[str, Any]] = {}
+        self._pd_prepared_cache: dict[str, Any] = {}
+        # A paired finite D request may arrive before its cache-only import has
+        # completed. Keep that ADD inside D's Core instead of making the
+        # orchestrator wait for a utility result on D's busy output socket.
+        self._pd_pending_decode_adds: dict[str, tuple[Any, int]] = {}
         self._pd_cache_sync_last_poll = 0.0
 
     def _install_materialized_mm_receiver_cache(self) -> None:
@@ -506,6 +511,104 @@ class StageEngineCoreProc(EngineCoreProc):
         }
         return future
 
+    @staticmethod
+    def _strip_remote_prefill_params(request: Any) -> None:
+        """Turn a fallback-capable D ADD into a local-prefix admission."""
+        request.kv_transfer_params = None
+        sampling_params = getattr(request, "sampling_params", None)
+        extra_args = getattr(sampling_params, "extra_args", None)
+        if isinstance(extra_args, dict) and "kv_transfer_params" in extra_args:
+            sampling_params.extra_args = dict(extra_args)
+            sampling_params.extra_args.pop("kv_transfer_params", None)
+        get_skip = getattr(request, "get_skip_reading_prefix_cache", None)
+        if callable(get_skip):
+            request.skip_reading_prefix_cache = get_skip()
+
+    def _activate_pd_decode(
+        self,
+        request: Any,
+        request_wave: int,
+        prepared: dict[str, Any] | None,
+    ) -> None:
+        """Admit a formal D request after resolving its local import state."""
+        if prepared is not None:
+            held_ms = (time.monotonic() - prepared["ready_mono"]) * 1000.0
+            prepared_request = prepared["request"]
+            if request.prompt_token_ids != prepared_request.prompt_token_ids:
+                if prepared.get("owns_blocks", False):
+                    self.scheduler.release_direct_pd_cache_sync(prepared_request)
+                raise RuntimeError(
+                    "Prepared P/D cache prompt changed before activation for "
+                    f"{request.request_id}"
+                )
+            self._strip_remote_prefill_params(request)
+            # A loading import owns the exact (possibly non-block-aligned)
+            # block table under this request id. A full local hit owns no
+            # private table and should be matched by normal prefix caching.
+            if prepared.get("owns_blocks", False):
+                request.num_computed_tokens = prepared_request.num_computed_tokens
+            if _LOG_INGRESS_DIAG:
+                logger.info(
+                    "[PD-D-CONTROL] event=prepared-cache-activate request=%s "
+                    "held_ms=%.3f imported_tokens=%d owns_blocks=%s",
+                    request.request_id,
+                    held_ms,
+                    request.num_computed_tokens,
+                    bool(prepared.get("owns_blocks", False)),
+                )
+        super().add_request(request, request_wave)
+
+    def _activate_pending_pd_decode(
+        self,
+        request_id: str,
+        prepared: dict[str, Any] | None,
+    ) -> bool:
+        pending = self._pd_pending_decode_adds.pop(request_id, None)
+        if pending is None:
+            return False
+        request, request_wave = pending
+        self._activate_pd_decode(request, request_wave, prepared)
+        return True
+
+    def add_request(self, request: Any, request_wave: int = 0) -> None:
+        """Resolve a paired early import locally without an API-side barrier."""
+        request_id = request.request_id
+        prepared = self._pd_prepared_cache.pop(request_id, None)
+        if prepared is not None:
+            self._activate_pd_decode(request, request_wave, prepared)
+            return
+
+        if request_id in self._pd_cache_sync_jobs:
+            if request_id in self._pd_pending_decode_adds:
+                raise RuntimeError(f"Duplicate pending P/D decode ADD for {request_id}")
+            self._pd_pending_decode_adds[request_id] = (request, request_wave)
+            if _LOG_INGRESS_DIAG:
+                logger.info(
+                    "[PD-D-CONTROL] event=decode-held-for-import request=%s",
+                    request_id,
+                )
+            return
+
+        # The early import was unavailable or failed before this ADD reached
+        # D. Its remote-prefill parameters provide the ordinary safe fallback.
+        super().add_request(request, request_wave)
+
+    def abort_requests(self, request_ids: list[str]) -> None:
+        """Also release retained early imports that never reach D decode."""
+        for request_id in request_ids:
+            # A transfer already submitted to NIXL cannot be synchronously
+            # revoked safely.  Let it finish as disposable cache instead of
+            # retaining a formal-query block table whose ADD was cancelled.
+            job = self._pd_cache_sync_jobs.get(request_id)
+            if job is not None:
+                job["request"].pd_cache_sync_retain = False
+            prepared = self._pd_prepared_cache.pop(request_id, None)
+            if prepared is not None:
+                if prepared.get("owns_blocks", False):
+                    self.scheduler.release_direct_pd_cache_sync(prepared["request"])
+            self._pd_pending_decode_adds.pop(request_id, None)
+        super().abort_requests(request_ids)
+
     def has_work(self) -> bool:
         return super().has_work() or bool(self._pd_cache_sync_jobs)
 
@@ -521,6 +624,13 @@ class StageEngineCoreProc(EngineCoreProc):
                 logger.exception(
                     "Failed to release direct P/D cache sync %s", request_id
                 )
+        # The formal ADD retained its ordinary remote-prefill parameters. Once
+        # the failed cache-only request has released connector state, admit it
+        # through vLLM's standard P/D path without another API round trip.
+        try:
+            self._activate_pending_pd_decode(request_id, prepared=None)
+        except Exception as fallback_exc:
+            exc = fallback_exc
         future = job["future"]
         if not future.done():
             future.set_exception(exc)
@@ -530,15 +640,50 @@ class StageEngineCoreProc(EngineCoreProc):
             return False
         progressed = False
 
+        # Preserve revision order inside each lineage. Normal prefix-cache
+        # matching only sees completed imports; registering a newer revision
+        # first would therefore request a redundant large suffix and increase
+        # D cache pressure. Independent lineages may still progress in the
+        # same Core pass below.
+        lineage_heads: dict[str, str] = {}
+        for candidate_id, candidate in self._pd_cache_sync_jobs.items():
+            candidate_request = candidate["request"]
+            lineage_id = getattr(candidate_request, "kv_lineage_id", None)
+            if not lineage_id:
+                continue
+            current_id = lineage_heads.get(lineage_id)
+            if current_id is None:
+                lineage_heads[lineage_id] = candidate_id
+                continue
+            current_request = self._pd_cache_sync_jobs[current_id]["request"]
+            candidate_key = (
+                int(getattr(candidate_request, "kv_lineage_revision", 0)),
+                float(candidate["started"]),
+                candidate_id,
+            )
+            current_key = (
+                int(getattr(current_request, "kv_lineage_revision", 0)),
+                float(self._pd_cache_sync_jobs[current_id]["started"]),
+                current_id,
+            )
+            if candidate_key < current_key:
+                lineage_heads[lineage_id] = candidate_id
+
         # Admission and registration are scheduler-owned and therefore run on
         # this EngineCore thread. Worker RPC only starts the NIXL background
-        # writer; it performs no model forward.
+        # writer; it performs no model forward. Keep each RPC request-sized:
+        # bulk registration allocates many long-context D block tables at once
+        # and can evict the prefixes the following requests need.
         for request_id, job in list(self._pd_cache_sync_jobs.items()):
             if job["phase"] != "queued":
                 continue
+            request = job["request"]
+            lineage_id = getattr(request, "kv_lineage_id", None)
+            if lineage_id and lineage_heads.get(lineage_id) != request_id:
+                continue
             try:
                 phase, metadata = self.scheduler.prepare_direct_pd_cache_sync(
-                    job["request"]
+                    request
                 )
                 if phase == "blocked":
                     continue
@@ -546,12 +691,26 @@ class StageEngineCoreProc(EngineCoreProc):
                 # failure releases their D block table instead of leaking it.
                 job["phase"] = phase
                 self.model_executor.collective_rpc(
-                    "start_pd_cache_sync", args=(metadata,)
+                    "start_pd_cache_sync",
+                    args=(metadata,),
                 )
                 progressed = True
                 if phase == "full_hit":
-                    elapsed_ms = (time.monotonic() - job["started"]) * 1000.0
+                    ready_mono = time.monotonic()
+                    elapsed_ms = (ready_mono - job["started"]) * 1000.0
                     self._pd_cache_sync_jobs.pop(request_id, None)
+                    prepared_cache = None
+                    if bool(getattr(job["request"], "pd_cache_sync_retain", False)):
+                        prepared_cache = {
+                            "request": job["request"],
+                            "ready_mono": ready_mono,
+                            "owns_blocks": False,
+                        }
+                        if not self._activate_pending_pd_decode(
+                            request_id,
+                            prepared_cache,
+                        ):
+                            self._pd_prepared_cache[request_id] = prepared_cache
                     job["future"].set_result(
                         {
                             "request_id": request_id,
@@ -570,7 +729,7 @@ class StageEngineCoreProc(EngineCoreProc):
             if job["phase"] == "loading"
         }
         now = time.monotonic()
-        if not loading or now - self._pd_cache_sync_last_poll < 0.005:
+        if not loading or now - self._pd_cache_sync_last_poll < 0.001:
             return progressed
         self._pd_cache_sync_last_poll = now
 
@@ -593,6 +752,17 @@ class StageEngineCoreProc(EngineCoreProc):
                 self.scheduler.complete_direct_pd_cache_sync(job["request"])
                 elapsed_ms = (time.monotonic() - job["started"]) * 1000.0
                 self._pd_cache_sync_jobs.pop(request_id, None)
+                if bool(getattr(job["request"], "pd_cache_sync_retain", False)):
+                    prepared_cache = {
+                        "request": job["request"],
+                        "ready_mono": time.monotonic(),
+                        "owns_blocks": True,
+                    }
+                    if not self._activate_pending_pd_decode(
+                        request_id,
+                        prepared_cache,
+                    ):
+                        self._pd_prepared_cache[request_id] = prepared_cache
                 job["future"].set_result(
                     {
                         "request_id": request_id,
@@ -600,6 +770,12 @@ class StageEngineCoreProc(EngineCoreProc):
                         "full_hit": False,
                     }
                 )
+                if _LOG_INGRESS_DIAG:
+                    logger.info(
+                        "[PD-D-CONTROL] event=completion-observed request=%s total_ms=%.3f",
+                        request_id,
+                        elapsed_ms,
+                    )
                 progressed = True
             except Exception as exc:
                 self._fail_pd_cache_sync_job(request_id, exc)
@@ -847,6 +1023,9 @@ class StageEngineCoreProc(EngineCoreProc):
         scheduler_request.additional_information = request.additional_information
         scheduler_request.model_intermediate_buffer = getattr(request, "model_intermediate_buffer", None)
         scheduler_request.pd_prefill_payload = getattr(request, "pd_prefill_payload", None)
+        scheduler_request.pd_cache_sync_retain = bool(
+            getattr(request, "pd_cache_sync_retain", False)
+        )
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
         if ingress_diag:
             ingress_done = time.monotonic()

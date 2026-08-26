@@ -590,7 +590,11 @@ def thinker2talker_async_chunk(
                 "P/D Thinker→Talker received an unresolved sampled-token sentinel; "
                 "disable async_scheduling on the decode stage"
             )
-        prompt_ids = _ensure_list(pd_prefill.prompt_token_ids)
+        prompt_ids = _ensure_list(
+            pd_prefill.prompt_token_ids
+            if pd_prefill.prompt_token_ids is not None
+            else request.prompt_token_ids
+        )
         decode_rows = len(output_token_ids)
         available_decode_rows = min(int(thinker_emb.shape[0]), int(thinker_hid.shape[0]))
         if available_decode_rows < decode_rows:

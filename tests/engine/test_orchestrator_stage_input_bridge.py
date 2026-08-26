@@ -420,10 +420,9 @@ async def test_pd_prefill_only_route_uses_cache_sync_forwarding() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pd_cache_sync_is_ordered_per_lineage_without_blocking_p_ready() -> None:
+async def test_pd_cache_sync_does_not_wait_for_lineage_utility_result() -> None:
     orchestrator = object.__new__(Orchestrator)
     orchestrator._pd_cache_sync_tasks = {}
-    orchestrator._pd_lineage_cache_sync_tails = {}
     calls: list[str] = []
     first_started = asyncio.Event()
     first_release = asyncio.Event()
@@ -453,12 +452,10 @@ async def test_pd_cache_sync_is_ordered_per_lineage_without_blocking_p_ready() -
     orchestrator._schedule_pd_cache_sync("warm-2", 0, object(), state_2, src_replica_id=0)
 
     await asyncio.wait_for(first_started.wait(), timeout=1.0)
-    await asyncio.sleep(0)
-    assert calls == ["warm-1"]
-    assert not second_started.is_set()
+    await asyncio.wait_for(second_started.wait(), timeout=1.0)
+    assert calls == ["warm-1", "warm-2"]
 
     first_release.set()
-    await asyncio.wait_for(second_started.wait(), timeout=1.0)
     await asyncio.gather(*list(orchestrator._pd_cache_sync_tasks.values()))
     assert calls == ["warm-1", "warm-2"]
 

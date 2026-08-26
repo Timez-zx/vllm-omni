@@ -98,6 +98,51 @@ NIXL_PUSH_DIAG = re.compile(
     r"select_ms=(?P<select>[\d.]+)\s+submit_ms=(?P<submit>[\d.]+)\s+"
     r"total_ms=(?P<total>[\d.]+)"
 )
+NIXL_D_REG_ENQUEUED = re.compile(
+    r"\[NIXL-D-TRACE\]\s+event=registration-enqueued\s+"
+    r"request=(?P<request>\S+)\s+mono=(?P<mono>[\d.]+)"
+)
+NIXL_D_REG_SENT = re.compile(
+    r"\[NIXL-D-TRACE\]\s+event=registration-sent\s+"
+    r"request=(?P<request>\S+)\s+mono=(?P<mono>[\d.]+)"
+)
+NIXL_P_REG_RECEIVED = re.compile(
+    r"\[NIXL-P-TRACE\]\s+event=registration-received\s+"
+    r"request=(?P<request>\S+)\s+mono=(?P<mono>[\d.]+)"
+)
+NIXL_P_WRITE_SUBMITTED = re.compile(
+    r"\[NIXL-P-TRACE\]\s+event=write-submitted\s+"
+    r"request=(?P<request>\S+)\s+mono=(?P<mono>[\d.]+)"
+)
+NIXL_P_FINISHED_STAGED = re.compile(
+    r"\[NIXL-P-TRACE\]\s+event=finished-blocks-staged\s+"
+    r"request=(?P<request>\S+)\s+mono=(?P<mono>[\d.]+)"
+)
+NIXL_P_FINISHED_RECEIVED = re.compile(
+    r"\[NIXL-P-TRACE\]\s+event=finished-metadata-received\s+"
+    r"request=(?P<request>\S+)\s+mono=(?P<mono>[\d.]+)"
+)
+NIXL_D_COMPLETED = re.compile(
+    r"\[NIXL-D-TRACE\]\s+event=completion-observed\s+"
+    r"request=(?P<request>\S+)\s+mono=(?P<mono>[\d.]+)"
+)
+NIXL_D_COMPLETION_FORWARDED = re.compile(
+    r"\[NIXL-D-TRACE\]\s+event=completion-forwarded\s+"
+    r"request=(?P<request>\S+)\s+mono=(?P<mono>[\d.]+)"
+)
+NIXL_D_COMPLETION_CORE_OBSERVED = re.compile(
+    r"\[NIXL-D-TRACE\]\s+event=completion-core-observed\s+"
+    r"request=(?P<request>\S+)\s+mono=(?P<mono>[\d.]+)"
+)
+PD_D_ACTIVATED = re.compile(
+    r"\[PD-D-CONTROL\]\s+event=prepared-cache-activate\s+"
+    r"request=(?P<request>\S+)\s+held_ms=(?P<held>[\d.]+)\s+"
+    r"imported_tokens=(?P<tokens>\d+)"
+)
+PD_D_HELD = re.compile(
+    r"\[PD-D-CONTROL\]\s+event=decode-held-for-import\s+"
+    r"request=(?P<request>\S+)"
+)
 
 
 def nearest_rank(values: list[float], percentile: int) -> float:
@@ -142,6 +187,10 @@ def parse_diagnostics(log_path: pathlib.Path) -> dict[str, Any]:
     pd_cache_sync_ms: dict[str, float] = {}
     nixl_push_diag: list[dict[str, float | int | str]] = []
     core_preprocess_wall: dict[str, float] = {}
+    core_output_ready_mono: dict[str, float] = {}
+    pd_control_times: dict[str, dict[str, float]] = defaultdict(dict)
+    pd_activation: dict[str, dict[str, float | int]] = {}
+    pd_decode_held: set[str] = set()
     stage0_wall_minus_mono: list[float] = []
 
     for line in log_path.open(errors="replace"):
@@ -209,6 +258,9 @@ def parse_diagnostics(log_path: pathlib.Path) -> dict[str, Any]:
             if match["mono"] is not None:
                 stage0_wall_minus_mono.append(float(match["wall"]) - float(match["mono"]))
             requests = tuple(match["requests"].split(","))
+            if match["mono"] is not None:
+                for request in requests:
+                    core_output_ready_mono[request] = float(match["mono"])
             if pending_batches[requests]:
                 batch = pending_batches[requests].popleft()
                 batch["payload_mib"] = float(match["payload"])
@@ -262,6 +314,31 @@ def parse_diagnostics(log_path: pathlib.Path) -> dict[str, Any]:
                 }
             )
 
+        for event, pattern in (
+            ("d_registration_enqueued", NIXL_D_REG_ENQUEUED),
+            ("d_registration_sent", NIXL_D_REG_SENT),
+            ("p_registration_received", NIXL_P_REG_RECEIVED),
+            ("p_finished_staged", NIXL_P_FINISHED_STAGED),
+            ("p_finished_received", NIXL_P_FINISHED_RECEIVED),
+            ("p_write_submitted", NIXL_P_WRITE_SUBMITTED),
+            ("d_completion_forwarded", NIXL_D_COMPLETION_FORWARDED),
+            ("d_completion_core_observed", NIXL_D_COMPLETION_CORE_OBSERVED),
+            ("d_completion_observed", NIXL_D_COMPLETED),
+        ):
+            match = pattern.search(line)
+            if match:
+                pd_control_times[match["request"]][event] = float(match["mono"])
+
+        match = PD_D_ACTIVATED.search(line)
+        if match:
+            pd_activation[match["request"]] = {
+                "held_ms": float(match["held"]),
+                "imported_tokens": int(match["tokens"]),
+            }
+        match = PD_D_HELD.search(line)
+        if match:
+            pd_decode_held.add(match["request"])
+
     for batch in runner_batches:
         modes = [snapshot_modes.get(request, {}).get("mode") for request in batch["requests"]]
         batch["full_snapshots"] = sum(mode == "full" for mode in modes)
@@ -288,6 +365,10 @@ def parse_diagnostics(log_path: pathlib.Path) -> dict[str, Any]:
         "nixl_delta_load_ms": nixl_delta_load_ms,
         "pd_cache_sync_ms": pd_cache_sync_ms,
         "nixl_push_diag": nixl_push_diag,
+        "core_output_ready_mono": core_output_ready_mono,
+        "pd_control_times": dict(pd_control_times),
+        "pd_activation": pd_activation,
+        "pd_decode_held": sorted(pd_decode_held),
     }
 
 
@@ -427,6 +508,84 @@ def batch_correlations(batches: list[dict[str, Any]]) -> dict[str, float]:
             [float(batch["forward_wall_ms"]) for batch in batches],
         ),
     }
+
+
+def pd_control_breakdown(
+    rows: list[dict[str, Any]],
+    diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    request_ids = {str(row["request_id"]) for row in rows}
+    control = diagnostics["pd_control_times"]
+    p_ready = diagnostics["core_output_ready_mono"]
+    activation = diagnostics["pd_activation"]
+    decode_held = set(diagnostics.get("pd_decode_held", ()))
+
+    def interval(start: str, end: str) -> list[float]:
+        output = []
+        for request_id in request_ids:
+            times = control.get(request_id, {})
+            start_value = p_ready.get(request_id) if start == "p_output_ready" else times.get(start)
+            end_value = p_ready.get(request_id) if end == "p_output_ready" else times.get(end)
+            if start_value is not None and end_value is not None:
+                output.append((float(end_value) - float(start_value)) * 1000.0)
+        return output
+
+    intervals = {
+        "registration_queue_ms": interval("d_registration_enqueued", "d_registration_sent"),
+        "registration_notification_ms": interval("d_registration_sent", "p_registration_received"),
+        "registration_lead_before_p_ready_ms": interval("d_registration_enqueued", "p_output_ready"),
+        "p_ready_to_write_ms": interval("p_output_ready", "p_write_submitted"),
+        "p_finished_to_worker_ms": interval(
+            "p_finished_staged", "p_finished_received"
+        ),
+        "p_worker_to_write_ms": interval(
+            "p_finished_received", "p_write_submitted"
+        ),
+        "write_to_d_notification_ms": interval(
+            "p_write_submitted", "d_completion_forwarded"
+        ),
+        "d_notification_to_core_ms": interval(
+            "d_completion_forwarded", "d_completion_core_observed"
+        ),
+        "write_to_d_completion_ms": interval("p_write_submitted", "d_completion_observed"),
+        "p_ready_to_d_completion_ms": interval("p_output_ready", "d_completion_observed"),
+    }
+    activated = [activation[request_id] for request_id in request_ids if request_id in activation]
+    if activated:
+        intervals["d_ready_to_activation_hold_ms"] = [float(row["held_ms"]) for row in activated]
+        intervals["pending_import_to_local_activation_ms"] = [
+            float(activation[request_id]["held_ms"])
+            for request_id in request_ids & decode_held
+            if request_id in activation
+        ]
+        intervals["prepared_cache_wait_for_query_ms"] = [
+            float(activation[request_id]["held_ms"])
+            for request_id in request_ids - decode_held
+            if request_id in activation
+        ]
+
+    output: dict[str, Any] = {
+        name: {"observed": len(samples), "percentiles": percentile_map(samples)}
+        for name, samples in intervals.items()
+        if samples
+    }
+
+    prompt_tokens = {
+        str(row["request_id"]): int(row["prompt_tokens"])
+        for row in rows
+        if row.get("prompt_tokens") is not None
+    }
+    imported_mismatches = 0
+    for request_id in request_ids:
+        activated_row = activation.get(request_id)
+        prompt = prompt_tokens.get(request_id)
+        if activated_row is not None and prompt is not None:
+            imported_mismatches += int(activated_row["imported_tokens"] != prompt - 1)
+    output["activation"] = {
+        "observed": len(activated),
+        "imported_tokens_not_prompt_minus_one": imported_mismatches,
+    }
+    return output
 
 
 def tail_rows(
@@ -628,6 +787,9 @@ def build_report(result_dir: pathlib.Path, top: int) -> dict[str, Any]:
             "total_sum_ms": sum(values(pushes, "total_ms")),
         }
 
+    if diagnostics["pd_activation"]:
+        report["pd_control_path"] = pd_control_breakdown(scored_rows, diagnostics)
+
     if matched_batches:
         scored_request_ids = {str(row["request_id"]) for row in scored_rows}
         scored_batches = [
@@ -744,7 +906,7 @@ def print_report(report: dict[str, Any]) -> None:
     print(f"    D scheduled->output ms:{format_triplet(engine_stages['thinker_d_prefill_ms'])}")
     if parsed["thinker_d_transfer_load"]:
         print(
-            "    D KV transfer/load ms: "
+            "    D registration->installed: "
             f"{format_triplet(engine_stages['thinker_d_transfer_load_ms'])} "
             f"({parsed['thinker_d_transfer_load']} parsed)"
         )
@@ -766,6 +928,38 @@ def print_report(report: dict[str, Any]) -> None:
         "    Code2Wav sched->output:"
         f"{format_triplet(engine_stages['code2wav_scheduled_to_output_ms'])}"
     )
+
+    pd_control = report.get("pd_control_path")
+    if pd_control is not None:
+        print("\nEarly P/D control path")
+        labels = (
+            ("registration_queue_ms", "D registration queue"),
+            ("registration_notification_ms", "D registration -> P"),
+            ("registration_lead_before_p_ready_ms", "registration lead before P ready"),
+            ("p_ready_to_write_ms", "P ready -> write submit"),
+            ("p_finished_to_worker_ms", "P finished -> worker metadata"),
+            ("p_worker_to_write_ms", "P worker -> write submit"),
+            ("write_to_d_notification_ms", "write submit -> NIXL notification"),
+            ("d_notification_to_core_ms", "NIXL notification -> D Core"),
+            ("write_to_d_completion_ms", "write submit -> D ready"),
+            ("p_ready_to_d_completion_ms", "P ready -> D ready"),
+            ("d_ready_to_activation_hold_ms", "D ready -> query activation hold"),
+            ("pending_import_to_local_activation_ms", "pending import -> local activation"),
+            ("prepared_cache_wait_for_query_ms", "prepared cache waits for query"),
+        )
+        for key, label in labels:
+            row = pd_control.get(key)
+            if row is not None:
+                print(
+                    f"  {label:34s} "
+                    f"{format_triplet(row['percentiles'])} ms ({row['observed']} observed)"
+                )
+        activation = pd_control["activation"]
+        print(
+            "  activation token invariant          "
+            f"{activation['observed']} observed, "
+            f"{activation['imported_tokens_not_prompt_minus_one']} mismatch"
+        )
 
     if report["snapshot_modes"]:
         print("\nSnapshot mode")

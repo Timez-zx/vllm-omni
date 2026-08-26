@@ -61,6 +61,56 @@ def test_stage0_input_cache_update_and_enqueue_are_ordered() -> None:
     assert events == ["build-a", "put-a", "build-b", "put-b"]
 
 
+def test_detect_pd_config_exports_static_push_endpoint_for_early_d_registration() -> None:
+    engine = object.__new__(AsyncOmniEngine)
+    kv_cfg = types.SimpleNamespace(
+        engine_id="p-engine",
+        kv_ip="127.0.0.1",
+        kv_connector_extra_config={
+            "orchestrator_remote_host": "127.0.0.1",
+            "orchestrator_remote_port": 5600,
+        },
+    )
+    p_vllm_config = types.SimpleNamespace(
+        kv_transfer_config=kv_cfg,
+        parallel_config=types.SimpleNamespace(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+        ),
+    )
+    engine.stage_configs = [
+        types.SimpleNamespace(
+            stage_id=0,
+            is_prefill_only=True,
+            is_decode_only=False,
+            engine_input_source=[],
+            engine_args=types.SimpleNamespace(kv_transfer_config=kv_cfg),
+        ),
+        types.SimpleNamespace(
+            stage_id=1,
+            is_prefill_only=False,
+            is_decode_only=True,
+            engine_input_source=[0],
+            engine_args=types.SimpleNamespace(kv_transfer_config=kv_cfg),
+        ),
+    ]
+    engine.stage_clients = [
+        types.SimpleNamespace(vllm_config=p_vllm_config),
+        types.SimpleNamespace(vllm_config=types.SimpleNamespace()),
+    ]
+
+    config = engine._detect_pd_config()
+
+    assert config is not None
+    assert config["prefill_remote"] == {
+        "remote_engine_id": "p-engine",
+        "remote_host": "127.0.0.1",
+        "remote_port": 5600,
+        "tp_size": 1,
+        "pp_size": 1,
+    }
+
+
 def test_orchestrator_startup_timeout_warns_how_to_raise_limits(monkeypatch):
     engine = object.__new__(AsyncOmniEngine)
     engine.orchestrator_thread = types.SimpleNamespace(is_alive=lambda: True)

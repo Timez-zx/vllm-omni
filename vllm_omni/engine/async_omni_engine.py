@@ -979,17 +979,37 @@ class AsyncOmniEngine:
             bootstrap_addr,
         )
         prefill_engine_id: str | None = None
+        prefill_remote: dict[str, Any] | None = None
         try:
             prefill_client = self.stage_clients[prefill_idx]
-            kv_cfg = getattr(getattr(prefill_client, "vllm_config", None), "kv_transfer_config", None)
+            prefill_vllm_config = getattr(prefill_client, "vllm_config", None)
+            kv_cfg = getattr(prefill_vllm_config, "kv_transfer_config", None)
             prefill_engine_id = getattr(kv_cfg, "engine_id", None)
+            extra_cfg = getattr(kv_cfg, "kv_connector_extra_config", None) or {}
+            if not isinstance(extra_cfg, Mapping):
+                try:
+                    extra_cfg = dict(extra_cfg)
+                except (TypeError, ValueError):
+                    extra_cfg = {}
+            remote_host = extra_cfg.get("orchestrator_remote_host")
+            remote_port = extra_cfg.get("orchestrator_remote_port")
+            parallel_config = getattr(prefill_vllm_config, "parallel_config", None)
+            if prefill_engine_id and remote_host and remote_port is not None:
+                prefill_remote = {
+                    "remote_engine_id": str(prefill_engine_id),
+                    "remote_host": str(remote_host),
+                    "remote_port": int(remote_port),
+                    "tp_size": int(getattr(parallel_config, "tensor_parallel_size", 1)),
+                    "pp_size": int(getattr(parallel_config, "pipeline_parallel_size", 1)),
+                }
         except Exception as exc:
-            logger.warning("[AsyncOmniEngine] Could not extract prefill engine_id: %s", exc)
+            logger.warning("[AsyncOmniEngine] Could not extract P/D pre-registration endpoint: %s", exc)
 
         return {
             "pd_pair": (prefill_idx, decode_idx),
             "bootstrap_addr": bootstrap_addr,
             "prefill_engine_id": prefill_engine_id,
+            "prefill_remote": prefill_remote,
         }
 
     @staticmethod

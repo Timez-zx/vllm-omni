@@ -17,6 +17,8 @@ finite request lifetimes and never treats a session id as proof of KV identity.
 from __future__ import annotations
 
 import os
+import queue
+import threading
 from time import monotonic
 from typing import TYPE_CHECKING, Any
 
@@ -45,12 +47,19 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_DIRECT_COMPLETION_WAKE_TIMEOUT_S = 0.001
+
 _LOG_CONNECTOR_DIAG = os.environ.get("VLLM_OMNI_LOG_HANDOFF_DIAG", "").strip().lower() in {
     "1",
     "true",
     "yes",
     "on",
 }
+
+
+def _is_formal_handoff_diagnostic(request_id: str) -> bool:
+    """Keep added hot-path diagnostics off high-frequency arrival requests."""
+    return "-warm-" not in request_id
 
 
 def _delta_registration_fields(
@@ -185,6 +194,42 @@ class NixlDeltaPushConnectorScheduler(NixlPushConnectorScheduler):
             }
             params["do_remote_prefill"] = False
 
+    def request_finished(
+        self,
+        request: Request,
+        block_ids: BlockIds,
+    ) -> tuple[bool, dict[str, Any] | None]:
+        result = super().request_finished(request, block_ids)
+        if (
+            _LOG_CONNECTOR_DIAG
+            and _is_formal_handoff_diagnostic(request.request_id)
+            and request.request_id in self._newly_finished_push_blocks
+        ):
+            logger.info(
+                "[NIXL-P-TRACE] event=finished-blocks-staged request=%s mono=%.6f",
+                request.request_id,
+                monotonic(),
+            )
+        return result
+
+class _TimestampedNotifQueue(queue.Queue[bytes]):
+    """Record when the NIXL writer first exposes a completion notification."""
+
+    def __init__(self, callback: Any) -> None:
+        super().__init__()
+        self._callback = callback
+
+    def put(
+        self,
+        item: bytes,
+        block: bool = True,
+        timeout: float | None = None,
+    ) -> None:
+        super().put(item, block=block, timeout=timeout)
+        # Publish the wake event only after the notification is drainable;
+        # otherwise the waiting Core thread can win another empty-queue race.
+        self._callback(item)
+
 
 class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
     """Select the positional KV suffix before upstream submits the WRITE."""
@@ -192,6 +237,7 @@ class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._delta_load_started: dict[str, float] = {}
+        self._delta_registration_enqueued: dict[str, float] = {}
         # Cache-only D imports are driven by an EngineCore control operation,
         # not by ModelRunner.execute_model().  Keep their completions out of
         # the ordinary connector output or Scheduler would mistake them for
@@ -200,13 +246,108 @@ class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
         self._direct_cache_sync_finished: set[str] = set()
         self._deferred_regular_finished_sending: set[str] = set()
         self._deferred_regular_finished_recving: set[str] = set()
+        self._completion_notif_seen: dict[str, float] = {}
+        self._completion_notif_lock = threading.Lock()
+        # The inherited writer parks when it has no unmatched P blocks.  A
+        # get_finished() call wakes it and may race its notification drain.
+        # The callback/event below lets the same Core poll wait at most 1 ms
+        # and retry, avoiding both an extra model step and continuous polling.
+        self._completion_notif_available = threading.Event()
+        self._pending_completion_notifs = _TimestampedNotifQueue(
+            self._record_completion_notification
+        )
+
+    def _record_completion_notification(self, notification: bytes) -> None:
+        try:
+            message = notification.decode("utf-8")
+            if message.startswith("HB:"):
+                return
+            request_id, _ = message.rsplit(":", 1)
+        except Exception:
+            return
+        now = monotonic()
+        self._completion_notif_available.set()
+        if _LOG_CONNECTOR_DIAG and _is_formal_handoff_diagnostic(request_id):
+            with self._completion_notif_lock:
+                self._completion_notif_seen.setdefault(request_id, now)
+            logger.info(
+                "[NIXL-D-TRACE] event=completion-forwarded request=%s mono=%.6f",
+                request_id,
+                now,
+            )
+
+    def _ensure_direct_progress_state(self) -> None:
+        """Initialize fields lazily for tests and rolling worker upgrades."""
+        if not hasattr(self, "_completion_notif_seen"):
+            self._completion_notif_seen = {}
+            self._completion_notif_lock = threading.Lock()
+        if not hasattr(self, "_completion_notif_available"):
+            self._completion_notif_available = threading.Event()
 
     def start_load_kv(self, metadata: NixlConnectorMetadata) -> None:
         """Timestamp D registration through completed KV installation."""
+        if not hasattr(self, "_delta_registration_enqueued"):
+            self._delta_registration_enqueued = {}
         now = monotonic()
         for req_id in metadata.reqs_to_recv:
             self._delta_load_started.setdefault(req_id, now)
+            self._delta_registration_enqueued.setdefault(req_id, now)
+            if _LOG_CONNECTOR_DIAG:
+                logger.info(
+                    "[NIXL-D-TRACE] event=registration-enqueued request=%s mono=%.6f",
+                    req_id,
+                    now,
+                )
+        if _LOG_CONNECTOR_DIAG:
+            for req_id in metadata.push_finished_blocks:
+                if not _is_formal_handoff_diagnostic(req_id):
+                    continue
+                logger.info(
+                    "[NIXL-P-TRACE] event=finished-metadata-received "
+                    "request=%s mono=%.6f",
+                    req_id,
+                    now,
+                )
         super().start_load_kv(metadata)
+
+    def _do_send_reg_notif(
+        self,
+        req_id: str,
+        reg_data: dict[str, Any],
+    ) -> None:
+        super()._do_send_reg_notif(req_id, reg_data)
+        now = monotonic()
+        started = self._delta_registration_enqueued.get(req_id, now)
+        if _LOG_CONNECTOR_DIAG:
+            logger.info(
+                "[NIXL-D-TRACE] event=registration-sent request=%s mono=%.6f queue_ms=%.3f",
+                req_id,
+                now,
+                (now - started) * 1000.0,
+            )
+
+    def _handle_push_reg_notif(self, notif: bytes) -> None:
+        # This method executes on P's writer thread.  Decode only enough of
+        # the inherited framing to identify the request in diagnostics; the
+        # parent remains authoritative for validation and matching.
+        now = monotonic()
+        try:
+            from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+                PUSH_REG_NOTIF_PREFIX,
+            )
+            import msgspec
+
+            registration = msgspec.msgpack.decode(notif[len(PUSH_REG_NOTIF_PREFIX) :])
+            req_id = registration.get("request_id", "?") if isinstance(registration, dict) else "?"
+        except Exception:
+            req_id = "?"
+        if _LOG_CONNECTOR_DIAG:
+            logger.info(
+                "[NIXL-P-TRACE] event=registration-received request=%s mono=%.6f",
+                req_id,
+                now,
+            )
+        super()._handle_push_reg_notif(notif)
 
     def _partition_finished(self) -> None:
         # Unit tests and rolling upgrades may construct this worker without
@@ -216,15 +357,34 @@ class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
             self._direct_cache_sync_finished = set()
             self._deferred_regular_finished_sending = set()
             self._deferred_regular_finished_recving = set()
+        self._ensure_direct_progress_state()
         done_sending, done_recving = super().get_finished()
         now = monotonic()
         for req_id in done_recving:
+            with self._completion_notif_lock:
+                forwarded = self._completion_notif_seen.pop(req_id, None)
             started = self._delta_load_started.pop(req_id, None)
             if started is not None:
+                self._delta_registration_enqueued.pop(req_id, None)
                 logger.info(
                     "[nixl-delta-load] request=%s transfer_load_ms=%.3f",
                     req_id,
                     (now - started) * 1000.0,
+                )
+                if _LOG_CONNECTOR_DIAG:
+                    logger.info(
+                        "[NIXL-D-TRACE] event=completion-observed request=%s mono=%.6f total_ms=%.3f",
+                        req_id,
+                        now,
+                        (now - started) * 1000.0,
+                    )
+            if _LOG_CONNECTOR_DIAG and forwarded is not None:
+                logger.info(
+                    "[NIXL-D-TRACE] event=completion-core-observed "
+                    "request=%s mono=%.6f notify_to_core_ms=%.3f",
+                    req_id,
+                    now,
+                    (now - forwarded) * 1000.0,
                 )
         direct_done = done_recving & self._direct_cache_sync_req_ids
         if direct_done:
@@ -235,12 +395,28 @@ class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
 
     def start_direct_cache_sync(self, metadata: NixlConnectorMetadata) -> None:
         """Start cache-only D imports without a model-runner invocation."""
+        self._ensure_direct_progress_state()
         self._direct_cache_sync_req_ids.update(metadata.reqs_to_recv)
         self.start_load_kv(metadata)
 
     def poll_direct_cache_sync(self) -> set[str]:
         """Return only cache-only completions, preserving normal completions."""
+        self._ensure_direct_progress_state()
+        self._completion_notif_available.clear()
         self._partition_finished()
+        # Upstream get_finished() wakes the NIXL writer and immediately drains
+        # its forwarded-notification queue.  If the writer was parked, that
+        # first drain can win the race.  Wait for the writer's queue callback
+        # and retry inside this same Core step instead of deferring activation
+        # until another potentially long model batch completes.
+        if (
+            not self._direct_cache_sync_finished
+            and self._direct_cache_sync_req_ids
+            and self._completion_notif_available.wait(
+                _DIRECT_COMPLETION_WAKE_TIMEOUT_S
+            )
+        ):
+            self._partition_finished()
         finished = set(self._direct_cache_sync_finished)
         self._direct_cache_sync_finished.clear()
         return finished
@@ -309,6 +485,14 @@ class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
         )
         if _LOG_CONNECTOR_DIAG:
             diag_end = monotonic()
+            logger.info(
+                "[NIXL-P-TRACE] event=write-submitted request=%s mono=%.6f "
+                "delta_blocks=%d submit_ms=%.3f",
+                request_id,
+                diag_end,
+                delta_source_blocks,
+                (diag_end - diag_selected) * 1000.0,
+            )
             logger.info(
                 "[NIXL-PUSH-DIAG] request=%s source_blocks=%d delta_blocks=%d "
                 "select_ms=%.3f submit_ms=%.3f total_ms=%.3f",

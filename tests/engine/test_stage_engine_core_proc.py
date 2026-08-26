@@ -187,6 +187,8 @@ def test_direct_pd_cache_sync_completes_without_model_request():
             "started": 0.0,
         }
     }
+    engine._pd_pending_decode_adds = {}
+    engine._pd_prepared_cache = {}
     engine._pd_cache_sync_last_poll = 0.0
     engine.scheduler = SimpleNamespace(
         prepare_direct_pd_cache_sync=Mock(return_value=("loading", object())),
@@ -199,8 +201,299 @@ def test_direct_pd_cache_sync_completes_without_model_request():
 
     assert engine._progress_pd_cache_sync_jobs() is True
     assert result.result()["request_id"] == request.request_id
+    first_rpc = engine.model_executor.collective_rpc.call_args_list[0]
+    assert first_rpc.args[0] == "start_pd_cache_sync"
+    assert len(first_rpc.kwargs["args"]) == 1
     engine.scheduler.complete_direct_pd_cache_sync.assert_called_once_with(request)
     assert request.request_id not in engine._pd_cache_sync_jobs
+
+
+def test_direct_pd_cache_sync_progresses_independent_lineages():
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    first = SimpleNamespace(
+        request_id="arrival-1",
+        kv_lineage_id="session-1",
+        kv_lineage_revision=1,
+        pd_cache_sync_retain=False,
+    )
+    second = SimpleNamespace(
+        request_id="arrival-2",
+        kv_lineage_id="session-2",
+        kv_lineage_revision=1,
+        pd_cache_sync_retain=False,
+    )
+    engine._pd_cache_sync_jobs = {
+        first.request_id: {
+            "request": first,
+            "future": Future(),
+            "phase": "queued",
+            "started": 1.0,
+        },
+        second.request_id: {
+            "request": second,
+            "future": Future(),
+            "phase": "queued",
+            "started": 2.0,
+        },
+    }
+    engine._pd_pending_decode_adds = {}
+    engine._pd_prepared_cache = {}
+    engine._pd_cache_sync_last_poll = 0.0
+    first_metadata = object()
+    second_metadata = object()
+
+    def prepare(request):
+        return (
+            ("loading", first_metadata)
+            if request is first
+            else ("loading", second_metadata)
+        )
+
+    engine.scheduler = SimpleNamespace(
+        prepare_direct_pd_cache_sync=Mock(side_effect=prepare),
+        complete_direct_pd_cache_sync=Mock(),
+        fail_direct_pd_cache_sync=Mock(),
+    )
+    engine.model_executor = SimpleNamespace(
+        collective_rpc=Mock(
+            side_effect=[
+                [True],
+                [True],
+                [{first.request_id, second.request_id}],
+            ]
+        )
+    )
+
+    assert engine._progress_pd_cache_sync_jobs() is True
+    assert engine._pd_cache_sync_jobs == {}
+    assert engine.scheduler.prepare_direct_pd_cache_sync.call_count == 2
+    start_rpcs = engine.model_executor.collective_rpc.call_args_list[:2]
+    assert [call.args[0] for call in start_rpcs] == [
+        "start_pd_cache_sync",
+        "start_pd_cache_sync",
+    ]
+    assert [call.kwargs["args"] for call in start_rpcs] == [
+        (first_metadata,),
+        (second_metadata,),
+    ]
+    assert {
+        call.args[0].request_id
+        for call in engine.scheduler.complete_direct_pd_cache_sync.call_args_list
+    } == {first.request_id, second.request_id}
+
+
+def test_direct_pd_cache_sync_serializes_same_lineage():
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    first = SimpleNamespace(
+        request_id="arrival-1",
+        kv_lineage_id="session-1",
+        kv_lineage_revision=1,
+        pd_cache_sync_retain=False,
+    )
+    second = SimpleNamespace(
+        request_id="arrival-2",
+        kv_lineage_id="session-1",
+        kv_lineage_revision=2,
+        pd_cache_sync_retain=False,
+    )
+    engine._pd_cache_sync_jobs = {
+        first.request_id: {
+            "request": first,
+            "future": Future(),
+            "phase": "loading",
+            "started": 1.0,
+        },
+        second.request_id: {
+            "request": second,
+            "future": Future(),
+            "phase": "queued",
+            "started": 2.0,
+        },
+    }
+    engine._pd_pending_decode_adds = {}
+    engine._pd_prepared_cache = {}
+    engine._pd_cache_sync_last_poll = 0.0
+    second_metadata = object()
+    engine.scheduler = SimpleNamespace(
+        prepare_direct_pd_cache_sync=Mock(
+            return_value=("loading", second_metadata)
+        ),
+        complete_direct_pd_cache_sync=Mock(),
+        fail_direct_pd_cache_sync=Mock(),
+    )
+    engine.model_executor = SimpleNamespace(
+        collective_rpc=Mock(
+            side_effect=[
+                [{first.request_id}],
+                [True],
+                [{second.request_id}],
+            ]
+        )
+    )
+
+    assert engine._progress_pd_cache_sync_jobs() is True
+    engine.scheduler.prepare_direct_pd_cache_sync.assert_not_called()
+    engine.scheduler.complete_direct_pd_cache_sync.assert_called_once_with(first)
+    assert first.request_id not in engine._pd_cache_sync_jobs
+    assert second.request_id in engine._pd_cache_sync_jobs
+
+    engine._pd_cache_sync_last_poll = 0.0
+    assert engine._progress_pd_cache_sync_jobs() is True
+    assert engine._pd_cache_sync_jobs == {}
+    engine.scheduler.prepare_direct_pd_cache_sync.assert_called_once_with(second)
+    start_rpc = engine.model_executor.collective_rpc.call_args_list[1]
+    assert start_rpc.args[0] == "start_pd_cache_sync"
+    assert start_rpc.kwargs["args"] == (second_metadata,)
+
+
+def test_retained_pd_cache_sync_is_activated_without_losing_partial_block():
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    prepared_request = SimpleNamespace(
+        request_id="paired-query",
+        prompt_token_ids=[1, 2, 3],
+        num_computed_tokens=2,
+    )
+    decode_request = SimpleNamespace(
+        request_id="paired-query",
+        prompt_token_ids=[1, 2, 3],
+        num_computed_tokens=0,
+    )
+    engine._pd_prepared_cache = {
+        "paired-query": {
+            "request": prepared_request,
+            "ready_mono": 0.0,
+            "owns_blocks": True,
+        }
+    }
+    engine.scheduler = SimpleNamespace(release_direct_pd_cache_sync=Mock())
+
+    with patch.object(EngineCoreProc, "add_request") as base_add:
+        engine.add_request(decode_request, 7)
+
+    engine.scheduler.release_direct_pd_cache_sync.assert_not_called()
+    base_add.assert_called_once_with(decode_request, 7)
+    assert decode_request.num_computed_tokens == 2
+    assert engine._pd_prepared_cache == {}
+
+
+def test_abort_releases_retained_pd_cache_sync():
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    prepared_request = SimpleNamespace(request_id="cancelled-query")
+    loading_request = SimpleNamespace(
+        request_id="loading-query",
+        pd_cache_sync_retain=True,
+    )
+    engine._pd_cache_sync_jobs = {
+        "loading-query": {
+            "request": loading_request,
+            "future": Future(),
+            "phase": "loading",
+            "started": 0.0,
+        }
+    }
+    engine._pd_prepared_cache = {
+        "cancelled-query": {
+            "request": prepared_request,
+            "ready_mono": 0.0,
+            "owns_blocks": True,
+        }
+    }
+    engine._pd_pending_decode_adds = {}
+    engine.scheduler = SimpleNamespace(release_direct_pd_cache_sync=Mock())
+
+    with patch.object(EngineCoreProc, "abort_requests") as base_abort:
+        engine.abort_requests(["cancelled-query", "loading-query"])
+
+    engine.scheduler.release_direct_pd_cache_sync.assert_called_once_with(
+        prepared_request
+    )
+    base_abort.assert_called_once_with(["cancelled-query", "loading-query"])
+    assert engine._pd_prepared_cache == {}
+    assert loading_request.pd_cache_sync_retain is False
+    assert "loading-query" in engine._pd_cache_sync_jobs
+
+
+def test_pd_decode_add_waits_inside_core_until_early_import_completes():
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    imported = SimpleNamespace(
+        request_id="paired-query",
+        prompt_token_ids=[1, 2, 3],
+        num_computed_tokens=2,
+        pd_cache_sync_retain=True,
+    )
+    decode = SimpleNamespace(
+        request_id="paired-query",
+        prompt_token_ids=[1, 2, 3],
+        num_computed_tokens=0,
+        kv_transfer_params={"do_remote_prefill": True},
+        sampling_params=SimpleNamespace(
+            extra_args={"kv_transfer_params": {"do_remote_prefill": True}}
+        ),
+    )
+    result = Future()
+    engine._pd_cache_sync_jobs = {
+        imported.request_id: {
+            "request": imported,
+            "future": result,
+            "phase": "loading",
+            "started": 0.0,
+        }
+    }
+    engine._pd_prepared_cache = {}
+    engine._pd_pending_decode_adds = {}
+    engine._pd_cache_sync_last_poll = 0.0
+    engine.scheduler = SimpleNamespace(
+        complete_direct_pd_cache_sync=Mock(),
+    )
+    engine.model_executor = SimpleNamespace(
+        collective_rpc=Mock(return_value=[{imported.request_id}])
+    )
+
+    with patch.object(EngineCoreProc, "add_request") as base_add:
+        engine.add_request(decode, 7)
+        base_add.assert_not_called()
+        assert imported.request_id in engine._pd_pending_decode_adds
+
+        assert engine._progress_pd_cache_sync_jobs() is True
+
+    base_add.assert_called_once_with(decode, 7)
+    assert decode.num_computed_tokens == 2
+    assert decode.kv_transfer_params is None
+    assert "kv_transfer_params" not in decode.sampling_params.extra_args
+    assert imported.request_id not in engine._pd_pending_decode_adds
+    assert result.done()
+
+
+def test_pd_decode_add_falls_back_locally_when_early_import_fails():
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    imported = SimpleNamespace(request_id="paired-query")
+    decode = SimpleNamespace(
+        request_id="paired-query",
+        kv_transfer_params={"do_remote_prefill": True},
+    )
+    result = Future()
+    engine._pd_cache_sync_jobs = {
+        imported.request_id: {
+            "request": imported,
+            "future": result,
+            "phase": "loading",
+            "started": 0.0,
+        }
+    }
+    engine._pd_prepared_cache = {}
+    engine._pd_pending_decode_adds = {imported.request_id: (decode, 4)}
+    engine.scheduler = SimpleNamespace(fail_direct_pd_cache_sync=Mock())
+
+    with patch.object(EngineCoreProc, "add_request") as base_add:
+        engine._fail_pd_cache_sync_job(
+            imported.request_id,
+            RuntimeError("transfer failed"),
+        )
+
+    engine.scheduler.fail_direct_pd_cache_sync.assert_called_once_with(imported)
+    base_add.assert_called_once_with(decode, 4)
+    assert decode.kv_transfer_params == {"do_remote_prefill": True}
+    assert isinstance(result.exception(), RuntimeError)
 
 
 def test_direct_pd_cache_sync_restores_generic_utility_request():

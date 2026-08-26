@@ -107,6 +107,32 @@ def test_scheduler_owned_kv_lineage_snapshot_is_explicit_and_disposable():
     assert not hasattr(missing, "kv_lineage_snapshot_block_hashes")
 
 
+def test_direct_pd_full_prompt_import_replays_last_token_on_activation():
+    sched = _make_scheduler(stage_id=1)
+    sched.connector = MagicMock()
+    sched.kv_cache_manager = MagicMock()
+    sched.kv_cache_manager.block_pool.hash_block_size = 16
+    sched._connector_finished = MagicMock()
+    request = SimpleNamespace(
+        request_id="pd-query",
+        num_computed_tokens=33,
+        num_tokens=33,
+        num_in_flight_tokens=0,
+        num_prompt_tokens=33,
+        block_hashes=[b"h1", b"h2"],
+        kv_lineage_id=None,
+        kv_lineage_revision=0,
+        pd_cache_sync_retain=True,
+        status=RequestStatus.WAITING,
+    )
+
+    sched.complete_direct_pd_cache_sync(request)
+
+    assert request.num_computed_tokens == 32
+    sched.kv_cache_manager.cache_blocks.assert_called_once_with(request, 33)
+    sched.kv_cache_manager.free.assert_not_called()
+
+
 def _run_resumable_segment_stop(
     session: Request,
     *,

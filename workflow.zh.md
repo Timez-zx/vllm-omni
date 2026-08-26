@@ -18,7 +18,7 @@
   → 同一 session 最多提交一个 Thinker-only arrival request
   → 处理期间的新帧合并为最新累计快照，不逐帧排队
   → P 完成并保存 snapshot 后 ACK，P lineage 线性推进
-  → P/D 模式下，D cache-sync 按 lineage 在后台有序执行
+  → P/D 模式下，D Core 在后台按 lineage revision 有序导入
 用户说完
   → 停止提交待处理快照，只等待当前 arrival 的 P-ready ACK
   → 提交完整 canonical context + 一个完整 WAV
@@ -33,7 +33,7 @@
 - 每个 warm-up 和最终回答都是独立 finite request。请求携带完整 canonical prompt；engine 的 prefix/KV cache 是可淘汰加速层，cache miss 只影响延迟。
 - 视频经 filter 后在本轮 append-only 保留；不使用 8 帧滑动淘汰。
 - 同一 session 最多有一个 arrival 在 P 中执行；期间到达的媒体只标记最新累计快照，P-ready 后最多再提交一次。query 停止该 coalescing loop，并等待当前 arrival 的 P-ready；不同 session 仍可并发。
-- P 的 KV/snapshot lineage 线性推进，每个 lineage 只保留最新 revision；没有多个同 session P 请求共享旧 parent。D cache-sync 可落后但按 lineage 有序执行。正式 query 以 D 实际命中的 prefix 为准，必要时一次接收累计缺失 suffix；cache miss 或 revision 不匹配只影响延迟，不影响正确性。
+- P 的 KV/snapshot lineage 线性推进，每个 lineage 只保留最新 revision；没有多个同 session P 请求共享旧 parent。D cache-sync 可落后，但由 D Core 本地排序，不等待 API 回执。正式 query 以 D 实际命中的 prefix 为准，必要时一次接收累计缺失 suffix；cache miss 或 revision 不匹配只影响延迟，不影响正确性。
 - warm-up 使用 `max_tokens=1`、`output_modalities=["text"]`，只维护 Thinker KV，不进入 Talker。P/D 模式下 P-ready 是应用完成边界，D cache-sync 是后台加速；非 P/D 模式只经过 Thinker。arrival 与正式 query 都使用原生 FCFS scheduler，不由应用分配 priority。
 - 音频在 query 时作为一个完整 WAV 输入。Qwen audio encoder 使用双向 attention，独立音频分段不保证与整段推理语义等价。
 - rendered prompt 达到 49,152 tokens 时，最近 2 个完成轮次只保留完整用户语音、用户文本和 Assistant 文本，删除历史图片；当前轮保留完整语音、文本和最新一张通过 filter 的图片。之后历史继续正常增长，到达上限后再次压缩。不生成 summary request。
@@ -55,7 +55,7 @@
 
 `origin_deploy_3gpu.yaml` 只用于非 P/D 对照：Thinker、Talker、Code2Wav 各一张卡。它不能产生 P/D 结论。
 
-P→D 使用 Delta-KV push；D→Talker→Code2Wav 使用共享内存。当前 P/D YAML SHA256 为 `d90a5a2c34ba365be4d8a400e50d6c3a28c5e535fb35ea67a25392ed74006461`。
+P→D 使用 Delta-KV push；D→Talker→Code2Wav 使用共享内存。当前 P/D YAML SHA256 为 `844cec83bf53ae26f9636054ba2ca2bee65b7bdf3deedbb90ed14124715d5244`。
 
 ### 持续 AV session workload
 
@@ -105,7 +105,7 @@ python benchmarks/live_agent/analysis/verify_run.py RESULT_DIR
 
 1. context 对齐后，finite request 与旧 persistent request 没有固有延迟劣势；session 状态留在应用层是当前研究基线。
 2. 视频 arrival warm-up 能模拟持续多模态 prefill；音频正式使用 query-time 完整 WAV，保证 Qwen 语义正确。
-3. P→D 秒级等待曾来自 connector 实现，不是 PCIe 或 P/D 的固有代价。每个 arrival 的 ACK 只表示 P snapshot 已保存；应用据此线性推进 P lineage，D cache-sync 在后台按 lineage 有序完成。
+3. P→D 秒级等待曾来自 connector 实现，不是 PCIe 或 P/D 的固有代价。每个 arrival 的 ACK 只表示 P snapshot 已保存；应用据此线性推进 P lineage，D Core 不等待 utility 回执并按 revision 有序导入。
 4. P conditioning states 支持 lineage delta 和共享 tensor handle。每个 lineage 只保留最新 snapshot；找不到声明的 parent 时为正确性回退 full snapshot。
 5. 同一 session 的 P arrival 严格串行并合并中间更新；query 只等待当前 arrival 的 P-ready，不等待 D-ready。不同 session 仍直接进入原生 FCFS scheduler，不使用全局 arrival gate 或应用 priority。
 6. context 只在 49,152-token 上限处压缩：最近 2 个完成轮次保留语音和文本但删除图片，当前轮只保留最新一张图片及完整语音/文本，然后继续增长。无提前压缩和 summary request。
@@ -165,7 +165,7 @@ GPU0（P）busy p95/p99 为 93%/100%，SM active p95/p99 为 57%/81%；GPU1（D�
 
 arrival 在 P 计算 delta 后，通过 cache-only control operation 导入 D 的普通 prefix cache。该操作不进入 D inference scheduler、不执行模型，也不进入 Talker。旧实现等待 D 导入成功后才 ACK 应用；当前实现改为 P snapshot 保存成功后立即 ACK，D cache-sync 在后台继续。
 
-第一版 cache-only 实现仍在唯一的 stage 输出循环中 `await` 每个 sync，错误地把不同 session 全局串行化。D/Code2Wav 已生成的输出因此在 API 侧积压 1.5–1.8 秒。随后公共循环改为只派发 sync 并继续取输出，但应用仍等待本 session 的 D-ready ACK。当前版本进一步把完成边界前移到 P-ready：同 session P 请求仍线性串行，D sync 则按 lineage 后台有序执行。
+第一版 cache-only 实现仍在唯一的 stage 输出循环中 `await` 每个 sync，错误地把不同 session 全局串行化。D/Code2Wav 已生成的输出因此在 API 侧积压 1.5–1.8 秒。随后公共循环改为只派发 sync 并继续取输出，但应用仍等待本 session 的 D-ready ACK。当前版本进一步把完成边界前移到 P-ready：同 session P 请求仍线性串行，实际 D 导入只在 D Core 本地排序，query 提交不等待 utility 回执。
 
 正式 query 不依赖所有中间 D sync 都已完成。D 以自己实际持有的 prefix 为准；若后台 sync 落后，现有 Delta-KV connector 会从 P 一次传输累计缺失 suffix。这样只改变加速是否及时，不改变 prompt 或输出语义。
 
@@ -294,7 +294,7 @@ Query-time 组的正式 query 最多需要 prefill 约 8k 新 tokens，但 Think
 
 补充 16 用户 × 4 轮应用/orchestrator 诊断：`/home/ubuntu/data/results/pd_app_diag_u16_t4_20260825/pd_app_diag_seed7_u16`。稳态 arrival render p50/p95/p99 为 8/22/35 ms；API submit、core decode、core preprocess 和 output encode/IPC 的 p99 分别约 10/11/4/8 ms，均不是主瓶颈。旧实现每个 arrival 同步等待 D cache-sync，812 次观测为 34/97/139 ms；该 D-ready ACK 同时串住下一 arrival 和正式 query。一个具体 p99 样本中，前一 arrival 总耗时 604 ms：P runner/GPU 约 60/49 ms，P 结果暴露到 orchestrator 约 233 ms，D transfer/load 与 cache-sync 约 122/149 ms；query 在其执行 164 ms 后到达，剩余等待 440 ms。这证明等待包含自定义 P/D 后处理，不应全部归因于 prefill 计算。
 
-当前版本已经拆分 P-ready 与 D-ready：P snapshot 保存后向应用返回一次 terminal ACK，D sync 继续在 request-scoped 后台任务中执行；同 lineage 的 D sync 有序，不产生第二个 terminal。该改动不消除 P core-output 到 orchestrator 的暴露延迟，只移除前台对 D transfer/sync 的等待。相关 orchestrator、connector、Core 和 API 回归共 133 项通过，39 项依赖运行环境的测试跳过。
+当前版本已经拆分 P-ready 与 D-ready：P snapshot 保存后向应用返回一次 terminal ACK，D sync 继续执行且不产生第二个 terminal。同 lineage 的实际导入在 D Core 内排序，而不是等待 API utility 回执；前台不再等待 D transfer/sync。
 
 P-ready 正式短测：`/home/ubuntu/data/results/pd_pready_u16_t12_20260825/pd_pready_seed7_u16`。配置为 P/D 4 GPU、16 用户 × 12 轮、前 2 轮 warm-up、seed 7；deploy SHA256 为 `d90a5a2c34ba365be4d8a400e50d6c3a28c5e535fb35ea67a25392ed74006461`，原始 `workload_plan.json` SHA256 为 `983b6a9f0111ddb669fc36d77d4e528f2b30c6970ade740f379c98e6f7c73fa8`，canonical plan hash 为 `1dfd08e50710f188e5d83526358b9c3aecf4ad0e8616a5b0bb44d6b45d3b0a6f`；三者与旧 D-ready native 对照完全相同。192/192 query、160/160 计分回合和 2,608 个 finite arrival request 通过；消费 2,674 帧，3,104/3,125 次 prefix-cache 观测命中，无 timeout、skip、stall、client error 或 engine warning。2,549 个实际提交的后台 D sync 全部完成，无失败。
 
@@ -336,6 +336,90 @@ P-ready 将 session-wait p99 降低 192 ms，Client TTFA p99 降低 139 ms，验
 prompt 长度与 P、D、engine TTFA 的相关系数分别为 0.636/0.660/0.691。prefix cache 只避免重算旧 token 的 KV；新增 token 的 P attention 和 D 的首轮 decode 仍需读取整段 40–50k KV。多个 session 同时接近 49,152-token 上限时形成 burst：最慢窗口中 P GPU busy/SM active p95 为 100%/77%，但 PCIe TX/RX p99 仅约 0.70/1.11 GiB/s。27 个压缩后的 full query 与 421 个 delta query 的 engine TTFA p99 都约 1.70 秒，说明压缩 full prefill 本身不是唯一根因；长 prefix burst 同时拖慢周围的 delta request。session wait p99 524 ms 是同一 P 压力经 P-ready 串行传播的次要部分，render p99 124 ms 更小。Talker/Code2Wav scheduled-to-output p99 仅 59/16 ms，不是瓶颈。
 
 另有 46/876 个 snapshot 在超过 16 chunks 后于 orchestrator 事件循环同步合并完整 layer-0/layer-24，单次中位数/p95/max 为 26/214/270 ms，会阻塞其他 session 的输出处理。该问题与 P-ready/D-ready 边界独立，仍属于待消除的自定义 P/D 工程开销。
+
+### D 本地 cache handoff：16 用户 × 12 轮
+
+D 在 P 计算期间预注册目标 block。正式 query 立即提交，并保留普通 remote-prefill 参数作为失败回退，不再等待 D output socket 上的 cache-sync utility 回执。KV 尚未就绪时，D Core 按 request ID 暂存 ADD；导入完成后在本地直接激活。不同 session 仍并发，同一 lineage 的 revision 只在 D Core 内排序，使累计快照复用前一 revision。正式 Talker snapshot 不再重复携带完整 prompt token 列表。数据仍通过 NIXL/PCIe 传输。
+
+完全取消 lineage 顺序并不合理：`/home/ubuntu/data/results/pd_local_handoff_u16_t12_20260826/pd_local_handoff_seed7_u16` 中正式 P→D suffix p99 膨胀到 10,757 tokens，TTFA p99 为 1,009 ms。改为 D 本地按 revision 排序后，suffix p99 恢复到 574 tokens，且没有恢复应用/API barrier。
+
+最终结果：`/home/ubuntu/data/results/pd_local_ordered_u16_t12_20260826/pd_local_ordered_seed7_u16`。配置和 workload plan 与上一轮 16×12 完全一致，canonical hash 为 `1dfd08e50710f188e5d83526358b9c3aecf4ad0e8616a5b0bb44d6b45d3b0a6f`。192/192 query、160/160 计分回合、2,462 个 finite arrival request 和 2,455 个消费 frame occurrence 均通过校验；3,014/3,035 次 prefix-cache 观测命中，无 timeout、skip 或 stall。
+
+| p50/p95/p99 | 第一版 early-D | D 本地有序版 |
+|---|---:|---:|
+| Client TTFA / Audio-ready-500 | 548/794/978 ms | 475/658/706 ms |
+| 等待本 session 前一 arrival | 0/66/193 ms | 0/22/93 ms |
+| Thinker-P | 121/268/314 ms | 110/198/219 ms |
+| Engine audio TTFA | 502/757/956 ms | 441/619/652 ms |
+| Thinker-D 增量 | 129/286/340 ms | 110/183/226 ms |
+
+全部 192 个正式 request 中有 112 个先于 KV 到达 D；这些请求从 KV-ready 到本地激活仅需 0.002/0.004/0.223 ms，证明 utility 回执/API 同步已不在关键路径。剩余 D 延迟属于真实数据与执行工作：P-ready→D-ready 为 56/97/155 ms，write-submit→D-ready 为 45/66/98 ms，D scheduler queue 为 1/3/6 ms，D scheduled→output 为 57/84/102 ms。删除重复 prompt 列表后，正式 D wire decode 从 12.6/43.6/86.7 降至 9.5/36.3/65.7 ms。160 个计分激活全部保持 `imported_tokens = prompt_tokens - 1`。
+
+正式 16 用户 × 30 轮结果为 `/home/ubuntu/data/results/pd_local_ordered_u16_t30_20260826/pd_local_ordered_seed7_u16`，canonical workload hash 为 `9f807d41b63a9b76fe7d2e0e30b7a1ae2dd350a02fba2998a32ff6786d194514`。480/480 query、448/448 计分回合、6,311 个 finite arrival、6,591 个消费 frame occurrence 和 6,604/6,604 次 D registration/completion 全部完成，无 timeout 或 stall。TTFA 为 551/1,266/1,781 ms，因此 16 用户长测仍未满足 1 秒 p99 SLO。
+
+长测中，同 session wait 为 0/247/534 ms，Thinker-P 为 141/466/708 ms，Thinker-D 为 131/333/546 ms。D 内部的 P-ready→KV-ready 为 65/169/263 ms，scheduler→output 为 61/117/178 ms，而等待导入后的本地激活仅 0/0/1 ms。因此剩余 tail 不是 utility/API 同步，而是 P burst 经 session 顺序传播、真实的有序 KV 可用/传输以及 D 执行共同叠加。tail-95 窗口中 P 的 SM/Tensor active p95 为 74%/54%，D 只有 35%/4%；D 主要在等待 handoff，而不是算力饱和。正式 D request 反序列化 p99 仍达 126 ms，属于可移除的工程开销，但不是 1.78 秒 tail 的主因。
+
+### D completion 同步竞态修复
+
+Push writer 原本在没有未匹配 P blocks 时休眠。D Core 调用 `get_finished()` 会唤醒 writer，但可能在 writer 转发 NIXL notification 前立即读空，导致完成事件再等一个 engine step。当前实现让同一次 Core poll 最多等待 1 ms 的 notification event 并重试；不持续轮询，也不改变 lineage admission。
+
+两条激进路径经相同 16×12 plan 验证后删除：P same-step 强制 flush 只把 finished metadata 提前 0–2 ms，正式请求的大等待实际来自 D registration 尚未到达；它使 suffix p99 膨胀到 9,523 tokens。在途主动轮询也只小幅缩短 notification：1 ms 和 5 ms 轮询的 suffix p99 分别恶化到 3,928 和 10,590 tokens。这些路径都会加快 D cache churn，不能作为正式实现。
+
+首轮长测：`/home/ubuntu/data/results/pd_event_handoff_final_u16_t30_20260826/pd_event_handoff_final_seed7_u16`。原始 workload plan 与上一组逐字节相同，SHA256 为 `5e62bb6915cced1918465f94c0bc690634730e722c05768a585d1df489dc8855`。480/480 query、448/448 计分回合、6,976 个 arrival request 和 7,424 个消费 frame occurrence 全部完成，无 timeout 或 stall；8,207/8,242 次 prefix-cache 观测命中。
+
+| p50/p95/p99 | 修复前 16×30 | 首轮修复后 | 最终代码复测 |
+|---|---:|---:|---:|
+| Client TTFA | 551/1,266/1,781 ms | 555/1,180/1,593 ms | 520/1,300/1,902 ms |
+| session wait | 0/247/534 ms | 0/140/406 ms | 0/159/444 ms |
+| Thinker-P | 141/466/708 ms | 132/499/699 ms | 129/445/745 ms |
+| Thinker-D | 131/333/546 ms | 121/340/515 ms | 120/361/518 ms |
+| P→D suffix tokens | 107/497/3,724 | 106/514/665 | 105/476/2,916 |
+| P-ready→D-ready | 65/169/263 ms | 62/156/213 ms | 58/140/216 ms |
+
+新时间点显示：P finished→worker metadata 为 8/55/87 ms，worker→write 为 1/61/145 ms；后者的慢样本几乎完全等待 D registration，registration 到齐后通常约 1 ms 即提交。write→NIXL notification 为 46/77/102 ms，notification→D Core 为 0/8/24 ms，完整 write→D-ready 为 47/84/113 ms。分位数不可相加；write→notification 是包含 writer 处理、传输和完成通知的生命周期，不是纯 DMA 时间。修复消除了额外 Core-step 竞态并避免 D lineage 累计落后，但没有消除这段 handoff 生命周期；16 用户 p99 仍超过 1 秒，剩余主因是 P burst、session 顺序传播和长 context 下的 D 首轮执行。
+
+tail-95 窗口中 P 的 SM/Tensor active p95 为 77%/51%，D 为 32%/3%；D 仍未算力饱和，长尾主要由 P 压力及 handoff 等待传播，而不是 D GPU 计算容量不足。
+
+对“notification 先入队、再唤醒”的最终代码重复了完整长测：`/home/ubuntu/data/results/pd_event_handoff_queuefix_u16_t30_20260826/pd_event_handoff_queuefix_seed7_u16`。workload plan SHA256 仍为上述值；448/448 计分回合成功，无 timeout/stall，6,297 个 finite arrival 和 6,726 个 frame occurrence 通过校验，7,518/7,553 次 prefix-cache 观测命中。该轮 write→notification 为 45/69/87 ms，notification→D Core 为 0/7/13 ms，write→D-ready 为 46/71/95 ms，证明目标竞态已消除；但端到端 TTFA p99 并未稳定改善。
+
+两轮修复后长测分别只有 4 和 6 个正式请求遇到 D prefix eviction/大后缀回填。448 个样本的 p99 边界恰好在第 4–5 个尾样本，因此 suffix p99 从 665 跳到 2,916 tokens，TTFA p99 也在 1,593–1,902 ms 之间波动。这不是普通 notification 传输变慢；它说明 completion 竞态是可修复的工程开销，但 16 用户整体 p99 仍由 P burst、session 顺序传播、D prefix eviction 和长 context 首轮执行共同决定。最终复测 tail-95 中 P/D 的 SM active p95 为 74%/35%，Tensor active p95 为 51%/3%。
+
+### 当前 Thinker-P tail 归因
+
+上述最终代码的 16 用户 × 30 轮复测是当前基准。Client TTFA 为 520/1,300/1,902 ms，Thinker-P time-to-output 为 129/445/745 ms。下面的归因取代早期修复前“P tail 主要来自同步 snapshot 构造或结果暴露”的阶段性结论。
+
+| Thinker-P 区间，p50/p95/p99 | 时间 | 归因 |
+|---|---:|---|
+| Core ingress → scheduler | 20/105/213 ms | 主要在等已经开始、不可中途抢占的 P batch 结束，不是纯 IPC 时间 |
+| Scheduler admission | 2/10/17 ms | 较小的 engine 记账开销 |
+| Runner 输入准备 | 16/45/69 ms | 可优化的工程开销；下方具体 tail batch 中达 110 ms |
+| 真实 CUDA forward | 45/151/285 ms | 真实模型计算 |
+| Runner 输出构造 | 1/6/11 ms | 异步 delta-snapshot 修复后已较小 |
+| Runner → Core 结果暴露 | 1/3/5 ms | 已不是 tail 来源 |
+| P 侧 NIXL push | 0.4/1.0/1.9 ms | 不是 P tail 来源 |
+
+各分位数可能对应不同 request 或 batch，不能直接相加。具体 tail query `video-e4499b63e578-bc903ac1` 可以说明完整生命周期：StagePool 传递、解码和 request 构造约用 31 ms；到达 P Core 时，一个两请求 batch 已经在执行。该 batch 的 runner 时间为 262 ms，其中真实 CUDA 计算 194 ms，因此该 query 等待了 226 ms 才到下一个 batch 边界。随后它与另外 5 个请求组成 batch，在 46–48k-token prefix 上处理 1,591 个新 token：输入准备 110 ms，真实 CUDA 执行 324 ms，输出构造 9 ms。其 78 ms 的 `forward_wall` 只是 CPU 提交 CUDA 的时间；之后 246 ms 的 sampling/bookkeeping 大部分在等同一批异步 GPU 计算，不是又做了 246 ms 的 snapshot 计算。
+
+完整长测同时说明了长 context 和碎片化 arrival 为什么都很重要。正式 query 的 P cache miss 只有 105/523/660 tokens，但每个新 token 仍需对保留 prefix 做 attention：
+
+| 正式 query prompt 长度 | 请求数 | Thinker-P 中位数/p95 |
+|---:|---:|---:|
+| 0–8k | 73 | 83/153 ms |
+| 8–24k | 170 | 115/216 ms |
+| 24–40k | 138 | 162/323 ms |
+| 40–50k | 66 | 322/762 ms |
+
+Prompt 长度与 Thinker-P 延迟的相关系数为 0.603。全部 4,683 个 P runner batch 中，真实 CUDA 时间与近似 attention 工作量 `sum(delta_tokens × retained_context)` 的相关系数为 0.939。Prefix cache 避免重算旧 token 的 KV，但不会消除新 suffix 对旧 keys/values 的 attention。
+
+同一轮长测的 P 平均 batch size 为 1.41，76.1% 是 singleton batch。累计 CUDA-forward 时间只占 602 秒测试窗口的约 46.7%，因此 P 不是持续算力饱和：平静时 arrival 形成低效的小 batch，burst 时又形成昂贵的长 context 混合 batch。上文等 token 的 scheduler A/B 证明了这个权衡：固定等待 100 ms 使 batch 数和 CUDA 时间都下降约 53%，吞吐提高 2.14 倍，但 TTFA p99 从 1,211 ms 恶化到 1,545 ms。因此固定计时等待不是解法。
+
+最终需区分三类原因：
+
+- **模型/workload 开销：** 新 AV suffix 仍需对长 cached prefix 做 attention，burst batch 包含真实 CUDA 计算。
+- **Engine 设计不匹配：** work-conserving 的立即 admission 使稳态 arrival 碎片化；一个 batch 开始后，新到正式 query 无法中途加入或让它 yield。Batching 效率与 deadline 之间的权衡在当前执行抽象下是结构性问题，但具体延迟数值并非不可改变。
+- **剩余工程开销：** 输入准备和 request ingress 仍可优化；同步 snapshot 拷贝、结果暴露和 P 侧 NIXL 提交已降至非主导量级。
+
+当前 P tail 的准确根因是 **bursty 的长 context 增量 prefill 与立即、不可中途抢占的 batch 执行相互作用**：正式 query 常先等一个在途 P batch，再在另一个昂贵的混合 batch 中执行。后续应研究 deadline-aware 的跨 session 增量 batching，以及可控的 prefill 执行粒度/yield point，并单独细分 input preparation。不应再加固定聚合等待，也不应把主要精力放在 NIXL/snapshot 微优化上。
 
 ### 此前两轮原始 AV 硬上限策略：16 用户 × 30 轮
 

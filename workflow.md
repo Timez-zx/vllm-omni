@@ -18,7 +18,7 @@ video arrives continuously
   → submit at most one Thinker-only arrival request per session
   → coalesce newer frames into the latest cumulative snapshot instead of queueing every frame
   → ACK after P computes KV and stores its snapshot; the P lineage advances linearly
-  → in P/D mode, D cache-sync continues in lineage order in the background
+  → in P/D mode, D Core imports revisions in lineage order in the background
 user finishes speaking
   → stop pending snapshot submission and wait only for the admitted arrival's P-ready ACK
   → submit the full canonical context plus one complete WAV
@@ -33,7 +33,7 @@ Current invariants:
 - Every warm-up and final answer is an independent finite request carrying the complete canonical prompt. Engine prefix/KV caches are disposable accelerators; a miss changes latency only.
 - Accepted video is append-only within the turn. The old latest-eight sliding eviction is gone.
 - At most one arrival from a session executes on P. New media marks one latest cumulative snapshot, which is submitted after P-ready. A query stops that coalescing loop and waits for the admitted arrival's P-ready ACK; different sessions still overlap.
-- The P KV/snapshot lineage advances linearly and retains only the latest revision; same-session P requests never share a stale parent. D cache-sync may lag but executes in lineage order. A final query uses D's actual local prefix and can receive the cumulative missing suffix in one transfer. A miss or parent mismatch changes latency, not correctness.
+- The P KV/snapshot lineage advances linearly and retains only the latest revision; same-session P requests never share a stale parent. D cache-sync may lag, but D Core orders revisions locally without an API result barrier. A final query uses D's actual local prefix and can receive the cumulative missing suffix in one transfer. A miss or parent mismatch changes latency, not correctness.
 - Warm-ups use `max_tokens=1` and `output_modalities=["text"]`. They maintain Thinker KV only and never enter Talker. In P/D mode P-ready is the application completion boundary and D cache-sync is a background accelerator; in non-P/D mode they visit only the Thinker. Arrival and final requests use the native FCFS scheduler.
 - Audio is submitted as one complete WAV at query time. Qwen's audio encoder is bidirectional, so independently encoded audio chunks are not guaranteed to preserve whole-audio semantics.
 - When the rendered prompt reaches 49,152 tokens, the newest two completed turns retain the full user audio, user text, and assistant text but discard historical images. The in-flight turn retains its full audio/text and only the newest image accepted by the filter. History then grows normally until the next threshold. No summary request is generated.
@@ -55,7 +55,7 @@ Upstream vLLM-Omni could not split one Thinker into separate P and D stages whil
 
 `origin_deploy_3gpu.yaml` is only the non-P/D control: one GPU each for Thinker, Talker, and Code2Wav. It cannot support a P/D conclusion.
 
-P→D uses Delta-KV push; D→Talker→Code2Wav uses shared memory. The current P/D YAML SHA256 is `d90a5a2c34ba365be4d8a400e50d6c3a28c5e535fb35ea67a25392ed74006461`.
+P→D uses Delta-KV push; D→Talker→Code2Wav uses shared memory. The current P/D YAML SHA256 is `844cec83bf53ae26f9636054ba2ca2bee65b7bdf3deedbb90ed14124715d5244`.
 
 ### Continuous-AV session workload
 
@@ -105,7 +105,7 @@ The verifier checks deployment, all four stages, finite-request uniqueness, arri
 
 1. After context alignment, finite requests have no inherent latency disadvantage versus the old persistent request. Application-owned sessions remain the research baseline.
 2. Video arrival warm-ups approximate continuous multimodal prefill. Formal audio stays as one complete query-time WAV to preserve Qwen semantics.
-3. Earlier multi-second P→D waits were connector defects, not an inherent PCIe or P/D cost. Each arrival ACK now means only that its P snapshot is stored; the application advances the linear P lineage while D cache-sync completes in lineage order in the background.
+3. Earlier multi-second P→D waits were connector defects, not an inherent PCIe or P/D cost. Each arrival ACK now means only that its P snapshot is stored; the application advances the linear P lineage while D Core imports revisions in order without waiting for utility results.
 4. P conditioning states support lineage deltas and shared tensor handles. Each lineage retains only its latest snapshot; a missing declared parent falls back to a full snapshot for correctness.
 5. Same-session P arrivals are strictly serialized and intermediate updates are coalesced; a query waits only for the admitted arrival's P-ready ACK, not D-ready. Different sessions still enter native FCFS concurrently, with no global arrival gate or application priority.
 6. Context is compacted only at the 49,152-token limit: the newest two completed turns retain audio/text but discard images, while the in-flight turn retains full audio/text and only its newest image. Normal growth then resumes. There is no proactive compaction or summary request.
@@ -165,7 +165,7 @@ The old long run updated only P's cache, so D received KV at the final query. P 
 
 An arrival computes its delta on P and imports it into D's ordinary prefix cache through a cache-only control operation. It does not enter D's inference scheduler, execute the model, or reach Talker. The old implementation acknowledged the application only after D imported the revision. The current implementation acknowledges as soon as P stores the snapshot and lets D cache-sync continue in the background.
 
-The first cache-only implementation awaited every sync inside the single stage-output loop. That accidentally serialized unrelated sessions and left already-generated D/Code2Wav outputs queued at the API for 1.5–1.8 seconds. The next version dispatched sync work without blocking the shared loop but still made each application session wait for D-ready. The current version moves the completion boundary to P-ready: same-session P requests remain linear, while D sync runs in lineage order in the background.
+The first cache-only implementation awaited every sync inside the single stage-output loop. That accidentally serialized unrelated sessions and left already-generated D/Code2Wav outputs queued at the API for 1.5–1.8 seconds. The next version dispatched sync work without blocking the shared loop but still made each application session wait for D-ready. The current version moves the completion boundary to P-ready: same-session P requests remain linear, while D Core orders the actual imports locally and no longer gates query submission on a utility result.
 
 A final query does not require every intermediate D sync to have completed. D uses the prefix it actually owns; if background sync is behind, the existing Delta-KV connector transfers the cumulative missing suffix from P. This affects acceleration availability, not prompt or output correctness.
 
@@ -294,7 +294,7 @@ Total scheduled tokens differ by only 0.15%, while real aggregation cuts both ru
 
 A further 16-user × 4-turn application/orchestrator diagnostic is stored at `/home/ubuntu/data/results/pd_app_diag_u16_t4_20260825/pd_app_diag_seed7_u16`. Steady-state arrival render p50/p95/p99 is 8/22/35 ms. API submit, core decode, core preprocess, and output encode/IPC have p99 values of about 10/11/4/8 ms, so none is a primary bottleneck. In the old implementation, every arrival waited synchronously for D cache-sync: 812 observations are 34/97/139 ms, and this D-ready ACK serialized both the next arrival and the final query. In one concrete p99 sample, the preceding arrival took 604 ms: about 60/49 ms for P runner/GPU, 233 ms from P result exposure to orchestrator receipt, and 122/149 ms for D transfer/load and cache-sync. The query arrived 164 ms into it and waited the remaining 440 ms. This proves that custom P/D post-processing, not only prefill compute, was exposed as session wait.
 
-The current version splits P-ready from D-ready. It emits one terminal ACK after the P snapshot is stored, while a request-scoped task continues D sync; same-lineage D tasks are ordered and do not emit a second terminal. This does not remove P core-output-to-orchestrator exposure delay, but it removes foreground waiting for D transfer/sync. The relevant orchestrator, connector, Core, and API regression passes 133 tests, with 39 environment-dependent tests skipped.
+The current version splits P-ready from D-ready. It emits one terminal ACK after the P snapshot is stored, while request-scoped D sync continues without a second terminal. Same-lineage imports are ordered inside D Core, not by awaiting API utility results. This removes foreground waiting for D transfer/sync.
 
 Formal P-ready short run: `/home/ubuntu/data/results/pd_pready_u16_t12_20260825/pd_pready_seed7_u16`. It uses four-GPU P/D, 16 users × 12 turns, two warm-up turns, and seed 7. Deploy SHA256 is `d90a5a2c34ba365be4d8a400e50d6c3a28c5e535fb35ea67a25392ed74006461`; raw `workload_plan.json` SHA256 is `983b6a9f0111ddb669fc36d77d4e528f2b30c6970ade740f379c98e6f7c73fa8`, and the canonical plan hash is `1dfd08e50710f188e5d83526358b9c3aecf4ad0e8616a5b0bb44d6b45d3b0a6f`. All three exactly match the old native D-ready control. Verification passes for all 192 queries, 160/160 scored turns, and 2,608 finite arrival requests. It consumes 2,674 frames and records 3,104/3,125 prefix-cache hits, with no timeout, skip, stall, client error, or engine warning. All 2,549 background D syncs actually submitted complete without failure.
 
@@ -336,6 +336,90 @@ The long-run primary cause is a **Thinker-P/Thinker-D burst with 40–50k-token 
 Prompt length correlates 0.636/0.660/0.691 with P, D, and engine TTFA. Prefix caching avoids recomputing old-token KV, but P attention for new tokens and D's first decode step still read the complete 40–50k KV prefix. Multiple sessions approach the 49,152-token limit together and form a burst. In the slowest window, P GPU-busy/SM-active p95 reaches 100%/77%, while PCIe TX/RX p99 is only about 0.70/1.11 GiB/s. The 27 post-compaction full queries and 421 delta queries both have engine-TTFA p99 near 1.70 seconds, so compaction full prefill alone is not the cause; the long-prefix burst also delays surrounding delta requests. Session-wait p99 of 524 ms is a secondary propagation of the same P pressure through P-ready serialization, and render p99 of 124 ms is smaller. Talker/Code2Wav scheduled-to-output p99 is only 59/16 ms and is not the bottleneck.
 
 Separately, 46/876 snapshots exceed 16 chunks and synchronously coalesce complete layer-0/layer-24 tensors on the orchestrator event loop; per-compaction median/p95/max is 26/214/270 ms and can block output handling for other sessions. That issue is independent of the P-ready/D-ready boundary and remains custom P/D engineering overhead to remove.
+
+### D-local cache handoff: 16 users × 12 turns
+
+D pre-registers destination blocks while P computes. The formal query is submitted immediately and keeps ordinary remote-prefill parameters as a failure fallback; it never waits for the cache-sync utility result on D's output socket. If KV is pending, D Core holds the ADD by request ID and activates it locally when the import completes. Imports from different sessions remain concurrent, while revisions of one lineage are ordered inside D Core so each cumulative snapshot can reuse its predecessor. The formal Talker snapshot no longer duplicates the complete prompt-token list. Data still moves through NIXL/PCIe.
+
+Removing lineage order entirely was invalid: `/home/ubuntu/data/results/pd_local_handoff_u16_t12_20260826/pd_local_handoff_seed7_u16` inflated formal P→D suffix p99 to 10,757 tokens and TTFA p99 to 1,009 ms. D-local revision order restores suffix p99 to 574 tokens without restoring an application/API barrier.
+
+Final result: `/home/ubuntu/data/results/pd_local_ordered_u16_t12_20260826/pd_local_ordered_seed7_u16`. The setup and workload plan are identical to the preceding 16×12 run (canonical hash `1dfd08e50710f188e5d83526358b9c3aecf4ad0e8616a5b0bb44d6b45d3b0a6f`). All 192 queries, 160/160 scored turns, 2,462 finite arrival requests, and 2,455 consumed frame occurrences pass verification; prefix-cache observations hit in 3,014/3,035 cases, with no timeout, skip, or stall.
+
+| p50/p95/p99 | Earlier early-D | D-local ordered |
+|---|---:|---:|
+| Client TTFA / Audio-ready-500 | 548/794/978 ms | 475/658/706 ms |
+| Wait for this session's preceding arrival | 0/66/193 ms | 0/22/93 ms |
+| Thinker-P | 121/268/314 ms | 110/198/219 ms |
+| Engine audio TTFA | 502/757/956 ms | 441/619/652 ms |
+| Thinker-D added | 129/286/340 ms | 110/183/226 ms |
+
+Of all 192 formal requests, 112 reached D before KV was ready. Their KV-ready-to-local-activation latency is 0.002/0.004/0.223 ms, proving that the utility-result/API synchronization is no longer on the critical path. Remaining D latency is real data and execution work: P-ready→D-ready is 56/97/155 ms, write-submit→D-ready is 45/66/98 ms, D scheduler queue is 1/3/6 ms, and D scheduled→output is 57/84/102 ms. Formal D wire decode falls from 12.6/43.6/86.7 to 9.5/36.3/65.7 ms after removing the duplicate prompt list. All 160 scored activations preserve `imported_tokens = prompt_tokens - 1`.
+
+The formal 16-user × 30-turn run is `/home/ubuntu/data/results/pd_local_ordered_u16_t30_20260826/pd_local_ordered_seed7_u16`, with canonical workload hash `9f807d41b63a9b76fe7d2e0e30b7a1ae2dd350a02fba2998a32ff6786d194514`. All 480 queries, 448/448 scored turns, 6,311 finite arrivals, 6,591 consumed frame occurrences, and 6,604/6,604 D registrations/completions finish without timeout or stall. TTFA is 551/1,266/1,781 ms, so 16 users still fail the one-second long-run p99 SLO.
+
+Long-run p50/p95/p99 is 0/247/534 ms for same-session wait, 141/466/708 ms for Thinker-P, and 131/333/546 ms for Thinker-D. For D, P-ready→KV-ready is 65/169/263 ms, scheduler→output is 61/117/178 ms, and local activation after a pending import is only 0/0/1 ms. Thus the remaining tail is not utility/API synchronization: it is a combination of P bursts propagated through session order, actual ordered KV availability/transfer, and D execution. In tail-95 windows, P SM/Tensor active p95 is 74%/54%, while D is only 35%/4%; D is waiting on the handoff rather than compute-saturated. Formal D request deserialization still reaches 126 ms at p99 and is removable engineering overhead, but it is not the dominant source of the 1.78-second tail.
+
+### D completion wake-race fix
+
+The push writer normally sleeps when it has no unmatched P blocks. A D Core `get_finished()` call wakes it but can drain the forwarded-notification queue before the writer publishes the NIXL notification, deferring completion by another engine step. The retained fix waits at most 1 ms for the notification event and retries inside the same Core poll. It does not continuously poll or change lineage admission.
+
+Two aggressive variants were removed after equal-plan 16×12 tests. Same-step P flush advanced finished metadata by only 0–2 ms because the slow formal requests were actually waiting for D registration; it inflated suffix p99 to 9,523 tokens. Active transfer polling shortened notification delay only slightly: 1 ms and 5 ms polling inflated suffix p99 to 3,928 and 10,590 tokens, respectively. These paths accelerated D cache churn and are not part of the final implementation.
+
+First long run: `/home/ubuntu/data/results/pd_event_handoff_final_u16_t30_20260826/pd_event_handoff_final_seed7_u16`. Its raw workload plan is byte-identical to the earlier run, SHA256 `5e62bb6915cced1918465f94c0bc690634730e722c05768a585d1df489dc8855`. All 480/480 queries, 448/448 scored turns, 6,976 arrival requests, and 7,424 consumed frame occurrences completed without timeout or stall; 8,207/8,242 prefix-cache observations hit.
+
+| p50/p95/p99 | Before fix, 16×30 | First fixed run | Final-code repeat |
+|---|---:|---:|---:|
+| Client TTFA | 551/1,266/1,781 ms | 555/1,180/1,593 ms | 520/1,300/1,902 ms |
+| Session wait | 0/247/534 ms | 0/140/406 ms | 0/159/444 ms |
+| Thinker-P | 141/466/708 ms | 132/499/699 ms | 129/445/745 ms |
+| Thinker-D | 131/333/546 ms | 121/340/515 ms | 120/361/518 ms |
+| P→D suffix tokens | 107/497/3,724 | 106/514/665 | 105/476/2,916 |
+| P-ready→D-ready | 65/169/263 ms | 62/156/213 ms | 58/140/216 ms |
+
+The new markers report P-finished→worker-metadata at 8/55/87 ms and worker→write at 1/61/145 ms. Slow samples in the latter almost entirely wait for D registration; after registration arrives, WRITE is normally submitted in about 1 ms. Write→NIXL-notification is 46/77/102 ms, notification→D-Core is 0/8/24 ms, and complete write→D-ready is 47/84/113 ms. Percentiles are not additive. Write→notification is a lifecycle interval covering writer processing, transfer, and completion notification, not pure DMA time. The fix removes the extra Core-step race and prevents cumulative D-lineage lag, but it does not remove this handoff lifecycle. The 16-user p99 remains above one second; the remaining dominant terms are P bursts, their propagation through per-session order, and D's first execution over long contexts.
+
+In tail-95 windows, P SM/Tensor active p95 is 77%/51% while D is only 32%/3%. D remains compute-unsaturated; the long tail is primarily P pressure propagated through handoff waits rather than insufficient D GPU compute capacity.
+
+The exact final code, including the queue-before-wake ordering hardening, was rerun end to end at `/home/ubuntu/data/results/pd_event_handoff_queuefix_u16_t30_20260826/pd_event_handoff_queuefix_seed7_u16`. The workload-plan SHA256 is unchanged. All 448/448 scored turns completed with no timeout or stall; 6,297 finite arrivals and 6,726 frame occurrences passed verification, and 7,518/7,553 prefix-cache observations hit. Write→notification is 45/69/87 ms, notification→D-Core is 0/7/13 ms, and write→D-ready is 46/71/95 ms. The targeted wake race is therefore removed, but end-to-end TTFA p99 does not improve consistently.
+
+The two post-fix long runs contain only four and six formal requests, respectively, with D-prefix eviction/large-suffix refill. With 448 scored samples, the p99 boundary falls between roughly the fourth and fifth tail samples. Consequently suffix p99 jumps from 665 to 2,916 tokens and TTFA p99 varies from 1,593 to 1,902 ms. This is not slower ordinary notification transfer. The completion race is removable engineering overhead, but 16-user overall p99 remains jointly controlled by P bursts, per-session propagation, D-prefix eviction, and D's first execution over a long context. In the final repeat's tail-95 windows, P/D SM-active p95 is 74%/35% and Tensor-active p95 is 51%/3%.
+
+### Current Thinker-P tail attribution
+
+The final-code 16-user × 30-turn repeat above is the current reference. Client TTFA is 520/1,300/1,902 ms and Thinker-P time-to-output is 129/445/745 ms. The following attribution supersedes the earlier, pre-fix conclusion that synchronous snapshot construction or result exposure dominates P.
+
+| Thinker-P interval, p50/p95/p99 | Time | Attribution |
+|---|---:|---|
+| Core ingress → scheduler | 20/105/213 ms | Mostly waiting for the already-running, non-preemptible P batch to finish; not pure IPC time |
+| Scheduler admission | 2/10/17 ms | Small engine bookkeeping cost |
+| Runner input preparation | 16/45/69 ms | Removable engineering cost; reaches 110 ms in the concrete tail batch below |
+| Actual CUDA forward | 45/151/285 ms | Real model work |
+| Runner output build | 1/6/11 ms | Small after the asynchronous delta-snapshot fix |
+| Runner → Core output exposure | 1/3/5 ms | No longer a tail source |
+| P-side NIXL push | 0.4/1.0/1.9 ms | Not a P-tail source |
+
+Percentiles are not additive because they need not select the same request or batch. One concrete tail query, `video-e4499b63e578-bc903ac1`, makes the lifecycle explicit. After about 31 ms of StagePool delivery, decode, and request construction, it reached P Core while a two-request batch was already running. That batch took 262 ms in the runner, including 194 ms of CUDA work, leaving this query waiting 226 ms for the next batch boundary. It then joined five other requests: the batch processed 1,591 new tokens over 46–48k-token prefixes and spent 110 ms preparing inputs, 324 ms in actual CUDA execution, and 9 ms building output. Its 78-ms host-side `forward_wall` is only CUDA enqueue time; the following 246-ms sampling/bookkeeping interval waits for the same asynchronous GPU work and is not an additional 246-ms snapshot computation.
+
+The complete run shows why both long context and fragmented arrivals matter. Formal queries miss only 105/523/660 P-cache tokens, but every new token still attends to the retained prefix:
+
+| Formal-query prompt length | Requests | Thinker-P median/p95 |
+|---:|---:|---:|
+| 0–8k | 73 | 83/153 ms |
+| 8–24k | 170 | 115/216 ms |
+| 24–40k | 138 | 162/323 ms |
+| 40–50k | 66 | 322/762 ms |
+
+Prompt length correlates 0.603 with Thinker-P latency. Across all 4,683 P runner batches, actual CUDA time correlates 0.939 with the approximate attention work `sum(delta_tokens × retained_context)`. Prefix caching avoids rebuilding old-token KV but does not remove attention from the new suffix to the old keys and values.
+
+The same run has a mean P batch size of 1.41 and 76.1% singleton batches. Summed CUDA-forward time occupies only about 46.7% of the 602-second run, so P is not continuously compute-saturated; arrivals create inefficient small batches during quiet periods and expensive long-context mixed batches during bursts. The equal-token scheduler A/B above confirms the trade-off: a fixed 100-ms aggregation window reduces batch count and CUDA time by about 53% and raises throughput 2.14×, but worsens TTFA p99 from 1,211 to 1,545 ms. A fixed timer is therefore not the solution.
+
+The final distinction is:
+
+- **Model/workload cost:** a new AV suffix still performs attention over a long cached prefix; burst batches perform genuine CUDA work.
+- **Engine-design mismatch:** work-conserving immediate admission fragments steady arrival traffic, while a running batch cannot admit or yield to a newly arrived formal query. This batching-efficiency versus deadline trade-off is structural under the current execution abstraction, though the exact latency is not fundamental.
+- **Remaining engineering cost:** input preparation and request ingress can still be reduced. Synchronous snapshot copying, output exposure, and P-side NIXL submission have already been reduced below the dominant scale.
+
+The current P-tail root cause is therefore **bursty, long-context incremental prefill interacting with immediate and non-preemptible batch execution**: a formal query commonly waits for one active P batch, then executes in another costly mixed batch. The relevant engine direction is deadline-aware cross-session incremental batching plus a bounded prefill execution quantum/yield point, with input-preparation subphases instrumented separately. It is not another fixed accumulation delay or further NIXL/snapshot micro-optimization.
 
 ### Previous raw-AV two-turn hard-limit policy: 16 users × 30 turns
 

@@ -326,6 +326,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         connector.update_connector_output(KVConnectorOutput(finished_recving={request.request_id}))
         self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
 
+        # Match vLLM's ordinary WAITING_FOR_REMOTE_KVS completion path.  A
+        # full-prompt import must replay the last prompt token so the model can
+        # produce the first sampled token; otherwise scheduler admission sees
+        # zero new tokens.  The imported partial block remains request-owned.
+        if request.num_computed_tokens == request.num_tokens:
+            request.num_computed_tokens = request.num_tokens - 1
+
         lineage_id = getattr(request, "kv_lineage_id", None)
         revision = int(getattr(request, "kv_lineage_revision", 0))
         hash_block_size = int(getattr(self.kv_cache_manager.block_pool, "hash_block_size", 0))
@@ -340,6 +347,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         request.status = RequestStatus.FINISHED_STOPPED
         self._connector_finished(request)
+        if not bool(getattr(request, "pd_cache_sync_retain", False)):
+            self.kv_cache_manager.free(request)
+
+    def release_direct_pd_cache_sync(self, request: Request) -> None:
+        """Release a retained cache-only request while preserving cached KV."""
         self.kv_cache_manager.free(request)
 
     def fail_direct_pd_cache_sync(self, request: Request) -> None:
