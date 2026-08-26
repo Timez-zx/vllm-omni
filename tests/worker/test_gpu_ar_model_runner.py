@@ -845,6 +845,46 @@ def test_build_omni_output_falls_back_to_mm_cpu_without_prefix_merge(monkeypatch
     assert output.multimodal_outputs is None
 
 
+def test_prefix_tensor_cache_is_skipped_when_model_consumes_only_scheduled_tail(monkeypatch):
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = SimpleNamespace(
+        requires_full_prefix_cached_hidden_states=False,
+        requires_full_prefix_cached_multimodal_outputs=False,
+    )
+
+    class PrefixCache:
+        def update_omni_tensor_prefix_cache(self, **kwargs):
+            raise AssertionError("tail-only model must not write the Omni tensor side-cache")
+
+        def has_prefix_cached_new_req_ids(self):
+            raise AssertionError("tail-only model must not inspect cached prefix tensors")
+
+    runner.omni_prefix_cache = PrefixCache()
+    runner.input_batch = SimpleNamespace()
+    monkeypatch.setattr(
+        "vllm_omni.worker.gpu_ar_model_runner.get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True),
+    )
+
+    # Both paths short-circuit before touching block-table slot mappings or
+    # cached tensors. Native engine KV prefix caching is outside this helper.
+    runner._maybe_update_prefix_cache(
+        hidden_states=torch.ones((1, 2)),
+        hidden_states_cpu=None,
+        multimodal_outputs={"hidden_states.layer_0": torch.ones((1, 2))},
+        num_tokens_unpadded=1,
+        num_tokens_padded=1,
+    )
+    combined = runner._maybe_get_combined_prefix_cache_tensors(
+        hidden_states=torch.ones((1, 2)),
+        hidden_states_cpu=None,
+        multimodal_outputs={"hidden_states.layer_0": torch.ones((1, 2))},
+        num_scheduled_tokens={"r1": 1},
+    )
+
+    assert combined == (None, None)
+
+
 def test_pd_prefill_delta_mode_skips_full_prefix_multimodal_merge() -> None:
     runner = object.__new__(GPUARModelRunner)
     runner.model = SimpleNamespace(supports_delta_prefix_multimodal_outputs=True)

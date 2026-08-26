@@ -153,10 +153,16 @@ class FakeStageClient:
         }
 
     async def get_output_async(self):
+        output = self.get_output_nowait()
+        if output is not None:
+            return output
+        return SimpleNamespace(outputs=[])
+
+    def get_output_nowait(self):
         try:
             return self._engine_core_outputs.get_nowait()
         except queue.Empty:
-            return SimpleNamespace(outputs=[])
+            return None
 
     def get_diffusion_output_nowait(self):
         try:
@@ -243,7 +249,8 @@ def test_pd_prefill_snapshot_accumulates_flat_wire_chunks() -> None:
     assert accumulated["embed"]["tts_bos"].shape == (1, 3)
 
 
-def test_pd_prefill_snapshot_uses_exact_lineage_parent_for_delta() -> None:
+@pytest.mark.asyncio
+async def test_pd_prefill_snapshot_uses_exact_lineage_parent_for_delta() -> None:
     orchestrator = object.__new__(Orchestrator)
     orchestrator._pd_prefill_snapshots = OrderedDict()
     orchestrator._pd_prefill_snapshot_bytes = 0
@@ -263,7 +270,7 @@ def test_pd_prefill_snapshot_uses_exact_lineage_parent_for_delta() -> None:
             }
         },
     )
-    assert orchestrator._materialize_pd_prefill_snapshot(parent_state) is True
+    assert await orchestrator._materialize_pd_prefill_snapshot(parent_state) is True
 
     request = SimpleNamespace(
         request_id="child",
@@ -289,7 +296,7 @@ def test_pd_prefill_snapshot_uses_exact_lineage_parent_for_delta() -> None:
     orchestrator._prepare_pd_prefill_snapshot_request(request, child_state)
 
     assert request.model_intermediate_buffer["meta"]["pd_prefill_snapshot_mode"] == "delta"
-    assert orchestrator._materialize_pd_prefill_snapshot(child_state) is True
+    assert await orchestrator._materialize_pd_prefill_snapshot(child_state) is True
     # Arrival prefill keeps only the received tail in the request state and
     # records a zero-copy chunk chain for its next finite request.
     layers = child_state.pd_prefill_multimodal_output["hidden_states"]["layers"]
@@ -319,7 +326,7 @@ def test_pd_prefill_snapshot_uses_exact_lineage_parent_for_delta() -> None:
         },
     )
     orchestrator._prepare_pd_prefill_snapshot_request(final_request, final_state)
-    assert orchestrator._materialize_pd_prefill_snapshot(final_state) is True
+    assert await orchestrator._materialize_pd_prefill_snapshot(final_state) is True
     final_layers = final_state.pd_prefill_multimodal_output["hidden_states"]["layers"]
     assert [chunk.flatten().tolist() for chunk in final_layers[0]] == [
         [1.0, 2.0, 3.0],
@@ -338,7 +345,8 @@ def test_pd_prefill_snapshot_uses_exact_lineage_parent_for_delta() -> None:
     assert orchestrator._pd_prefill_snapshot_bytes == 48
 
 
-def test_pd_prefill_snapshot_compacts_long_arrival_chunk_chain() -> None:
+@pytest.mark.asyncio
+async def test_pd_prefill_snapshot_compacts_long_arrival_chunk_chain() -> None:
     orchestrator = object.__new__(Orchestrator)
     orchestrator._pd_prefill_snapshots = OrderedDict()
     orchestrator._pd_prefill_snapshot_bytes = 0
@@ -359,7 +367,7 @@ def test_pd_prefill_snapshot_compacts_long_arrival_chunk_chain() -> None:
             }
         },
     )
-    assert orchestrator._materialize_pd_prefill_snapshot(parent_state) is True
+    assert await orchestrator._materialize_pd_prefill_snapshot(parent_state) is True
 
     request = SimpleNamespace(
         request_id="warmup",
@@ -383,17 +391,58 @@ def test_pd_prefill_snapshot_compacts_long_arrival_chunk_chain() -> None:
         },
     )
     orchestrator._prepare_pd_prefill_snapshot_request(request, state)
-    assert orchestrator._materialize_pd_prefill_snapshot(state) is True
+    assert await orchestrator._materialize_pd_prefill_snapshot(state) is True
 
-    cached = orchestrator._pd_prefill_snapshots["session-1"].output["hidden_states"]["layers"]
-    assert isinstance(cached[0], torch.Tensor)
-    assert cached[0].flatten().tolist() == [1.0, 2.0]
-    assert cached[24].flatten().tolist() == [21.0, 22.0]
-    assert cached[0].is_shared()
-    assert cached[24].is_shared()
+    snapshot = orchestrator._pd_prefill_snapshots["session-1"]
+    cached = snapshot.output["hidden_states"]["layers"]
+    assert snapshot.packed_prefix_chunks == 1
+    assert len(cached[0]) == 1
+    assert cached[0][0].flatten().tolist() == [1.0, 2.0]
+    assert cached[24][0].flatten().tolist() == [21.0, 22.0]
+    assert cached[0][0].is_shared()
+    assert cached[24][0].is_shared()
+
+    first_packed_layer_0_storage = cached[0][0].untyped_storage().data_ptr()
+    first_packed_layer_24_storage = cached[24][0].untyped_storage().data_ptr()
+    for revision, value in ((3, 3.0), (4, 4.0)):
+        request = SimpleNamespace(
+            request_id=f"warmup-{revision}",
+            prompt_token_ids=list(range(1, revision + 1)),
+            kv_lineage_id="session-1",
+            kv_lineage_parent_revision=revision - 1,
+            kv_lineage_revision=revision,
+            kv_lineage_prefix_tokens=revision - 1,
+            model_intermediate_buffer=None,
+        )
+        state = OrchestratorRequestState(
+            request_id=f"warmup-{revision}",
+            prompt={"prefill_only": True},
+            pd_prefill_multimodal_output={
+                "hidden_states": {
+                    "layers": {
+                        0: torch.tensor([[value]]),
+                        24: torch.tensor([[value + 20.0]]),
+                    }
+                }
+            },
+        )
+        orchestrator._prepare_pd_prefill_snapshot_request(request, state)
+        assert await orchestrator._materialize_pd_prefill_snapshot(state) is True
+
+    # Revision 4 packs only revisions 3-4. Prefix slicing may create a new
+    # tensor view, but the first packed slab keeps the same shared storage
+    # instead of being copied into an ever-growing full snapshot.
+    snapshot = orchestrator._pd_prefill_snapshots["session-1"]
+    cached = snapshot.output["hidden_states"]["layers"]
+    assert snapshot.packed_prefix_chunks == 2
+    assert cached[0][0].untyped_storage().data_ptr() == first_packed_layer_0_storage
+    assert cached[24][0].untyped_storage().data_ptr() == first_packed_layer_24_storage
+    assert [chunk.flatten().tolist() for chunk in cached[0]] == [[1.0, 2.0], [3.0, 4.0]]
+    assert [chunk.flatten().tolist() for chunk in cached[24]] == [[21.0, 22.0], [23.0, 24.0]]
 
 
-def test_pd_prefill_snapshot_keeps_only_the_latest_linear_revision() -> None:
+@pytest.mark.asyncio
+async def test_pd_prefill_snapshot_keeps_only_the_latest_linear_revision() -> None:
     orchestrator = object.__new__(Orchestrator)
     orchestrator._pd_prefill_snapshots = OrderedDict()
     orchestrator._pd_prefill_snapshot_bytes = 0
@@ -413,7 +462,7 @@ def test_pd_prefill_snapshot_keeps_only_the_latest_linear_revision() -> None:
             }
         },
     )
-    assert orchestrator._materialize_pd_prefill_snapshot(parent_state)
+    assert await orchestrator._materialize_pd_prefill_snapshot(parent_state)
 
     child_request = SimpleNamespace(
         request_id="child",
@@ -438,14 +487,15 @@ def test_pd_prefill_snapshot_keeps_only_the_latest_linear_revision() -> None:
     )
     orchestrator._prepare_pd_prefill_snapshot_request(child_request, child_state)
     assert child_request.model_intermediate_buffer["meta"]["pd_prefill_snapshot_mode"] == "delta"
-    assert orchestrator._materialize_pd_prefill_snapshot(child_state)
+    assert await orchestrator._materialize_pd_prefill_snapshot(child_state)
 
     latest = orchestrator._pd_prefill_snapshots["session-1"]
     assert latest.revision == 2
     assert set(orchestrator._pd_prefill_snapshots) == {"session-1"}
 
 
-def test_pd_prefill_snapshot_reports_missing_payload() -> None:
+@pytest.mark.asyncio
+async def test_pd_prefill_snapshot_reports_missing_payload() -> None:
     orchestrator = object.__new__(Orchestrator)
     orchestrator._pd_prefill_snapshots = OrderedDict()
     orchestrator._pd_prefill_snapshot_bytes = 0
@@ -459,7 +509,7 @@ def test_pd_prefill_snapshot_reports_missing_payload() -> None:
         pd_prefill_multimodal_output={"hidden_states": {"layers": {}}},
     )
 
-    assert orchestrator._materialize_pd_prefill_snapshot(state) is False
+    assert await orchestrator._materialize_pd_prefill_snapshot(state) is False
     assert "session-1" not in orchestrator._pd_prefill_snapshots
 
 
@@ -2228,6 +2278,7 @@ async def test_stage_pool_failed_replica_releases_distributed_affinity_and_stops
     assert pool.get_bound_replica_id("distributed-request") is None
     assert pool.get_bound_replica_id("legacy-request") is None
     assert await pool.poll_llm_raw_output(0) is None
+    assert pool.poll_llm_raw_output_nowait(0) is None
 
 
 def test_stage_pool_reattached_replica_becomes_available_again() -> None:

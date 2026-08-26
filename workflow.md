@@ -421,6 +421,47 @@ The final distinction is:
 
 The current P-tail root cause is therefore **bursty, long-context incremental prefill interacting with immediate and non-preemptible batch execution**: a formal query commonly waits for one active P batch, then executes in another costly mixed batch. The relevant engine direction is deadline-aware cross-session incremental batching plus a bounded prefill execution quantum/yield point, with input-preparation subphases instrumented separately. It is not another fixed accumulation delay or further NIXL/snapshot micro-optimization.
 
+### Removing full-prefix output reconstruction on Thinker-D
+
+Thinker-D already receives its attention prefix through the native KV cache, while Talker's complete prompt conditioning comes from the P snapshot. The old runner still stored and reconstructed full-prefix layer-0/layer-24 outputs in a separate CPU tensor side-cache for every formal D request before appending the current decode row. That prompt-length-dependent work was redundant. D now emits only rows produced by the current scheduler step, and `thinker2talker_async_chunk` appends them to the P snapshot. Native attention KV caching, request tokens, the P snapshot, and Talker input semantics are unchanged.
+
+Formal long-run result: `/home/ubuntu/data/results/pd_decode_tailonly_u16_t30_20260826/pd_decode_tailonly_t30_seed7_u16`; pre-fix baseline: `/home/ubuntu/data/results/pd_event_handoff_queuefix_u16_t30_20260826/pd_event_handoff_queuefix_seed7_u16`. Both use four-GPU P/D, 16 users × 30 turns, two warm-up turns, seed 7, and the same deployment and workload plan. Raw/canonical plan hashes are `5e62bb6915cced1918465f94c0bc690634730e722c05768a585d1df489dc8855` / `9f807d41b63a9b76fe7d2e0e30b7a1ae2dd350a02fba2998a32ff6786d194514`. Both finish 480/480 queries and 448/448 scored turns without timeout or stall. Because this is a live closed-loop workload, the fixed run actually processes more finite arrivals/frame occurrences than the baseline (6,826/7,215 versus 6,297/6,726), so the gain is not caused by reducing input load.
+
+| p50/p95/p99 | Pre-fix | Fixed |
+|---|---:|---:|
+| Client TTFA | 520/1,300/1,902 ms | 491/1,097/1,487 ms |
+| Same-session wait | 0/159/444 ms | 0/124/341 ms |
+| Thinker-P | 129/445/745 ms | 130/452/678 ms |
+| P-ready→D-ready | 58/140/216 ms | 60/138/196 ms |
+| Thinker-D added | 120/361/518 ms | 82/249/507 ms |
+| D scheduled→output | 61/131/174 ms | 23/35/46 ms |
+| First D batch GPU forward | 6.7/9.7/12.2 ms | 6.7/9.5/12.4 ms |
+| First D batch output build | 41.9/73.0/117.4 ms | 6.2/9.2/12.1 ms |
+| First D batch runner total | 47.8/81.9/137.2 ms | 12.2/17.3/20.6 ms |
+
+Across all 448 scored requests, first-D-batch GPU-forward time is unchanged while output-build p99 falls 89.7% and D scheduled-to-output p99 falls 73.6%; this is the direct causal validation of the change. End-to-end TTFA p95/p99 also falls 15.6%/21.8%, so the gain survives a 30-turn long session, though a single-seed live closed-loop A/B is not by itself a capacity claim.
+
+Before the output-consumer follow-up below, the remaining tail was no longer D model computation. Thinker-P p99 was 678 ms, including 250 ms from Core ingress to scheduler and 389 ms from scheduling to output; formal-query runner prepare/GPU-forward/output-build p99 was 63/294/13 ms. A request-aligned, non-overlapping P-to-D timeline was: P output received by StagePool→D scheduler selection at 53/134/196 ms, D scheduler→D Core output at 23/35/45 ms, and D Core output→API receive at 5/134/303 ms. This isolated shared-output consumption as a removable engineering component. When the query arrived first and waited for KV, local activation after KV ready was already 0/0/0 ms; the earlier 216-ms activation-hold p99 mostly represented the reverse case—KV ready while the formal D request had not arrived.
+
+### Shared-output consumption and snapshot suffix packing
+
+The orchestrator previously polled stages serially with a separate 1-ms timeout for each empty stage, consumed at most one message per stage per pass, and synchronously routed P outputs. P snapshot chains were also compacted by copying the complete layer-0/layer-24 history whenever the chain exceeded 16 chunks. At 16 users this full-history copy had p50/p95/p99/max of 76/136/166/272 ms and a 0.89 correlation with prompt length; while it ran, D/Talker outputs accumulated in the shared event loop.
+
+The current implementation keeps P routing FIFO in an independent worker, scans decoded stage queues with non-blocking round-robin, and stores snapshots as immutable packed-prefix slabs plus a recent suffix. Crossing the 16-chunk threshold packs only the new suffix; older slabs retain the same shared storage. This preserves request order, tensor contents, prefix/KV lineage, and arrival frequency.
+
+Final validation: `/home/ubuntu/data/results/pd_output_suffixpack_u16_t30_20260826/pd_output_suffixpack_t30_seed7_u16`. Setup is four-GPU P/D, 16 users × 30 turns, two warm-up turns, seed 7, with the same continuous-AV workload. All 480 finite queries and 448 scored turns complete; 6,878 arrival requests, 7,297 accepted frame occurrences, and 7,980/8,015 prefix-cache observations validate, with no timeout or stall.
+
+| p50/p95/p99 | Full-copy + blocking poll | Full-copy + non-blocking poll | Suffix-pack + non-blocking poll |
+|---|---:|---:|---:|
+| Client TTFA | 501/1,047/1,382 ms | 519/1,122/1,670 ms | 497/1,015/1,430 ms |
+| Full/suffix packing time | 76/136/166 ms | 74/145/221 ms | 32/57/85 ms |
+| All D output-queue wait | 2/69/196 ms | 1/38/132 ms | 1/14/71 ms |
+| First formal D output-queue wait | 2/18/78 ms | 1/12/47 ms | 1/10/49 ms |
+| First formal Talker output-queue wait | 2/146/305 ms | 1/17/84 ms | 1/13/88 ms |
+| First formal Code2Wav output-queue wait | 2/27/136 ms | 1/20/63 ms | 1/13/35 ms |
+
+Suffix packing reduces compaction p99 by 49% and its prompt-length correlation to 0.26. Non-blocking consumption removes the steady per-stage polling tax; the formal D first-output queue component is now 1/10/49 ms. On the broader, directly comparable boundary, D Core encoded→API receive is 2/52/198 ms versus 5/134/303 ms before this follow-up. The remaining p99 before queue insertion is 133 ms, so socket/decode exposure is reduced but not eliminated. End-to-end p99 does not improve monotonically across single-seed closed-loop repeats, so this is not presented as a capacity gain. In the final run, same-session wait, Thinker-P, P-ready→D-ready, and D scheduled→output are respectively 0/113/419, 129/407/567, 59/145/209, and 24/38/50 ms. The remaining 1.43-second TTFA p99 is dominated by P bursts propagated through session order plus the P/D rendezvous; shared-output exposure is now secondary rather than the largest component, and D GPU execution remains small.
+
 ### Previous raw-AV two-turn hard-limit policy: 16 users × 30 turns
 
 Result: `/home/ubuntu/data/results/pd_recent2_long_u16_t30_20260824/pd_recent2_long_t30_seed7_u16`
@@ -437,7 +478,7 @@ D transfer/load p99 is 323 ms; Talker and Code2Wav scheduled-to-output p99 is 88
 |---|---|
 | Session and finite-request lifecycle | `vllm_omni/entrypoints/openai/video_stream_base.py` |
 | P/D snapshots and stage routing | `vllm_omni/engine/orchestrator.py` |
-| P-runner delta output | `vllm_omni/worker/gpu_ar_model_runner.py` |
+| P/D runner prefix output | `vllm_omni/worker/gpu_ar_model_runner.py` |
 | P/D deployment | `benchmarks/thinker_talker/pd_deploy_4gpu.yaml` |
 | Multi-user workload | `benchmarks/live_agent/web_client/mu_bench.py` |
 | P/D capacity entry point | `benchmarks/live_agent/web_client/run_pd_av_session_ladder.sh` |

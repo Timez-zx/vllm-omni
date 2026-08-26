@@ -795,6 +795,18 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         model = getattr(self, "model", None)
         return bool(getattr(model, "requires_full_prefix_cached_hidden_states", True))
 
+    def _model_needs_full_prefix_multimodal_outputs(self) -> bool:
+        """Whether downstream output needs cached multimodal prefix rows.
+
+        The default preserves the generic Omni contract: a prefix-cache hit
+        reconstructs cached multimodal rows before the stage payload is sent
+        downstream. A stage whose downstream processor already owns an
+        equivalent prompt snapshot can opt out and emit only the rows produced
+        by the current scheduler step.
+        """
+        model = getattr(self, "model", None)
+        return bool(getattr(model, "requires_full_prefix_cached_multimodal_outputs", True))
+
     def _model_supports_delta_prefix_multimodal_outputs(self) -> bool:
         """Whether a model can emit only the newly scheduled MM rows.
 
@@ -983,6 +995,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             # If this happens, it generally means the model is not following the correct
             # interface yet and is therefore currently not compatible with prefix cache.
             hs_for_cache = hidden_states if self._model_needs_full_prefix_hidden_states() else None
+            mm_for_cache = (
+                flatten_payload(multimodal_outputs)
+                if multimodal_outputs and self._model_needs_full_prefix_multimodal_outputs()
+                else None
+            )
+            # Native KV prefix caching is independent of this CPU tensor
+            # side-cache. If the model consumes neither cached hidden nor
+            # cached multimodal rows, avoid the slot-map D2H and cache writes.
+            if hs_for_cache is None and mm_for_cache is None:
+                return
             # FIX: The .cpu attribute of slot_mapping is stale (not updated by the Triton
             # _compute_slot_mapping_kernel which only writes to .gpu). We must use .gpu and
             # sync back to CPU to get the correctly computed slot mapping.
@@ -990,7 +1012,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             slot_mapping_cpu = slot_mapping_gpu[:num_tokens_padded].cpu()
             self.omni_prefix_cache.update_omni_tensor_prefix_cache(
                 hidden_states=hs_for_cache,
-                multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
+                multimodal_outputs=mm_for_cache,
                 num_tokens_unpadded=num_tokens_unpadded,
                 slot_mapping=slot_mapping_cpu,
                 num_tokens_padded=num_tokens_padded,
@@ -1018,12 +1040,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if self.omni_prefix_cache is not None:
             if not is_last_pp_rank:
                 raise RuntimeError("Omni prefix-cache tensor merge is only valid on the last pipeline parallel rank.")
-            if (
-                not self._model_needs_full_prefix_hidden_states()
-                and not self.omni_prefix_cache.has_prefix_cached_new_req_ids()
-            ):
+            needs_full_hidden = self._model_needs_full_prefix_hidden_states()
+            needs_full_mm = self._model_needs_full_prefix_multimodal_outputs()
+            if not needs_full_hidden and not needs_full_mm:
                 return None, None
-            if self._model_needs_full_prefix_hidden_states():
+            if not needs_full_hidden and not self.omni_prefix_cache.has_prefix_cached_new_req_ids():
+                return None, None
+            if needs_full_hidden:
                 combined_hidden_states = self.omni_prefix_cache.get_merged_hidden_states(
                     query_start_loc=self.query_start_loc.cpu,
                     input_batch=self.input_batch,
@@ -1031,7 +1054,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     hidden_states_cpu=hidden_states_cpu,
                     num_scheduled_tokens=num_scheduled_tokens,
                 )
-            needs_full_prefix_mm = (
+            needs_full_prefix_mm = needs_full_mm and (
                 bool(pd_needs_full_prefix_mm)
                 if pd_needs_full_prefix_mm is not None
                 else self._batch_needs_full_prefix_multimodal_outputs()

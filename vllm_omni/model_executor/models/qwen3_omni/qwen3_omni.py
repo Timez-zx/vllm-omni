@@ -207,6 +207,16 @@ class Qwen3OmniMoeForConditionalGeneration(
                 # carry the exact lineage-aware snapshot.
                 self.omni_pooler_payload_include_hidden = False
                 self.requires_full_prefix_cached_hidden_states = False
+            # In the P/D topology, Thinker-D receives the complete prompt
+            # conditioning snapshot from P. Its D->Talker processor appends
+            # only newly decoded layer-0/layer-24 rows to that snapshot, so
+            # rebuilding the same full prefix from the runner's CPU tensor
+            # cache is redundant. Keep native KV prefix caching enabled; opt
+            # out only from the separate Omni output-tensor side-cache.
+            if getattr(model_config, "stage_id", -1) == 1:
+                self.omni_pooler_payload_include_hidden = False
+                self.requires_full_prefix_cached_hidden_states = False
+                self.requires_full_prefix_cached_multimodal_outputs = False
             # Initialize thinker model (multimodal processing + text generation)
             # Create a new vllm_config with thinker_config as the hf_config
             thinker_vllm_config = vllm_config.with_hf_config(

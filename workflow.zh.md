@@ -421,6 +421,47 @@ Prompt 长度与 Thinker-P 延迟的相关系数为 0.603。全部 4,683 个 P r
 
 当前 P tail 的准确根因是 **bursty 的长 context 增量 prefill 与立即、不可中途抢占的 batch 执行相互作用**：正式 query 常先等一个在途 P batch，再在另一个昂贵的混合 batch 中执行。后续应研究 deadline-aware 的跨 session 增量 batching，以及可控的 prefill 执行粒度/yield point，并单独细分 input preparation。不应再加固定聚合等待，也不应把主要精力放在 NIXL/snapshot 微优化上。
 
+### Thinker-D 完整 prefix 输出重建修复
+
+Thinker-D 已通过原生 KV cache 获得 attention prefix，Talker 的完整 prompt conditioning 则由 P snapshot 提供。旧 runner 仍为每个正式 D request 在独立 CPU tensor side-cache 中保存并恢复完整 prefix 的 layer-0/layer-24 输出，然后才附加本轮 decode row；该工作与 prompt 长度成正比且完全重复。当前 D 只输出本 scheduler step 的新 row，`thinker2talker_async_chunk` 再将其接到 P snapshot。原生 attention KV cache、请求 token、P snapshot 和 Talker 输入语义均未改变。
+
+正式长测结果：`/home/ubuntu/data/results/pd_decode_tailonly_u16_t30_20260826/pd_decode_tailonly_t30_seed7_u16`；修复前基线：`/home/ubuntu/data/results/pd_event_handoff_queuefix_u16_t30_20260826/pd_event_handoff_queuefix_seed7_u16`。两者均为 4-GPU P/D、16 用户 × 30 轮、前 2 轮 warm-up、seed 7，并使用相同部署和 workload plan；raw/canonical plan hash 为 `5e62bb6915cced1918465f94c0bc690634730e722c05768a585d1df489dc8855` / `9f807d41b63a9b76fe7d2e0e30b7a1ae2dd350a02fba2998a32ff6786d194514`。两组均完成 480/480 query 和 448/448 计分回合，无 timeout 或 stall。因为 workload 是 live closed loop，修复后运行实际处理了更多 finite arrival/frame occurrence（6,826/7,215，对照 6,297/6,726），因此收益不是通过减少输入负载获得。
+
+| p50/p95/p99 | 修复前 | 修复后 |
+|---|---:|---:|
+| Client TTFA | 520/1,300/1,902 ms | 491/1,097/1,487 ms |
+| 同 session 等待 | 0/159/444 ms | 0/124/341 ms |
+| Thinker-P | 129/445/745 ms | 130/452/678 ms |
+| P-ready→D-ready | 58/140/216 ms | 60/138/196 ms |
+| Thinker-D 增量 | 120/361/518 ms | 82/249/507 ms |
+| D scheduled→output | 61/131/174 ms | 23/35/46 ms |
+| D 首 batch GPU forward | 6.7/9.7/12.2 ms | 6.7/9.5/12.4 ms |
+| D 首 batch output build | 41.9/73.0/117.4 ms | 6.2/9.2/12.1 ms |
+| D 首 batch runner total | 47.8/81.9/137.2 ms | 12.2/17.3/20.6 ms |
+
+全部 448 个计分请求中，D 首 batch 的 GPU forward 不变，而 output build p99 下降 89.7%，D scheduled→output p99 下降 73.6%；这是该修改的直接因果证据。端到端 TTFA p95/p99 同时下降 15.6%/21.8%，说明收益在 30 轮长 session 下仍保留，但单 seed 的 live closed-loop A/B 不单独外推容量。
+
+在下述输出消费修复之前，剩余 tail 已不在 D 模型计算：Thinker-P p99 为 678 ms，其中 Core ingress→scheduler 为 250 ms、scheduled→output 为 389 ms；正式 query runner 的 prepare/GPU forward/output build p99 为 63/294/13 ms。对同一请求做互不重叠的 P→D 分解，P StagePool 收到输出→D scheduler 选中为 53/134/196 ms，D scheduler→D Core 输出为 23/35/45 ms，D Core 输出→API 收到为 5/134/303 ms。由此定位出可消除的共享输出消费开销。query 先到并等待 KV 时，KV ready 后的本地激活已经只有 0/0/0 ms；此前 216 ms 的 activation-hold p99 主要是反方向的“KV 已就绪但正式 D request 尚未到达”。
+
+### 共享输出消费与 snapshot suffix packing
+
+旧 orchestrator 逐 stage 串行轮询，每个空 stage 单独等待 1 ms，每轮每个 stage 最多消费一条消息，并同步路由 P 输出。snapshot chain 超过 16 chunks 时，还会完整复制 layer-0/layer-24 历史。16 用户下该全历史复制的 p50/p95/p99/max 为 76/136/166/272 ms，与 prompt 长度相关系数为 0.89；复制期间 D/Talker 输出在同一事件循环中积压。
+
+当前实现使用独立 FIFO worker 路由 P 输出，非阻塞 round-robin 消费已解码的各 stage 队列，并将 snapshot 表示为不可变 packed-prefix slabs 加最近 suffix。超过 16 chunks 时只打包新 suffix，旧 slab 继续复用同一 shared storage。request 顺序、tensor 内容、prefix/KV lineage 和 arrival 频率均未改变。
+
+最终结果：`/home/ubuntu/data/results/pd_output_suffixpack_u16_t30_20260826/pd_output_suffixpack_t30_seed7_u16`。配置为 4-GPU P/D、16 用户 × 30 轮、前 2 轮 warm-up、seed 7，使用相同 continuous-AV workload。480/480 finite query、448/448 计分回合、6,878 个 arrival request、7,297 个有效 frame occurrence 和 7,980/8,015 次 prefix-cache 观测均通过，无 timeout 或 stall。
+
+| p50/p95/p99 | 全量复制 + 阻塞轮询 | 全量复制 + 非阻塞轮询 | suffix packing + 非阻塞轮询 |
+|---|---:|---:|---:|
+| Client TTFA | 501/1,047/1,382 ms | 519/1,122/1,670 ms | 497/1,015/1,430 ms |
+| 全量/suffix packing | 76/136/166 ms | 74/145/221 ms | 32/57/85 ms |
+| 全部 D output queue 等待 | 2/69/196 ms | 1/38/132 ms | 1/14/71 ms |
+| 正式 D 首输出 queue 等待 | 2/18/78 ms | 1/12/47 ms | 1/10/49 ms |
+| 正式 Talker 首输出 queue 等待 | 2/146/305 ms | 1/17/84 ms | 1/13/88 ms |
+| 正式 Code2Wav 首输出 queue 等待 | 2/27/136 ms | 1/20/63 ms | 1/13/35 ms |
+
+suffix packing 将 compaction p99 降低 49%，与 prompt 长度的相关系数降至 0.26；非阻塞消费消除了逐 stage 空轮询税。正式 D 首输出的 queue 组件现在为 1/10/49 ms。使用更宽且可直接对比的边界，D Core encoded→API receive 从修复前的 5/134/303 ms 降至 2/52/198 ms；当前 queue 插入前仍有 133 ms p99，因此 socket/decode 暴露已降低但尚未归零。单 seed closed-loop 的端到端 p99 并未单调下降，因此这里不声称容量提升。最终长测中，同 session wait、Thinker-P、P-ready→D-ready、D scheduled→output 分别为 0/113/419、129/407/567、59/145/209、24/38/50 ms。剩余 1.43 秒 TTFA p99 主要来自 P burst 经 session 顺序传播并叠加 P/D rendezvous；共享输出暴露已从最大项降为次要项，D GPU 执行仍很小。
+
 ### 此前两轮原始 AV 硬上限策略：16 用户 × 30 轮
 
 结果：`/home/ubuntu/data/results/pd_recent2_long_u16_t30_20260824/pd_recent2_long_t30_seed7_u16`
@@ -437,7 +478,7 @@ D transfer/load p99 为 323 ms；Talker、Code2Wav 实际 scheduled-to-output p9
 |---|---|
 | Session 与 finite-request 生命周期 | `vllm_omni/entrypoints/openai/video_stream_base.py` |
 | P/D snapshot 与 stage routing | `vllm_omni/engine/orchestrator.py` |
-| P runner delta output | `vllm_omni/worker/gpu_ar_model_runner.py` |
+| P/D runner prefix output | `vllm_omni/worker/gpu_ar_model_runner.py` |
 | P/D 部署 | `benchmarks/thinker_talker/pd_deploy_4gpu.yaml` |
 | 多用户 workload | `benchmarks/live_agent/web_client/mu_bench.py` |
 | P/D capacity 入口 | `benchmarks/live_agent/web_client/run_pd_av_session_ladder.sh` |

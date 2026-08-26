@@ -1221,6 +1221,27 @@ class StagePool:
             )
             raise
 
+    def poll_llm_raw_output_nowait(self, replica_id: int) -> EngineCoreOutputs | None:
+        """Drain one already-decoded LLM output without an empty-queue wait."""
+        if not self.is_replica_available(replica_id):
+            return None
+        raw_client = self.clients[replica_id]
+        if raw_client is None:
+            return None
+        client = cast(StagePoolLLMClient, raw_client)
+        try:
+            outputs = client.get_output_nowait()
+            if outputs is None or not outputs.outputs:
+                return None
+            return outputs
+        except Exception:
+            logger.exception(
+                "[StagePool] non-blocking output poll failed for stage-%s replica-%s",
+                self.stage_id,
+                replica_id,
+            )
+            raise
+
     def poll_diffusion_output(self, replica_id: int) -> Any | None:
         """Drain one ready diffusion output from the given replica if present."""
         if not self.is_replica_available(replica_id):

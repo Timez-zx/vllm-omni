@@ -209,6 +209,10 @@ class _PDPrefillSnapshot:
     prompt_token_ids: tuple[int, ...]
     output: dict[str, Any]
     nbytes: int
+    # Leading chunks that have already been copied into dedicated shared
+    # slabs. Future revisions must reuse these slabs rather than repeatedly
+    # concatenating the full history.
+    packed_prefix_chunks: int = 0
 
 
 @dataclass
@@ -462,6 +466,13 @@ class Orchestrator:
         # slow sync. Cache sync remains request-scoped while each application
         # session continues to send complete canonical prompts.
         self._pd_cache_sync_tasks: dict[str, asyncio.Task[Any]] = {}
+        # P output routing is kept FIFO but runs independently from the global
+        # stage poller. Snapshot compaction can then yield to D/Talker output
+        # consumption instead of blocking every stage on the orchestrator
+        # event loop.
+        self._pd_prefill_output_queue: asyncio.Queue[
+            tuple[int, int, list[Any], float]
+        ] | None = None
         # Arrival-prefill requests may populate vLLM's sender-side media
         # cache, leaving the final request with hash-only feature references.
         # Retain only the tiny values needed to reconstruct M-RoPE on D.
@@ -595,6 +606,9 @@ class Orchestrator:
         """Main entry point for the Orchestrator event loop."""
         logger.info("[Orchestrator] Starting event loop")
 
+        if self._pd_pair is not None:
+            self._pd_prefill_output_queue = asyncio.Queue()
+
         request_task = asyncio.create_task(self._request_handler(), name="orchestrator-request-handler")
         output_task = asyncio.create_task(
             self._orchestration_output_handler(),
@@ -611,6 +625,13 @@ class Orchestrator:
             membership_watcher = self._membership.start()
 
         tasks = [request_task, output_task]
+        if self._pd_prefill_output_queue is not None:
+            tasks.append(
+                asyncio.create_task(
+                    self._pd_prefill_output_worker(),
+                    name="orchestrator-pd-prefill-output-worker",
+                )
+            )
         if self.duplex_control_plane is not None:
             tasks.append(asyncio.create_task(self._duplex_reaper_loop(), name="orchestrator-duplex-reaper"))
         if membership_watcher is not None:
@@ -996,6 +1017,38 @@ class Orchestrator:
             logger.debug("[Orchestrator] _orchestration_output_handler cancelled")
             return
 
+    async def _pd_prefill_output_worker(self) -> None:
+        """Route P outputs in order without blocking other stage consumers."""
+        queue = self._pd_prefill_output_queue
+        if queue is None:
+            return
+        while not self._shutdown_event.is_set() or not queue.empty():
+            try:
+                stage_id, replica_id, outputs, enqueued_mono = await asyncio.wait_for(
+                    queue.get(),
+                    timeout=0.1,
+                )
+            except TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                raise
+            route_started = _time.monotonic()
+            try:
+                await self._handle_processed_outputs(stage_id, replica_id, outputs)
+            finally:
+                queue.task_done()
+            if _LOG_HANDOFF_DIAG and (_DIAG_STAGES is None or str(stage_id) in _DIAG_STAGES):
+                route_done = _time.monotonic()
+                logger.info(
+                    "[ORCH-P-ROUTE-DIAG] mono=%.6f reqs=%s queue_wait_ms=%.3f "
+                    "route_ms=%.3f qsize_after=%d",
+                    route_done,
+                    ",".join(str(getattr(output, "request_id", "?")) for output in outputs),
+                    (route_started - enqueued_mono) * 1000.0,
+                    (route_done - route_started) * 1000.0,
+                    queue.qsize(),
+                )
+
     async def _orchestration_loop(self) -> None:
         """Poll stage pools and route logical outputs."""
         while not self._shutdown_event.is_set():
@@ -1016,9 +1069,14 @@ class Orchestrator:
                         idle = False
                     else:
                         try:
-                            raw_outputs = await pool.poll_llm_raw_output(replica_id, timeout_s=0.001)
+                            output_step_start = _time.perf_counter()
+                            # Each AsyncMPClient already has a persistent socket
+                            # reader. Do not serialize a 1 ms timeout across
+                            # every empty stage before consuming a ready stage.
+                            raw_outputs = pool.poll_llm_raw_output_nowait(replica_id)
                             if raw_outputs is None:
                                 continue
+                            output_poll_done = _time.perf_counter()
 
                             if _LOG_HANDOFF_DIAG and (_DIAG_STAGES is None or str(stage_id) in _DIAG_STAGES):
                                 recv_wall = _time.time()
@@ -1040,6 +1098,7 @@ class Orchestrator:
                                     )
 
                             await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
+                            output_kv_done = _time.perf_counter()
                             for eco in raw_outputs.outputs:
                                 req_state = self.request_states.get(getattr(eco, "request_id", None))
                                 if req_state is None:
@@ -1084,6 +1143,7 @@ class Orchestrator:
                                 raw_outputs,
                                 iteration_stats=iteration_stats,
                             )
+                            output_process_done = _time.perf_counter()
                             if record_stats:
                                 self._stat_logger.record(
                                     raw_outputs.scheduler_stats,
@@ -1162,7 +1222,34 @@ class Orchestrator:
                             )
                             raise
 
-                        await self._handle_processed_outputs(stage_id, replica_id, raw_output)
+                        pd_prefill_stage = self._pd_pair[0] if self._pd_pair is not None else None
+                        if stage_id == pd_prefill_stage and self._pd_prefill_output_queue is not None:
+                            self._pd_prefill_output_queue.put_nowait(
+                                (stage_id, replica_id, raw_output, _time.monotonic())
+                            )
+                        else:
+                            await self._handle_processed_outputs(stage_id, replica_id, raw_output)
+                        if _LOG_HANDOFF_DIAG and (_DIAG_STAGES is None or str(stage_id) in _DIAG_STAGES):
+                            output_route_done = _time.perf_counter()
+                            request_ids = ",".join(
+                                str(getattr(output, "request_id", "?"))
+                                for output in raw_outputs.outputs
+                            )
+                            queue_size, _ = pool.replica_monitor_sample(replica_id)
+                            logger.info(
+                                "[ORCH-OUTPUT-DIAG] mono=%.6f stage=%s reqs=%s poll_ms=%.3f "
+                                "kv_ms=%.3f process_ms=%.3f route_ms=%.3f total_ms=%.3f "
+                                "qsize_after=%d",
+                                _time.monotonic(),
+                                stage_id,
+                                request_ids,
+                                (output_poll_done - output_step_start) * 1000.0,
+                                (output_kv_done - output_poll_done) * 1000.0,
+                                (output_process_done - output_kv_done) * 1000.0,
+                                (output_route_done - output_process_done) * 1000.0,
+                                (output_route_done - output_step_start) * 1000.0,
+                                queue_size,
+                            )
                         idle = False
 
             self._orch_monitor.note_loop(idle=idle)
@@ -1506,7 +1593,7 @@ class Orchestrator:
                         None,
                         processed_mm,
                     )
-            snapshot_cached = self._materialize_pd_prefill_snapshot(req_state)
+            snapshot_cached = await self._materialize_pd_prefill_snapshot(req_state)
 
             # A cache-population request must stop at P.  In a non-split
             # pipeline the Thinker itself is the text output stage; after a
@@ -1994,6 +2081,8 @@ class Orchestrator:
         self,
         req_state: OrchestratorRequestState,
         output: dict[str, Any],
+        *,
+        packed_prefix_chunks: int = 0,
     ) -> bool:
         lineage_id = req_state.pd_prefill_lineage_id
         prompt_ids = req_state.pd_prefill_prompt_token_ids
@@ -2015,6 +2104,7 @@ class Orchestrator:
             prompt_token_ids=prompt_ids,
             output=output,
             nbytes=nbytes,
+            packed_prefix_chunks=max(0, int(packed_prefix_chunks)),
         )
         self._pd_prefill_snapshots[lineage_id] = snapshot
         self._pd_prefill_snapshot_bytes += nbytes
@@ -2049,7 +2139,7 @@ class Orchestrator:
             return ()
         return tuple(selected)
 
-    def _materialize_pd_prefill_snapshot(self, req_state: OrchestratorRequestState) -> bool:
+    async def _materialize_pd_prefill_snapshot(self, req_state: OrchestratorRequestState) -> bool:
         """Merge a P cache-hit tail with the lineage's latest snapshot."""
         diag_start = _time.monotonic() if _LOG_HANDOFF_DIAG else 0.0
         current = req_state.pd_prefill_multimodal_output
@@ -2071,6 +2161,7 @@ class Orchestrator:
                 f"[Orchestrator][PD] P snapshot has {current_rows} rows for a {prompt_rows}-token prompt"
             )
 
+        packed_prefix_chunks = 0
         if current_rows < prompt_rows:
             prefix_rows = prompt_rows - current_rows
             parent = req_state.pd_prefill_parent_snapshot
@@ -2090,6 +2181,11 @@ class Orchestrator:
             )
             if not parent_0_chunks or not parent_24_chunks:
                 raise RuntimeError(f"[Orchestrator][PD] parent P snapshot is incomplete for req={req_state.request_id}")
+            packed_prefix_chunks = min(
+                max(0, int(parent.packed_prefix_chunks)),
+                len(parent_0_chunks),
+                len(parent_24_chunks),
+            )
             layer_0_chunks = (*parent_0_chunks, layer_0[:current_rows])
             layer_24_chunks = (*parent_24_chunks, layer_24[:current_rows])
         else:
@@ -2109,18 +2205,41 @@ class Orchestrator:
         prefill_only = isinstance(req_state.prompt, dict) and req_state.prompt.get("prefill_only") is True
         max_chunks = int(getattr(self, "_pd_prefill_snapshot_max_chunks", 16))
         chunks_before = max(len(layer_0_chunks), len(layer_24_chunks))
+        unpacked_chunks_before = max(
+            len(layer_0_chunks) - packed_prefix_chunks,
+            len(layer_24_chunks) - packed_prefix_chunks,
+        )
         compact_ms = 0.0
-        if chunks_before > max_chunks:
+        if unpacked_chunks_before > max_chunks:
+            if len(layer_0_chunks) != len(layer_24_chunks):
+                raise RuntimeError(
+                    "[Orchestrator][PD] snapshot layers have mismatched chunk boundaries: "
+                    f"req={req_state.request_id} layer0={len(layer_0_chunks)} "
+                    f"layer24={len(layer_24_chunks)}"
+                )
             compact_start = _time.monotonic() if _LOG_HANDOFF_DIAG else 0.0
-            # Bound the shared-buffer/FD chain.  Allocate the destination in
-            # shared storage first and concatenate exactly once; a later D
-            # request can forward this tensor as a handle without another
-            # full-prompt copy in the orchestrator.
+            # Pack only the newly accumulated suffix into a shared slab.
+            # Previously packed prefix slabs remain immutable and are reused
+            # by later revisions, so no token is recopied on every threshold.
+            compacted_layer_0, compacted_layer_24 = await asyncio.to_thread(
+                self._materialize_pd_snapshot_pair,
+                layer_0_chunks[packed_prefix_chunks:],
+                layer_24_chunks[packed_prefix_chunks:],
+            )
+            layer_0_chunks = (
+                *layer_0_chunks[:packed_prefix_chunks],
+                compacted_layer_0,
+            )
+            layer_24_chunks = (
+                *layer_24_chunks[:packed_prefix_chunks],
+                compacted_layer_24,
+            )
+            packed_prefix_chunks += 1
             compacted: dict[str, Any] = {
                 "hidden_states": {
                     "layers": {
-                        0: self._materialize_pd_snapshot_layer(layer_0_chunks, shared=True),
-                        24: self._materialize_pd_snapshot_layer(layer_24_chunks, shared=True),
+                        0: layer_0_chunks,
+                        24: layer_24_chunks,
                     }
                 }
             }
@@ -2135,16 +2254,22 @@ class Orchestrator:
             # so materializing a contiguous copy here is redundant.
             req_state.pd_prefill_multimodal_output = cached_output
         cache_start = _time.monotonic() if _LOG_HANDOFF_DIAG else 0.0
-        snapshot_cached = self._cache_pd_prefill_snapshot(req_state, cached_output)
+        snapshot_cached = self._cache_pd_prefill_snapshot(
+            req_state,
+            cached_output,
+            packed_prefix_chunks=packed_prefix_chunks,
+        )
         if _LOG_HANDOFF_DIAG:
             diag_end = _time.monotonic()
             logger.info(
                 "[PD-SNAPSHOT-DIAG] req=%s prompt_rows=%d delta_rows=%d "
-                "chunks_before=%d compact_ms=%.3f cache_ms=%.3f total_ms=%.3f",
+                "chunks_before=%d unpacked_chunks_before=%d compact_ms=%.3f "
+                "cache_ms=%.3f total_ms=%.3f",
                 req_state.request_id,
                 prompt_rows,
                 current_rows,
                 chunks_before,
+                unpacked_chunks_before,
                 compact_ms,
                 (diag_end - cache_start) * 1000.0,
                 (diag_end - diag_start) * 1000.0,
@@ -2164,6 +2289,18 @@ class Orchestrator:
             float(getattr(self, "_pd_prefill_snapshot_bytes", 0)) / float(1 << 20),
         )
         return snapshot_cached
+
+    @classmethod
+    def _materialize_pd_snapshot_pair(
+        cls,
+        layer_0_chunks: tuple[torch.Tensor, ...],
+        layer_24_chunks: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compact both immutable snapshot layers off the event-loop thread."""
+        return (
+            cls._materialize_pd_snapshot_layer(layer_0_chunks, shared=True),
+            cls._materialize_pd_snapshot_layer(layer_24_chunks, shared=True),
+        )
 
     @staticmethod
     def _materialize_pd_snapshot_layer(
