@@ -14,19 +14,21 @@ The WebSocket is stateful, but engine requests are not:
   assembles the full token/media prompt for the finite engine request;
 - each accepted frame triggers or coalesces a silent, finite Thinker-only
   prefill request over full history plus the cumulative current-turn frames;
-- at most one low-priority arrival prefill runs across all sessions, preventing
-  a multi-user prefill batch without starving cache population whenever any
-  unrelated session is answering;
-- a final query cancels its session's unfinished warm-up; cache population is
-  background work and never blocks a correct full-prompt response;
+- each session runs at most one arrival request at a time; frames accepted while
+  it runs remain separate prompt images but are coalesced into the next
+  cumulative snapshot;
+- different sessions submit arrival requests concurrently to the native FCFS
+  scheduler; there is no application-wide gate or request priority;
+- a final query waits only for its session's currently admitted arrival request,
+  preserving a linear prefix lineage before it submits the full prompt;
 - the final query appends one complete WAV and creates a separate finite
   response request;
 - the Thinker may reuse identical blocks through vLLM prefix caching;
 - cache eviction or a miss changes latency only, never prompt semantics;
-- at 32,768 tokens, ahead of the hard 49,152-token limit, the application uses
-  a logarithmic search to drop complete oldest turns toward 16,384 tokens; the
-  next arrival prefill warms that compacted lineage before it becomes
-  query-critical.
+- only when the rendered prompt reaches 49,152 tokens, the application retains
+  the newest two completed turns as user audio/text plus assistant text,
+  discards their historical images, and keeps only the newest accepted image
+  in the current turn. It does not generate a summary request.
 
 Frames accepted since the preceding query are consumed by exactly one turn.
 Frames arriving during generation accumulate for the next turn. Similarity and
@@ -37,18 +39,16 @@ The old persistent/resumable engine request, append into that live request,
 shadow compression, and Talker rolling paths have been removed. Arrival
 warm-ups are independent `output_modalities=["text"]`, prefill-only requests;
 the scheduler does not commit their sampled next token and they cannot invoke
-Talker. Normal Thinker replies
-are capped at 256 tokens so one malformed long answer cannot turn a live voice
-capacity cell into a minutes-long generation test. Final responses use priority
-0 and warm-ups use priority 10.
+Talker. Normal Thinker replies are capped at 256 tokens so one malformed long
+answer cannot turn a live voice capacity cell into a minutes-long generation
+test.
 
 ## Canonical deployment
 
 Formal measurements use only
 `benchmarks/thinker_talker/origin_deploy_3gpu.yaml`: GPU 0 is Thinker, GPU 1 is
-Talker, and GPU 2 is Code2Wav. Thinker prefix caching and priority scheduling
-are enabled. The launcher requires FlashInfer for Thinker and uses the safe
-API-side multimodal processor cache mode.
+Talker, and GPU 2 is Code2Wav. Thinker prefix caching is enabled and requests
+use native FCFS scheduling. The launcher requires FlashInfer for Thinker.
 
 ```bash
 RESULTS_DIR=/path/to/results \
@@ -77,6 +77,7 @@ Each user owns one long-lived WebSocket:
 - an empty `video.query`, so query semantics come from speech;
 - playback-paced closed loop: the next think interval begins after simulated
   1x playback; startup is measured when exactly 500 ms is available;
+- deterministic user startup stagger over 0–8 seconds;
 - one speaker per session and no recording reuse within that session.
 
 The server scales frames to at most 640x352 and uses similarity threshold 0.95

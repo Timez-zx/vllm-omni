@@ -85,11 +85,7 @@ def session_config(system_prompt: str) -> dict:
         "frame_filter_max_gap": 4,
         "use_audio_in_video": True,
         "context_window_trigger_tokens": 49152,
-        "context_window_target_tokens": 16384,
-        "context_window_compaction_headroom_tokens": 16384,
-        "enable_history_summary": True,
-        "history_summary_recent_turns": 2,
-        "history_summary_max_tokens": 512,
+        "context_window_retained_turns": 2,
     }
 
 

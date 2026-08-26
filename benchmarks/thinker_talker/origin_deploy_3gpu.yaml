@@ -17,18 +17,21 @@ stages:
   - stage_id: 0
     max_num_batched_tokens: 32768
     max_num_seqs: 64
-    # Final responses use priority 0; silent arrival warm-ups use priority 10.
+    # Continuous AV creates many short prefills. Expose each completed batch
+    # immediately instead of keeping the async scheduler one step ahead.
+    async_scheduling: false
     scheduling_policy: priority
     gpu_memory_utilization: 0.9
-    # Full-history finite requests reuse processed media by UUID. Keep the
-    # bounded eight-user working set in the API-side processor cache; the
-    # canonical launcher disables the unsafe mirrored EngineCore LRU.
+    # The API-side SHM sender is created before this worker attaches. The
+    # worker then materializes each retained media item only once.
     mm_processor_cache_gb: 16
     trust_remote_code: true
     quantization: fp8
     kv_cache_dtype: fp8
     enable_prefix_caching: true
     devices: "0"
+    env:
+      VLLM_OMNI_STAGE0_SHM_MM_CACHE: "1"
     default_sampling_params:
       temperature: 0.0
       max_tokens: 2048

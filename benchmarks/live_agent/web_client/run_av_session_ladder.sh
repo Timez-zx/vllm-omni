@@ -17,6 +17,7 @@ RESULTS_DIR=${RESULTS_DIR:-/tmp/vllm-omni-results}
 ENGINE_LOG=${MU_ENGINE_LOG:-$RESULTS_DIR/qwen_live.log}
 PORT=${MU_PORT:-8091}
 MU_DEPLOY=${MU_DEPLOY:-$REPO_ROOT/benchmarks/thinker_talker/origin_deploy_3gpu.yaml}
+EXPECTED_DEPLOY_BASENAME=${MU_EXPECTED_DEPLOY_BASENAME:-origin_deploy_3gpu.yaml}
 
 : "${MU_FRAMES_DIR:?set MU_FRAMES_DIR to the ordered JPEG frame directory}"
 : "${MU_AUDIO_MANIFEST:?set MU_AUDIO_MANIFEST to the real-utterance JSONL manifest}"
@@ -25,8 +26,8 @@ MU_DEPLOY=${MU_DEPLOY:-$REPO_ROOT/benchmarks/thinker_talker/origin_deploy_3gpu.y
   echo "deploy YAML not found: $MU_DEPLOY" >&2
   exit 2
 }
-[ "${MU_DEPLOY##*/}" = "origin_deploy_3gpu.yaml" ] || {
-  echo "formal AV capacity runs are pinned to origin_deploy_3gpu.yaml: $MU_DEPLOY" >&2
+[ "${MU_DEPLOY##*/}" = "$EXPECTED_DEPLOY_BASENAME" ] || {
+  echo "AV capacity run is pinned to $EXPECTED_DEPLOY_BASENAME: $MU_DEPLOY" >&2
   exit 2
 }
 [ -d "$MU_FRAMES_DIR" ] || {
@@ -42,6 +43,7 @@ USERS=${USERS:-"8 16 32 48 64 96 128 160"}
 SEEDS=${SEEDS:-"7"}
 TURNS=${TURNS:-30}
 WARMUP_TURNS=${WARMUP_TURNS:-2}
+STAGGER=${MU_STAGGER_S:-0,8}
 RESULT_PREFIX=${RESULT_PREFIX:-avsession}
 SKIP_DONE=${SKIP_DONE:-1}
 CELL_TIMEOUT_S=${CELL_TIMEOUT_S:-14400}
@@ -93,6 +95,7 @@ run_cell() {
     timeout "$CELL_TIMEOUT_S" "$PYBIN" "$SCRIPT_DIR/mu_bench.py" \
       --users "$users" --turns "$TURNS" --repeat-sessions "$reps" \
       --warmup-turns "$WARMUP_TURNS" --seed "$seed" \
+      --stagger "$STAGGER" \
       --frames-dir "$MU_FRAMES_DIR" --audio-manifest "$MU_AUDIO_MANIFEST" \
       --out "$out" "${trace_args[@]}" 2>&1 | tee "$out/driver.log"
   rc=${PIPESTATUS[0]}

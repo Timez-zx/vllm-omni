@@ -298,14 +298,10 @@
       // finite engine request over the canonical multimodal history; prefix KV
       // is an opportunistic engine cache, never a correctness dependency.
       context_window_trigger_tokens: 49152,
+      // Only at the threshold, rebuild from the newest two complete raw AV
+      // turns plus the current turn; then let history grow normally again.
+      context_window_retained_turns: 2,
       thinker_max_response_tokens: 256,
-      context_window_target_tokens: 16384,
-      context_window_compaction_headroom_tokens: 16384,
-      // Replace old AV turns with durable text memory while retaining the
-      // newest two complete turns verbatim.
-      enable_history_summary: true,
-      history_summary_recent_turns: 2,
-      history_summary_max_tokens: 512,
     };
   }
 

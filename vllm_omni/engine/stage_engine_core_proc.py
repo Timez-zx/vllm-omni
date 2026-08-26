@@ -14,6 +14,8 @@ from typing import Any
 
 import vllm.v1.engine.core as _vllm_engine_core_module
 from vllm.logger import init_logger
+from vllm.multimodal.cache import MultiModalCache, ShmObjectStoreReceiverCache
+from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItem
 from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value,
 )
@@ -48,6 +50,62 @@ def _signal_exit_code(signum: int) -> int:
     return _SIGNAL_EXIT_BASE + signum
 
 
+class _MaterializedShmReceiverCache:
+    """Reuse SHM-deserialized processor outputs across finite requests."""
+
+    def __init__(self, delegate: ShmObjectStoreReceiverCache, capacity_gb: float) -> None:
+        self._delegate = delegate
+        self._materialized = MultiModalCache.get_lru_cache(
+            capacity_gb,
+            MultiModalKwargsItem,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+    def get_and_update_features(
+        self,
+        mm_features: list[MultiModalFeatureSpec],
+    ) -> list[MultiModalFeatureSpec]:
+        # Touch the complete request first so all referenced SHM objects stay
+        # alive while the worker materializes the batch.
+        for feature in mm_features:
+            cache_key = feature.mm_hash or feature.identifier
+            self.touch_receiver_cache_item(cache_key, feature.data)
+
+        for feature in mm_features:
+            cache_key = feature.mm_hash or feature.identifier
+            feature.data = self.get_and_update_item(feature.data, cache_key)
+        return mm_features
+
+    def get_and_update_item(
+        self,
+        mm_item: MultiModalKwargsItem | None,
+        mm_hash: str,
+    ) -> MultiModalKwargsItem:
+        cached = self._materialized.get(mm_hash)
+        if cached is not None:
+            return cached
+
+        materialized = self._delegate.get_and_update_item(mm_item, mm_hash)
+        self._materialized[mm_hash] = materialized
+        return materialized
+
+    def touch_receiver_cache_item(
+        self,
+        mm_hash: str,
+        mm_item: MultiModalKwargsItem | None = None,
+    ) -> None:
+        self._delegate.touch_receiver_cache_item(mm_hash, mm_item)
+
+    def clear_cache(self) -> None:
+        self._materialized.clear()
+        self._delegate.clear_cache()
+
+    def materialized_cache_info(self, *, delta: bool = False) -> Any:
+        return self._materialized.stat(delta=delta)
+
+
 class StageEngineCoreProc(EngineCoreProc):
     """Stage-specific engine core process for vLLM-Omni.
 
@@ -55,6 +113,31 @@ class StageEngineCoreProc(EngineCoreProc):
     entry point for launching in a subprocess.  Does **not** delegate to
     ``EngineCoreProc.run_engine_core()``.
     """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._install_materialized_mm_receiver_cache()
+
+    def _install_materialized_mm_receiver_cache(self) -> None:
+        """Avoid repeatedly decoding full-history SHM media on stage workers."""
+        driver_worker = getattr(self.model_executor, "driver_worker", None)
+        mm_cache = getattr(driver_worker, "mm_receiver_cache", None)
+        if driver_worker is None or not isinstance(mm_cache, ShmObjectStoreReceiverCache):
+            return
+
+        mm_config = self.vllm_config.model_config.get_multimodal_config()
+        capacity_gb = float(mm_config.mm_processor_cache_gb)
+        if capacity_gb <= 0:
+            return
+
+        driver_worker.mm_receiver_cache = _MaterializedShmReceiverCache(
+            mm_cache,
+            capacity_gb,
+        )
+        logger.info(
+            "Enabled %.3g GiB worker-local materialized SHM media cache",
+            capacity_gb,
+        )
 
     def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
         """Preserve omni payloads when vLLM builds its scheduler request."""

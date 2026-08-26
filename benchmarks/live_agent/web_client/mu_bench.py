@@ -162,6 +162,39 @@ class User:
         self.pending_speech_bytes = len(turn.utterance.pcm)
         self.utterance_done.clear()
 
+    async def _run_turn_loop_with_background(
+        self,
+        ws,
+        background: list[asyncio.Task],
+    ) -> None:
+        """Run live turns while treating a stopped media task as fatal.
+
+        A reader or cadence pump that exits can otherwise leave the turn loop
+        waiting forever for an utterance or response event that nobody can
+        produce.
+        """
+        turn_task = asyncio.create_task(self._turn_loop(ws), name=f"{self.name}-turn-loop")
+        try:
+            done, _ = await asyncio.wait(
+                [turn_task, *background],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if turn_task in done:
+                await turn_task
+                return
+
+            stopped = next(task for task in background if task in done)
+            if stopped.cancelled():
+                raise RuntimeError(f"background task {stopped.get_name()} was cancelled")
+            error = stopped.exception()
+            if error is None:
+                raise RuntimeError(f"background task {stopped.get_name()} stopped early")
+            raise RuntimeError(f"background task {stopped.get_name()} failed: {error!r}") from error
+        finally:
+            if not turn_task.done():
+                turn_task.cancel()
+            await asyncio.gather(turn_task, return_exceptions=True)
+
     async def run(self) -> None:
         import websockets
 
@@ -183,18 +216,18 @@ class User:
                 self.session_started = time.monotonic()
                 await ws.send(json.dumps(cfg))
                 self.trace_started = time.monotonic()
-                tasks = [asyncio.create_task(self._reader(ws))]
+                tasks = [asyncio.create_task(self._reader(ws), name=f"{self.name}-reader")]
                 if self.replay_events is None:
                     tasks.extend(
                         [
-                            asyncio.create_task(self._frame_pump(ws)),
-                            asyncio.create_task(self._microphone_pump(ws)),
+                            asyncio.create_task(self._frame_pump(ws), name=f"{self.name}-frame-pump"),
+                            asyncio.create_task(self._microphone_pump(ws), name=f"{self.name}-microphone-pump"),
                         ]
                     )
                 try:
                     if self.replay_events is None:
                         await asyncio.sleep(WARMUP_S)
-                        await self._turn_loop(ws)
+                        await self._run_turn_loop_with_background(ws, tasks)
                         # Freeze the recorded input trace before closing the
                         # session. Otherwise the cadence pumps can append media
                         # after video.done while the reader waits for its ack.

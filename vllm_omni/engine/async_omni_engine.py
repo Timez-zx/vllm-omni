@@ -277,6 +277,10 @@ class AsyncOmniEngine:
                 max_workers=_n_inp, thread_name_prefix="omni-input")
             if _n_inp > 0 else None
         )
+        # Stage-0 multimodal caches are ordered streams: cache mutation and
+        # queue submission must remain adjacent even when preprocessing runs
+        # in the input thread pool.
+        self._stage0_input_submission_lock = threading.Lock()
         self._shutdown_called = False
         self._weak_finalizer: weakref.finalize | None = None
         self._correlated_rpc_client: CorrelatedRpcClient | None = None
@@ -350,6 +354,7 @@ class AsyncOmniEngine:
             omni_lb_policy=self._omni_lb_policy,
             request_queue=self.request_queue,
         )
+        self._runtime.set_stage_plans_ready_hook(self._initialize_stage0_input_processor)
         self._runtime.initialize()
 
         self.num_stages = len(self.stage_configs)
@@ -359,11 +364,12 @@ class AsyncOmniEngine:
         ]
         self.stage_vllm_configs = [pool.stage_vllm_config for pool in self.stage_pools]
         self.output_processors = [pool.output_processor for pool in self.stage_pools]
-        self.input_processor = (
-            build_stage0_input_processor(self.stage_vllm_configs[0])
-            if self.stage_vllm_configs and self.stage_vllm_configs[0] is not None
-            else None
-        )
+        if self.input_processor is None:
+            self.input_processor = (
+                build_stage0_input_processor(self.stage_vllm_configs[0])
+                if self.stage_vllm_configs and self.stage_vllm_configs[0] is not None
+                else None
+            )
         self.prompt_expand_func = next(
             (
                 getattr(client, "prompt_expand_func", None)
@@ -388,6 +394,26 @@ class AsyncOmniEngine:
         if any(meta.final_output_type == "audio" for meta in self.stage_metadata):
             supported_tasks.add("speech")
         self.supported_tasks = tuple(supported_tasks) if supported_tasks else ("generate",)
+
+    def _initialize_stage0_input_processor(self, stage_plans: Sequence[Any]) -> None:
+        """Create the stage-0 sender cache before its worker tries to attach."""
+        if not stage_plans or not stage_plans[0].replicas:
+            return
+        stage0_config = stage_plans[0].replicas[0].stage_vllm_config
+        if stage0_config is None:
+            return
+
+        use_shm_cache = os.environ.get("VLLM_OMNI_STAGE0_SHM_MM_CACHE", "0").lower() not in {
+            "",
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        if use_shm_cache:
+            mm_config = stage0_config.model_config.get_multimodal_config()
+            mm_config.mm_processor_cache_type = "shm"
+        self.input_processor = build_stage0_input_processor(stage0_config)
 
     def _bootstrap_orchestrator(
         self,
@@ -1355,32 +1381,33 @@ class AsyncOmniEngine:
         a queue + coroutine-switch round-trip.  The Orchestrator receives a
         ready-to-submit OmniEngineCoreRequest.
         """
-        msg = self._build_add_request_message(
-            request_id=request_id,
-            prompt=prompt,
-            prompt_text=prompt_text,
-            sampling_params_list=sampling_params_list,
-            final_stage_id=final_stage_id,
-            final_output_stage_ids=final_output_stage_ids,
-            arrival_time=arrival_time,
-            lora_request=lora_request,
-            tokenization_kwargs=tokenization_kwargs,
-            trace_headers=trace_headers,
-            priority=priority,
-            data_parallel_rank=data_parallel_rank,
-            reasoning_ended=reasoning_ended,
-            resumable=resumable,
-        )
-        self.request_queue.sync_q.put(msg)
+        with self._stage0_input_submission_lock:
+            msg = self._build_add_request_message(
+                request_id=request_id,
+                prompt=prompt,
+                prompt_text=prompt_text,
+                sampling_params_list=sampling_params_list,
+                final_stage_id=final_stage_id,
+                final_output_stage_ids=final_output_stage_ids,
+                arrival_time=arrival_time,
+                lora_request=lora_request,
+                tokenization_kwargs=tokenization_kwargs,
+                trace_headers=trace_headers,
+                priority=priority,
+                data_parallel_rank=data_parallel_rank,
+                reasoning_ended=reasoning_ended,
+                resumable=resumable,
+            )
+            self.request_queue.sync_q.put(msg)
 
-        # CFG companion expansion: create and enqueue companion requests
-        # so the AR stage also generates their KV caches.
-        if self.prompt_expand_func is not None and final_stage_id > 0:
-            original_prompt = msg.original_prompt
-            effective_spl = msg.sampling_params_list
-            stage0_params = effective_spl[0] if effective_spl else None
-            if stage0_params is not None:
-                self._enqueue_cfg_companions(request_id, original_prompt, stage0_params, effective_spl)
+            # CFG companions use the same input processor/cache and must stay
+            # adjacent to their parent in cache order.
+            if self.prompt_expand_func is not None and final_stage_id > 0:
+                original_prompt = msg.original_prompt
+                effective_spl = msg.sampling_params_list
+                stage0_params = effective_spl[0] if effective_spl else None
+                if stage0_params is not None:
+                    self._enqueue_cfg_companions(request_id, original_prompt, stage0_params, effective_spl)
 
     async def add_request_async(
         self,
@@ -1443,18 +1470,19 @@ class AsyncOmniEngine:
         resumable: bool = True,
     ) -> None:
         """Send an incremental streaming update for an existing request."""
-        msg = self._build_add_request_message(
-            request_id=request_id,
-            prompt=prompt,
-            prompt_text=prompt_text,
-            sampling_params_list=sampling_params_list,
-            final_stage_id=final_stage_id,
-            final_output_stage_ids=final_output_stage_ids,
-            arrival_time=arrival_time,
-            resumable=resumable,
-            message_type="streaming_update",
-        )
-        self.request_queue.sync_q.put(msg)
+        with self._stage0_input_submission_lock:
+            msg = self._build_add_request_message(
+                request_id=request_id,
+                prompt=prompt,
+                prompt_text=prompt_text,
+                sampling_params_list=sampling_params_list,
+                final_stage_id=final_stage_id,
+                final_output_stage_ids=final_output_stage_ids,
+                arrival_time=arrival_time,
+                resumable=resumable,
+                message_type="streaming_update",
+            )
+            self.request_queue.sync_q.put(msg)
 
     async def add_streaming_update_async(
         self,

@@ -2,40 +2,35 @@
 
 ## Goal and scope
 
-The goal is to serve more continuous audio-video sessions with fewer GPUs while meeting TTFA and playback-continuity targets. The research focus is engine capacity, scheduling, KV cache behavior, and tail latency rather than model quality.
+The goal is to serve more continuous audio-video sessions with fewer GPUs while meeting TTFA and playback-continuity targets. The research target is engine capacity, scheduling, KV cache behavior, and tail latency rather than model quality.
 
-No locally deployable open realtime model currently matches the interaction semantics of Seed Realtime or Gemini Live. This branch approximates that workload with Qwen3-Omni's Thinker → Talker → Code2Wav pipeline: clients continuously upload audio and video, while the model answers in turns. This produces useful multimodal-prefill, speech-decode, and multi-tenant contention, but it is not native full duplex or semantic barge-in.
+No locally deployable open model currently matches Seed Realtime or Gemini Live. This branch approximates continuous AV sessions with Qwen3-Omni's Thinker → Talker → Code2Wav pipeline. It targets concurrent continuous-video incremental compute and response decode, not native full duplex or semantic barge-in.
 
 ## Phase 1: application baseline
 
-The current design is stateful at the application and finite-lived at the engine request layer:
+The application owns session state; the engine handles only ordinary finite requests:
 
 ```text
-continuous media arrival
-  → video frames launch silent finite Thinker requests to warm prefix KV
-  → end of user speech submits complete canonical history + complete WAV
-  → Thinker → Talker → Code2Wav
-  → response finishes and the request is destroyed
-  → the application commits the turn; the next turn gets a new request ID
+video arrival → silent finite Thinker request warms prefix KV
+end of speech → complete canonical history + current complete WAV
+              → Thinker → Talker → Code2Wav
+response end  → destroy request and commit the turn in the application
 ```
 
-Key constraints:
+- Every turn and arrival warm-up uses a new request ID. The engine holds no live request across turns.
+- Every submission contains the complete canonical prompt. Prefix/KV entries are disposable; a miss changes cost, not semantics.
+- The application caches processed canonical message blocks, renders only new blocks, and assembles the complete prompt.
+- Video is append-only within a turn after similarity/freshness filtering. There is no eight-frame sliding window or second sampling pass.
+- Each session runs at most one arrival request. It runs Thinker with `max_tokens=1`, emits no text, and never invokes Talker.
+- Frames accepted while an arrival runs remain separate images and enter the next cumulative prompt snapshot together. Coalescing reduces request count; it does not merge or discard image content.
+- Different sessions submit arrivals concurrently to native FCFS. There is no application-wide gate or request priority.
+- A final query waits for its session's admitted arrival, then submits the complete prompt, preserving ordered prefix lineage.
+- User audio is one complete WAV at query time, preserving Qwen whole-audio semantics. Only the final query invokes Talker.
+- Media received during a response belongs to the next turn, and each accepted item is consumed by one final query.
+- Thinker responses are capped at 256 tokens. Video is bounded to 640×352, and JPEG work runs in subprocesses.
+- Compaction starts only at 49,152 prompt tokens. It retains the newest two completed turns as user audio/text plus assistant text, removes historical images, and keeps only the newest current-turn image. If needed, it drops more complete old turns. It never generates a summary request.
 
-- The WebSocket application owns session state, media reception, and complete canonical multimodal history.
-- Every silent warm-up and final response is a new ordinary finite request. The engine owns no live request across turns.
-- Every turn submits the complete canonical prompt. Prefix/KV cache entries are disposable; a miss adds prefill work but cannot change correctness.
-- The application stores processed canonical message blocks. It renders only the new user and assistant blocks, then assembles the full prompt without reprocessing all historical media.
-- Video is append-only within a turn. The similarity/freshness filter decides admission; accepted frames are not subjected to an eight-frame sliding window or another sampling pass.
-- New frames launch or coalesce into low-priority `video-warm-<uuid>` requests. They run Thinker only with `max_tokens=1`, emit no text, and never enter Talker. At most one arrival warm-up is admitted globally. A query closes background admission and immediately cancels registered and same-session pending warm-ups instead of waiting for cache fill.
-- The foreground gate reopens after the first engine output. New media may then resume arrival prefill and contend with ongoing Thinker decode. This is intentional engine pressure from the target realtime workload, not a cross-turn persistent request.
-- User audio is a single complete WAV at query time, preserving Qwen's whole-audio semantics. Only the final query may produce speech.
-- Media arriving during a response belongs to the next turn, and each media item is consumed once.
-- A normal response is capped at 256 Thinker tokens. Video is bounded to 640×352, and JPEG work runs in subprocesses.
-- The hard history threshold is 49,152 tokens, and a 16,384-token headroom normally triggers proactive compaction near 32,768 tokens. Compaction generates at most 512 tokens of durable text memory, retains the newest two complete turns, and targets a prompt near 16,384 tokens. A summary or rewrite failure leaves history unchanged during proactive maintenance; only the hard limit enables complete-turn dropping as a safe fallback. Compaction and turn commit share one session lock and rotate the cache lineage.
-
-`enable_audio_arrival_prefill_approximation` is off by default. It seals audio into one-second chunks for silent arrival prefill and exists only to emulate duplex engine load; it is not semantically equivalent to Qwen whole-audio inference.
-
-The old cross-turn persistent request, resumable append, Talker 45k rolling, Thinker shadow compression, and session ledger have been removed. The current baseline follows a general engine request abstraction and can connect naturally to routing, replication, and P/D separation.
+The old cross-turn persistent request, resumable append, Talker rolling, shadow compression, and session ledger have been removed.
 
 ## Phase 2: fixed deployment
 
@@ -43,26 +38,26 @@ Formal experiments use only `benchmarks/thinker_talker/origin_deploy_3gpu.yaml`:
 
 | Stage | GPU | Configuration |
 |---|---:|---|
-| Thinker | 0 | FP8 weights/KV, prefix cache, priority scheduler |
-| Talker | 1 | FP8 weights/KV, session-isolated conditioning prefix cache |
+| Thinker | 0 | FP8 weights/KV, prefix cache, synchronous scheduling, equal-priority requests |
+| Talker | 1 | FP8 weights/KV, conditioning prefix cache |
 | Code2Wav | 2 | separate process |
 
-Final responses have priority 0 and silent warm-ups priority 10. The YAML remains unchanged across user counts and session-policy controls. `run_qwen_server.sh` locates the CUDA toolkit and checks that Thinker selected FlashInfer. The multimodal processor cache uses API-side `processor_only` mode.
+`run_qwen_server.sh` verifies that Thinker selected FlashInfer and creates the stage-0 SHM multimodal cache before its worker starts. The API renderer and input processor share one sender; the worker reuses materialized media rather than restoring the complete media history for every finite request.
 
 ## Phase 3: formal workload
 
-The only formal workload is continuous AV sessions:
+- Each user owns one long-lived WebSocket.
+- Video uploads continuously at 2 FPS; accepted frames trigger or queue for the next silent Thinker arrival prefill.
+- The microphone uploads PCM16 at 5 Hz, pausing during assistant playback plus a 300 ms echo guard.
+- Every turn uses a unique real 16 kHz mono SLURP recording followed by 700 ms endpoint silence, with empty query text.
+- Audio is appended as one complete WAV to the warmed video prefix at query time.
+- Each session keeps one speaker; DAVIS video uses a fixed sequence and different starting offsets.
+- The next turn starts after 1× response playback, producing a playback-paced closed loop.
+- Users start at deterministic offsets over 0–8 seconds.
 
-- each user keeps one long-lived WebSocket;
-- video uploads continuously at 2 FPS, and accepted frames immediately launch or coalesce into silent Thinker warm-ups;
-- the microphone uploads PCM16 at 5 Hz, pausing during assistant playback plus a 300 ms echo guard;
-- every turn uses a unique real 16 kHz mono SLURP recording followed by 700 ms endpoint silence, with empty query text;
-- audio is appended as one complete WAV to the warmed video prefix at query time, and only this request invokes Talker;
-- a session keeps one speaker, while DAVIS video uses a fixed sequence with different starting offsets;
-- the next turn starts after response playback completes at 1×, producing a playback-paced closed loop;
-- users start at deterministic offsets over 0–40 seconds.
+This is duplex-like rather than complete AV duplex. Video continues to trigger arrival prefill during user speech and assistant playback. Audio uploads at 5 Hz, but Qwen processes one complete WAV only at query time, and the microphone pauses during playback. The workload targets continuous visual incremental compute; it does not claim to reproduce Gemini Live or Seed Realtime model structure or absolute capacity.
 
-A formal cell has 30 turns per user and excludes the first two as warm-up. The ladder runs 8, 16, 32, ... users and stops each seed at the first SLO failure. The engine restarts for every cell. Synthetic media in `probe.py` is only for protocol validation.
+A formal cell has 30 turns per user and excludes the first two from metrics. The engine restarts for every cell. Synthetic media in `probe.py` is only for protocol validation.
 
 ```bash
 MU_FRAMES_DIR=/home/ubuntu/data/workloads/continuous_av_v1/frames \
@@ -70,106 +65,67 @@ MU_AUDIO_MANIFEST=/home/ubuntu/data/workloads/continuous_av_v1/audio_manifest.js
 VLLM_OMNI_BIN=/home/ubuntu/miniconda3/envs/omni/bin/vllm-omni \
 MU_PYTHON=/home/ubuntu/miniconda3/envs/omni/bin/python \
 RESULTS_DIR=/home/ubuntu/data/results/finite_request_capacity_<commit> \
-RESULT_PREFIX=finite_request USERS="8 16 32" SEEDS="7 17" \
-TURNS=30 WARMUP_TURNS=2 \
+RESULT_PREFIX=finite_request USERS=16 SEEDS=7 TURNS=30 WARMUP_TURNS=2 \
 bash benchmarks/live_agent/web_client/run_av_session_ladder.sh
 ```
 
 ## Phase 4: metrics and pass rule
 
-- **TTFA**: query to the first audio packet. It depends on packet size and is only a within-deployment diagnostic.
-- **Audio-ready-500**: time until 500 ms of playable audio has accumulated; this is the packetization-independent startup metric.
-- **Stall max**: the largest single playback underflow at 1×.
-- **RTF deliver**: generated audio duration divided by delivery duration, measuring sustained supply.
+- **TTFT**: query to first text.
+- **TTFA / Audio-ready-500**: query until 500 ms of playable audio has accumulated. The current first packet exceeds 500 ms, so they are equal.
+- **Stall max**: largest single playback underflow at 1×.
+- **RTF deliver**: generated audio duration divided by delivery duration.
 
-A cell passes only when:
+A cell passes only when every measured turn completes, Audio-ready-500 p99 is below 1 second, Stall-max p99 is below 50 ms, and there are no client, protocol, or fatal engine errors.
 
-- every post-warm-up turn completes;
-- Audio-ready-500 p99 is below 1 second;
-- Stall-max p99 is below 50 ms;
-- there is no client, protocol, or fatal engine error.
+Results must use workload schema 4 and run `benchmarks/live_agent/analysis/verify_run.py`. The verifier checks finite requests, arrival requests, the frame ledger, prefix-cache hits, and three separate stage processes.
 
-Results must use workload schema 4 and pass `benchmarks/live_agent/analysis/verify_run.py`. The verifier checks unique finite requests, arrival warm-ups, the frame ledger, real prefix-cache hits, and separate stage processes.
-
-## Phase 5: current baseline and conclusions
-
-### Archived architecture control
-
-The context-aligned eight-user experiment established that finite request lifetime is not the performance problem. Audio-ready-500 p99 was 796 ms for the current finite-request path and 824 ms for the archived persistent path after recomputing both at a fixed 500 ms audio threshold. Application-owned sessions, finite engine requests, and disposable prefix/KV reuse are a valid architecture. Results:
-
-- `/home/ubuntu/data/results/current_context_aligned_854535bb_20260822/context_aligned_seed7_u8`
-- `/home/ubuntu/data/results/av_real_formal_4650f134/avreal_formal_seed7_u8`
-
-### 16-user summary + recent diagnostic
+## Phase 5: current 16-user result
 
 Setup:
 
-- source: dirty working tree on `3b661ed19ae343b90576eec39575baf1e1c27a5e`; this is a pre-commit diagnostic, not a clean-commit archive;
-- deploy: `origin_deploy_3gpu.yaml`, SHA256 `ae7cbeb615b24ee8654cf6c867887b2920324fc81ec93be6aaaa8995c55e4e24`;
-- workload: schema 4, seed 7, 16 users × 30 turns, two warm-up turns, with no `MU_SESSION_CFG_JSON`;
-- plan SHA256: `bdaa528c57ba688b3c0d6889d0877029a595a5f249ef81b631e0b8e13b597aa7`;
-- input-trace SHA256: `f217432fa3fdc7362f4926f9a7c2c4c9219bc0dd453901d0d93de8f2245fe561`;
-- result: `/home/ubuntu/data/results/nonpd_summary_recent_u16_t30_diag_20260823_v2/nonpd_summary_recent_diag_seed7_u16`.
-
-Results:
+- source: dirty working tree on `726ebd90fe1120d8d0ce1d8c4d99dd54e6703912`;
+- deploy: `origin_deploy_3gpu.yaml`, measurement SHA256 `8cfcd31af59031ba20dc822632510a2de721dca9ede8a80070c8cf5647a7787f`;
+- workload: schema 4, seed 7, 16 users × 12 turns, two warm-up turns, 0–8 second stagger;
+- plan SHA256: `1dfd08e50710f188e5d83526358b9c3aecf4ad0e8616a5b0bb44d6b45d3b0a6f`;
+- result: `/home/ubuntu/data/results/nonpd_shm_sync_u16_t12_20260826/nonpd_shm_sync_seed7_u16`.
 
 | Metric | Result |
 |---|---:|
-| Completion | 448/448, zero timeouts, zero client errors |
-| TTFT p50/p99 | 297/914 ms |
-| TTFA p50/p95/p99 | 554/1111/1412 ms |
-| Audio-ready-500 p99 | 1412 ms |
-| Stall-max p99 | 0 ms |
-| Prompt tokens p50/p95/p99/max | 20.4k/33.5k/35.4k/37.1k |
+| Completion | 160/160, zero timeouts, zero client errors |
+| TTFT p50/p99 | 341/2550 ms |
+| TTFA p50/p95/p99 | 1371/5371/8212 ms |
+| Stall-max p99 | 1972 ms |
+| Same-session arrival wait p50/p95/p99 | 0/662/1153 ms |
+| Prompt render p50/p95/p99 | 19/81/149 ms |
+| Thinker TTFT p50/p95/p99 | 268/1022/1392 ms |
+| Thinker ITL p50/p95/p99 | 87/345/544 ms |
+| Engine→first audio p50/p95/p99 | 1292/4664/7601 ms |
 
-The cell failed because Audio-ready-500 p99 exceeded one second, but playback had no stalls after startup. `verify_run.py` confirmed 480 unique finite requests, 2,613 arrival-prefill requests, 6,228 consumed frame occurrences, 3,508/3,538 prefix-cache hits, and three independent stage processes.
+Verification found 192 final requests, 2,196 arrival requests, 2,712 consumed frame occurrences, and 2,559 prefix-cache hits. There were zero preemptions, zero recomputes, and zero arrival failures.
 
-An invalid v1 run exposed a P/D admission handshake that had been incorrectly carried into the non-P/D path, producing up to 13.843 seconds of foreground waiting. The non-P/D path now directly cancels the background task and lets local AsyncOmni clean up the request. In v2, query-gate p50/p95/p99/max was 0.2/1.3/2.4/2.9 ms, removing this application-level confounder.
+Tail conclusions:
 
-Tail attribution:
+1. Expanding stagger from 0–8 to 0–40 seconds still produced 7,794 ms TTFA p99; stagger is not the root cause. Control result: `/home/ubuntu/data/results/nonpd_shm_sync_stagger40_u16_t12_20260826/nonpd_shm_sync_stagger40_seed7_u16`.
+2. Prompt-render p99 is 149 ms, and same-session arrival-wait p99 is 1,153 ms. Both amplify the tail but cannot explain 8.2 seconds TTFA.
+3. Thinker dominates. Formal-request decode ITL reaches 544 ms p99: every generated token repeatedly waits for a heavy batch containing arrival prefills. Talker and Code2Wav chiefly wait for upstream tokens.
+4. The application permits one arrival per session, so 16 sessions can create 16 concurrent arrivals. vLLM schedules `running` requests before admitting requests from `waiting`; priority does not displace an existing `running` prefill. Admitted arrivals therefore share token budget and model forwards with formal decode. Continuous replenishment creates decode starvation.
 
-1. **Concurrent prefill/decode work on the Thinker GPU is the primary source.** About 63% of tail95 excess is on the Thinker side and 37% is after first text. Thinker TTFT p99 is 914 ms, while median Thinker inter-token latency rises from 18.8 ms overall to 37.8 ms in tail95.
-2. **Concurrency explains more than one request's prompt length.** Mean per-request new prefill tokens rise only from 850 overall to 1,025 in tail95. Foreground prefill tokens admitted while waiting for first text rise from 1,135 to 2,612, or 2.3×. When 1/2/3/4 queries arrive within 250 ms, TTFT p50 is 254/369/418/642 ms.
-3. **GPU0 is materially busier during tail windows.** Thinker SM-active p50/p95 rises from 38%/66% overall to 53%/87% in tail95. Tail-window values are 14%/24% for Talker and 3%/7% for Code2Wav, so neither downstream GPU is saturated. Allocated memory is not compute utilization.
-4. **Queue depth rises with latency.** The mean number of other sessions waiting for first audio at query arrival rises from 0.54 overall to 1.13 in tail95. With 0/1/2/3 such sessions, TTFA p50 is 505/595/696/867 ms.
-5. **Summary maintenance is a secondary amplifier.** There were 42 summaries. Using approximate second-resolution server overlap, summaries intersected 72/448 measured turns and 9/23 tail95 turns. TTFA p95 remains about 1,018 ms without summary overlap, so summaries do not explain the primary tail. Forty-five SHM mailbox fallbacks covered only 2/23 tail95 turns and are also not the main cause.
+Conclusion: the current application/session implementation is an adequate engine-research baseline. The 16-user tail is not caused by stagger, prompt rendering, summaries, or Talker/Code2Wav saturation. It comes from multi-user fine-grained arrival prefill repeatedly slowing Thinker decode.
 
-Conclusion: the application is now adequate as the engine-research baseline. At 16 users the dominant delay is not full-history rendering, foreground admission, Talker, or Code2Wav saturation. It is foreground and arrival prefill on GPU0 interfering with Thinker decode; summary maintenance amplifies a minority of tail events.
+## Phase 6: established architecture result
 
-## Phase 6: audio arrival-prefill research arm
-
-Qwen's audio encoder uses bidirectional attention within an approximately eight-second window, so independently encoding one-second audio chunks changes semantics. This path is off by default and exists only to study arrival-prefill load.
-
-This short A/B used schema 4, seed 7, eight users × six turns, one warm-up turn, a 0–8 second stagger, and plan SHA256 `b6160ec3d78a2126fb07830e5c1b75f9319ba579543555c8474852ad9f9ddf9b`. The baseline had no override; the arrival arm used `MU_SESSION_CFG_JSON='{"enable_audio_arrival_prefill_approximation":true}'`. Result metadata reports dirty source `cbf2226a`, so this supports a directional conclusion only and is not a formal result reproducible from one commit.
-
-Short eight-user × six-turn A/B:
-
-| Input mode | Audio-ready-500 p50/p95/p99 |
-|---|---:|
-| Query-time complete WAV | 368/475/654 ms |
-| One-second audio-arrival approximation | 343/554/692 ms |
-
-Arrival saves only about 25 ms at the median and worsens p95/p99 because additional warm-ups compete with foreground queries. The formal workload therefore keeps complete WAV at query time. Semantically equivalent audio arrival prefill requires a native causal/streaming audio encoder.
-
-Results: `/home/ubuntu/data/results/audio_arrival_ab_baseline_20260822/u8_t6` and `/home/ubuntu/data/results/audio_arrival_approx_dev_20260822/u8_t6`.
-
-## Phase 7: next steps
-
-1. Commit the current application baseline, then replay the recorded input trace on that clean commit for a formal 16-user archive.
-2. If the first capacity boundary must be stated rigorously, add an eight-user cell at the same commit and seed; this task intentionally ran only 16 users.
-3. Engine experiments should first isolate foreground decode from arrival and foreground prefill, then compare P/D separation on its dedicated branch. Do not hide the contention with more application tuning.
+Keep the design stateful in the application, finite at the engine request layer, and dependent only on disposable prefix/KV reuse. The formal workload must not add an application-wide cross-user gate; doing so changes the duplex-like engine load and hides contention. The next step is deadline/QoS-aware incremental-prefill scheduling under a fixed input trace, followed by a 16×30 formal run after the implementation is frozen.
 
 ## Recovery map
 
 | Purpose | Path |
 |---|---|
 | Session and finite-request lifecycle | `vllm_omni/entrypoints/openai/video_stream_base.py` |
-| Canonical multimodal history | `vllm_omni/entrypoints/openai/serving_video_stream.py` |
-| Prefix-cache observation | `vllm_omni/worker/gpu_model_runner.py` |
 | Multi-user workload | `benchmarks/live_agent/web_client/mu_bench.py` |
 | Workload plan and media loading | `benchmarks/live_agent/web_client/continuous_av_workload.py` |
-| Capacity ladder | `benchmarks/live_agent/web_client/run_av_session_ladder.sh` |
-| Formal deployment | `benchmarks/thinker_talker/origin_deploy_3gpu.yaml` |
-| Run verification | `benchmarks/live_agent/analysis/verify_run.py` |
+| Capacity runner | `benchmarks/live_agent/web_client/run_av_session_ladder.sh` |
+| Fixed deployment | `benchmarks/thinker_talker/origin_deploy_3gpu.yaml` |
+| Result verification | `benchmarks/live_agent/analysis/verify_run.py` |
 | Tail attribution | `benchmarks/live_agent/analysis/p99_attribution.py`, `benchmarks/live_agent/analysis/stage_stats_v2.py` |
 | GPU sampling | `benchmarks/live_agent/harness/gpu_sampler.py` |

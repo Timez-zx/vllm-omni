@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start the canonical three-GPU Qwen3-Omni engine and wait for health.
+# Start a pinned Qwen3-Omni benchmark deployment and wait for health.
 set -uo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -11,6 +11,8 @@ DEPLOY=${DEPLOY_CONFIG:-$REPO_ROOT/benchmarks/thinker_talker/origin_deploy_3gpu.
 MODEL=${QWEN_MODEL:-Qwen/Qwen3-Omni-30B-A3B-Instruct}
 VLLM_OMNI_BIN=${VLLM_OMNI_BIN:-$(command -v vllm-omni || true)}
 GPU_IDS=${MU_GPU_IDS:-0,1,2}
+EXPECTED_DEPLOY_BASENAME=${MU_EXPECTED_DEPLOY_BASENAME:-origin_deploy_3gpu.yaml}
+EXPECTED_GPU_COUNT=${MU_EXPECTED_GPU_COUNT:-3}
 MIN_FREE_MIB=${MU_MIN_FREE_MIB:-60000}
 
 [ -n "$VLLM_OMNI_BIN" ] && [ -x "$VLLM_OMNI_BIN" ] || {
@@ -22,12 +24,12 @@ MIN_FREE_MIB=${MU_MIN_FREE_MIB:-60000}
   exit 2
 }
 deploy_name=${DEPLOY##*/}
-[ "$deploy_name" = "origin_deploy_3gpu.yaml" ] || {
-  echo "formal runs are pinned to origin_deploy_3gpu.yaml: $DEPLOY" >&2
+[ "$deploy_name" = "$EXPECTED_DEPLOY_BASENAME" ] || {
+  echo "benchmark run is pinned to $EXPECTED_DEPLOY_BASENAME: $DEPLOY" >&2
   exit 2
 }
 [ -z "${VLLM_OMNI_COLOCATE_STAGES:-}" ] || {
-  echo "origin_deploy_3gpu.yaml requires three separate stage processes; unset VLLM_OMNI_COLOCATE_STAGES" >&2
+  echo "$EXPECTED_DEPLOY_BASENAME requires separate stage processes; unset VLLM_OMNI_COLOCATE_STAGES" >&2
   exit 2
 }
 
@@ -42,8 +44,8 @@ for variable in \
 done
 
 IFS=',' read -r -a gpu_ids <<< "$GPU_IDS"
-[ "${#gpu_ids[@]}" -eq 3 ] || {
-  echo "MU_GPU_IDS must contain exactly three GPU ids: $GPU_IDS" >&2
+[ "${#gpu_ids[@]}" -eq "$EXPECTED_GPU_COUNT" ] || {
+  echo "MU_GPU_IDS must contain exactly $EXPECTED_GPU_COUNT GPU ids: $GPU_IDS" >&2
   exit 2
 }
 for gpu in "${gpu_ids[@]}"; do
@@ -79,6 +81,19 @@ if [ -n "${CUDA_HOME:-}" ]; then
   export PATH="$(dirname -- "$VLLM_OMNI_BIN"):$CUDA_HOME/bin:$PATH"
   export LD_LIBRARY_PATH="$CUDA_HOME/lib:${LD_LIBRARY_PATH:-}"
 fi
+# vLLM otherwise generates this name independently in spawned stage
+# processes.  A single explicit name lets the stage-0 worker attach to the
+# object store created by the API-side multimodal processor cache.
+if grep -qE '^[[:space:]]*VLLM_OMNI_STAGE0_SHM_MM_CACHE:' "$DEPLOY"; then
+  export VLLM_OMNI_STAGE0_SHM_MM_CACHE=1
+  export VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME=${VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME:-vllm_omni_mm_${BASHPID}_${RANDOM}}
+else
+  # The regular three-stage deployment has no stage-0 SHM object store.
+  # Keep complete processor outputs on the API side instead of using vLLM's
+  # mirrored sender/receiver LRU: concurrent Omni preprocessing can reorder
+  # the two LRUs and otherwise turn an eviction into a failed request.
+  export VLLM_OMNI_SAFE_MM_PROCESSOR_CACHE=${VLLM_OMNI_SAFE_MM_PROCESSOR_CACHE:-1}
+fi
 REPO_ROOT_ENV="$REPO_ROOT" PYTHONPATH="$REPO_ROOT" "$PYTHON_BIN" -c '
 import os
 from pathlib import Path
@@ -90,11 +105,7 @@ loaded = Path(vllm_omni.__file__).resolve()
 assert repo in loaded.parents, f"loaded {loaded}, expected checkout under {repo}"
 required = {
     "context_window_trigger_tokens",
-    "context_window_target_tokens",
-    "context_window_compaction_headroom_tokens",
-    "enable_history_summary",
-    "history_summary_recent_turns",
-    "history_summary_max_tokens",
+    "context_window_retained_turns",
     "max_frame_width",
     "frame_filter_min_gap",
 }
@@ -113,7 +124,6 @@ fi
 
 CUDA_VISIBLE_DEVICES="$GPU_IDS" PYTHONPATH="$REPO_ROOT" \
 VLLM_OMNI_TALKER_TEXT_ONLY="${VLLM_OMNI_TALKER_TEXT_ONLY:-1}" \
-VLLM_OMNI_SAFE_MM_PROCESSOR_CACHE="${VLLM_OMNI_SAFE_MM_PROCESSOR_CACHE:-1}" \
 setsid "$VLLM_OMNI_BIN" serve "$MODEL" \
   --omni --deploy-config "$DEPLOY" \
   --trust-remote-code --host 127.0.0.1 --port "$PORT" \
@@ -134,7 +144,7 @@ for i in $(seq 1 200); do
     nvidia-smi --id="$GPU_IDS" --query-gpu=index,memory.used --format=csv,noheader
     exit 0
   fi
-  if grep -qE "Engine core initialization failed|not enough GPU memory|ModuleNotFoundError|FileNotFoundError|[Vv]alidation error" "$LOG" 2>/dev/null; then
+  if grep -qE "Engine core initialization failed|EngineCore failed to start|not enough GPU memory|ModuleNotFoundError|FileNotFoundError|Could not find nvcc|[Vv]alidation error" "$LOG" 2>/dev/null; then
     echo "engine startup failed; see $LOG" >&2
     tail -20 "$LOG" >&2
     exit 1
