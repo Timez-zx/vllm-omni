@@ -68,7 +68,12 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 _LOG_HANDOFF_DIAG = os.environ.get("VLLM_OMNI_LOG_HANDOFF_DIAG", "0") not in ("0", "", "false", "False")
-_DIAG_STAGE = os.environ.get("VLLM_OMNI_DIAG_STAGE")
+_DIAG_STAGE_RAW = os.environ.get("VLLM_OMNI_DIAG_STAGE")
+_DIAG_STAGES = (
+    None
+    if _DIAG_STAGE_RAW is None
+    else frozenset(stage.strip() for stage in _DIAG_STAGE_RAW.split(",") if stage.strip())
+)
 
 
 def _pd_snapshot_cache_bytes() -> int:
@@ -231,6 +236,15 @@ class OrchestratorRequestState:
     pd_prefill_revision: int = 0
     pd_prefill_max_parent_rows: int = 0
     pd_prefill_prompt_token_ids: tuple[int, ...] = ()
+    # A finite arrival-prefill has completed on P and is being imported into
+    # D's ordinary prefix cache through the cache-only control path. It never
+    # enters D's inference scheduler; the flag tracks the pending background
+    # cache import after the client-visible P-ready ACK.
+    pd_decode_cache_sync_pending: bool = False
+    # The client-visible prefill-only request completes as soon as P has
+    # materialized the reusable snapshot.  D cache population continues in a
+    # request-scoped background task and must not emit a second terminal item.
+    pd_prefill_ready_emitted: bool = False
 
     streaming: StreamingInputState = field(default_factory=lambda: StreamingInputState())
 
@@ -429,10 +443,19 @@ class Orchestrator:
         self._pd_bootstrap_addr: str | None = None
         self._pd_prefill_engine_id: str | None = None
         self._pd_kv_params: dict[str, Any] = {}
+        # Arrival requests are linear within each application session, so only
+        # the newest conditioning snapshot for a lineage is needed.
         self._pd_prefill_snapshots: OrderedDict[str, _PDPrefillSnapshot] = OrderedDict()
         self._pd_prefill_snapshot_bytes = 0
         self._pd_prefill_snapshot_limit_bytes = _pd_snapshot_cache_bytes()
         self._pd_prefill_snapshot_max_chunks = _pd_snapshot_max_chunks()
+        # Cache-sync completion is request-scoped.  Never await it from the
+        # single stage-output polling loop: doing so serializes unrelated
+        # sessions and lets already-produced stage outputs pile up behind one
+        # slow sync. Cache sync remains request-scoped while each application
+        # session advances its lineage in submission order.
+        self._pd_cache_sync_tasks: dict[str, asyncio.Task[None]] = {}
+        self._pd_lineage_cache_sync_tails: dict[str, asyncio.Task[None]] = {}
         # Arrival-prefill requests may populate vLLM's sender-side media
         # cache, leaving the final request with hash-only feature references.
         # Retain only the tiny values needed to reconstruct M-RoPE on D.
@@ -617,6 +640,16 @@ class Orchestrator:
                 await asyncio.gather(*tasks, return_exceptions=True)
             except Exception:
                 pass
+
+            cache_sync_tasks = list(self._pd_cache_sync_tasks.values())
+            for task in cache_sync_tasks:
+                if not task.done():
+                    task.cancel()
+            if cache_sync_tasks:
+                await asyncio.gather(*cache_sync_tasks, return_exceptions=True)
+            self._pd_cache_sync_tasks.clear()
+            self._pd_lineage_cache_sync_tails.clear()
+
             if self.duplex_control_plane is not None:
                 await self.duplex_control_plane.shutdown()
 
@@ -736,14 +769,14 @@ class Orchestrator:
         self.request_states[request_id] = req_state
         self._register_running_request(req_state)
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
-        req_state.stage_submit_ts[stage_id] = _time.time()
         enqueue_ts = msg.enqueue_ts
         if enqueue_ts > 0:
             req_state.pipeline_timings["queue_wait_ms"] = (_time.perf_counter() - enqueue_ts) * 1000.0
         preprocess_ms = msg.preprocess_ms
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
-        await self.stage_pools[stage_id].submit_initial(
+        req_state.stage_submit_ts[stage_id] = _time.time()
+        await self.stage_pools[0].submit_initial(
             request_id,
             req_state,
             prompt,
@@ -978,7 +1011,7 @@ class Orchestrator:
                             if raw_outputs is None:
                                 continue
 
-                            if _LOG_HANDOFF_DIAG and (_DIAG_STAGE is None or str(stage_id) == _DIAG_STAGE):
+                            if _LOG_HANDOFF_DIAG and (_DIAG_STAGES is None or str(stage_id) in _DIAG_STAGES):
                                 recv_wall = _time.time()
                                 for diagnostic_output in raw_outputs.outputs:
                                     diagnostic_req_id = getattr(diagnostic_output, "request_id", None)
@@ -1248,6 +1281,9 @@ class Orchestrator:
                 await self._abort_request_ids(cleanup_ids)
             self._release_request_bindings(cleanup_ids)
             for request_id in cleanup_ids:
+                cache_sync_task = getattr(self, "_pd_cache_sync_tasks", {}).get(request_id)
+                if cache_sync_task is not None and cache_sync_task is not asyncio.current_task():
+                    cache_sync_task.cancel()
                 self._pd_kv_params.pop(request_id, None)
                 req_state = self.request_states.pop(request_id, None)
                 if req_state is not None and req_state.running_counter_registered and self._running_counter is not None:
@@ -1353,6 +1389,53 @@ class Orchestrator:
             await self._cleanup_request_ids([req_id])
             return
 
+        if (
+            finished
+            and req_state.pd_decode_cache_sync_pending
+            and self._pd_pair is not None
+            and stage_id == self._pd_pair[1]
+        ):
+            # Compatibility fallback for an older D backend that still emits
+            # a finite inference output. The direct cache-only path completes
+            # and acknowledges inside _forward_to_next_stage instead.
+            req_state.pd_decode_cache_sync_pending = False
+            elapsed_ms = max(
+                0.0,
+                (_time.time() - req_state.stage_submit_ts.get(stage_id, _time.time())) * 1000.0,
+            )
+            logger.info(
+                "[Orchestrator][PD cache-sync] completed req=%s lineage=%s revision=%d d_ms=%.3f",
+                req_id,
+                req_state.pd_prefill_lineage_id,
+                req_state.pd_prefill_revision,
+                elapsed_ms,
+            )
+            if req_state.pd_prefill_ready_emitted:
+                await self._cleanup_request_ids([req_id])
+                return
+            final_stage_id = req_state.final_stage_id
+            final_pool = self.stage_pools[final_stage_id]
+            terminal_output = _build_terminal_empty_output(
+                req_id,
+                final_output_type=getattr(final_pool.stage_client, "final_output_type", None),
+                audio_sample_rate=final_pool._infer_audio_sample_rate(),
+            )
+            terminal_ts = _time.time()
+            req_state.stage_submit_ts[final_stage_id] = terminal_ts
+            await self.output_async_queue.put(
+                OutputMessage(
+                    request_id=req_id,
+                    stage_id=final_stage_id,
+                    replica_id=replica_id,
+                    engine_outputs=terminal_output,
+                    metrics=None,
+                    finished=True,
+                    stage_submit_ts=terminal_ts,
+                )
+            )
+            await self._cleanup_request_ids([req_id])
+            return
+
         request_finished = False
         if (
             finished
@@ -1414,7 +1497,7 @@ class Orchestrator:
                         None,
                         processed_mm,
                     )
-            self._materialize_pd_prefill_snapshot(req_state)
+            snapshot_cached = self._materialize_pd_prefill_snapshot(req_state)
 
             # A cache-population request must stop at P.  In a non-split
             # pipeline the Thinker itself is the text output stage; after a
@@ -1423,28 +1506,71 @@ class Orchestrator:
             prompt = req_state.prompt
             prefill_only = isinstance(prompt, dict) and prompt.get("prefill_only") is True
             if prefill_only:
-                final_stage_id = req_state.final_stage_id
-                final_pool = self.stage_pools[final_stage_id]
+                # Do not acknowledge a lineage revision that the orchestrator
+                # cannot serve to the next finite request.  The application
+                # advances its revision only after this request completes, so
+                # a request-scoped error preserves the last valid parent.
+                if req_state.pd_prefill_lineage_id and not snapshot_cached:
+                    error = "Thinker-P finished a prefill-only request without a usable lineage snapshot"
+                    logger.error(
+                        "[Orchestrator][PD snapshot] req=%s lineage=%s revision=%d: %s",
+                        req_id,
+                        req_state.pd_prefill_lineage_id,
+                        req_state.pd_prefill_revision,
+                        error,
+                    )
+                    await self.output_async_queue.put(
+                        ErrorMessage(
+                            request_id=req_id,
+                            stage_id=stage_id,
+                            error=error,
+                            error_type="PDSnapshotError",
+                        )
+                    )
+                    await self._cleanup_request_ids([req_id])
+                    return
+                req_state.pd_decode_cache_sync_pending = True
+                logger.info(
+                    "[Orchestrator][PD cache-sync] submit req=%s lineage=%s "
+                    "parent_revision=%d revision=%d prompt_tokens=%d",
+                    req_id,
+                    req_state.pd_prefill_lineage_id,
+                    int(getattr(prompt, "kv_lineage_parent_revision", 0))
+                    if not isinstance(prompt, dict)
+                    else int(prompt.get("kv_lineage_parent_revision", 0)),
+                    req_state.pd_prefill_revision,
+                    len(req_state.pd_prefill_prompt_token_ids),
+                )
+                self._schedule_pd_cache_sync(
+                    req_id,
+                    stage_id,
+                    output,
+                    req_state,
+                    src_replica_id=replica_id,
+                )
+                # P has finished and its snapshot/prefix blocks are now a
+                # valid parent for the next request in this lineage.  Do not
+                # keep the application session blocked on D's disposable
+                # cache import: a later foreground request can send the
+                # cumulative suffix from whatever prefix D still owns.
+                final_pool = self.stage_pools[req_state.final_stage_id]
                 terminal_output = _build_terminal_empty_output(
                     req_id,
                     final_output_type=getattr(final_pool.stage_client, "final_output_type", None),
                     audio_sample_rate=final_pool._infer_audio_sample_rate(),
                 )
-                terminal_ts = _time.time()
-                req_state.stage_submit_ts[final_stage_id] = terminal_ts
-                logger.debug("[Orchestrator][PD] prefill-only req=%s stopped after stage-%s", req_id, stage_id)
+                req_state.pd_prefill_ready_emitted = True
                 await self.output_async_queue.put(
                     OutputMessage(
                         request_id=req_id,
-                        stage_id=final_stage_id,
+                        stage_id=stage_id,
                         replica_id=replica_id,
                         engine_outputs=terminal_output,
-                        metrics=None,
+                        metrics=stage_metrics,
                         finished=True,
-                        stage_submit_ts=terminal_ts,
+                        stage_submit_ts=submit_ts,
                     )
                 )
-                await self._cleanup_request_ids([req_id])
                 return
 
         duplex_output_decision = self._duplex_output_decision(stage_id, output, req_state)
@@ -1771,24 +1897,6 @@ class Orchestrator:
             )
         return features
 
-    @staticmethod
-    def _pd_snapshot_nbytes(output: dict[str, Any]) -> int:
-        total = 0
-        stack: list[Any] = [output]
-        seen: set[int] = set()
-        while stack:
-            value = stack.pop()
-            if isinstance(value, torch.Tensor):
-                identity = id(value)
-                if identity not in seen:
-                    seen.add(identity)
-                    total += int(value.nbytes)
-            elif isinstance(value, dict):
-                stack.extend(value.values())
-            elif isinstance(value, (list, tuple)):
-                stack.extend(value)
-        return total
-
     def _prepare_pd_prefill_snapshot_request(
         self,
         stage0_request: Any,
@@ -1836,37 +1944,56 @@ class Orchestrator:
             usable_parent_rows,
         )
 
+    @staticmethod
+    def _pd_snapshot_nbytes(output: dict[str, Any]) -> int:
+        total = 0
+        stack: list[Any] = [output]
+        seen: set[int] = set()
+        while stack:
+            value = stack.pop()
+            if isinstance(value, torch.Tensor):
+                identity = id(value)
+                if identity not in seen:
+                    seen.add(identity)
+                    total += int(value.nbytes)
+            elif isinstance(value, dict):
+                stack.extend(value.values())
+            elif isinstance(value, (list, tuple)):
+                stack.extend(value)
+        return total
+
     def _cache_pd_prefill_snapshot(
         self,
         req_state: OrchestratorRequestState,
         output: dict[str, Any],
-    ) -> None:
+    ) -> bool:
         lineage_id = req_state.pd_prefill_lineage_id
         prompt_ids = req_state.pd_prefill_prompt_token_ids
         limit_bytes = int(getattr(self, "_pd_prefill_snapshot_limit_bytes", 0))
         if not lineage_id or not prompt_ids or limit_bytes <= 0:
-            return
+            return False
 
         nbytes = self._pd_snapshot_nbytes(output)
         if nbytes <= 0 or nbytes > limit_bytes:
-            return
+            return False
         if not hasattr(self, "_pd_prefill_snapshots"):
             self._pd_prefill_snapshots = OrderedDict()
             self._pd_prefill_snapshot_bytes = 0
         previous = self._pd_prefill_snapshots.pop(lineage_id, None)
         if previous is not None:
             self._pd_prefill_snapshot_bytes -= previous.nbytes
-        self._pd_prefill_snapshots[lineage_id] = _PDPrefillSnapshot(
+        snapshot = _PDPrefillSnapshot(
             revision=req_state.pd_prefill_revision,
             prompt_token_ids=prompt_ids,
             output=output,
             nbytes=nbytes,
         )
+        self._pd_prefill_snapshots[lineage_id] = snapshot
         self._pd_prefill_snapshot_bytes += nbytes
-
         while self._pd_prefill_snapshots and self._pd_prefill_snapshot_bytes > limit_bytes:
             _, evicted = self._pd_prefill_snapshots.popitem(last=False)
             self._pd_prefill_snapshot_bytes -= evicted.nbytes
+        return self._pd_prefill_snapshots.get(lineage_id) is snapshot
 
     @staticmethod
     def _pd_snapshot_layer_chunks(output: dict[str, Any], layer: int) -> tuple[torch.Tensor, ...]:
@@ -1894,20 +2021,21 @@ class Orchestrator:
             return ()
         return tuple(selected)
 
-    def _materialize_pd_prefill_snapshot(self, req_state: OrchestratorRequestState) -> None:
-        """Merge a P cache-hit tail with its pinned lineage snapshot."""
+    def _materialize_pd_prefill_snapshot(self, req_state: OrchestratorRequestState) -> bool:
+        """Merge a P cache-hit tail with the lineage's latest snapshot."""
+        diag_start = _time.monotonic() if _LOG_HANDOFF_DIAG else 0.0
         current = req_state.pd_prefill_multimodal_output
         if not isinstance(current, dict):
-            return
+            return False
         hidden = current.get("hidden_states")
         layers = hidden.get("layers") if isinstance(hidden, dict) else None
         if not isinstance(layers, dict):
-            return
+            return False
 
         layer_0 = layers.get(0, layers.get("0"))
         layer_24 = layers.get(24, layers.get("24"))
         if not isinstance(layer_0, torch.Tensor) or not isinstance(layer_24, torch.Tensor):
-            return
+            return False
         prompt_rows = len(req_state.pd_prefill_prompt_token_ids)
         current_rows = min(int(layer_0.shape[0]), int(layer_24.shape[0]))
         if current_rows > prompt_rows:
@@ -1952,7 +2080,10 @@ class Orchestrator:
 
         prefill_only = isinstance(req_state.prompt, dict) and req_state.prompt.get("prefill_only") is True
         max_chunks = int(getattr(self, "_pd_prefill_snapshot_max_chunks", 16))
-        if max(len(layer_0_chunks), len(layer_24_chunks)) > max_chunks:
+        chunks_before = max(len(layer_0_chunks), len(layer_24_chunks))
+        compact_ms = 0.0
+        if chunks_before > max_chunks:
+            compact_start = _time.monotonic() if _LOG_HANDOFF_DIAG else 0.0
             # Bound the shared-buffer/FD chain.  Allocate the destination in
             # shared storage first and concatenate exactly once; a later D
             # request can forward this tensor as a handle without another
@@ -1968,25 +2099,43 @@ class Orchestrator:
             if isinstance(embeds, dict):
                 compacted["embed"] = embeds
             cached_output = compacted
+            if _LOG_HANDOFF_DIAG:
+                compact_ms = (_time.monotonic() - compact_start) * 1000.0
         if not prefill_only:
             # Keep P's shared output chunks intact.  D already concatenates
             # the prompt conditioning with its first decode rows for Talker,
             # so materializing a contiguous copy here is redundant.
             req_state.pd_prefill_multimodal_output = cached_output
-        self._cache_pd_prefill_snapshot(req_state, cached_output)
+        cache_start = _time.monotonic() if _LOG_HANDOFF_DIAG else 0.0
+        snapshot_cached = self._cache_pd_prefill_snapshot(req_state, cached_output)
+        if _LOG_HANDOFF_DIAG:
+            diag_end = _time.monotonic()
+            logger.info(
+                "[PD-SNAPSHOT-DIAG] req=%s prompt_rows=%d delta_rows=%d "
+                "chunks_before=%d compact_ms=%.3f cache_ms=%.3f total_ms=%.3f",
+                req_state.request_id,
+                prompt_rows,
+                current_rows,
+                chunks_before,
+                compact_ms,
+                (diag_end - cache_start) * 1000.0,
+                (diag_end - diag_start) * 1000.0,
+            )
         logger.info(
             "[Orchestrator][PD snapshot] req=%s assembled prefix_rows=%d delta_rows=%d "
-            "deferred=%s cache_chunks=%d cache_mib=%.1f",
+            "deferred=%s cached=%s cache_chunks=%d cache_mib=%.1f",
             req_state.request_id,
             prefix_rows,
             current_rows,
             prefill_only,
+            snapshot_cached,
             max(
                 len(self._pd_snapshot_layer_chunks(cached_output, 0)),
                 len(self._pd_snapshot_layer_chunks(cached_output, 24)),
             ),
             float(getattr(self, "_pd_prefill_snapshot_bytes", 0)) / float(1 << 20),
         )
+        return snapshot_cached
 
     @staticmethod
     def _materialize_pd_snapshot_layer(
@@ -2253,6 +2402,7 @@ class Orchestrator:
         src_replica_id: int | None = None,
         is_streaming_session: bool = False,
         is_final_update: bool = False,
+        pd_cache_sync: bool = False,
     ) -> None:
         """Forward output from the current logical stage to the next one."""
         next_logical = src_stage_id + 1
@@ -2471,7 +2621,7 @@ class Orchestrator:
                 )
 
             prefill_snapshot = req_state.pd_prefill_multimodal_output
-            if isinstance(prefill_snapshot, dict):
+            if not pd_cache_sync and isinstance(prefill_snapshot, dict):
                 embeds = prefill_snapshot.get("embed")
                 embeds = embeds if isinstance(embeds, dict) else {}
 
@@ -2525,6 +2675,74 @@ class Orchestrator:
                     resumable=next_stage_resumable,
                 )
                 request.external_req_id = request.request_id
+                if pd_cache_sync:
+                    req_state.stage_submit_ts[next_logical] = _time.time()
+                    try:
+                        replica_id, sync_result = await next_pool.submit_pd_cache_sync(
+                            req_id,
+                            request,
+                        )
+                    except Exception as exc:
+                        req_state.pd_decode_cache_sync_pending = False
+                        logger.exception(
+                            "[Orchestrator][PD cache-sync] failed req=%s lineage=%s revision=%d",
+                            req_id,
+                            req_state.pd_prefill_lineage_id,
+                            req_state.pd_prefill_revision,
+                        )
+                        if req_state.pd_prefill_ready_emitted:
+                            # P-ready was already reported successfully. D's
+                            # cache is disposable, and a later foreground
+                            # request can transfer the cumulative suffix from
+                            # D's last valid prefix. Do not emit a contradictory
+                            # second terminal result for this request.
+                            await self._cleanup_request_ids([req_id])
+                            return
+                        await self.output_async_queue.put(
+                            ErrorMessage(
+                                request_id=req_id,
+                                stage_id=next_logical,
+                                error=str(exc),
+                                error_type="PDCacheSyncError",
+                            )
+                        )
+                        await self._cleanup_request_ids([req_id])
+                        return
+
+                    req_state.pd_decode_cache_sync_pending = False
+                    logger.info(
+                        "[Orchestrator][PD cache-sync] completed req=%s lineage=%s revision=%d d_ms=%.3f full_hit=%s",
+                        req_id,
+                        req_state.pd_prefill_lineage_id,
+                        req_state.pd_prefill_revision,
+                        float(sync_result.get("cache_sync_ms", 0.0)) if isinstance(sync_result, dict) else 0.0,
+                        bool(sync_result.get("full_hit", False)) if isinstance(sync_result, dict) else False,
+                    )
+                    if req_state.pd_prefill_ready_emitted:
+                        await self._cleanup_request_ids([req_id])
+                        return
+                    final_stage_id = req_state.final_stage_id
+                    final_pool = self.stage_pools[final_stage_id]
+                    terminal_output = _build_terminal_empty_output(
+                        req_id,
+                        final_output_type=getattr(final_pool.stage_client, "final_output_type", None),
+                        audio_sample_rate=final_pool._infer_audio_sample_rate(),
+                    )
+                    terminal_ts = _time.time()
+                    req_state.stage_submit_ts[final_stage_id] = terminal_ts
+                    await self.output_async_queue.put(
+                        OutputMessage(
+                            request_id=req_id,
+                            stage_id=final_stage_id,
+                            replica_id=replica_id,
+                            engine_outputs=terminal_output,
+                            metrics=None,
+                            finished=True,
+                            stage_submit_ts=terminal_ts,
+                        )
+                    )
+                    await self._cleanup_request_ids([req_id])
+                    return
                 if already_submitted:
                     replica_id = await next_pool.submit_update(req_id, req_state, request)
                 else:
@@ -2656,6 +2874,125 @@ class Orchestrator:
             request_id=req_id,
             tx_ms=_tx_ms,
         )
+
+    def _schedule_pd_cache_sync(
+        self,
+        req_id: str,
+        stage_id: int,
+        output: Any,
+        req_state: OrchestratorRequestState,
+        *,
+        src_replica_id: int,
+    ) -> None:
+        """Run one arrival cache sync without blocking global output polling."""
+        tasks = getattr(self, "_pd_cache_sync_tasks", None)
+        if tasks is None:
+            # Some focused unit tests construct the orchestrator without
+            # invoking __init__.
+            tasks = self._pd_cache_sync_tasks = {}
+
+        previous = tasks.get(req_id)
+        if previous is not None and not previous.done():
+            raise RuntimeError(f"duplicate in-flight P/D cache sync for request {req_id}")
+
+        lineage_id = req_state.pd_prefill_lineage_id
+        lineage_tails = getattr(self, "_pd_lineage_cache_sync_tails", None)
+        if lineage_tails is None:
+            lineage_tails = self._pd_lineage_cache_sync_tails = {}
+        predecessor = lineage_tails.get(lineage_id) if lineage_id else None
+
+        task = asyncio.create_task(
+            self._run_pd_cache_sync(
+                req_id,
+                stage_id,
+                output,
+                req_state,
+                src_replica_id=src_replica_id,
+                predecessor=predecessor,
+            ),
+            name=f"orchestrator-pd-cache-sync-{req_id}",
+        )
+        tasks[req_id] = task
+        if lineage_id:
+            lineage_tails[lineage_id] = task
+
+        def _discard(done: asyncio.Task[None]) -> None:
+            if tasks.get(req_id) is done:
+                tasks.pop(req_id, None)
+            if lineage_id and lineage_tails.get(lineage_id) is done:
+                lineage_tails.pop(lineage_id, None)
+
+        task.add_done_callback(_discard)
+
+    async def _run_pd_cache_sync(
+        self,
+        req_id: str,
+        stage_id: int,
+        output: Any,
+        req_state: OrchestratorRequestState,
+        *,
+        src_replica_id: int,
+        predecessor: asyncio.Task[None] | None = None,
+    ) -> None:
+        try:
+            if predecessor is not None:
+                try:
+                    await predecessor
+                except asyncio.CancelledError:
+                    # A predecessor may be explicitly aborted while this
+                    # newer revision remains valid.  Cancellation of this
+                    # task itself must still propagate normally.
+                    if not predecessor.cancelled():
+                        raise
+                except Exception:
+                    # Cache warming is disposable.  D will request a larger
+                    # cumulative suffix when this revision (or a foreground
+                    # query) is registered against its last valid prefix.
+                    logger.warning(
+                        "[Orchestrator][PD cache-sync] predecessor failed; "
+                        "continuing lineage=%s revision=%d",
+                        req_state.pd_prefill_lineage_id,
+                        req_state.pd_prefill_revision,
+                        exc_info=True,
+                    )
+            await self._forward_to_next_stage(
+                req_id,
+                stage_id,
+                output,
+                req_state,
+                src_replica_id=src_replica_id,
+                pd_cache_sync=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            req_state.pd_decode_cache_sync_pending = False
+            logger.exception(
+                "[Orchestrator][PD cache-sync] unexpected forwarding failure req=%s lineage=%s revision=%d",
+                req_id,
+                req_state.pd_prefill_lineage_id,
+                req_state.pd_prefill_revision,
+            )
+            # An explicit abort may already have removed the request while the
+            # control operation was completing.  Do not resurrect it with a
+            # late error message.
+            if self.request_states.get(req_id) is not req_state:
+                return
+            if req_state.pd_prefill_ready_emitted:
+                # The client has already consumed the one P-ready terminal.
+                # Treat background cache warming as best-effort and preserve
+                # the last valid D prefix for cumulative recovery.
+                await self._cleanup_request_ids([req_id], abort=True)
+                return
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    request_id=req_id,
+                    stage_id=stage_id + 1,
+                    error=str(exc),
+                    error_type="PDCacheSyncError",
+                )
+            )
+            await self._cleanup_request_ids([req_id], abort=True)
 
     async def _prewarm_async_chunk_stages(
         self,

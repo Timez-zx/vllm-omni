@@ -19,7 +19,7 @@ from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.perf import PerfStats
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
@@ -40,7 +40,40 @@ logger = init_logger(__name__)
 _MAX_KV_LINEAGE_SNAPSHOTS = 4096
 _LOG_SCHED_DIAG = os.environ.get("VLLM_OMNI_LOG_SCHED_DIAG", "0") not in ("0", "", "false", "False")
 _LOG_HANDOFF_DIAG = os.environ.get("VLLM_OMNI_LOG_HANDOFF_DIAG", "0") not in ("0", "", "false", "False")
-_DIAG_STAGE = os.environ.get("VLLM_OMNI_DIAG_STAGE")
+_LOG_CORE_STEP_DIAG = os.environ.get("VLLM_OMNI_LOG_CORE_STEP_DIAG", "0") not in (
+    "0",
+    "",
+    "false",
+    "False",
+)
+_DIAG_STAGE_RAW = os.environ.get("VLLM_OMNI_DIAG_STAGE")
+_DIAG_STAGES = (
+    None
+    if _DIAG_STAGE_RAW is None
+    else frozenset(stage.strip() for stage in _DIAG_STAGE_RAW.split(",") if stage.strip())
+)
+
+
+def _prefill_microbatch_window_s(stage_id: object) -> float:
+    """Experimental stage-0 scheduler admission window, disabled by default."""
+    if str(stage_id) != "0":
+        return 0.0
+    raw = os.environ.get("VLLM_OMNI_PREFILL_MICROBATCH_WINDOW_MS", "0")
+    try:
+        window_ms = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid VLLM_OMNI_PREFILL_MICROBATCH_WINDOW_MS=%r; disabling scheduler microbatching",
+            raw,
+        )
+        return 0.0
+    if window_ms < 0:
+        logger.warning(
+            "Negative VLLM_OMNI_PREFILL_MICROBATCH_WINDOW_MS=%r; disabling scheduler microbatching",
+            raw,
+        )
+        return 0.0
+    return min(window_ms, 1000.0) / 1000.0
 
 
 def _diagnostic_tensor_bytes(value: Any) -> int:
@@ -120,6 +153,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # starts before the request reaches EngineCore, so it cannot isolate
         # time spent in the scheduler's own waiting queue.
         self._diag_scheduler_admit_mono: dict[str, float] = {}
+
+        # Controlled A/B hook for short finite prefills. While the oldest
+        # stage-0 request is younger than this bound, schedule() continues to
+        # process running work but temporarily hides the waiting queue. The
+        # EngineCore loop remains free to drain newly arrived requests, so the
+        # next admission can contain a real multi-request batch.
+        stage_id = getattr(self.vllm_config.model_config, "stage_id", None)
+        self._prefill_microbatch_window_s = _prefill_microbatch_window_s(stage_id)
+        self._prefill_scheduler_admit_mono: dict[str, float] = {}
 
         # Track ACTIVE transfers (submitted to runner but not yet acked via kv_extracted_req_ids)
         self.active_kv_transfers: set[str] = set()
@@ -208,6 +250,106 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             while len(lineage_snapshots) > _MAX_KV_LINEAGE_SNAPSHOTS:
                 lineage_snapshots.popitem(last=False)
 
+    def prepare_direct_pd_cache_sync(self, request: Request) -> tuple[str, Any | None]:
+        """Allocate a D prefix-cache import without admitting an inference request.
+
+        Returns ``("blocked", None)`` when cache capacity is temporarily
+        unavailable, ``("full_hit", metadata)`` when D already owns the full
+        prefix, or ``("loading", metadata)`` after staging a NIXL delta import.
+        The caller passes the metadata directly to the worker control path.
+        """
+        connector = self.connector
+        if connector is None:
+            raise RuntimeError("Direct P/D cache sync requires a KV connector")
+        if request.request_id in self.requests:
+            raise RuntimeError(f"Direct P/D cache sync collides with inference request {request.request_id}")
+
+        computed_blocks, local_tokens, _ = self.kv_cache_manager.get_computed_blocks(request)
+        external_tokens, load_async = connector.get_num_new_matched_tokens(request, local_tokens)
+        if external_tokens is None:
+            return "blocked", None
+
+        remote_tokens = local_tokens + external_tokens
+        if external_tokens == 0:
+            # NixlDeltaPushConnector emits an empty registration here so P can
+            # release its request-scoped lease even though D needs no bytes.
+            connector.update_state_after_alloc(request, computed_blocks, 0)
+            metadata = connector.build_connector_meta(SchedulerOutput.make_empty())
+            hash_block_size = int(getattr(self.kv_cache_manager.block_pool, "hash_block_size", 0))
+            lineage_id = getattr(request, "kv_lineage_id", None)
+            revision = int(getattr(request, "kv_lineage_revision", 0))
+            if lineage_id:
+                self._store_kv_lineage_snapshot(
+                    lineage_id,
+                    revision,
+                    request.block_hashes,
+                    remote_tokens,
+                    hash_block_size,
+                )
+            # Stop the D heartbeat; no allocated request block table exists on
+            # this path, so the ordinary scheduler finalizer cannot be used.
+            request.status = RequestStatus.FINISHED_STOPPED
+            connector.request_finished(request, [])
+            return "full_hit", metadata
+
+        if not load_async:
+            raise RuntimeError("Direct P/D cache sync expected an asynchronous external KV load")
+
+        new_blocks = self.kv_cache_manager.allocate_slots(
+            request,
+            0,
+            num_new_computed_tokens=local_tokens,
+            new_computed_blocks=computed_blocks,
+            num_lookahead_tokens=0,
+            num_external_computed_tokens=external_tokens,
+            delay_cache_blocks=True,
+            full_sequence_must_fit=True,
+            has_scheduled_reqs=bool(self.running),
+        )
+        if new_blocks is None:
+            return "blocked", None
+
+        connector.update_state_after_alloc(
+            request,
+            self.kv_cache_manager.get_blocks(request.request_id),
+            external_tokens,
+        )
+        request.num_computed_tokens = remote_tokens
+        metadata = connector.build_connector_meta(SchedulerOutput.make_empty())
+        return "loading", metadata
+
+    def complete_direct_pd_cache_sync(self, request: Request) -> None:
+        """Commit a completed cache-only import to D's prefix cache."""
+        connector = self.connector
+        if connector is None:
+            raise RuntimeError("Direct P/D cache sync requires a KV connector")
+        connector.update_connector_output(KVConnectorOutput(finished_recving={request.request_id}))
+        self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
+
+        lineage_id = getattr(request, "kv_lineage_id", None)
+        revision = int(getattr(request, "kv_lineage_revision", 0))
+        hash_block_size = int(getattr(self.kv_cache_manager.block_pool, "hash_block_size", 0))
+        if lineage_id:
+            self._store_kv_lineage_snapshot(
+                lineage_id,
+                revision,
+                request.block_hashes,
+                request.num_computed_tokens,
+                hash_block_size,
+            )
+
+        request.status = RequestStatus.FINISHED_STOPPED
+        self._connector_finished(request)
+        self.kv_cache_manager.free(request)
+
+    def fail_direct_pd_cache_sync(self, request: Request) -> None:
+        """Release scheduler-side resources after a cache-only import error."""
+        request.status = RequestStatus.FINISHED_ABORTED
+        try:
+            self._connector_finished(request)
+        finally:
+            self.kv_cache_manager.free(request)
+
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
         # Output placeholders are zero when async scheduling isn't used
@@ -248,7 +390,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return result
 
     def _should_defer_waiting_admission(self) -> bool:
-        return False
+        window_s = getattr(self, "_prefill_microbatch_window_s", 0.0)
+        if window_s <= 0 or not self.waiting:
+            return False
+        admitted = getattr(self, "_prefill_scheduler_admit_mono", {})
+        oldest = min(
+            (admitted.get(request.request_id, 0.0) for request in self.waiting),
+            default=0.0,
+        )
+        return oldest > 0 and monotonic() - oldest < window_s
 
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
         """
@@ -324,11 +474,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return False
 
     def add_request(self, request: Request) -> None:
+        if getattr(self, "_prefill_microbatch_window_s", 0.0) > 0:
+            self._prefill_scheduler_admit_mono[request.request_id] = monotonic()
         if _LOG_SCHED_DIAG:
             self._diag_scheduler_admit_mono[request.request_id] = monotonic()
         super().add_request(request)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        core_step_start = monotonic() if _LOG_CORE_STEP_DIAG else 0.0
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
         # async abort (e.g. client disconnect during TTS streaming) to leave
@@ -349,6 +502,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             original_waiting = self.waiting
             self.waiting = create_request_queue(self.policy)
 
+        before_base_schedule = monotonic() if _LOG_CORE_STEP_DIAG else 0.0
         try:
             scheduler_output = super().schedule(throttle_prefills)
         finally:
@@ -366,10 +520,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 )
             if self.input_coordinator:
                 self.input_coordinator.restore_queues(self.waiting)
+        after_base_schedule = monotonic() if _LOG_CORE_STEP_DIAG else 0.0
+
+        if getattr(self, "_prefill_microbatch_window_s", 0.0) > 0:
+            for scheduled in scheduler_output.scheduled_new_reqs:
+                self._prefill_scheduler_admit_mono.pop(scheduled.req_id, None)
 
         if _LOG_SCHED_DIAG:
             stage_id = getattr(self.vllm_config.model_config, "stage_id", "?")
-            diag_stage_matches = _DIAG_STAGE is None or str(stage_id) == _DIAG_STAGE
+            diag_stage_matches = _DIAG_STAGES is None or str(stage_id) in _DIAG_STAGES
         else:
             diag_stage_matches = False
         if diag_stage_matches:
@@ -451,10 +610,26 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             finished_reqs = {}
 
         # Wrap in omni scheduler output to carry transfer metadata.
-        return self._wrap_omni_scheduler_output(
+        result = self._wrap_omni_scheduler_output(
             scheduler_output,
             finished_requests_needing_kv_transfer=finished_reqs,
         )
+        if _LOG_CORE_STEP_DIAG and result.num_scheduled_tokens:
+            done = monotonic()
+            stage_id = getattr(self.vllm_config.model_config, "stage_id", "?")
+            if _DIAG_STAGES is None or str(stage_id) in _DIAG_STAGES:
+                logger.info(
+                    "[CORE-STEP-DIAG] event=scheduler-return stage=%s mono=%.6f "
+                    "reqs=%s pre_base_ms=%.3f base_ms=%.3f post_base_ms=%.3f total_ms=%.3f",
+                    stage_id,
+                    done,
+                    ",".join(result.num_scheduled_tokens),
+                    (before_base_schedule - core_step_start) * 1000.0,
+                    (after_base_schedule - before_base_schedule) * 1000.0,
+                    (done - after_base_schedule) * 1000.0,
+                    (done - core_step_start) * 1000.0,
+                )
+        return result
 
     def update_from_output(
         self,
@@ -867,24 +1042,27 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         if _LOG_HANDOFF_DIAG:
             stage_id = getattr(self.vllm_config.model_config, "stage_id", "?")
-            diag_stage_matches = _DIAG_STAGE is None or str(stage_id) == _DIAG_STAGE
+            diag_stage_matches = _DIAG_STAGES is None or str(stage_id) in _DIAG_STAGES
         else:
             diag_stage_matches = False
         if diag_stage_matches:
+            handoff_diag_end = monotonic()
             req_ids = [
                 output.request_id
                 for client_outputs in engine_core_outputs.values()
                 for output in client_outputs.outputs
             ]
-            logger.info(
-                "[HANDOFF-DIAG] event=core-output-ready stage=%s wall=%.6f reqs=%s "
-                "payload_mib=%.3f scheduler_update_ms=%.3f",
-                stage_id,
-                time(),
-                ",".join(req_ids),
-                _diagnostic_tensor_bytes(mm_outputs) / float(1 << 20),
-                (monotonic() - handoff_diag_start) * 1000.0,
-            )
+            if req_ids:
+                logger.info(
+                    "[HANDOFF-DIAG] event=core-output-ready stage=%s wall=%.6f mono=%.6f reqs=%s "
+                    "payload_mib=%.3f scheduler_update_ms=%.3f",
+                    stage_id,
+                    time(),
+                    handoff_diag_end,
+                    ",".join(req_ids),
+                    _diagnostic_tensor_bytes(mm_outputs) / float(1 << 20),
+                    (handoff_diag_end - handoff_diag_start) * 1000.0,
+                )
 
         return engine_core_outputs
 

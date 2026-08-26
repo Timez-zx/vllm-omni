@@ -57,6 +57,27 @@ def _make_update(prompt_token_ids: list[int] | None = None) -> StreamingUpdate:
     )
 
 
+def test_prefill_microbatch_window_defers_only_until_oldest_request_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sched = _make_scheduler()
+    sched._prefill_microbatch_window_s = 0.1
+    sched._prefill_scheduler_admit_mono = {"oldest": 10.0, "newest": 10.07}
+    sched.waiting = [
+        SimpleNamespace(request_id="oldest"),
+        SimpleNamespace(request_id="newest"),
+    ]
+
+    monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.monotonic", lambda: 10.09)
+    assert sched._should_defer_waiting_admission() is True
+
+    monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.monotonic", lambda: 10.101)
+    assert sched._should_defer_waiting_admission() is False
+
+    sched.waiting = []
+    assert sched._should_defer_waiting_admission() is False
+
+
 def test_scheduler_owned_kv_lineage_snapshot_is_explicit_and_disposable():
     sched = _make_scheduler()
     sched.kv_cache_manager = SimpleNamespace()
@@ -101,8 +122,8 @@ def _run_resumable_segment_stop(
         return [42], True
 
     sched._update_request_with_output.side_effect = stop_request
-    sched._get_confirmed_num_computed_tokens.side_effect = (
-        lambda request: request.num_computed_tokens - request.num_output_placeholders
+    sched._get_confirmed_num_computed_tokens.side_effect = lambda request: (
+        request.num_computed_tokens - request.num_output_placeholders
     )
     sched._handle_stopped_request.return_value = session_finished
     # vLLM 0.26 returns (kv_xfer_params, ec_xfer_params); an unconfigured

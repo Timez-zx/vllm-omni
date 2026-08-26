@@ -59,6 +59,41 @@ def test_parse_uses_per_session_request_order_across_history_compaction(tmp_path
     assert records["video-second-suffix"]["kv_delta_blocks"] == 840
 
 
+def test_parse_resets_logical_turns_when_a_session_name_is_reused(tmp_path: Path) -> None:
+    log = tmp_path / "engine.log"
+    lines = []
+    for request_id, reported_turn in (
+        ("video-old", 0),
+        ("video-old-next", 1),
+        ("video-new", 0),
+        ("video-new-next", 1),
+    ):
+        lines.append(
+            "(API pid=1) INFO 08-21 18:00:00 [video.py:1] "
+            f"[finite-request] session=r0u0 request={request_id} "
+            f"turn={reported_turn} prompt_tokens=100"
+        )
+        lines.extend(
+            [
+                "(API pid=1) INFO 08-21 18:00:01 [stats.py:999] "
+                f"[StageRequestStats [request_id={request_id}-suffix]]",
+                "(API pid=1) INFO 08-21 18:00:01 [stats.py:999] | num_tokens_in | 100 | 100 |",
+                "(API pid=1) INFO 08-21 18:00:01 [stats.py:999] | vllm_ttft_ms | 10 | 20 |",
+                "(API pid=1) INFO 08-21 18:00:01 [stats.py:999] "
+                "| serving_time_to_first_output_ms | 10 | 20 |",
+                "(API pid=1) INFO 08-21 18:00:01 [stats.py:1000] [Overall Summary]",
+            ]
+        )
+    log.write_text("\n".join(lines))
+
+    records = {record["request_id"]: record for record in parse(log)}
+
+    assert records["video-old-suffix"]["turn"] == 0
+    assert records["video-old-next-suffix"]["turn"] == 1
+    assert records["video-new-suffix"]["turn"] == 0
+    assert records["video-new-next-suffix"]["turn"] == 1
+
+
 def test_parse_preserves_non_contiguous_stage_ids(tmp_path: Path) -> None:
     log = tmp_path / "engine.log"
     log.write_text(

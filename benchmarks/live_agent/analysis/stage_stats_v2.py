@@ -24,10 +24,12 @@ MATCHING TURNS
 --------------
 The server's ``[finite-request]`` record maps each engine request to its
 session. Logical turns are assigned by request arrival order within that
-session. The logged ``turn`` field is deliberately not used: it reflects the
-current retained-history depth and can decrease after context compaction.
-Older logs without this record fall back to completion order. ``--expect``
-asserts the count so a silent mismatch cannot pass.
+session. A subsequent logged ``turn=0`` resets that counter, which separates
+benchmark runs that reused names such as ``r0u0`` in one server log. Other
+logged turn values are deliberately not used: they reflect retained-history
+depth and can decrease after context compaction. Older logs without this
+record fall back to completion order. ``--expect`` asserts the count so a
+silent mismatch cannot pass.
 
 CAVEAT recorded on purpose: stage 1 and stage 2 report num_tokens_in = 0. The talker's
 placeholder prompt (prompt_token_ids=[0]*prompt_len, qwen3_omni.py:710) is evidently not
@@ -98,6 +100,9 @@ def parse(path: pathlib.Path) -> list[dict]:
         finite_match = FINITE_REQUEST.search(line)
         if finite_match:
             session = finite_match.group(1)
+            reported_turn = int(finite_match.group(3))
+            if reported_turn == 0 and finite_request_counts.get(session, 0) > 0:
+                finite_request_counts[session] = 0
             logical_turn = finite_request_counts.get(session, 0)
             finite_request_counts[session] = logical_turn + 1
             finite_requests[finite_match.group(2)] = (session, logical_turn)

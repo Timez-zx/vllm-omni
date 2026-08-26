@@ -16,6 +16,8 @@ finite request lifetimes and never treats a session id as proof of KV identity.
 
 from __future__ import annotations
 
+import os
+from time import monotonic
 from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
@@ -42,6 +44,13 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+_LOG_CONNECTOR_DIAG = os.environ.get("VLLM_OMNI_LOG_HANDOFF_DIAG", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def _delta_registration_fields(
@@ -180,12 +189,78 @@ class NixlDeltaPushConnectorScheduler(NixlPushConnectorScheduler):
 class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
     """Select the positional KV suffix before upstream submits the WRITE."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._delta_load_started: dict[str, float] = {}
+        # Cache-only D imports are driven by an EngineCore control operation,
+        # not by ModelRunner.execute_model().  Keep their completions out of
+        # the ordinary connector output or Scheduler would mistake them for
+        # inference requests.
+        self._direct_cache_sync_req_ids: set[str] = set()
+        self._direct_cache_sync_finished: set[str] = set()
+        self._deferred_regular_finished_sending: set[str] = set()
+        self._deferred_regular_finished_recving: set[str] = set()
+
+    def start_load_kv(self, metadata: NixlConnectorMetadata) -> None:
+        """Timestamp D registration through completed KV installation."""
+        now = monotonic()
+        for req_id in metadata.reqs_to_recv:
+            self._delta_load_started.setdefault(req_id, now)
+        super().start_load_kv(metadata)
+
+    def _partition_finished(self) -> None:
+        # Unit tests and rolling upgrades may construct this worker without
+        # running the newest __init__; initialize the routing sets lazily.
+        if not hasattr(self, "_direct_cache_sync_req_ids"):
+            self._direct_cache_sync_req_ids = set()
+            self._direct_cache_sync_finished = set()
+            self._deferred_regular_finished_sending = set()
+            self._deferred_regular_finished_recving = set()
+        done_sending, done_recving = super().get_finished()
+        now = monotonic()
+        for req_id in done_recving:
+            started = self._delta_load_started.pop(req_id, None)
+            if started is not None:
+                logger.info(
+                    "[nixl-delta-load] request=%s transfer_load_ms=%.3f",
+                    req_id,
+                    (now - started) * 1000.0,
+                )
+        direct_done = done_recving & self._direct_cache_sync_req_ids
+        if direct_done:
+            self._direct_cache_sync_req_ids.difference_update(direct_done)
+            self._direct_cache_sync_finished.update(direct_done)
+        self._deferred_regular_finished_sending.update(done_sending)
+        self._deferred_regular_finished_recving.update(done_recving - direct_done)
+
+    def start_direct_cache_sync(self, metadata: NixlConnectorMetadata) -> None:
+        """Start cache-only D imports without a model-runner invocation."""
+        self._direct_cache_sync_req_ids.update(metadata.reqs_to_recv)
+        self.start_load_kv(metadata)
+
+    def poll_direct_cache_sync(self) -> set[str]:
+        """Return only cache-only completions, preserving normal completions."""
+        self._partition_finished()
+        finished = set(self._direct_cache_sync_finished)
+        self._direct_cache_sync_finished.clear()
+        return finished
+
+    def get_finished(self) -> tuple[set[str], set[str]]:
+        """Hide cache-only completions from the inference scheduler."""
+        self._partition_finished()
+        done_sending = set(self._deferred_regular_finished_sending)
+        done_recving = set(self._deferred_regular_finished_recving)
+        self._deferred_regular_finished_sending.clear()
+        self._deferred_regular_finished_recving.clear()
+        return done_sending, done_recving
+
     def _do_start_push_kv(
         self,
         request_id: str,
         local_block_ids: BlockIds,
         registration_data: dict[str, Any],
     ) -> None:
+        diag_start = monotonic() if _LOG_CONNECTOR_DIAG else 0.0
         required = (
             "source_block_offset",
             "matched_prefix_tokens",
@@ -217,6 +292,7 @@ class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
             source_block_size=self.block_size,
             decode_block_size=int(registration_data["decode_block_size"]),
         )
+        diag_selected = monotonic() if _LOG_CONNECTOR_DIAG else 0.0
         total_source_blocks = sum(len(group) for group in source_groups)
         delta_source_blocks = sum(len(group) for group in selected_source)
         logger.info(
@@ -231,6 +307,18 @@ class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
             selected_source,
             registration_data,
         )
+        if _LOG_CONNECTOR_DIAG:
+            diag_end = monotonic()
+            logger.info(
+                "[NIXL-PUSH-DIAG] request=%s source_blocks=%d delta_blocks=%d "
+                "select_ms=%.3f submit_ms=%.3f total_ms=%.3f",
+                request_id,
+                total_source_blocks,
+                delta_source_blocks,
+                (diag_selected - diag_start) * 1000.0,
+                (diag_end - diag_selected) * 1000.0,
+                (diag_end - diag_start) * 1000.0,
+            )
 
 
 class NixlDeltaPushConnector(NixlPushConnector):

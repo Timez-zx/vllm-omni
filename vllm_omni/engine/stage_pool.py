@@ -48,7 +48,12 @@ logger = init_logger(__name__)
 # record_output_timestamps. Read once at import; the launcher exports it.
 _LOG_AUDIO_CHUNKS = _os.environ.get("VLLM_OMNI_LOG_AUDIO_CHUNKS", "0") not in ("0", "", "false", "False")
 _LOG_INGRESS_DIAG = _os.environ.get("VLLM_OMNI_LOG_HANDOFF_DIAG", "0") not in ("0", "", "false", "False")
-_DIAG_STAGE = _os.environ.get("VLLM_OMNI_DIAG_STAGE")
+_DIAG_STAGE_RAW = _os.environ.get("VLLM_OMNI_DIAG_STAGE")
+_DIAG_STAGES = (
+    None
+    if _DIAG_STAGE_RAW is None
+    else frozenset(stage.strip() for stage in _DIAG_STAGE_RAW.split(",") if stage.strip())
+)
 
 
 @dataclass
@@ -968,7 +973,7 @@ class StagePool:
         params_override: Any = None,
     ) -> int:
         """Submit a stage-entry request into this pool."""
-        ingress_diag = _LOG_INGRESS_DIAG and (_DIAG_STAGE is None or str(self.stage_id) == _DIAG_STAGE)
+        ingress_diag = _LOG_INGRESS_DIAG and (_DIAG_STAGES is None or str(self.stage_id) in _DIAG_STAGES)
         ingress_start = _time.monotonic() if ingress_diag else 0.0
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
         # Direct engine callers may provide plain vLLM SamplingParams.
@@ -1041,6 +1046,26 @@ class StagePool:
                 (ingress_sent - ingress_start) * 1000.0,
             )
         return replica_id
+
+    async def submit_pd_cache_sync(
+        self,
+        request_id: str,
+        request: Any,
+        *,
+        affinity_request_id: str | None = None,
+    ) -> tuple[int, Any]:
+        """Import P KV into one D replica without registering model output state."""
+        replica_id = await self._pick_or_select(
+            request_id,
+            affinity_request_id=affinity_request_id,
+        )
+        client = self.clients[replica_id]
+        if client is None:
+            raise RuntimeError(
+                f"stage {self.stage_id} replica {replica_id} is not attached"
+            )
+        result = await self._llm_client(replica_id).pd_cache_sync_async(request)
+        return replica_id, result
 
     async def submit_update(
         self,

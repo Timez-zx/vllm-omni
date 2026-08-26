@@ -1,32 +1,38 @@
 # Qwen3-Omni continuous AV session
 
-This directory contains the browser client and the only supported capacity
-workload for `thinker-talker-vllm`.
+This directory contains the browser client and the canonical continuous-AV
+capacity workload for the Thinker/Talker branches.
 
 ## Request and state model
 
 The WebSocket is stateful, but engine requests are not:
 
 - the application retains accepted user audio, selected video, text, and the
-  assistant response for the conversation;
+  assistant response in its active conversation window;
 - processed canonical message blocks are retained by the application; each
   turn renders only its new user block and completed assistant block, then
   assembles the full token/media prompt for the finite engine request;
-- each accepted frame triggers or coalesces a silent, finite Thinker-only
-  prefill request over full history plus the cumulative current-turn frames;
-- at most one low-priority arrival prefill runs across all sessions, preventing
-  a multi-user prefill batch without starving cache population whenever any
-  unrelated session is answering;
-- a final query cancels its session's unfinished warm-up; cache population is
-  background work and never blocks a correct full-prompt response;
+- during an input turn, at most one silent finite Thinker-only arrival request
+  runs on P per session. Frames accepted while it runs are coalesced into one latest
+  cumulative snapshot. Frames received during an answer form the next turn's
+  first cumulative request once that answer completes;
+- in P/D mode, that finite warm-up acknowledges the application after P stores
+  its reusable snapshot. D cache-sync continues in lineage order in a
+  request-scoped background task; the warm-up still never enters Talker;
+- P arrivals from one session execute serially and advance one linear KV
+  lineage. D may lag; a final query transfers the cumulative suffix missing
+  from D's actual local prefix. Different sessions may overlap;
+- a final query stops pending coalesced submissions and waits for the one
+  arrival already admitted to P to become P-ready; it does not wait for
+  D-ready before submitting the complete prompt;
 - the final query appends one complete WAV and creates a separate finite
   response request;
 - the Thinker may reuse identical blocks through vLLM prefix caching;
 - cache eviction or a miss changes latency only, never prompt semantics;
-- at 32,768 tokens, ahead of the hard 49,152-token limit, the application uses
-  a logarithmic search to drop complete oldest turns toward 16,384 tokens; the
-  next arrival prefill warms that compacted lineage before it becomes
-  query-critical.
+- when the rendered prompt reaches 49,152 tokens, the application drops older
+  complete turns and rebuilds from the newest two complete raw AV turns plus
+  the current turn. History then grows normally until the next threshold.
+  No summary request is generated.
 
 Frames accepted since the preceding query are consumed by exactly one turn.
 Frames arriving during generation accumulate for the next turn. Similarity and
@@ -39,16 +45,19 @@ warm-ups are independent `output_modalities=["text"]`, prefill-only requests;
 the scheduler does not commit their sampled next token and they cannot invoke
 Talker. Normal Thinker replies
 are capped at 256 tokens so one malformed long answer cannot turn a live voice
-capacity cell into a minutes-long generation test. Final responses use priority
-0 and warm-ups use priority 10.
+capacity cell into a minutes-long generation test. Arrival and final requests
+use the same native FCFS scheduler policy.
 
-## Canonical deployment
+## Canonical deployments
 
-Formal measurements use only
-`benchmarks/thinker_talker/origin_deploy_3gpu.yaml`: GPU 0 is Thinker, GPU 1 is
-Talker, and GPU 2 is Code2Wav. Thinker prefix caching and priority scheduling
-are enabled. The launcher requires FlashInfer for Thinker and uses the safe
-API-side multimodal processor cache mode.
+The non-P/D baseline uses `origin_deploy_3gpu.yaml`: GPU 0 is Thinker, GPU 1 is
+Talker, and GPU 2 is Code2Wav. P/D measurements use
+`pd_deploy_4gpu.yaml`: GPU 0 is Thinker P, GPU 1 is Thinker D, GPU 2 is Talker,
+and GPU 3 is Code2Wav. Never use a three-GPU result to make a P/D claim.
+
+Both deployments enable Thinker prefix caching and native FCFS scheduling. The
+launcher requires FlashInfer for Thinker and uses the safe API-side
+multimodal-processor cache mode.
 
 ```bash
 RESULTS_DIR=/path/to/results \
@@ -99,7 +108,7 @@ python benchmarks/live_agent/web_client/prepare_slurp_davis.py \
   --out /path/to/continuous-av-v1
 ```
 
-Run the capacity ladder:
+Run the non-P/D capacity ladder:
 
 ```bash
 MU_FRAMES_DIR=/home/ubuntu/data/workloads/continuous_av_v1/frames \
@@ -110,6 +119,20 @@ RESULTS_DIR=/home/ubuntu/data/results/finite_request_capacity_<commit> \
 RESULT_PREFIX=finite_request USERS="8 16 32" SEEDS="7 17" \
 TURNS=30 WARMUP_TURNS=2 \
 bash benchmarks/live_agent/web_client/run_av_session_ladder.sh
+```
+
+For P/D, use the pinned four-GPU wrapper rather than overriding the generic
+runner manually:
+
+```bash
+MU_FRAMES_DIR=/home/ubuntu/data/workloads/continuous_av_v1/frames \
+MU_AUDIO_MANIFEST=/home/ubuntu/data/workloads/continuous_av_v1/audio_manifest.jsonl \
+VLLM_OMNI_BIN=/home/ubuntu/miniconda3/envs/omni/bin/vllm-omni \
+MU_PYTHON=/home/ubuntu/miniconda3/envs/omni/bin/python \
+RESULTS_DIR=/home/ubuntu/data/results/pd_capacity_<commit> \
+RESULT_PREFIX=pd_capacity USERS="8 16 32" SEEDS=7 \
+TURNS=30 WARMUP_TURNS=2 \
+bash benchmarks/live_agent/web_client/run_pd_av_session_ladder.sh
 ```
 
 A cell passes only if every measured turn completes, audio-ready-500 p99 is
@@ -123,9 +146,21 @@ Thinker prefix-cache activity:
 
 ```bash
 python benchmarks/live_agent/analysis/verify_run.py RESULT_DIR
+python benchmarks/live_agent/analysis/pd_tail_diagnosis.py RESULT_DIR
 ```
 
 ## Diagnostics
+
+`pd_tail_diagnosis.py` separates the actual Thinker-P cache miss from the
+block-aligned P→D transfer delta. It also reports D-side KV transfer/load,
+scheduler delay, and the query's wait for its session's admitted arrival. Its
+runner-batch attribution additionally requires the server to start with:
+
+```bash
+VLLM_OMNI_LOG_SCHED_DIAG=1
+VLLM_OMNI_LOG_RUNNER_DIAG=1
+VLLM_OMNI_LOG_HANDOFF_DIAG=1
+```
 
 ```bash
 python benchmarks/live_agent/web_client/selftest.py

@@ -16,7 +16,10 @@ stages:
   - stage_id: 0
     max_num_batched_tokens: 32768
     max_num_seqs: 64
-    scheduling_policy: priority
+    # Continuous AV produces many short prefill requests.  Keep P synchronous
+    # by default so a completed batch is exposed before the next one is
+    # scheduled; this reduces query tail from one-step-ahead result deferral.
+    async_scheduling: false
     gpu_memory_utilization: 0.9
     mm_processor_cache_gb: 16
     trust_remote_code: true
@@ -53,7 +56,6 @@ stages:
   - stage_id: 1
     max_num_batched_tokens: 32768
     max_num_seqs: 64
-    scheduling_policy: priority
     gpu_memory_utilization: 0.9
     trust_remote_code: true
     quantization: fp8

@@ -1,5 +1,6 @@
 from threading import Lock
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import yaml
@@ -77,6 +78,42 @@ def test_select_delta_source_blocks_rejects_wrong_layout():
             source_block_size=16,
             decode_block_size=16,
         )
+
+
+def test_worker_tracks_decode_transfer_load_lifetime(monkeypatch):
+    worker = object.__new__(NixlDeltaPushConnectorWorker)
+    worker.shutdown = lambda: None
+    worker._delta_load_started = {}
+    parent_start = Mock()
+    parent_finished = Mock(return_value=({"sent"}, {"recv"}))
+    monkeypatch.setattr(NixlPushConnectorWorker, "start_load_kv", parent_start)
+    monkeypatch.setattr(NixlPushConnectorWorker, "get_finished", parent_finished)
+
+    metadata = SimpleNamespace(reqs_to_recv={"recv": object()})
+    worker.start_load_kv(metadata)
+    assert "recv" in worker._delta_load_started
+
+    assert worker.get_finished() == ({"sent"}, {"recv"})
+    assert worker._delta_load_started == {}
+    parent_start.assert_called_once_with(metadata)
+
+
+def test_direct_cache_sync_completion_is_hidden_from_inference_scheduler(monkeypatch):
+    worker = object.__new__(NixlDeltaPushConnectorWorker)
+    worker.shutdown = lambda: None
+    worker._delta_load_started = {}
+    worker._direct_cache_sync_req_ids = {"cache-only"}
+    worker._direct_cache_sync_finished = set()
+    worker._deferred_regular_finished_sending = set()
+    worker._deferred_regular_finished_recving = set()
+    monkeypatch.setattr(
+        NixlPushConnectorWorker,
+        "get_finished",
+        Mock(return_value=({"sent"}, {"cache-only", "decode"})),
+    )
+
+    assert worker.get_finished() == ({"sent"}, {"decode"})
+    assert worker.poll_direct_cache_sync() == {"cache-only"}
 
 
 def test_scheduler_attaches_delta_offset_to_registration(monkeypatch):

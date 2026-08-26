@@ -19,6 +19,7 @@ from vllm_omni.engine.orchestrator import (
     OrchestratorRequestState,
     _OrchestratorDuplexStagePort,
 )
+from vllm_omni.engine.messages import ErrorMessage, OutputMessage
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.experimental.fullduplex.engine.contracts import (
     DuplexStageRequestContext,
@@ -354,7 +355,150 @@ async def test_async_route_forwards_to_outgoing_only_stage() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pd_prefill_only_route_stops_before_decode() -> None:
+async def test_pd_prefill_only_route_uses_cache_sync_forwarding() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.async_chunk = True
+    orchestrator._pd_pair = (0, 1)
+    orchestrator._pd_kv_params = {}
+    orchestrator._cfg_tracker = SimpleNamespace(is_companion=lambda _request_id: False)
+    orchestrator.stage_pools = [
+        SimpleNamespace(final_output=False),
+        SimpleNamespace(
+            final_output=True,
+            stage_client=SimpleNamespace(final_output_type="text"),
+            _infer_audio_sample_rate=lambda: 24000,
+        ),
+    ]
+    orchestrator.output_async_queue = asyncio.Queue()
+    orchestrator._cleanup_request_ids = AsyncMock()
+    sync_started = asyncio.Event()
+    sync_release = asyncio.Event()
+
+    async def _blocking_cache_sync(*_args, **_kwargs) -> None:
+        sync_started.set()
+        await sync_release.wait()
+
+    orchestrator._forward_to_next_stage = AsyncMock(side_effect=_blocking_cache_sync)
+    req_state = OrchestratorRequestState(
+        request_id="pd-warm",
+        prompt={"prompt_token_ids": [1, 2], "prefill_only": True},
+        sampling_params_list=[SamplingParams(max_tokens=1) for _ in range(2)],
+        final_stage_id=1,
+        final_output_stage_ids={1},
+    )
+    output = SimpleNamespace(
+        request_id=req_state.request_id,
+        finished=True,
+        kv_transfer_params={"remote_request_id": req_state.request_id},
+        multimodal_output={"hidden_states": {"layers": {}}},
+    )
+
+    # Routing must return while this request's cache sync is still pending;
+    # otherwise the one global stage-output loop serializes every session.
+    await orchestrator._route_output(0, 0, output, req_state, None)
+    await asyncio.wait_for(sync_started.wait(), timeout=1.0)
+
+    orchestrator._forward_to_next_stage.assert_awaited_once_with(
+        req_state.request_id,
+        0,
+        output,
+        req_state,
+        src_replica_id=0,
+        pd_cache_sync=True,
+    )
+    assert len(orchestrator._pd_cache_sync_tasks) == 1
+    orchestrator._cleanup_request_ids.assert_not_awaited()
+    p_ready = orchestrator.output_async_queue.get_nowait()
+    assert isinstance(p_ready, OutputMessage)
+    assert p_ready.request_id == req_state.request_id
+    assert p_ready.stage_id == 0
+    assert p_ready.finished is True
+    assert req_state.pd_prefill_ready_emitted is True
+
+    sync_release.set()
+    await asyncio.gather(*orchestrator._pd_cache_sync_tasks.values())
+
+
+@pytest.mark.asyncio
+async def test_pd_cache_sync_is_ordered_per_lineage_without_blocking_p_ready() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._pd_cache_sync_tasks = {}
+    orchestrator._pd_lineage_cache_sync_tails = {}
+    calls: list[str] = []
+    first_started = asyncio.Event()
+    first_release = asyncio.Event()
+    second_started = asyncio.Event()
+
+    async def _forward(request_id, *_args, **_kwargs) -> None:
+        calls.append(request_id)
+        if request_id == "warm-1":
+            first_started.set()
+            await first_release.wait()
+        else:
+            second_started.set()
+
+    orchestrator._forward_to_next_stage = _forward
+    state_1 = OrchestratorRequestState(
+        request_id="warm-1",
+        pd_prefill_lineage_id="session-1",
+        pd_prefill_revision=1,
+    )
+    state_2 = OrchestratorRequestState(
+        request_id="warm-2",
+        pd_prefill_lineage_id="session-1",
+        pd_prefill_revision=2,
+    )
+
+    orchestrator._schedule_pd_cache_sync("warm-1", 0, object(), state_1, src_replica_id=0)
+    orchestrator._schedule_pd_cache_sync("warm-2", 0, object(), state_2, src_replica_id=0)
+
+    await asyncio.wait_for(first_started.wait(), timeout=1.0)
+    await asyncio.sleep(0)
+    assert calls == ["warm-1"]
+    assert not second_started.is_set()
+
+    first_release.set()
+    await asyncio.wait_for(second_started.wait(), timeout=1.0)
+    await asyncio.gather(*list(orchestrator._pd_cache_sync_tasks.values()))
+    assert calls == ["warm-1", "warm-2"]
+
+
+@pytest.mark.asyncio
+async def test_pd_cache_sync_failure_after_p_ready_has_no_second_terminal() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._pd_cache_sync_tasks = {}
+    orchestrator._pd_lineage_cache_sync_tails = {}
+    orchestrator.output_async_queue = asyncio.Queue()
+    orchestrator.request_states = {}
+    orchestrator._cleanup_request_ids = AsyncMock()
+    orchestrator._forward_to_next_stage = AsyncMock(side_effect=RuntimeError("D cache unavailable"))
+    req_state = OrchestratorRequestState(
+        request_id="warm-failed-sync",
+        pd_prefill_lineage_id="session-1",
+        pd_prefill_revision=2,
+        pd_prefill_ready_emitted=True,
+        pd_decode_cache_sync_pending=True,
+    )
+    orchestrator.request_states[req_state.request_id] = req_state
+
+    orchestrator._schedule_pd_cache_sync(
+        req_state.request_id,
+        0,
+        object(),
+        req_state,
+        src_replica_id=0,
+    )
+    await asyncio.gather(*list(orchestrator._pd_cache_sync_tasks.values()))
+
+    assert orchestrator.output_async_queue.empty()
+    orchestrator._cleanup_request_ids.assert_awaited_once_with(
+        [req_state.request_id],
+        abort=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_pd_prefill_only_route_rejects_missing_lineage_snapshot() -> None:
     orchestrator = object.__new__(Orchestrator)
     orchestrator.async_chunk = True
     orchestrator._pd_pair = (0, 1)
@@ -372,11 +516,14 @@ async def test_pd_prefill_only_route_stops_before_decode() -> None:
     orchestrator._cleanup_request_ids = AsyncMock()
     orchestrator._forward_to_next_stage = AsyncMock()
     req_state = OrchestratorRequestState(
-        request_id="pd-warm",
+        request_id="pd-warm-missing",
         prompt={"prompt_token_ids": [1, 2], "prefill_only": True},
         sampling_params_list=[SamplingParams(max_tokens=1) for _ in range(2)],
         final_stage_id=1,
         final_output_stage_ids={1},
+        pd_prefill_lineage_id="session-1",
+        pd_prefill_revision=1,
+        pd_prefill_prompt_token_ids=(1, 2),
     )
     output = SimpleNamespace(
         request_id=req_state.request_id,
@@ -390,9 +537,8 @@ async def test_pd_prefill_only_route_stops_before_decode() -> None:
     orchestrator._forward_to_next_stage.assert_not_awaited()
     orchestrator._cleanup_request_ids.assert_awaited_once_with([req_state.request_id])
     routed = orchestrator.output_async_queue.get_nowait()
-    assert routed.stage_id == 1
-    assert routed.finished is True
-    assert routed.engine_outputs.outputs[0].text == ""
+    assert isinstance(routed, ErrorMessage)
+    assert routed.error_type == "PDSnapshotError"
 
 
 @pytest.mark.asyncio

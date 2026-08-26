@@ -1445,10 +1445,19 @@ class Qwen3OmniMoeForConditionalGeneration(
             tts_pad_embed.device
         )  # [t, d]
 
+        assistant_prefix = assistant_hidden[:3]
+        if assistant_prefix.shape[0] < 3:
+            assistant_prefix = torch.cat(
+                (
+                    assistant_prefix,
+                    assistant_hidden.new_zeros((3 - assistant_prefix.shape[0], assistant_hidden.shape[1])),
+                ),
+                dim=0,
+            )
         # [3 tokens] + [4 pad] + [1 BOS] + [1 first text] = 9 tokens
         assistant_text_hidden = torch.cat(
             (
-                assistant_hidden[:3],
+                assistant_prefix,
                 tts_pad_embed.expand(4, -1),
                 tts_bos_embed,
                 assistant_hidden[3:4]

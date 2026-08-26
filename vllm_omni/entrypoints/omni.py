@@ -148,11 +148,13 @@ class Omni(OmniBase):
                 pd_pair = self._get_pd_separation_pair()
                 if pd_pair is not None:
                     p_id = pd_pair[0]
-                    prefill_only = isinstance(prompt, dict) and prompt.get("prefill_only") is True
                     req_sp_list[p_id] = self._prepare_prefill_sampling_params(
                         req_id,
                         req_sp_list[p_id],
-                        transfer_kv=not prefill_only,
+                        # Keep D's disposable prefix lineage at the same
+                        # committed revision as P before acknowledging a
+                        # finite arrival-prefill request.
+                        transfer_kv=True,
                     )
 
                 self.engine.add_request(

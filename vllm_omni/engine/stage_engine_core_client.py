@@ -292,6 +292,17 @@ class StageEngineCoreClientBase(StageClientBase):
         )
         await super().add_request_async(request)
 
+    async def pd_cache_sync_async(self, request: EngineCoreRequest) -> Any:
+        """Run D's cache-only P/D import control operation."""
+        logger.debug(
+            "[%s] stage-%s [rep-%s] P/D cache sync: %s",
+            self.__class__.__name__,
+            self.stage_id,
+            self.replica_id,
+            request.request_id,
+        )
+        return await self.call_utility_async("start_pd_cache_sync", request)
+
     # ==================== Stage Methods ====================
 
     @staticmethod

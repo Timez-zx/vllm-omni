@@ -17,8 +17,6 @@ stages:
   - stage_id: 0
     max_num_batched_tokens: 32768
     max_num_seqs: 64
-    # Final responses use priority 0; silent arrival warm-ups use priority 10.
-    scheduling_policy: priority
     gpu_memory_utilization: 0.9
     # Full-history finite requests reuse processed media by UUID. Keep the
     # bounded eight-user working set in the API-side processor cache; the

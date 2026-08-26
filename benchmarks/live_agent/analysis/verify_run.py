@@ -19,6 +19,10 @@ FLAGS_PY = REPO_ROOT / "vllm_omni/core/sched/runtime_flags.py"
 TRACES = {
     "VLLM_OMNI_MAILBOX": (re.compile(r"shm_mailbox_connector|ShmMailboxConnector"), "SHM mailbox"),
 }
+CANONICAL_DEPLOYS = {
+    "origin_deploy_3gpu.yaml": {"0", "1", "2"},
+    "pd_deploy_4gpu.yaml": {"0", "1", "2", "3"},
+}
 
 
 def defaults() -> dict[str, str]:
@@ -47,9 +51,12 @@ def check(result_dir: Path) -> int:
     )
 
     bad = 0
-    expected_deploy = os.environ.get("MU_EXPECTED_DEPLOY_BASENAME", "origin_deploy_3gpu.yaml")
-    if deploy.name != expected_deploy:
+    expected_deploy = os.environ.get("MU_EXPECTED_DEPLOY_BASENAME")
+    if expected_deploy is not None and deploy.name != expected_deploy:
         print(f"   !! unexpected deploy: {deploy}")
+        bad += 1
+    elif expected_deploy is None and deploy.name not in CANONICAL_DEPLOYS:
+        print(f"   !! unsupported deploy: {deploy}")
         bad += 1
 
     if summary.get("workload_schema") != 4:
@@ -75,7 +82,12 @@ def check(result_dir: Path) -> int:
 
     stages = set(re.findall(r"StageEngineCoreProc_stage(\d+)_replica0 pid=\d+", log))
     print(f"   stage processes: {sorted(stages)}")
-    expected_stages = set(os.environ.get("MU_EXPECTED_STAGE_IDS", "0,1,2").split(","))
+    expected_stage_ids = os.environ.get("MU_EXPECTED_STAGE_IDS")
+    expected_stages = (
+        set(expected_stage_ids.split(","))
+        if expected_stage_ids is not None
+        else CANONICAL_DEPLOYS.get(deploy.name, set())
+    )
     if stages != expected_stages:
         print(f"   !! expected separate stage processes {sorted(expected_stages)}")
         bad += 1

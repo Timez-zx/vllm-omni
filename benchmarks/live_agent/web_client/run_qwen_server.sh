@@ -99,11 +99,7 @@ loaded = Path(vllm_omni.__file__).resolve()
 assert repo in loaded.parents, f"loaded {loaded}, expected checkout under {repo}"
 required = {
     "context_window_trigger_tokens",
-    "context_window_target_tokens",
-    "context_window_compaction_headroom_tokens",
-    "enable_history_summary",
-    "history_summary_recent_turns",
-    "history_summary_max_tokens",
+    "context_window_retained_turns",
     "max_frame_width",
     "frame_filter_min_gap",
 }

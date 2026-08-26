@@ -1,7 +1,10 @@
 from vllm.multimodal.inputs import MultiModalBatchedField, MultiModalFieldElem, MultiModalKwargsItem
 from vllm.multimodal.registry import MultiModalRegistry
 
-from vllm_omni.patch import _extract_mm_layout_values, _safe_mm_processor_cache_type
+from vllm_omni.patch import (
+    _extract_mm_layout_values,
+    _safe_mm_processor_cache_type,
+)
 
 
 def test_safe_mm_processor_cache_switches_lru_to_processor_only(monkeypatch):

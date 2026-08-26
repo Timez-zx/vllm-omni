@@ -75,11 +75,7 @@ def main() -> int:
 
     wanted = {
         "context_window_trigger_tokens",
-        "context_window_target_tokens",
-        "context_window_compaction_headroom_tokens",
-        "enable_history_summary",
-        "history_summary_recent_turns",
-        "history_summary_max_tokens",
+        "context_window_retained_turns",
         "max_frame_width",
         "max_frame_height",
         "enable_frame_filter",

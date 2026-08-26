@@ -468,7 +468,6 @@ class AsyncOmni(EngineClient, OmniBase):
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         arrival_time: float | None = None,
-        _request_admitted_event: asyncio.Event | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -588,11 +587,14 @@ class AsyncOmni(EngineClient, OmniBase):
             pd_pair = self._get_pd_separation_pair()
             if pd_pair is not None:
                 p_id = pd_pair[0]
-                prefill_only = isinstance(prompt, dict) and prompt.get("prefill_only") is True
                 req_sp_list[p_id] = self._prepare_prefill_sampling_params(
                     request_id,
                     req_sp_list[p_id],
-                    transfer_kv=not prefill_only,
+                    # A finite arrival-prefill warms P synchronously and D in
+                    # the background.  The client-visible completion marks P
+                    # snapshot readiness; D may import the same disposable KV
+                    # revision after the application starts its next request.
+                    transfer_kv=True,
                 )
 
             # Add request(s) to stage 0. For streaming inputs, submit
@@ -617,8 +619,6 @@ class AsyncOmni(EngineClient, OmniBase):
                     arrival_time=wall_start_ts,
                     priority=priority,
                 )
-            if _request_admitted_event is not None:
-                _request_admitted_event.set()
             submit_ts = time.time()
             req_state.metrics.stage_first_ts[0] = submit_ts
             req_start_ts[request_id] = submit_ts
