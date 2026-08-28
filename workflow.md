@@ -209,7 +209,36 @@ Warmed one-user, 12-slot AV result:
 | Deadline misses | 0 |
 | P-to-D delta load | 54–81 ms |
 
-Every slot traversed P, D, Talker, and Code2Wav and returned a `[16,6]` codec tensor plus 10,965 24 kHz audio samples. The first request pays NIXL handshake, hidden-cache initialization, and shape JIT, so it is not a steady-state latency sample. This result validates the four-stage deployment, delta KV handoff, and long-session lineage; multi-user P/D capacity has not yet been measured.
+Every slot traversed P, D, Talker, and Code2Wav and returned a `[16,6]` codec tensor plus 10,965 24 kHz audio samples. The first request pays NIXL handshake, hidden-cache initialization, and shape JIT, so it is not a steady-state latency sample.
+
+### Inherited P/D optimizations
+
+`duplexomni-pd` is based on the latest `thinker-talker-pd` commit and already inherits the generic delta-KV, cross-layer block packing, early D registration during P compute, dedicated P-output worker, shared-tensor IPC, off-event-loop snapshot compaction, and nonblocking stage-output consumption optimizations. Qwen-specific arrival admission, `async_chunk`, and summary compaction were not copied; DuplexOmni uses fixed 480 ms slots and 6144-token epoch compaction.
+
+The capacity analyzer now understands the four-stage P/D layout and reports Thinker-P, Thinker-D, Talker, and Code2Wav separately instead of mislabeling D as Talker.
+
+### P/D capacity
+
+The formal run used 60 slots/user, continuous audio plus one image per slot, independent random phases, distinct cross-user media, and a warmed engine. The frame filter accepted 32/60 frames per user under the same policy. The SLO and collapse definitions are unchanged from Phase 4.
+
+| Users | E2E p50/p99 | Request p50/p99 | App queue p99 | Miss | Queue-p50 growth | Result |
+|---:|---:|---:|---:|---:|---:|---|
+| 1 | 386/484 ms | 382/479 ms | 0.47 ms | 3.3% | 0 ms | Just outside strict SLO |
+| 2 | 397/515 ms | 393/511 ms | 0.82 ms | 10.8% | 0 ms | Stable throughput, SLO failure |
+| 3 | 519/942 ms | 505/696 ms | 413 ms | 67.8% | 0 ms | Service-time knee |
+| 4 | 748/1463 ms | 583/840 ms | 823 ms | 94.6% | 342 ms | Material backlog |
+| 5 | 2017/3367 ms | 644/856 ms | 2751 ms | 98.0% | 2153 ms | Throughput collapse |
+
+Under the predefined `p99 <= 480 ms and miss <= 1%` rule, no 60-slot point passes strict realtime; one user misses the p99 bound by about 4 ms. Throughput collapse begins at five users. Four is the highest point below the formal collapse threshold, but is not realtime-usable.
+
+| Engine stage | 1 user p50/p99 | 5 users p50/p99 |
+|---|---:|---:|
+| Thinker-P | 69/111 ms | 95/183 ms |
+| Thinker-D | 205/242 ms | 374/544 ms |
+| Talker | 73/82 ms | 104/309 ms |
+| Code2Wav | 9/10 ms | 9/28 ms |
+
+Thinker-D is the first capacity limit. Every user generates about 24 Thinker tokens per 480 ms slot, or roughly 50 continuously decoded tokens/s/user. At five users, D GPU busy p50/p95 is 70%/80% versus 39%/74% on P; SM-active p95 is only about 46%/49%, so neither GPU is simply compute- or memory-bandwidth-saturated. The tail reflects the service-rate limit formed by continuous decode, fixed per-request scheduling costs, and P/D pipeline waiting. Delta-KV handoff and Code2Wav are not the primary bottlenecks. The five-user queue starts growing before context compaction, so compaction changes local tails but does not cause the collapse.
 
 ## Recovery map
 

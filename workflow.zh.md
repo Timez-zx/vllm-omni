@@ -209,7 +209,36 @@ warmed 单用户 12-slot AV 结果：
 | Deadline miss | 0 |
 | P→D delta load | 54–81 ms |
 
-所有 slot 都经过 P、D、Talker 和 Code2Wav；每轮返回 `[16,6]` codec 和 10,965 个 24 kHz audio samples。首请求包含 NIXL 握手、hidden cache 初始化和 shape JIT，不能计入稳态延迟。当前结论只证明四阶段部署、delta KV handoff 和长 session lineage 正确；尚未测量多用户 P/D 容量。
+所有 slot 都经过 P、D、Talker 和 Code2Wav；每轮返回 `[16,6]` codec 和 10,965 个 24 kHz audio samples。首请求包含 NIXL 握手、hidden cache 初始化和 shape JIT，不能计入稳态延迟。
+
+### P/D 优化继承
+
+`duplexomni-pd` 基于 `thinker-talker-pd` 的最新提交，已直接继承以下通用优化：delta KV、跨 layer block packing、P 计算期间提前注册 D、独立 P 输出 worker、shared-tensor IPC、event-loop 外 snapshot 压缩，以及非阻塞 stage 输出消费。没有移植 Qwen 专用的 arrival admission、`async_chunk` 和 summary 压缩；DuplexOmni 使用固定 480 ms slot 和 6144-token epoch compaction。
+
+容量分析器已适配四阶段 P/D 指标，分别报告 Thinker-P、Thinker-D、Talker 和 Code2Wav，避免把 D 误标为 Talker。
+
+### P/D 容量
+
+正式测量使用 60 slots/user、连续 audio + 每 slot 一张图、随机用户相位、不同用户媒体和 warmed engine。frame filter 每用户接收 32/60 张图；所有用户采用相同规则。SLO 和 collapse 判据沿用阶段四。
+
+| 用户 | E2E p50/p99 | Request p50/p99 | App queue p99 | Miss | Queue p50 增长 | 结论 |
+|---:|---:|---:|---:|---:|---:|---|
+| 1 | 386/484 ms | 382/479 ms | 0.47 ms | 3.3% | 0 ms | 严格 SLO 边界外 |
+| 2 | 397/515 ms | 393/511 ms | 0.82 ms | 10.8% | 0 ms | 吞吐稳定，SLO 失败 |
+| 3 | 519/942 ms | 505/696 ms | 413 ms | 67.8% | 0 ms | 服务时间拐点 |
+| 4 | 748/1463 ms | 583/840 ms | 823 ms | 94.6% | 342 ms | 明显积压 |
+| 5 | 2017/3367 ms | 644/856 ms | 2751 ms | 98.0% | 2153 ms | throughput collapse |
+
+按预先定义的 `p99 <= 480 ms 且 miss <= 1%`，60-slot 长测没有通过严格实时标准的容量点；1 用户仅超出约 4 ms。吞吐崩溃发生在 5 用户，4 用户是未触发 collapse 判据的最高点，但已不具备实时可用性。
+
+| Engine stage | 1 user p50/p99 | 5 users p50/p99 |
+|---|---:|---:|
+| Thinker-P | 69/111 ms | 95/183 ms |
+| Thinker-D | 205/242 ms | 374/544 ms |
+| Talker | 73/82 ms | 104/309 ms |
+| Code2Wav | 9/10 ms | 9/28 ms |
+
+容量首先受 Thinker-D 限制：每用户每 480 ms 都生成约 24 个 Thinker token，约等于 50 tokens/s/user 的持续 decode。5 用户时 D GPU busy p50/p95 为 70%/80%，P 为 39%/74%；两者 SM-active p95 仅约 46%/49%，因此不是单纯的算力或显存带宽打满。当前 tail 是持续 decode、短 finite request 的固定调度成本和 P/D pipeline 等待共同形成的服务率上限；P→D delta handoff 和 Code2Wav 不是第一瓶颈。5 用户的队列在 context compaction 前已经持续增长，压缩只会改变局部 tail，不是 collapse 根因。
 
 ## 快速恢复入口
 

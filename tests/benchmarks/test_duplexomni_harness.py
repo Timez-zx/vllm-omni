@@ -187,3 +187,50 @@ def test_multi_user_media_is_distinct_without_changing_payload_shape() -> None:
     assert len(pcm_user_0) == len(pcm_user_1) == len(pcm)
     assert pcm_user_0 != pcm_user_1
     assert image_user_0 != image_user_1
+
+
+def test_capacity_analysis_maps_pd_stages_without_mislabeling_talker() -> None:
+    analysis = _module("duplexomni_capacity_pd", "analyze_capacity.py")
+    record = {
+        "request_latency_ms": 220.0,
+        "metrics": {
+            "stage_metrics": {
+                "0": {
+                    "serving_time_to_first_output_ms": 50.0,
+                    "stage_gen_time_ms": 50.0,
+                    "vllm_ttft_ms": 50.0,
+                },
+                "1": {
+                    "serving_time_to_first_output_ms": 100.0,
+                    "stage_gen_time_ms": 70.0,
+                    "vllm_ttft_ms": 20.0,
+                    "vllm_tpot_ms": 7.0,
+                },
+                "2": {
+                    "serving_time_to_first_output_ms": 180.0,
+                    "stage_gen_time_ms": 60.0,
+                    "vllm_ttft_ms": 15.0,
+                    "vllm_tpot_ms": 9.0,
+                },
+                "3": {
+                    "serving_time_to_first_output_ms": 210.0,
+                    "stage_gen_time_ms": 10.0,
+                },
+            }
+        },
+    }
+
+    assert analysis._is_pd_disaggregated([record]) is True
+    components = analysis._component_values([record], pd_disaggregated=True)
+
+    assert components["thinker_to_first"] == [100.0]
+    assert components["thinker_p_engine"] == [50.0]
+    assert components["thinker_d_engine"] == [70.0]
+    assert components["thinker_engine"] == [120.0]
+    assert components["talker_engine"] == [60.0]
+    assert components["code2wav_engine"] == [10.0]
+    assert components["talker_added"] == [80.0]
+    assert components["code2wav_added"] == [30.0]
+    assert components["api_return_added"] == [10.0]
+    assert components["thinker_ttft"] == [20.0]
+    assert components["talker_ttft"] == [15.0]

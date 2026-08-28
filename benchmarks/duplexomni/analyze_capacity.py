@@ -44,7 +44,18 @@ def _stage_value(record: dict[str, Any], stage: int, field: str) -> float | None
     return _number(stage_metrics.get(field))
 
 
-def _component_values(records: list[dict[str, Any]]) -> dict[str, list[float]]:
+def _is_pd_disaggregated(records: list[dict[str, Any]]) -> bool:
+    return any(
+        "3" in ((record.get("metrics") or {}).get("stage_metrics") or {})
+        for record in records
+    )
+
+
+def _component_values(
+    records: list[dict[str, Any]],
+    *,
+    pd_disaggregated: bool,
+) -> dict[str, list[float]]:
     result: dict[str, list[float]] = {
         "thinker_to_first": [],
         "thinker_pre_submit_lower_bound": [],
@@ -57,47 +68,92 @@ def _component_values(records: list[dict[str, Any]]) -> dict[str, list[float]]:
         "client_json_decode": [],
         "client_request_mib": [],
         "thinker_engine": [],
+        "thinker_p_engine": [],
+        "thinker_d_engine": [],
         "talker_engine": [],
         "code2wav_engine": [],
         "thinker_ttft": [],
+        "thinker_p_ttft": [],
+        "thinker_d_ttft": [],
         "talker_ttft": [],
         "thinker_tpot": [],
         "talker_tpot": [],
     }
+    thinker_stage = 1 if pd_disaggregated else 0
+    talker_stage = 2 if pd_disaggregated else 1
+    code2wav_stage = 3 if pd_disaggregated else 2
     for record in records:
-        stage0 = _stage_value(record, 0, "serving_time_to_first_output_ms")
-        stage1 = _stage_value(record, 1, "serving_time_to_first_output_ms")
-        stage2 = _stage_value(record, 2, "serving_time_to_first_output_ms")
+        thinker_first = _stage_value(
+            record,
+            thinker_stage,
+            "serving_time_to_first_output_ms",
+        )
+        talker_first = _stage_value(
+            record,
+            talker_stage,
+            "serving_time_to_first_output_ms",
+        )
+        code2wav_first = _stage_value(
+            record,
+            code2wav_stage,
+            "serving_time_to_first_output_ms",
+        )
         request = _number(record.get("request_latency_ms"))
         stage_engine_values: list[float] = []
-        if stage0 is not None:
-            result["thinker_to_first"].append(stage0)
-        if stage0 is not None and stage1 is not None:
-            result["talker_added"].append(max(0.0, stage1 - stage0))
-        if stage1 is not None and stage2 is not None:
-            result["code2wav_added"].append(max(0.0, stage2 - stage1))
-        if stage2 is not None and request is not None:
-            result["api_return_added"].append(max(0.0, request - stage2))
-        for stage, name in ((0, "thinker"), (1, "talker"), (2, "code2wav")):
+        if thinker_first is not None:
+            result["thinker_to_first"].append(thinker_first)
+        if thinker_first is not None and talker_first is not None:
+            result["talker_added"].append(max(0.0, talker_first - thinker_first))
+        if talker_first is not None and code2wav_first is not None:
+            result["code2wav_added"].append(max(0.0, code2wav_first - talker_first))
+        if code2wav_first is not None and request is not None:
+            result["api_return_added"].append(max(0.0, request - code2wav_first))
+
+        stage_layout = (
+            ((0, "thinker_p"), (1, "thinker_d"), (2, "talker"), (3, "code2wav"))
+            if pd_disaggregated
+            else ((0, "thinker"), (1, "talker"), (2, "code2wav"))
+        )
+        thinker_engine_parts: list[float] = []
+        for stage, name in stage_layout:
             engine = _stage_value(record, stage, "stage_gen_time_ms")
             if engine is not None:
                 result[f"{name}_engine"].append(engine)
                 stage_engine_values.append(engine)
-                if stage == 0 and stage0 is not None:
+                if name in {"thinker", "thinker_p", "thinker_d"}:
+                    thinker_engine_parts.append(engine)
+                if not pd_disaggregated and stage == 0 and thinker_first is not None:
                     # Stage generation runs from stage submission to final
                     # output, whereas serving-to-first starts at request
                     # arrival. Subtracting the longer submit-to-final interval
                     # therefore gives a conservative lower bound on work or
                     # waiting before stage submission.
-                    result["thinker_pre_submit_lower_bound"].append(max(0.0, stage0 - engine))
-        for stage, name in ((0, "thinker"), (1, "talker")):
+                    result["thinker_pre_submit_lower_bound"].append(
+                        max(0.0, thinker_first - engine)
+                    )
+        if pd_disaggregated and len(thinker_engine_parts) == 2:
+            result["thinker_engine"].append(sum(thinker_engine_parts))
+
+        ttft_layout = (
+            ((0, "thinker_p"), (1, "thinker_d"), (2, "talker"))
+            if pd_disaggregated
+            else ((0, "thinker"), (1, "talker"))
+        )
+        for stage, name in ttft_layout:
             ttft = _stage_value(record, stage, "vllm_ttft_ms")
             if ttft is not None:
                 result[f"{name}_ttft"].append(ttft)
             tpot = _stage_value(record, stage, "vllm_tpot_ms")
             if tpot is not None:
-                result[f"{name}_tpot"].append(tpot)
-        if request is not None and len(stage_engine_values) == 3:
+                if name == "thinker_d":
+                    result["thinker_tpot"].append(tpot)
+                elif name in {"thinker", "talker"}:
+                    result[f"{name}_tpot"].append(tpot)
+        if pd_disaggregated:
+            d_ttft = _stage_value(record, 1, "vllm_ttft_ms")
+            if d_ttft is not None:
+                result["thinker_ttft"].append(d_ttft)
+        if request is not None and len(stage_engine_values) == len(stage_layout):
             result["non_stage_total"].append(max(0.0, request - sum(stage_engine_values)))
         client_timing = record.get("client_timing") or {}
         for field, name in (
@@ -147,6 +203,7 @@ def _gpu_summary(path: Path, start: float, end: float) -> dict[str, Any]:
 def analyze(label: str, directory: Path) -> dict[str, Any]:
     manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
     records = [record for session in manifest["sessions"] for record in session["records"]]
+    pd_disaggregated = _is_pd_disaggregated(records)
     e2e = [float(record["e2e_slot_latency_ms"]) for record in records]
     request = [float(record["request_latency_ms"]) for record in records]
     queue = [float(record["app_queue_ms"]) for record in records]
@@ -156,7 +213,7 @@ def analyze(label: str, directory: Path) -> dict[str, Any]:
     first_queue = [float(record["app_queue_ms"]) for record in records if int(record["slot"]) < third]
     last_queue = [float(record["app_queue_ms"]) for record in records if int(record["slot"]) >= slots - third]
     queue_growth = (_percentile(last_queue, 50) or 0.0) - (_percentile(first_queue, 50) or 0.0)
-    components = _component_values(records)
+    components = _component_values(records, pd_disaggregated=pd_disaggregated)
     start = float(manifest["benchmark_start_monotonic_s"])
     end = start + max(float(record["response_ready_ms"]) for record in records) / 1000.0
     request_p50 = _percentile(request, 50) or 0.0
@@ -165,6 +222,7 @@ def analyze(label: str, directory: Path) -> dict[str, Any]:
         "users": manifest["users"],
         "slots_per_user": slots,
         "records": len(records),
+        "pd_disaggregated": pd_disaggregated,
         "prompt_tokens_max": max(int(record["usage"].get("prompt_tokens") or 0) for record in records),
         "e2e_ms": _distribution(e2e),
         "request_ms": _distribution(request),
