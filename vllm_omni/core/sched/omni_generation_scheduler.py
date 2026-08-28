@@ -389,6 +389,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     model_intermediate_buffer=(
                         getattr(request, "model_intermediate_buffer", None) if request else None
                     ),
+                    pd_prefill_payload=(getattr(request, "pd_prefill_payload", None) if request else None),
                 )
                 new_list.append(omni_nr)
 

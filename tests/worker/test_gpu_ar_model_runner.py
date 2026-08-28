@@ -135,6 +135,36 @@ def test_resolve_pooler_payload_req_ids_downstream_stage_uses_filtered_requests(
     assert payload_req_ids == ["r2"]
 
 
+def test_pd_prefill_only_request_still_emits_snapshot_payload() -> None:
+    runner = object.__new__(GPUARModelRunner)
+    runner.model_intermediate_buffer = {
+        "warm": {
+            "omni_final_stage_id": 0,
+            "meta": {"pd_prefill_snapshot_mode": "delta"},
+        }
+    }
+    runner.requests = {"warm": SimpleNamespace(additional_information_cpu={"omni_final_stage_id": 0})}
+    runner._downstream_payload_cache = {"warm": False}
+
+    assert runner._request_needs_downstream_stage_payload("warm") is True
+
+
+def test_pd_snapshot_payload_marker_falls_back_to_request_state() -> None:
+    runner = object.__new__(GPUARModelRunner)
+    runner.model_intermediate_buffer = {"warm": {"omni_final_stage_id": 0}}
+    runner.requests = {
+        "warm": SimpleNamespace(
+            additional_information_cpu={
+                "omni_final_stage_id": 0,
+                "meta": {"pd_prefill_snapshot_mode": "full"},
+            }
+        )
+    }
+    runner._downstream_payload_cache = {}
+
+    assert runner._request_needs_downstream_stage_payload("warm") is True
+
+
 def test_sparse_mm_req_ids_requires_sparse_audio_marker():
     assert GPUARModelRunner._sparse_mm_req_ids({"meta": {"req_id": ["r1"]}}) is None
     assert GPUARModelRunner._sparse_mm_req_ids({"meta.req_id": ["r1"]}) is None
@@ -466,8 +496,14 @@ def test_async_omni_output_guard_requires_safe_conditions():
 
     runner.omni_prefix_cache = object()
     assert not GPUARModelRunner._should_use_async_omni_output(runner)
+    assert GPUARModelRunner._should_use_async_omni_output(runner, allow_pd_delta=True)
+
+    runner.model_config.async_chunk = False
+    assert not GPUARModelRunner._should_use_async_omni_output(runner)
+    assert GPUARModelRunner._should_use_async_omni_output(runner, allow_pd_delta=True)
 
     runner.omni_prefix_cache = None
+    runner.model_config.async_chunk = True
     runner.model.has_postprocess = True
     assert not GPUARModelRunner._should_use_async_omni_output(runner)
 
@@ -567,6 +603,7 @@ def test_build_omni_output_splits_mm_by_hidden_len_when_scheduled_is_padded(monk
     """Thinker mm rows align to hidden_states.shape[0], not padded scheduled count."""
     runner = _make_async_output_runner(engine_output_type="latent")
     runner.model.omni_pooler_payload_include_hidden = False
+    runner.model.supports_delta_prefix_multimodal_outputs = True
     runner._async_chunk = False
     runner.requests = {"r1": object(), "r2": object(), "r3": object()}
 
@@ -607,6 +644,7 @@ def test_build_omni_output_splits_mm_by_hidden_len_when_scheduled_is_padded(monk
     assert torch.equal(output.inter_stage_outputs[0]["hidden_states.layer_0"], layers[0:1])
     assert torch.equal(output.inter_stage_outputs[1]["hidden_states.layer_0"], layers[1:2])
     assert torch.equal(output.inter_stage_outputs[2]["hidden_states.layer_0"], layers[2:3])
+    assert all(payload["hidden_states.layer_0"].is_shared() for payload in output.inter_stage_outputs)
 
 
 def test_async_snapshot_payload_omits_hidden_when_model_opts_out():
@@ -805,6 +843,263 @@ def test_build_omni_output_falls_back_to_mm_cpu_without_prefix_merge(monkeypatch
     assert torch.equal(output.inter_stage_outputs[0]["codes.audio"], codes[0:1])
     assert torch.equal(output.inter_stage_outputs[1]["codes.audio"], codes[1:2])
     assert output.multimodal_outputs is None
+
+
+def test_prefix_tensor_cache_is_skipped_when_model_consumes_only_scheduled_tail(monkeypatch):
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = SimpleNamespace(
+        requires_full_prefix_cached_hidden_states=False,
+        requires_full_prefix_cached_multimodal_outputs=False,
+    )
+
+    class PrefixCache:
+        def update_omni_tensor_prefix_cache(self, **kwargs):
+            raise AssertionError("tail-only model must not write the Omni tensor side-cache")
+
+        def has_prefix_cached_new_req_ids(self):
+            raise AssertionError("tail-only model must not inspect cached prefix tensors")
+
+    runner.omni_prefix_cache = PrefixCache()
+    runner.input_batch = SimpleNamespace()
+    monkeypatch.setattr(
+        "vllm_omni.worker.gpu_ar_model_runner.get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True),
+    )
+
+    # Both paths short-circuit before touching block-table slot mappings or
+    # cached tensors. Native engine KV prefix caching is outside this helper.
+    runner._maybe_update_prefix_cache(
+        hidden_states=torch.ones((1, 2)),
+        hidden_states_cpu=None,
+        multimodal_outputs={"hidden_states.layer_0": torch.ones((1, 2))},
+        num_tokens_unpadded=1,
+        num_tokens_padded=1,
+    )
+    combined = runner._maybe_get_combined_prefix_cache_tensors(
+        hidden_states=torch.ones((1, 2)),
+        hidden_states_cpu=None,
+        multimodal_outputs={"hidden_states.layer_0": torch.ones((1, 2))},
+        num_scheduled_tokens={"r1": 1},
+    )
+
+    assert combined == (None, None)
+
+
+def test_pd_prefill_delta_mode_skips_full_prefix_multimodal_merge() -> None:
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = SimpleNamespace(supports_delta_prefix_multimodal_outputs=True)
+    runner.input_batch = SimpleNamespace(
+        req_ids=["r1", "r2"],
+        req_id_to_index={"r1": 0, "r2": 1},
+        num_computed_tokens_cpu=torch.tensor([256, 256]),
+    )
+    runner.model_intermediate_buffer = {
+        "r1": {"meta": {"pd_prefill_snapshot_mode": "delta", "pd_prefill_snapshot_parent_rows": 512}},
+        "r2": {"meta": {"pd_prefill_snapshot_mode": "delta", "pd_prefill_snapshot_parent_rows": 512}},
+    }
+    runner._pd_new_request_prefix_rows = {"r1": 256, "r2": 256}
+
+    assert runner._batch_needs_full_prefix_multimodal_outputs() is False
+    # Advancing within the same chunked request is not a larger native
+    # prefix hit and must not enable full-prefix reconstruction.
+    runner.input_batch.num_computed_tokens_cpu[1] = 528
+    runner._pd_new_request_prefix_rows = {}
+    assert runner._batch_needs_full_prefix_multimodal_outputs() is False
+    # A newly admitted request whose native hit extends past the exact parent
+    # does need the cached gap reconstructed once.
+    runner._pd_new_request_prefix_rows = {"r2": 528}
+    assert runner._batch_needs_full_prefix_multimodal_outputs() is True
+
+
+def test_pd_prefill_longer_global_hit_returns_only_gap_after_parent() -> None:
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = SimpleNamespace(supports_delta_prefix_multimodal_outputs=True)
+    runner.model_intermediate_buffer = {
+        "r1": {"meta": {"pd_prefill_snapshot_mode": "delta", "pd_prefill_snapshot_parent_rows": 4}},
+    }
+    layer_0 = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    layer_24 = layer_0 + 100
+    tts = torch.ones((1, 4))
+
+    payload = runner._build_combined_prefix_cache_mm_payload(
+        {
+            "hidden_states.layer_0": {"r1": layer_0},
+            "hidden_states.layer_24": {"r1": layer_24},
+            "embed.tts_bos": {"r1": tts},
+        },
+        rid="r1",
+        idx=0,
+    )
+
+    torch.testing.assert_close(payload["hidden_states.layer_0"], layer_0[4:])
+    torch.testing.assert_close(payload["hidden_states.layer_24"], layer_24[4:])
+    assert payload["hidden_states.layer_0"].is_shared()
+    assert payload["hidden_states.layer_24"].is_shared()
+    assert payload["embed.tts_bos"] is tts
+
+
+def test_pd_prefix_output_decision_is_snapshotted_before_request_cleanup() -> None:
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = SimpleNamespace(supports_delta_prefix_multimodal_outputs=True)
+    runner.input_batch = SimpleNamespace(
+        req_ids=["r1"],
+        req_id_to_index={"r1": 0},
+        num_computed_tokens_cpu=torch.tensor([8]),
+    )
+    runner.model_intermediate_buffer = {
+        "r1": {
+            "meta": {
+                "pd_prefill_snapshot_mode": "delta",
+                "pd_prefill_snapshot_parent_rows": 4,
+            }
+        },
+    }
+    runner._pd_new_request_prefix_rows = {"r1": 8}
+
+    parent_rows, trim_rows, needs_full_prefix = runner._snapshot_pd_prefix_multimodal_requirements()
+    assert parent_rows == {"r1": 4}
+    assert trim_rows == {"r1": 4}
+    assert needs_full_prefix == {"r1"}
+
+    # Model the async output-builder race: normal completion has already
+    # removed both the live batch entry and its per-request metadata.
+    runner.input_batch.req_ids = []
+    runner.input_batch.req_id_to_index = {}
+    runner.model_intermediate_buffer = {}
+
+    layer_0 = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    payload = runner._build_combined_prefix_cache_mm_payload(
+        {
+            "hidden_states.layer_0": {"r1": layer_0},
+            "hidden_states.layer_24": {"r1": layer_0 + 100},
+        },
+        rid="r1",
+        idx=0,
+        pd_parent_rows_by_req=parent_rows,
+    )
+    torch.testing.assert_close(payload["hidden_states.layer_0"], layer_0[4:])
+
+
+def test_pd_prefill_later_chunk_emits_scheduled_rows_without_retrimming_parent() -> None:
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = SimpleNamespace(supports_delta_prefix_multimodal_outputs=True)
+    runner.input_batch = SimpleNamespace(
+        req_ids=["r1"],
+        req_id_to_index={"r1": 0},
+        num_computed_tokens_cpu=torch.tensor([8]),
+    )
+    runner.model_intermediate_buffer = {
+        "r1": {
+            "meta": {
+                "pd_prefill_snapshot_mode": "delta",
+                "pd_prefill_snapshot_parent_rows": 4,
+            }
+        },
+    }
+    runner._pd_new_request_prefix_rows = {}
+
+    parent_rows, trim_rows, needs_full_prefix = runner._snapshot_pd_prefix_multimodal_requirements()
+    assert parent_rows == {"r1": 4}
+    assert trim_rows == {"r1": 0}
+    assert needs_full_prefix == set()
+
+
+def test_pd_prefill_raw_step_trims_only_overlap_before_parent() -> None:
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = SimpleNamespace(supports_delta_prefix_multimodal_outputs=True)
+    layer_0 = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    layer_24 = layer_0 + 100
+    # A different request may force a batch-level merged mapping.  This delta
+    # request must still consume its own raw scheduled rows.
+    unrelated_combined = {
+        "hidden_states.layer_0": {"other": torch.ones((2, 4))},
+    }
+
+    payload = runner._build_omni_mm_payload(
+        combined_multimodal_outputs=unrelated_combined,
+        mm_cpu={
+            "hidden_states.layer_0": layer_0,
+            "hidden_states.layer_24": layer_24,
+        },
+        rid="r1",
+        idx=0,
+        start=0,
+        end=6,
+        audio_sparse_output=False,
+        sparse_mm_index={},
+        hidden_seq_len=6,
+        scheduled_seq_len=6,
+        pd_parent_rows_by_req={"r1": 4},
+        pd_trim_rows_by_req={"r1": 2},
+        pd_needs_full_prefix_mm={"other"},
+    )
+
+    torch.testing.assert_close(payload["hidden_states.layer_0"], layer_0[2:])
+    torch.testing.assert_close(payload["hidden_states.layer_24"], layer_24[2:])
+
+
+def test_pd_mixed_full_and_delta_batch_keeps_raw_delta_payload(monkeypatch) -> None:
+    runner = _make_async_output_runner(engine_output_type="latent")
+    runner.omni_prefix_cache = object()
+    runner.model = SimpleNamespace(
+        has_postprocess=False,
+        supports_delta_prefix_multimodal_outputs=True,
+        omni_pooler_payload_include_hidden=False,
+    )
+    raw_layer_0 = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    raw_layer_24 = raw_layer_0 + 100
+    combined = {
+        "hidden_states.layer_0": {"full": torch.tensor([[20.0, 21.0], [22.0, 23.0]])},
+        "hidden_states.layer_24": {"full": torch.tensor([[120.0, 121.0], [122.0, 123.0]])},
+    }
+
+    monkeypatch.setattr(GPUARModelRunner, "_stage_deferred_prefix_cache_mm_outputs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_prepare_prefix_cache_pooler_payload_sources",
+        lambda *args, **kwargs: (None, None, combined),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
+
+    output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+        runner,
+        scheduler_output=SimpleNamespace(
+            total_num_scheduled_tokens=4,
+            num_scheduled_tokens={"delta": 2, "full": 2},
+        ),
+        hidden_states=torch.zeros((4, 2)),
+        staged_hidden_states_cpu=None,
+        multimodal_outputs={
+            "hidden_states.layer_0": raw_layer_0,
+            "hidden_states.layer_24": raw_layer_24,
+        },
+        req_ids_output_copy=["delta", "full"],
+        req_id_to_index_output_copy={"delta": 0, "full": 1},
+        valid_sampled_token_ids=[[], []],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        num_scheduled_tokens_np=np.array([2, 2], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0, 2], dtype=torch.long),
+        pd_parent_rows_by_req={"delta": 8},
+        pd_trim_rows_by_req={"delta": 0},
+        pd_needs_full_prefix_mm={"full"},
+        resolved_pooler_payload=("latent", ["delta", "full"]),
+    )
+
+    assert output.inter_stage_outputs is not None
+    torch.testing.assert_close(output.inter_stage_outputs[0]["hidden_states.layer_0"], raw_layer_0[:2])
+    torch.testing.assert_close(output.inter_stage_outputs[0]["hidden_states.layer_24"], raw_layer_24[:2])
+    torch.testing.assert_close(
+        output.inter_stage_outputs[1]["hidden_states.layer_0"],
+        combined["hidden_states.layer_0"]["full"],
+    )
 
 
 # --- builder gap-fill: contract corners not covered by the tests above ---

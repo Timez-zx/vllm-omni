@@ -59,6 +59,7 @@ from vllm_omni.engine.stage_init_utils import (
     load_omni_transfer_config_for_model,
     prepare_engine_environment,
     release_device_locks,
+    stage_runtime_env,
 )
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.entrypoints.stage_utils import resolve_stage_physical_devices
@@ -127,6 +128,7 @@ class StageRuntime:
         diffusion_batch_size: int,
         async_chunk: bool,
         tokenizer: str | None = None,
+        log_stats: bool = False,
     ) -> None:
         self._stage_configs = stage_configs
         self._model = model
@@ -135,6 +137,7 @@ class StageRuntime:
         self._diffusion_batch_size = diffusion_batch_size
         self._async_chunk = async_chunk
         self._tokenizer = tokenizer
+        self._log_stats = bool(log_stats)
         self._num_stages = len(stage_configs)
 
         # Populated by initialize()
@@ -334,10 +337,11 @@ class StageRuntime:
 
     @contextmanager
     def _stage_device_scope(self, stage_id: int, runtime_cfg: Any) -> Iterator[None]:
-        """Temporarily apply the stage device env while launching a replica."""
+        """Temporarily apply the complete stage env while launching a replica."""
         physical_devices = self._resolve_replica_physical_devices(stage_id, runtime_cfg)
         with self._scoped_spawn_device_env(physical_devices):
-            yield
+            with stage_runtime_env(stage_id, runtime_cfg):
+                yield
 
     # ---- Internal methods ----
 
@@ -645,31 +649,33 @@ class StageRuntime:
                             executor_class=guest_replica.executor_class,
                             stage_id=guest_id,
                             replica_id=guest_replica.replica_id,
-                            log_stats=False,
+                            log_stats=self._log_stats,
                         )
                     )
                 logger.info(
                     "[colocate] stage %s will host stage(s) %s in its process",
-                    plan.metadata.stage_id, guest_ids,
+                    plan.metadata.stage_id,
+                    guest_ids,
                 )
 
             # Serialize engine-core spawning across all LLM replicas to avoid
             # ZMQ port-allocation races and simultaneous CUDA context init.
             with self._replica_launch_lock:
-                with launch_stage_replica(
-                    vllm_config=vllm_config,
-                    executor_class=executor_class,
-                    log_stats=False,
-                    stage_id=plan.metadata.stage_id,
-                    replica_id=plan.replica_id,
-                    stage_config=plan.stage_cfg,
-                    omni_master_server=self._get_omni_master_server(),
-                    omni_coordinator_address=self._get_coordinator_address(),
-                    stage_visible_devices=physical_devices,
-                    spawn_device_lock=self._spawn_device_lock,
-                    siblings=siblings,
-                ) as resources:
-                    pass
+                with stage_runtime_env(plan.metadata.stage_id, plan.metadata.runtime_cfg):
+                    with launch_stage_replica(
+                        vllm_config=vllm_config,
+                        executor_class=executor_class,
+                        log_stats=self._log_stats,
+                        stage_id=plan.metadata.stage_id,
+                        replica_id=plan.replica_id,
+                        stage_config=plan.stage_cfg,
+                        omni_master_server=self._get_omni_master_server(),
+                        omni_coordinator_address=self._get_coordinator_address(),
+                        stage_visible_devices=physical_devices,
+                        spawn_device_lock=self._spawn_device_lock,
+                        siblings=siblings,
+                    ) as resources:
+                        pass
 
             if siblings and resources is not None:
                 for launch in siblings:
@@ -690,6 +696,8 @@ class StageRuntime:
                 client_addresses=self._client_addresses_from_zmq(resources.addresses),
                 engine_manager=resources.manager,
                 coordinator=resources.coordinator,
+                input_tensor_queue=resources.input_tensor_queue,
+                output_tensor_queue=resources.output_tensor_queue,
             )
 
             logger.info("[StageRuntime] Stage %s initialized", plan.metadata.stage_id)
@@ -739,9 +747,7 @@ class StageRuntime:
             engine_manager=stash.manager,
             coordinator=None,
         )
-        logger.info(
-            "[StageRuntime] Stage %s attached as colocated guest", plan.metadata.stage_id
-        )
+        logger.info("[StageRuntime] Stage %s attached as colocated guest", plan.metadata.stage_id)
         return stage_client
 
     def _get_coordinator_address(self) -> str | None:
@@ -826,7 +832,11 @@ class StageRuntime:
                 stage_vllm_config = plan.replicas[0].stage_vllm_config
                 if stage_vllm_config is None:
                     raise RuntimeError(f"Stage {plan.stage_id} is missing vllm_config")
-                output_processor = build_llm_stage_output_processor(plan, stage_vllm_config)
+                output_processor = build_llm_stage_output_processor(
+                    plan,
+                    stage_vllm_config,
+                    log_stats=self._log_stats,
+                )
 
             stage_pools.append(
                 StagePool(
@@ -865,6 +875,7 @@ class DistStageRuntime(StageRuntime):
         diffusion_batch_size: int,
         async_chunk: bool,
         tokenizer: str | None = None,
+        log_stats: bool = False,
         single_stage_id_filter: int | None,
         omni_master_address: str,
         omni_master_port: int,
@@ -881,6 +892,7 @@ class DistStageRuntime(StageRuntime):
             diffusion_batch_size=diffusion_batch_size,
             async_chunk=async_chunk,
             tokenizer=tokenizer,
+            log_stats=log_stats,
         )
         self._single_stage_id_filter = single_stage_id_filter
         self._omni_master_address = omni_master_address
@@ -1203,6 +1215,7 @@ def create_stage_runtime(
     diffusion_batch_size: int,
     async_chunk: bool,
     tokenizer: str | None = None,
+    log_stats: bool = False,
     # Distributed-only params:
     single_stage_id_filter: int | None = None,
     omni_master_address: str | None = None,
@@ -1224,6 +1237,7 @@ def create_stage_runtime(
             diffusion_batch_size=diffusion_batch_size,
             async_chunk=async_chunk,
             tokenizer=tokenizer,
+            log_stats=log_stats,
             single_stage_id_filter=single_stage_id_filter,
             omni_master_address=omni_master_address,
             omni_master_port=omni_master_port,
@@ -1240,4 +1254,5 @@ def create_stage_runtime(
         diffusion_batch_size=diffusion_batch_size,
         async_chunk=async_chunk,
         tokenizer=tokenizer,
+        log_stats=log_stats,
     )

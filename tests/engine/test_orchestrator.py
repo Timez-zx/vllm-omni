@@ -6,12 +6,14 @@ import logging
 import queue
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
 import janus
 import pytest
+import torch
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError
@@ -131,6 +133,7 @@ class FakeStageClient:
         self.custom_process_input_func = None
         self._kv_sender_info = dict(kv_sender_info) if kv_sender_info is not None else None
         self.add_request_calls: list[tuple] = []
+        self.pd_cache_sync_calls: list[Any] = []
         self.abort_calls: list[list[str]] = []
         self.collective_rpc_calls: list[tuple[str, float | None, tuple[Any, ...], dict[str, Any]]] = []
         self.shutdown_calls = 0
@@ -141,11 +144,25 @@ class FakeStageClient:
     async def add_request_async(self, *args, **kwargs) -> None:
         self.add_request_calls.append(args)
 
+    async def pd_cache_sync_async(self, request) -> dict[str, Any]:
+        self.pd_cache_sync_calls.append(request)
+        return {
+            "request_id": request.request_id,
+            "cache_sync_ms": 1.0,
+            "full_hit": False,
+        }
+
     async def get_output_async(self):
+        output = self.get_output_nowait()
+        if output is not None:
+            return output
+        return SimpleNamespace(outputs=[])
+
+    def get_output_nowait(self):
         try:
             return self._engine_core_outputs.get_nowait()
         except queue.Empty:
-            return SimpleNamespace(outputs=[])
+            return None
 
     def get_diffusion_output_nowait(self):
         try:
@@ -209,6 +226,360 @@ def test_terminal_empty_audio_output_uses_stage_sample_rate() -> None:
     )
 
     assert terminal_output.outputs[0].multimodal_output["sr"] == 44100
+
+
+def test_pd_prefill_snapshot_accumulates_flat_wire_chunks() -> None:
+    first = {
+        "hidden_states.layer_0": torch.ones(2, 3),
+        "hidden_states.layer_24": torch.full((2, 3), 24.0),
+        "embed.tts_bos": torch.ones(1, 3),
+    }
+    second = {
+        "hidden_states.layer_0": torch.full((1, 3), 2.0),
+        "hidden_states.layer_24": torch.full((1, 3), 25.0),
+    }
+
+    accumulated = Orchestrator._accumulate_pd_prefill_output(None, first)
+    accumulated = Orchestrator._accumulate_pd_prefill_output(accumulated, second)
+
+    assert accumulated is not None
+    assert accumulated["hidden_states"]["layers"][0].shape == (3, 3)
+    assert accumulated["hidden_states"]["layers"][24].shape == (3, 3)
+    assert accumulated["hidden_states"]["layers"][0][-1].tolist() == [2.0, 2.0, 2.0]
+    assert accumulated["embed"]["tts_bos"].shape == (1, 3)
+
+
+@pytest.mark.asyncio
+async def test_pd_prefill_snapshot_uses_pipeline_selected_hidden_layer() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._pd_snapshot_hidden_layer = 48
+    orchestrator._pd_prefill_snapshots = OrderedDict()
+    orchestrator._pd_prefill_snapshot_bytes = 0
+    orchestrator._pd_prefill_snapshot_limit_bytes = 1 << 20
+    orchestrator._pd_prefill_snapshot_max_chunks = 16
+    state = OrchestratorRequestState(
+        request_id="duplex-pd",
+        pd_prefill_lineage_id="duplex-session",
+        pd_prefill_revision=1,
+        pd_prefill_prompt_token_ids=(1, 2),
+        pd_prefill_multimodal_output={
+            "hidden_states": {
+                "layers": {
+                    0: torch.tensor([[1.0], [2.0]]),
+                    48: torch.tensor([[41.0], [42.0]]),
+                }
+            }
+        },
+    )
+
+    assert await orchestrator._materialize_pd_prefill_snapshot(state) is True
+    layers = orchestrator._pd_prefill_snapshots["duplex-session"].output[
+        "hidden_states"
+    ]["layers"]
+    assert set(layers) == {0, 48}
+
+
+@pytest.mark.asyncio
+async def test_pd_prefill_snapshot_uses_exact_lineage_parent_for_delta() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._pd_prefill_snapshots = OrderedDict()
+    orchestrator._pd_prefill_snapshot_bytes = 0
+    orchestrator._pd_prefill_snapshot_limit_bytes = 1 << 20
+
+    parent_state = OrchestratorRequestState(
+        request_id="parent",
+        pd_prefill_lineage_id="session-1",
+        pd_prefill_revision=1,
+        pd_prefill_prompt_token_ids=(1, 2, 3),
+        pd_prefill_multimodal_output={
+            "hidden_states": {
+                "layers": {
+                    0: torch.tensor([[1.0], [2.0], [3.0]]),
+                    24: torch.tensor([[21.0], [22.0], [23.0]]),
+                }
+            }
+        },
+    )
+    assert await orchestrator._materialize_pd_prefill_snapshot(parent_state) is True
+
+    request = SimpleNamespace(
+        request_id="child",
+        prompt_token_ids=[1, 2, 3, 4, 5],
+        kv_lineage_id="session-1",
+        kv_lineage_parent_revision=1,
+        kv_lineage_revision=2,
+        kv_lineage_prefix_tokens=3,
+        model_intermediate_buffer=None,
+    )
+    child_state = OrchestratorRequestState(
+        request_id="child",
+        prompt={"prefill_only": True},
+        pd_prefill_multimodal_output={
+            "hidden_states": {
+                "layers": {
+                    0: torch.tensor([[4.0], [5.0]]),
+                    24: torch.tensor([[24.0], [25.0]]),
+                }
+            }
+        },
+    )
+    orchestrator._prepare_pd_prefill_snapshot_request(request, child_state)
+
+    assert request.model_intermediate_buffer["meta"]["pd_prefill_snapshot_mode"] == "delta"
+    assert await orchestrator._materialize_pd_prefill_snapshot(child_state) is True
+    # Arrival prefill keeps only the received tail in the request state and
+    # records a zero-copy chunk chain for its next finite request.
+    layers = child_state.pd_prefill_multimodal_output["hidden_states"]["layers"]
+    assert layers[0].flatten().tolist() == [4.0, 5.0]
+    cached_layers = orchestrator._pd_prefill_snapshots["session-1"].output["hidden_states"]["layers"]
+    assert [chunk.flatten().tolist() for chunk in cached_layers[0]] == [[1.0, 2.0, 3.0], [4.0, 5.0]]
+    assert orchestrator._pd_prefill_snapshots["session-1"].revision == 2
+
+    final_request = SimpleNamespace(
+        request_id="final",
+        prompt_token_ids=[1, 2, 3, 4, 5, 6],
+        kv_lineage_id="session-1",
+        kv_lineage_parent_revision=2,
+        kv_lineage_revision=3,
+        kv_lineage_prefix_tokens=5,
+        model_intermediate_buffer=None,
+    )
+    final_state = OrchestratorRequestState(
+        request_id="final",
+        pd_prefill_multimodal_output={
+            "hidden_states": {
+                "layers": {
+                    0: torch.tensor([[6.0]]),
+                    24: torch.tensor([[26.0]]),
+                }
+            }
+        },
+    )
+    orchestrator._prepare_pd_prefill_snapshot_request(final_request, final_state)
+    assert await orchestrator._materialize_pd_prefill_snapshot(final_state) is True
+    final_layers = final_state.pd_prefill_multimodal_output["hidden_states"]["layers"]
+    assert [chunk.flatten().tolist() for chunk in final_layers[0]] == [
+        [1.0, 2.0, 3.0],
+        [4.0, 5.0],
+        [6.0],
+    ]
+    assert [chunk.flatten().tolist() for chunk in final_layers[24]] == [
+        [21.0, 22.0, 23.0],
+        [24.0, 25.0],
+        [26.0],
+    ]
+    cached_final_layers = orchestrator._pd_prefill_snapshots["session-1"].output["hidden_states"]["layers"]
+    assert cached_final_layers[0] is final_layers[0]
+    assert cached_final_layers[24] is final_layers[24]
+    assert set(orchestrator._pd_prefill_snapshots) == {"session-1"}
+    assert orchestrator._pd_prefill_snapshot_bytes == 48
+
+
+@pytest.mark.asyncio
+async def test_pd_prefill_snapshot_compacts_long_arrival_chunk_chain() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._pd_prefill_snapshots = OrderedDict()
+    orchestrator._pd_prefill_snapshot_bytes = 0
+    orchestrator._pd_prefill_snapshot_limit_bytes = 1 << 20
+    orchestrator._pd_prefill_snapshot_max_chunks = 1
+
+    parent_state = OrchestratorRequestState(
+        request_id="parent",
+        pd_prefill_lineage_id="session-1",
+        pd_prefill_revision=1,
+        pd_prefill_prompt_token_ids=(1,),
+        pd_prefill_multimodal_output={
+            "hidden_states": {
+                "layers": {
+                    0: torch.tensor([[1.0]]),
+                    24: torch.tensor([[21.0]]),
+                }
+            }
+        },
+    )
+    assert await orchestrator._materialize_pd_prefill_snapshot(parent_state) is True
+
+    request = SimpleNamespace(
+        request_id="warmup",
+        prompt_token_ids=[1, 2],
+        kv_lineage_id="session-1",
+        kv_lineage_parent_revision=1,
+        kv_lineage_revision=2,
+        kv_lineage_prefix_tokens=1,
+        model_intermediate_buffer=None,
+    )
+    state = OrchestratorRequestState(
+        request_id="warmup",
+        prompt={"prefill_only": True},
+        pd_prefill_multimodal_output={
+            "hidden_states": {
+                "layers": {
+                    0: torch.tensor([[2.0]]),
+                    24: torch.tensor([[22.0]]),
+                }
+            }
+        },
+    )
+    orchestrator._prepare_pd_prefill_snapshot_request(request, state)
+    assert await orchestrator._materialize_pd_prefill_snapshot(state) is True
+
+    snapshot = orchestrator._pd_prefill_snapshots["session-1"]
+    cached = snapshot.output["hidden_states"]["layers"]
+    assert snapshot.packed_prefix_chunks == 1
+    assert len(cached[0]) == 1
+    assert cached[0][0].flatten().tolist() == [1.0, 2.0]
+    assert cached[24][0].flatten().tolist() == [21.0, 22.0]
+    assert cached[0][0].is_shared()
+    assert cached[24][0].is_shared()
+
+    first_packed_layer_0_storage = cached[0][0].untyped_storage().data_ptr()
+    first_packed_layer_24_storage = cached[24][0].untyped_storage().data_ptr()
+    for revision, value in ((3, 3.0), (4, 4.0)):
+        request = SimpleNamespace(
+            request_id=f"warmup-{revision}",
+            prompt_token_ids=list(range(1, revision + 1)),
+            kv_lineage_id="session-1",
+            kv_lineage_parent_revision=revision - 1,
+            kv_lineage_revision=revision,
+            kv_lineage_prefix_tokens=revision - 1,
+            model_intermediate_buffer=None,
+        )
+        state = OrchestratorRequestState(
+            request_id=f"warmup-{revision}",
+            prompt={"prefill_only": True},
+            pd_prefill_multimodal_output={
+                "hidden_states": {
+                    "layers": {
+                        0: torch.tensor([[value]]),
+                        24: torch.tensor([[value + 20.0]]),
+                    }
+                }
+            },
+        )
+        orchestrator._prepare_pd_prefill_snapshot_request(request, state)
+        assert await orchestrator._materialize_pd_prefill_snapshot(state) is True
+
+    # Revision 4 packs only revisions 3-4. Prefix slicing may create a new
+    # tensor view, but the first packed slab keeps the same shared storage
+    # instead of being copied into an ever-growing full snapshot.
+    snapshot = orchestrator._pd_prefill_snapshots["session-1"]
+    cached = snapshot.output["hidden_states"]["layers"]
+    assert snapshot.packed_prefix_chunks == 2
+    assert cached[0][0].untyped_storage().data_ptr() == first_packed_layer_0_storage
+    assert cached[24][0].untyped_storage().data_ptr() == first_packed_layer_24_storage
+    assert [chunk.flatten().tolist() for chunk in cached[0]] == [[1.0, 2.0], [3.0, 4.0]]
+    assert [chunk.flatten().tolist() for chunk in cached[24]] == [[21.0, 22.0], [23.0, 24.0]]
+
+
+@pytest.mark.asyncio
+async def test_pd_prefill_snapshot_keeps_only_the_latest_linear_revision() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._pd_prefill_snapshots = OrderedDict()
+    orchestrator._pd_prefill_snapshot_bytes = 0
+    orchestrator._pd_prefill_snapshot_limit_bytes = 1 << 20
+
+    parent_state = OrchestratorRequestState(
+        request_id="parent",
+        pd_prefill_lineage_id="session-1",
+        pd_prefill_revision=1,
+        pd_prefill_prompt_token_ids=(1,),
+        pd_prefill_multimodal_output={
+            "hidden_states": {
+                "layers": {
+                    0: torch.tensor([[1.0]]),
+                    24: torch.tensor([[21.0]]),
+                }
+            }
+        },
+    )
+    assert await orchestrator._materialize_pd_prefill_snapshot(parent_state)
+
+    child_request = SimpleNamespace(
+        request_id="child",
+        prompt_token_ids=[1, 2],
+        kv_lineage_id="session-1",
+        kv_lineage_parent_revision=1,
+        kv_lineage_revision=2,
+        kv_lineage_prefix_tokens=1,
+        model_intermediate_buffer=None,
+    )
+    child_state = OrchestratorRequestState(
+        request_id=child_request.request_id,
+        prompt={"prefill_only": True},
+        pd_prefill_multimodal_output={
+            "hidden_states": {
+                "layers": {
+                    0: torch.tensor([[2.0]]),
+                    24: torch.tensor([[22.0]]),
+                }
+            }
+        },
+    )
+    orchestrator._prepare_pd_prefill_snapshot_request(child_request, child_state)
+    assert child_request.model_intermediate_buffer["meta"]["pd_prefill_snapshot_mode"] == "delta"
+    assert await orchestrator._materialize_pd_prefill_snapshot(child_state)
+
+    latest = orchestrator._pd_prefill_snapshots["session-1"]
+    assert latest.revision == 2
+    assert set(orchestrator._pd_prefill_snapshots) == {"session-1"}
+
+
+@pytest.mark.asyncio
+async def test_pd_prefill_snapshot_reports_missing_payload() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._pd_prefill_snapshots = OrderedDict()
+    orchestrator._pd_prefill_snapshot_bytes = 0
+    orchestrator._pd_prefill_snapshot_limit_bytes = 1 << 20
+    state = OrchestratorRequestState(
+        request_id="missing",
+        prompt={"prefill_only": True},
+        pd_prefill_lineage_id="session-1",
+        pd_prefill_revision=1,
+        pd_prefill_prompt_token_ids=(1, 2),
+        pd_prefill_multimodal_output={"hidden_states": {"layers": {}}},
+    )
+
+    assert await orchestrator._materialize_pd_prefill_snapshot(state) is False
+    assert "session-1" not in orchestrator._pd_prefill_snapshots
+
+
+def test_pd_mrope_metadata_rebuilds_without_media_tensors() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._pd_mrope_values_by_identifier = {}
+    feature = SimpleNamespace(
+        modality="image",
+        identifier="image-hash",
+        mm_position=SimpleNamespace(offset=22, length=220),
+        data={"image_grid_thw": SimpleNamespace(data=torch.tensor([1, 22, 40]))},
+    )
+
+    metadata = orchestrator._capture_pd_mrope_metadata([feature])
+    rebuilt = orchestrator._build_pd_mrope_features(metadata)
+
+    assert metadata == [
+        {
+            "modality": "image",
+            "identifier": "image-hash",
+            "offset": 22,
+            "length": 220,
+            "values": {"image_grid_thw": [1, 22, 40]},
+        }
+    ]
+    assert len(rebuilt) == 1
+    assert rebuilt[0].mm_position.offset == 22
+    assert rebuilt[0].mm_position.length == 220
+    assert rebuilt[0].data is not None
+    assert set(rebuilt[0].data) == {"image_grid_thw"}
+
+    cached_feature = SimpleNamespace(
+        modality="image",
+        identifier="image-hash",
+        mm_position=SimpleNamespace(offset=33, length=220),
+        data=None,
+    )
+    cached_metadata = orchestrator._capture_pd_mrope_metadata([cached_feature])
+    assert cached_metadata[0]["offset"] == 33
+    assert cached_metadata[0]["values"] == {"image_grid_thw": [1, 22, 40]}
 
 
 class FakeCollectiveRpcStageClient(FakeStageClient):
@@ -330,6 +701,7 @@ def _build_harness(
     stage_vllm_configs: list[object] | None = None,
     async_chunk: bool = False,
     stage_pools: list[StagePool] | None = None,
+    pd_config: dict[str, Any] | None = None,
 ) -> OrchestratorFixture:
     """Build an Orchestrator test harness.
 
@@ -364,6 +736,7 @@ def _build_harness(
                 rpc_async_queue=rpc_queue.async_q,
                 stage_pools=stage_pools,
                 async_chunk=async_chunk,
+                pd_config=pd_config,
             )
             ready_future.set_result((orchestrator, request_queue, output_queue, rpc_queue))
             await orchestrator.run()
@@ -541,6 +914,195 @@ async def test_run_two_stage_llm(orchestrator_factory) -> None:
         assert output_msg.engine_outputs.request_id == "req-llm"
         assert "req-llm" not in orchestrator_fixture.orchestrator.request_states
     finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_pd_prefill_only_uses_decode_cache_control_path(orchestrator_factory) -> None:
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True)
+    p_output = SimpleNamespace(
+        request_id="warm-1",
+        finished=True,
+        kv_transfer_params={"remote_request_id": "warm-1"},
+    )
+    d_output = SimpleNamespace(request_id="warm-1", finished=True)
+    processors = [
+        FakeOutputProcessor(request_outputs=[p_output]),
+        FakeOutputProcessor(request_outputs=[d_output]),
+    ]
+    orchestrator_fixture = orchestrator_factory(
+        [stage0, stage1],
+        output_processors=processors,
+        pd_config={
+            "pd_pair": (0, 1),
+            "bootstrap_addr": "127.0.0.1:5600",
+            "prefill_engine_id": "p-engine",
+        },
+    )
+    processed_prompt = SimpleNamespace(
+        request_id="warm-1",
+        prompt_token_ids=[1, 2, 3],
+        kv_lineage_id="session-1",
+        kv_lineage_parent_revision=0,
+        kv_lineage_revision=1,
+        kv_lineage_prefix_tokens=0,
+        model_intermediate_buffer=None,
+        mm_features=None,
+    )
+    original_prompt = {
+        "prompt_token_ids": [1, 2, 3],
+        "prefill_only": True,
+        "kv_lineage_id": "session-1",
+        "kv_lineage_parent_revision": 0,
+        "kv_lineage_revision": 1,
+        "kv_lineage_prefix_tokens": 0,
+    }
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="warm-1",
+            prompt=processed_prompt,
+            original_prompt=original_prompt,
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=0,
+        )
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+        req_state = orchestrator_fixture.orchestrator.request_states["warm-1"]
+        req_state.pd_prefill_multimodal_output = {
+            "hidden_states": {
+                "layers": {
+                    0: torch.ones(3, 2),
+                    24: torch.full((3, 2), 24.0),
+                }
+            }
+        }
+
+        stage0.push_engine_core_outputs(_engine_core_outputs("stage0-raw", 1.0))
+        await _wait_for(lambda: len(stage1.pd_cache_sync_calls) == 1)
+        d_request = stage1.pd_cache_sync_calls[0]
+        assert d_request.prefill_only is True
+        assert d_request.kv_lineage_id == "session-1"
+        assert d_request.kv_lineage_revision == 1
+        assert d_request.pd_prefill_payload is None
+        assert d_request.sampling_params.extra_args["kv_transfer_params"]["do_remote_prefill"] is True
+        assert stage1.add_request_calls == []
+
+        output_msg = await _get_output_message(orchestrator_fixture)
+
+        assert output_msg.request_id == "warm-1"
+        assert output_msg.stage_id == 0
+        assert output_msg.finished is True
+        assert "warm-1" not in orchestrator_fixture.orchestrator.request_states
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_pd_formal_query_does_not_wait_for_early_cache_utility_result(
+    orchestrator_factory,
+) -> None:
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True)
+    p_output = SimpleNamespace(
+        request_id="query-1",
+        finished=True,
+        kv_transfer_params={"remote_request_id": "query-1"},
+    )
+    processors = [
+        FakeOutputProcessor(request_outputs=[p_output]),
+        FakeOutputProcessor(),
+    ]
+    orchestrator_fixture = orchestrator_factory(
+        [stage0, stage1],
+        output_processors=processors,
+        pd_config={
+            "pd_pair": (0, 1),
+            "prefill_engine_id": "p-engine",
+            "prefill_remote": {
+                "remote_engine_id": "p-engine",
+                "remote_host": "127.0.0.1",
+                "remote_port": 5600,
+                "tp_size": 1,
+                "pp_size": 1,
+            },
+        },
+    )
+    processed_prompt = SimpleNamespace(
+        request_id="query-1",
+        prompt_token_ids=[1, 2, 3],
+        kv_lineage_id="session-1",
+        kv_lineage_parent_revision=0,
+        kv_lineage_revision=1,
+        kv_lineage_prefix_tokens=0,
+        model_intermediate_buffer=None,
+        mm_features=None,
+    )
+    original_prompt = {
+        "prompt_token_ids": [1, 2, 3],
+        "kv_lineage_id": "session-1",
+        "kv_lineage_parent_revision": 0,
+        "kv_lineage_revision": 1,
+        "kv_lineage_prefix_tokens": 0,
+    }
+    cache_sync_started = asyncio.Event()
+    cache_sync_release = asyncio.Event()
+
+    async def delayed_cache_sync(request) -> dict[str, Any]:
+        stage1.pd_cache_sync_calls.append(request)
+        cache_sync_started.set()
+        await cache_sync_release.wait()
+        return {
+            "request_id": request.request_id,
+            "cache_sync_ms": 1.0,
+            "full_hit": False,
+        }
+
+    stage1.pd_cache_sync_async = delayed_cache_sync
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="query-1",
+            prompt=processed_prompt,
+            original_prompt=original_prompt,
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+        await asyncio.wait_for(cache_sync_started.wait(), timeout=1.0)
+        assert stage0.add_request_calls
+        assert stage1.add_request_calls == []
+        early_request = stage1.pd_cache_sync_calls[0]
+        assert early_request.pd_cache_sync_retain is True
+        early_kv = early_request.sampling_params.extra_args["kv_transfer_params"]
+        assert early_kv["remote_request_id"] == "query-1"
+        assert early_kv["do_remote_prefill"] is True
+
+        req_state = orchestrator_fixture.orchestrator.request_states["query-1"]
+        req_state.pd_prefill_multimodal_output = {
+            "hidden_states": {
+                "layers": {
+                    0: torch.ones(3, 2),
+                    24: torch.full((3, 2), 24.0),
+                }
+            }
+        }
+        stage0.push_engine_core_outputs(_engine_core_outputs("stage0-raw", 1.0))
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+
+        decode_request = stage1.add_request_calls[0][0]
+        assert decode_request.request_id == "query-1"
+        assert decode_request.pd_prefill_payload is not None
+        # Until D resolves the local import, this request keeps ordinary P/D
+        # parameters as a safe fallback. D Core strips them on early success.
+        assert decode_request.sampling_params.extra_args[
+            "kv_transfer_params"
+        ]["do_remote_prefill"] is True
+        assert not cache_sync_release.is_set()
+        cache_sync_release.set()
+    finally:
+        cache_sync_release.set()
         await _shutdown_orchestrator(orchestrator_fixture)
 
 
@@ -1746,6 +2308,7 @@ async def test_stage_pool_failed_replica_releases_distributed_affinity_and_stops
     assert pool.get_bound_replica_id("distributed-request") is None
     assert pool.get_bound_replica_id("legacy-request") is None
     assert await pool.poll_llm_raw_output(0) is None
+    assert pool.poll_llm_raw_output_nowait(0) is None
 
 
 def test_stage_pool_reattached_replica_becomes_available_again() -> None:
@@ -1945,7 +2508,11 @@ def test_stage_pool_metrics_use_resumable_segment_token_count() -> None:
     class SegmentMetricsOutputProcessor(FakeOutputProcessor):
         def pop_native_text_metrics(self, request_id: str) -> dict[str, Any]:
             assert request_id == "req-stream"
-            return {"num_generation_tokens": 3}
+            return {
+                "num_generation_tokens": 3,
+                "vllm_queue_ms": 12.5,
+                "vllm_prefill_ms": 34.5,
+            }
 
     stage0 = FakeStageClient(stage_type="llm", final_output=False)
     pool = StagePool(
@@ -1968,6 +2535,8 @@ def test_stage_pool_metrics_use_resumable_segment_token_count() -> None:
 
     assert metrics.num_tokens_out == 3
     assert metrics.output_unit_count == 3
+    assert metrics.vllm_queue_ms == 12.5
+    assert metrics.vllm_prefill_ms == 34.5
 
 
 @pytest.mark.asyncio

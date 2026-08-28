@@ -15,6 +15,9 @@ from vllm_omni.engine.duplexomni_pipeline import (
     pipeline_identity_from_prompt,
 )
 from vllm_omni.engine.orchestrator import Orchestrator
+from vllm_omni.model_executor.models.duplexomni.pipeline import (
+    DUPLEXOMNI_PD_PIPELINE,
+)
 
 
 def _codes(value: int) -> list[list[int]]:
@@ -91,3 +94,32 @@ def test_injected_history_does_not_mutate_the_original_prompt() -> None:
     assert prompt["additional_information"]["codes"]["ref"] == []
     assert updated["additional_information"]["ids"]["duplex_history_indices"] == [0]
     assert updated["additional_information"]["codes"]["ref"] == [_codes(7)]
+
+
+def test_pd_pipeline_splits_only_the_thinker_and_selects_layer48() -> None:
+    stages = DUPLEXOMNI_PD_PIPELINE.stages
+
+    assert [stage.model_stage for stage in stages] == [
+        "thinker",
+        "thinker",
+        "talker",
+        "code2wav",
+    ]
+    assert stages[0].extras == {
+        "is_prefill_only": True,
+        "pd_snapshot_hidden_layer": 48,
+    }
+    assert stages[1].extras == {
+        "is_decode_only": True,
+        "pd_snapshot_hidden_layer": 48,
+    }
+    assert stages[1].input_sources == (0,)
+    assert stages[2].input_sources == (1,)
+    assert stages[3].input_sources == (2,)
+
+
+def test_duplexomni_talker_source_moves_to_decode_stage_in_pd_mode() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._pd_pair = (0, 1)
+
+    assert orchestrator._duplexomni_thinker_output_stage() == 1

@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
 
-from vllm_omni.engine import AdditionalInformationPayload
+from vllm_omni.engine import AdditionalInformationPayload, OmniPDPrefillPayload
 
 
 @dataclass
@@ -27,6 +27,7 @@ class OmniNewRequestData(NewRequestData):
     external_req_id: str | None = None
     additional_information: AdditionalInformationPayload | None = None
     model_intermediate_buffer: dict[str, object] | None = None
+    pd_prefill_payload: OmniPDPrefillPayload | None = None
 
     @classmethod
     def from_request(
@@ -60,6 +61,7 @@ class OmniNewRequestData(NewRequestData):
             prefill_token_ids=prefill_token_ids,
             additional_information=getattr(request, "additional_information", None),
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
+            pd_prefill_payload=getattr(request, "pd_prefill_payload", None),
         )
 
 

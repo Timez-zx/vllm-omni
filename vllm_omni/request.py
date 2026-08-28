@@ -12,7 +12,12 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
-from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreRequest, PromptEmbedsPayload
+from vllm_omni.engine import (
+    AdditionalInformationPayload,
+    OmniEngineCoreRequest,
+    OmniPDPrefillPayload,
+    PromptEmbedsPayload,
+)
 
 
 class OmniRequest(Request):
@@ -37,6 +42,7 @@ class OmniRequest(Request):
         external_req_id: str | None = None,
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict | None = None,
+        pd_prefill_payload: OmniPDPrefillPayload | None = None,
         cache_token_ids: list[int] | None = None,
         prefill_only: bool = False,
         kv_lineage_id: str | None = None,
@@ -121,6 +127,7 @@ class OmniRequest(Request):
         self.additional_information: AdditionalInformationPayload | None = additional_information
         # Runner-owned runtime payload.
         self.model_intermediate_buffer: dict | None = model_intermediate_buffer
+        self.pd_prefill_payload = pd_prefill_payload
         self.prefill_only = prefill_only
 
     @staticmethod
@@ -169,6 +176,7 @@ class OmniRequest(Request):
             block_hasher=block_hasher,
             additional_information=request.additional_information,
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
+            pd_prefill_payload=getattr(request, "pd_prefill_payload", None),
             cache_token_ids=getattr(request, "cache_token_ids", None),
             prefill_only=getattr(request, "prefill_only", False),
             kv_lineage_id=getattr(request, "kv_lineage_id", None),
@@ -176,9 +184,7 @@ class OmniRequest(Request):
             kv_lineage_revision=getattr(request, "kv_lineage_revision", 0),
             kv_lineage_prefix_tokens=getattr(request, "kv_lineage_prefix_tokens", 0),
             kv_lineage_snapshot_block_hashes=getattr(request, "kv_lineage_snapshot_block_hashes", None),
-            kv_lineage_snapshot_num_computed_tokens=getattr(
-                request, "kv_lineage_snapshot_num_computed_tokens", 0
-            ),
+            kv_lineage_snapshot_num_computed_tokens=getattr(request, "kv_lineage_snapshot_num_computed_tokens", 0),
             kv_lineage_snapshot_hash_block_size=getattr(request, "kv_lineage_snapshot_hash_block_size", 0),
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,

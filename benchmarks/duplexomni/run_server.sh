@@ -1,21 +1,39 @@
 #!/usr/bin/env bash
-# Start the three-GPU DuplexOmni correctness deployment and wait for health.
+# Start a DuplexOmni deployment and wait for health.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 MODE=${1:-fp8}
 PORT=${DUPLEXOMNI_PORT:-8092}
-GPU_IDS=${DUPLEXOMNI_GPU_IDS:-0,1,2}
 MODEL=${DUPLEXOMNI_MODEL:-MuyeHuang/DuplexOmni}
 RESULTS_DIR=${DUPLEXOMNI_RESULTS_DIR:-/tmp/vllm-omni-duplexomni}
 VLLM_OMNI_BIN=${VLLM_OMNI_BIN:-$(command -v vllm-omni || true)}
 
 case "$MODE" in
-  bf16) DEPLOY=${DUPLEXOMNI_DEPLOY_CONFIG:-$SCRIPT_DIR/deploy_bf16_3gpu.yaml} ;;
-  fp8) DEPLOY=${DUPLEXOMNI_DEPLOY_CONFIG:-$SCRIPT_DIR/deploy_fp8_3gpu.yaml} ;;
-  *) echo "usage: $0 [bf16|fp8]" >&2; exit 2 ;;
+  bf16)
+    DEPLOY=${DUPLEXOMNI_DEPLOY_CONFIG:-$SCRIPT_DIR/deploy_bf16_3gpu.yaml}
+    EXPECTED_GPUS=3
+    DEFAULT_GPU_IDS=0,1,2
+    ;;
+  fp8)
+    DEPLOY=${DUPLEXOMNI_DEPLOY_CONFIG:-$SCRIPT_DIR/deploy_fp8_3gpu.yaml}
+    EXPECTED_GPUS=3
+    DEFAULT_GPU_IDS=0,1,2
+    ;;
+  pd-bf16)
+    DEPLOY=${DUPLEXOMNI_DEPLOY_CONFIG:-$SCRIPT_DIR/deploy_pd_bf16_4gpu.yaml}
+    EXPECTED_GPUS=4
+    DEFAULT_GPU_IDS=0,1,2,3
+    ;;
+  pd)
+    DEPLOY=${DUPLEXOMNI_DEPLOY_CONFIG:-$SCRIPT_DIR/deploy_pd_fp8_4gpu.yaml}
+    EXPECTED_GPUS=4
+    DEFAULT_GPU_IDS=0,1,2,3
+    ;;
+  *) echo "usage: $0 [bf16|fp8|pd-bf16|pd]" >&2; exit 2 ;;
 esac
+GPU_IDS=${DUPLEXOMNI_GPU_IDS:-$DEFAULT_GPU_IDS}
 
 [ -n "$VLLM_OMNI_BIN" ] && [ -x "$VLLM_OMNI_BIN" ] || {
   echo "set VLLM_OMNI_BIN to the vllm-omni executable" >&2
@@ -23,8 +41,8 @@ esac
 }
 [ -f "$DEPLOY" ] || { echo "deploy config missing: $DEPLOY" >&2; exit 2; }
 IFS=',' read -r -a gpu_ids <<< "$GPU_IDS"
-[ "${#gpu_ids[@]}" -eq 3 ] || {
-  echo "DUPLEXOMNI_GPU_IDS must contain exactly three GPU ids" >&2
+[ "${#gpu_ids[@]}" -eq "$EXPECTED_GPUS" ] || {
+  echo "DUPLEXOMNI_GPU_IDS must contain exactly $EXPECTED_GPUS GPU ids for mode $MODE" >&2
   exit 2
 }
 

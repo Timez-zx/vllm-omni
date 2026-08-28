@@ -173,6 +173,44 @@ bash benchmarks/duplexomni/run_server.sh fp8
 4. 6144-token compaction 已解决单用户长 session 的 context 延迟增长。当前容量首先受 Thinker 限制，Talker/Code2Wav 不是第一瓶颈。
 5. 应用/session/finite-request 边界合理。下一步 engine research 应针对“持续短 decode + 小增量多模态 prefill”做 deadline/QoS-aware batching 和调度，而不是把跨 slot 生命周期重新塞回一个 persistent request。
 
+## 阶段九：DuplexOmni P/D 部署
+
+`duplexomni-pd` 保持阶段二的应用/session/finite-request 设计不变，只拆分 Thinker engine：
+
+| Stage | GPU | 配置与职责 |
+|---|---:|---|
+| Thinker-P | 0 | FP8 weight/KV；多模态 prompt prefill；保存 layer 0 和 layer 48 hidden snapshot |
+| Thinker-D | 1 | FP8 weight/KV；导入 P 的 KV 后生成约 24 个文本/控制 token |
+| Talker + MTP | 2 | FP8 weight/KV；生成 `16×6` codec |
+| Code2Wav | 3 | BF16；生成波形 |
+
+P/D 使用 `NixlDeltaPushConnector`。首个 slot 建立完整 lineage；后续 slot 依赖应用提供的精确 prefix lineage，P 只向 D 传新增 KV block。D 同时输出客户端可见文本，并把完整 decode hidden rows 与 P 的 prompt snapshot 组合后交给 Talker。为此，scheduler→runner 数据契约显式保留 `pd_prefill_payload`；否则 D 虽能生成文本，Talker 会缺少 prompt hidden state。
+
+正式配置为 `benchmarks/duplexomni/deploy_pd_fp8_4gpu.yaml`；BF16 回归配置为 `deploy_pd_bf16_4gpu.yaml`。
+
+```bash
+DUPLEXOMNI_RESULTS_DIR=/tmp/duplexomni-pd-server \
+VLLM_OMNI_BIN=/home/ubuntu/miniconda3/envs/omni/bin/vllm-omni \
+bash benchmarks/duplexomni/run_server.sh pd
+
+/home/ubuntu/miniconda3/envs/omni/bin/python benchmarks/duplexomni/single_user.py \
+  --label fp8 --slots 12 --output /tmp/duplexomni-pd-1x12
+```
+
+warmed 单用户 12-slot AV 结果：
+
+| 指标 | 结果 |
+|---|---:|
+| 有效 codec/EOS | 12/12 |
+| E2E p50/p95/p99/max | 361/387/390/391 ms |
+| Request p50/p95/p99/max | 357/383/387/387 ms |
+| Thinker p50/p95/p99/max | 273/298/301/301 ms |
+| Application queue p99 | 0.16 ms |
+| Deadline miss | 0 |
+| P→D delta load | 54–81 ms |
+
+所有 slot 都经过 P、D、Talker 和 Code2Wav；每轮返回 `[16,6]` codec 和 10,965 个 24 kHz audio samples。首请求包含 NIXL 握手、hidden cache 初始化和 shape JIT，不能计入稳态延迟。当前结论只证明四阶段部署、delta KV handoff 和长 session lineage 正确；尚未测量多用户 P/D 容量。
+
 ## 快速恢复入口
 
 | 内容 | 路径 |
@@ -180,8 +218,8 @@ bash benchmarks/duplexomni/run_server.sh fp8
 | WebSocket session、slot、filter、压缩 | `vllm_omni/entrypoints/openai/serving_duplexomni_stream.py` |
 | Thinker/Talker 跨 slot 顺序 | `vllm_omni/engine/duplexomni_pipeline.py` |
 | Thinker→Talker 协议与 cache identity | `vllm_omni/model_executor/stage_input_processors/duplexomni.py` |
-| 三阶段 pipeline | `vllm_omni/model_executor/models/duplexomni/pipeline.py` |
-| 正式部署 | `benchmarks/duplexomni/deploy_fp8_3gpu.yaml` |
+| 三/四阶段 pipeline | `vllm_omni/model_executor/models/duplexomni/pipeline.py` |
+| 非 P/D / P/D 部署 | `benchmarks/duplexomni/deploy_fp8_3gpu.yaml`、`benchmarks/duplexomni/deploy_pd_fp8_4gpu.yaml` |
 | 单/多用户 workload | `benchmarks/duplexomni/single_user.py`、`benchmarks/duplexomni/multi_user.py` |
 | 容量分析 | `benchmarks/duplexomni/analyze_capacity.py` |
 | Prefill 因果分析 | `benchmarks/duplexomni/analyze_prefill_causal.py` |

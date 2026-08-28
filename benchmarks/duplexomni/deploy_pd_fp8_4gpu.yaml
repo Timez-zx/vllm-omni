@@ -1,0 +1,2 @@
+# Benchmark entry point for the default four-GPU FP8 P/D deployment.
+base_config: ../../vllm_omni/deploy/duplexomni_pd_4gpu.yaml

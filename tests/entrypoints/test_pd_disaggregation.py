@@ -670,6 +670,26 @@ class TestPreparePrefillSamplingParams:
         assert kv_params["do_remote_prefill"] is False
         assert kv_params["transfer_id"] == "xfer-req-1"
 
+    def test_prefill_only_request_does_not_pin_kv_for_decode(self, monkeypatch):
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(),
+                _decode_stage_cfg(engine_input_source=[0]),
+            ],
+        )
+        sp = SamplingParams(max_tokens=2048)
+        result = omni._prepare_prefill_sampling_params(
+            "warm-1",
+            sp,
+            transfer_kv=False,
+        )
+
+        kv_params = result.extra_args["kv_transfer_params"]
+        assert kv_params["do_remote_decode"] is False
+        assert kv_params["do_remote_prefill"] is False
+        assert result.max_tokens == 1
+
     def test_preserves_existing_extra_args(self, monkeypatch):
         omni = _make_pd_omni(
             monkeypatch,

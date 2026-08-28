@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError, model_validator
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.logger import init_logger
@@ -36,7 +36,11 @@ from vllm_omni.engine.duplexomni_pipeline import (
 from vllm_omni.entrypoints.openai.video_frame_filter import FrameSimilarityFilter
 from vllm_omni.entrypoints.openai.video_stream_base import (
     OmniStreamingVideoHandler,
+    _ThinkerLineageTicket,
+    _attach_thinker_lineage,
+    _commit_thinker_lineage,
     _downscale_frame_bytes,
+    _reset_thinker_lineage,
 )
 
 logger = init_logger(__name__)
@@ -55,6 +59,14 @@ class DuplexOmniSessionConfig(BaseModel):
     """Application policy for one DuplexOmni WebSocket session."""
 
     model_config = ConfigDict(extra="forbid")
+
+    # These are disposable engine-cache hints.  The application still owns
+    # the authoritative session history and submits one finite request/slot.
+    _thinker_lineage_id: str = PrivateAttr(
+        default_factory=lambda: f"duplex-thinker:{uuid.uuid4().hex}"
+    )
+    _thinker_lineage_revision: int = PrivateAttr(default=0)
+    _thinker_lineage_token_ids: list[int] = PrivateAttr(default_factory=list)
 
     session_id: str | None = Field(default=None, min_length=1, max_length=128)
     model: str = "DuplexOmni"
@@ -261,6 +273,11 @@ class DuplexOmniStreamingVideoHandler(OmniStreamingVideoHandler):
             idle_timeout=idle_timeout,
             config_timeout=config_timeout,
             engine_client=engine_client,
+        )
+        self._thinker_output_stage_id = (
+            1
+            if getattr(engine_client, "pipeline_model_type", None) == "duplexomni_pd"
+            else 0
         )
 
     async def _receive_config(self, websocket: WebSocket) -> DuplexOmniSessionConfig | None:
@@ -502,6 +519,7 @@ class DuplexOmniStreamingVideoHandler(OmniStreamingVideoHandler):
             submitted: float,
             engine_prompt: dict[str, Any] | None,
             canonical_ticket: _DuplexCanonicalTicket | None,
+            lineage_ticket: _ThinkerLineageTicket | None,
         ) -> None:
             nonlocal canonical_state
             text_parts: list[str] = []
@@ -512,11 +530,14 @@ class DuplexOmniStreamingVideoHandler(OmniStreamingVideoHandler):
             audio_chunks = 0
 
             async def mark_thinker_ready() -> None:
-                nonlocal thinker_at, canonical_state
+                nonlocal thinker_at, canonical_state, lineage_ticket
                 if thinker_at is not None:
                     return
                 thinker_at = time.monotonic()
                 running.turn.assistant_text = "".join(text_parts).strip()
+                if not _commit_thinker_lineage(config, lineage_ticket):
+                    _reset_thinker_lineage(config)
+                lineage_ticket = None
                 if canonical_ticket is not None and canonical_state is not None:
                     try:
                         await self._commit_canonical_turn(
@@ -549,6 +570,8 @@ class DuplexOmniStreamingVideoHandler(OmniStreamingVideoHandler):
                     if engine_prompt is None:
                         engine_prompt = await self._preprocess_to_engine_prompt(request)
                     engine_prompt = dict(engine_prompt)
+                    if lineage_ticket is None:
+                        lineage_ticket = _attach_thinker_lineage(config, engine_prompt)
                     engine_prompt["prefill_only"] = True
                     prompt_token_ids = engine_prompt.get("prompt_token_ids")
                     if isinstance(prompt_token_ids, list):
@@ -656,7 +679,7 @@ class DuplexOmniStreamingVideoHandler(OmniStreamingVideoHandler):
                             thinker_at is None
                             and modality == "text"
                             and isinstance(incoming_metrics, dict)
-                            and incoming_metrics.get("stage_id") == 0
+                            and incoming_metrics.get("stage_id") == self._thinker_output_stage_id
                         ):
                             await mark_thinker_ready()
 
@@ -734,6 +757,7 @@ class DuplexOmniStreamingVideoHandler(OmniStreamingVideoHandler):
                         epoch_slot = 0
                         base_turns = len(history)
                         last_prompt_tokens = 0
+                        _reset_thinker_lineage(config)
                         await emit(
                             {
                                 "type": "session.history.compacted",
@@ -767,6 +791,7 @@ class DuplexOmniStreamingVideoHandler(OmniStreamingVideoHandler):
                     render_started = time.monotonic()
                     engine_prompt: dict[str, Any] | None = None
                     canonical_ticket: _DuplexCanonicalTicket | None = None
+                    lineage_ticket: _ThinkerLineageTicket | None = None
                     if canonical_enabled:
                         try:
                             if canonical_state is None:
@@ -779,6 +804,7 @@ class DuplexOmniStreamingVideoHandler(OmniStreamingVideoHandler):
                                 cache_salt=cache_salt,
                                 additional_information=additional_information,
                             )
+                            lineage_ticket = _attach_thinker_lineage(config, engine_prompt)
                         except Exception:
                             canonical_state = None
                             logger.warning(
@@ -812,6 +838,7 @@ class DuplexOmniStreamingVideoHandler(OmniStreamingVideoHandler):
                             submitted,
                             engine_prompt,
                             canonical_ticket,
+                            lineage_ticket,
                         ),
                         name=f"duplexomni-{session_id}-{slot_input.index}",
                     )

@@ -87,6 +87,16 @@ def _request_additional_information(request: Any) -> dict[str, Any]:
     return raw_info if isinstance(raw_info, dict) else {}
 
 
+def _pd_prompt_chunks(payload: Any, field: str) -> tuple[torch.Tensor, ...]:
+    chunks = getattr(payload, f"{field}_chunks", None)
+    if chunks:
+        return tuple(chunk.detach().cpu() for chunk in chunks)
+    tensor = getattr(payload, field, None)
+    if isinstance(tensor, torch.Tensor):
+        return (tensor.detach().cpu(),)
+    raise RuntimeError(f"DuplexOmni P/D snapshot is missing {field}")
+
+
 def _pipeline_meta(raw_info: Any) -> dict[str, Any] | None:
     meta = raw_info.get("meta") if isinstance(raw_info, dict) else None
     if not isinstance(meta, dict) or not isinstance(meta.get(PIPELINE_SESSION_ID), str):
@@ -300,6 +310,48 @@ def thinker2talker_full_payload(
     all_ids = _as_list(getattr(request, "all_token_ids", []))
     if not all_ids:
         all_ids = prompt_ids + _as_list(getattr(request, "output_token_ids", []))
+
+    # P/D transfers Thinker KV to D, but Talker also needs the prompt rows from
+    # layer 0 and DuplexOmni's final layer 48. The wire-compatible
+    # ``prompt_layer_24`` field carries whichever hidden layer the pipeline
+    # selected; append D's newly decoded rows before applying the ordinary
+    # DuplexOmni assistant/codec alignment below.
+    pd_prefill = getattr(request, "pd_prefill_payload", None)
+    if pd_prefill is not None:
+        decode_steps = min(int(thinker_emb.shape[0]), int(thinker_top.shape[0]))
+        if decode_steps <= 0:
+            raise RuntimeError("DuplexOmni P/D Thinker produced no decode rows")
+        prompt_layer_0 = _pd_prompt_chunks(pd_prefill, "prompt_layer_0")
+        prompt_layer_hidden = _pd_prompt_chunks(pd_prefill, "prompt_layer_24")
+        layer_0_rows = sum(int(chunk.shape[0]) for chunk in prompt_layer_0)
+        hidden_rows = sum(int(chunk.shape[0]) for chunk in prompt_layer_hidden)
+        if layer_0_rows != len(prompt_ids) or hidden_rows != len(prompt_ids):
+            raise RuntimeError(
+                "DuplexOmni P/D prompt snapshot is not row-aligned: "
+                f"prompt_tokens={len(prompt_ids)} layer0_rows={layer_0_rows} "
+                f"hidden_rows={hidden_rows}"
+            )
+        # vLLM intentionally leaves the final prompt token uncached so D can
+        # recompute logits.  Therefore the accumulated D rows are:
+        #   [last prompt row, generated token 0, ..., generated token N-2]
+        # The P snapshot already contains that prompt row; append only the
+        # N-1 training-aligned generated rows required by Talker.
+        decoded_layer_0 = thinker_emb[-decode_steps:].detach().cpu()[1:]
+        decoded_layer_hidden = thinker_top[-decode_steps:].detach().cpu()[1:]
+        thinker_emb = torch.cat((*prompt_layer_0, decoded_layer_0), dim=0)
+        thinker_top = torch.cat((*prompt_layer_hidden, decoded_layer_hidden), dim=0)
+        # Remote-KV CachedRequestState may retain only its last output token.
+        # The accumulated row count is the authoritative completion length;
+        # _conditioning_layout uses only this suffix length, not token values.
+        all_ids = [*prompt_ids, *([0] * decode_steps)]
+        logger.info(
+            "DuplexOmni P/D assembled Talker conditioning request=%s "
+            "prompt_rows=%d decode_steps=%d conditioning_rows=%d",
+            getattr(request, "request_id", "-"),
+            len(prompt_ids),
+            decode_steps,
+            max(0, decode_steps - 1),
+        )
     available_rows = min(int(thinker_emb.shape[0]), int(thinker_top.shape[0]), max(0, len(all_ids) - 1))
     raw_info = _request_additional_information(request)
     history, history_indices = _codec_history_from_info(raw_info)

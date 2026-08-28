@@ -74,6 +74,75 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
     ),
 )
 
+# Four-stage finite-request topology used to isolate Thinker prefill from
+# Thinker decode. The 0 -> 1 edge transfers KV through vLLM's P/D connector;
+# stage 1 streams the usual Thinker hidden-state payload to Talker.
+QWEN3_OMNI_PD_PIPELINE = PipelineConfig(
+    model_type="qwen3_omni_moe_pd",
+    model_arch="Qwen3OmniMoeForConditionalGeneration",
+    endpoint_restrictions=QWEN3_OMNI_PIPELINE.endpoint_restrictions,
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="thinker",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            hf_config_name="thinker_config",
+            engine_output_type="latent",
+            sampling_constraints={"detokenize": True},
+            extras={"is_prefill_only": True},
+        ),
+        StagePipelineConfig(
+            stage_id=1,
+            model_stage="thinker",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(0,),
+            final_output=True,
+            final_output_type="text",
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            hf_config_name="thinker_config",
+            engine_output_type="latent",
+            custom_process_next_stage_input_func=f"{_PROC}.thinker2talker_full_payload",
+            async_chunk_process_next_stage_input_func=f"{_PROC}.thinker2talker_async_chunk",
+            sampling_constraints={"detokenize": True},
+            extras={"is_decode_only": True},
+        ),
+        StagePipelineConfig(
+            stage_id=2,
+            model_stage="talker",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(1,),
+            hf_config_name="talker_config",
+            engine_output_type="latent",
+            # P/D may finish on D's first token. Even in async-chunk mode the
+            # control-plane request must therefore translate Thinker ids into
+            # codec-space placeholders; bulk conditioning still uses the
+            # connector payload.
+            custom_process_input_func=f"{_PROC}.thinker2talker_token_only",
+            custom_process_next_stage_input_func=f"{_PROC}.talker2code2wav_full_payload",
+            async_chunk_process_next_stage_input_func=f"{_PROC}.talker2code2wav_async_chunk",
+            sampling_constraints={
+                "detokenize": False,
+                "stop_token_ids": [2150],
+            },
+        ),
+        StagePipelineConfig(
+            stage_id=3,
+            model_stage="code2wav",
+            execution_type=StageExecutionType.LLM_GENERATION,
+            input_sources=(2,),
+            final_output=True,
+            final_output_type="audio",
+            hf_config_name="thinker_config",
+            engine_output_type="audio",
+            sampling_constraints={"detokenize": True},
+        ),
+    ),
+)
+
 QWEN3_OMNI_THINKER_ONLY_PIPELINE = PipelineConfig(
     model_type="qwen3_omni_moe_thinker_only",
     model_arch="Qwen3OmniMoeForConditionalGeneration",

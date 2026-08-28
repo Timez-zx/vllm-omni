@@ -6,9 +6,11 @@ Directly inherits from vLLM's AsyncMPClient to reuse EngineCore architecture.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import os
 import socket
+import time
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
@@ -18,6 +20,8 @@ from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.engine.tensor_ipc import TensorIpcReceiver, TensorIpcSender
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 from vllm_omni.distributed.omni_connectors.utils.config import (
     TRANSFER_ENGINE_CONNECTOR_NAMES,
@@ -36,6 +40,30 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniTokensPrompt
 
 logger = init_logger(__name__)
+
+_LOG_HANDOFF_DIAG = os.environ.get("VLLM_OMNI_LOG_HANDOFF_DIAG", "0") not in ("0", "", "false", "False")
+_DIAG_STAGE_RAW = os.environ.get("VLLM_OMNI_DIAG_STAGE")
+_DIAG_STAGES = (
+    None
+    if _DIAG_STAGE_RAW is None
+    else frozenset(stage.strip() for stage in _DIAG_STAGE_RAW.split(",") if stage.strip())
+)
+
+
+class _SharedTensorIpcSender(TensorIpcSender):
+    """Move only already-shared tensors out of the EngineCore ZMQ frame.
+
+    The P/D bridge explicitly materializes its large, request-scoped
+    conditioning tensors in shared storage.  Restricting the sender to those
+    tensors keeps ordinary multimodal request data on its existing transport
+    and, importantly, avoids an implicit synchronous ``share_memory_`` copy in
+    the API process.
+    """
+
+    def __call__(self, tensor: Any) -> dict[str, Any] | None:
+        if not tensor.is_shared():
+            return None
+        return super().__call__(tensor)
 
 
 def _default_process_engine_inputs(
@@ -87,6 +115,8 @@ class StageEngineCoreClientBase(StageClientBase):
         coordinator: Any = None,
         client_count: int = 1,
         client_index: int = 0,
+        input_tensor_queue: Any | None = None,
+        output_tensor_queue: Any | None = None,
     ) -> StageEngineCoreClient | DPLBStageEngineCoreClient:
         """Create the appropriate stage async client for the DP mode."""
         parallel_config = vllm_config.parallel_config
@@ -100,6 +130,8 @@ class StageEngineCoreClientBase(StageClientBase):
             coordinator=coordinator,
             client_count=client_count,
             client_index=client_index,
+            input_tensor_queue=input_tensor_queue,
+            output_tensor_queue=output_tensor_queue,
         )
 
         if parallel_config.data_parallel_size > 1 and not parallel_config.data_parallel_external_lb:
@@ -119,6 +151,8 @@ class StageEngineCoreClientBase(StageClientBase):
         metadata: StageMetadata | None = None,
         engine_manager: Any = None,
         coordinator: Any = None,
+        input_tensor_queue: Any | None = None,
+        output_tensor_queue: Any | None = None,
     ):
         """Create an async EngineCore client for a single stage.
 
@@ -148,6 +182,11 @@ class StageEngineCoreClientBase(StageClientBase):
 
         self.engine_outputs: Any = None
         self.client_addresses = dict(client_addresses or {})
+        # AsyncMPClient's socket task decodes EngineCoreOutputs before placing
+        # them on ``outputs_queue``. Keep an object-local timestamp so the
+        # consumer can distinguish socket/decode latency from time waiting in
+        # that queue. The hook and get_output_async run on the same event loop.
+        self._output_queue_received_mono: dict[int, float] = {}
         self._omni_kv_config = getattr(getattr(vllm_config, "model_config", None), "omni_kv_config", None)
         self._kv_sender_host = self._resolve_contact_host()
         self._kv_sender_info: dict[str, Any] | None = None
@@ -184,6 +223,35 @@ class StageEngineCoreClientBase(StageClientBase):
                 client_count=client_count,
                 client_index=client_index,
             )
+            if input_tensor_queue is not None:
+                # The paired P stage has already put its large conditioning
+                # tensors in shared storage.  Keep only their compact handles
+                # in the API -> D ZMQ request.
+                self._input_tensor_ipc_sender = _SharedTensorIpcSender(input_tensor_queue)
+                self.encoder = MsgpackEncoder(
+                    oob_tensor_consumer=self._input_tensor_ipc_sender,
+                )
+                logger.info(
+                    "[%s] stage-%s [rep-%s] shared-only input tensor IPC enabled",
+                    client_name,
+                    self.stage_id,
+                    self.replica_id,
+                )
+            if output_tensor_queue is not None:
+                # AsyncMPClient starts its output task lazily, so replacing the
+                # decoder here is race-free. Tensor handles in the ZMQ frame
+                # are resolved through the reverse torch-shm queue.
+                self._output_tensor_ipc_receiver = TensorIpcReceiver(output_tensor_queue)
+                self.decoder = MsgpackDecoder(
+                    OmniEngineCoreOutputs,
+                    oob_tensor_provider=self._output_tensor_ipc_receiver,
+                )
+                logger.info(
+                    "[%s] stage-%s [rep-%s] reverse tensor IPC enabled",
+                    client_name,
+                    self.stage_id,
+                    self.replica_id,
+                )
             if engine_manager is not None:
                 self.resources.engine_manager = engine_manager
                 self.start_engine_core_monitor()
@@ -238,6 +306,79 @@ class StageEngineCoreClientBase(StageClientBase):
             request.request_id,
         )
         await super().add_request_async(request)
+
+    async def process_engine_outputs(self, outputs: Any) -> None:
+        """Timestamp an output after ZMQ receive/decode and before queueing.
+
+        Upstream AsyncMPClient calls this optional hook immediately before it
+        puts ``outputs`` on its asyncio output queue. It intentionally performs
+        no processing and therefore does not change output ordering.
+        """
+        self._output_queue_received_mono[id(outputs)] = time.monotonic()
+
+    async def get_output_async(self) -> Any:
+        """Expose per-message time spent in AsyncMPClient.outputs_queue."""
+        outputs = await super().get_output_async()
+        self._record_output_queue_wait(outputs)
+        return outputs
+
+    def get_output_nowait(self) -> Any | None:
+        """Return one decoded core output without polling an empty queue.
+
+        AsyncMPClient already owns a socket-reader task that feeds
+        ``outputs_queue``.  The orchestrator can therefore scan all stages
+        fairly without paying a separate timeout for every empty stage.
+        """
+        self._ensure_output_queue_task()
+        output_queue = self.outputs_queue
+        assert output_queue is not None
+        try:
+            outputs = output_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+        if isinstance(outputs, Exception):
+            raise self._format_exception(outputs) from None
+        self._record_output_queue_wait(outputs)
+        return outputs
+
+    def _record_output_queue_wait(self, outputs: Any) -> None:
+        """Record and optionally log time spent in ``outputs_queue``."""
+        received_mono = self._output_queue_received_mono.pop(id(outputs), None)
+        if (
+            received_mono is not None
+            and _LOG_HANDOFF_DIAG
+            and (_DIAG_STAGES is None or str(self.stage_id) in _DIAG_STAGES)
+        ):
+            request_ids = ",".join(
+                str(getattr(output, "request_id", "?"))
+                for output in getattr(outputs, "outputs", ())
+            )
+            queue_size = -1
+            output_queue = getattr(self, "outputs_queue", None)
+            if output_queue is not None:
+                try:
+                    queue_size = int(output_queue.qsize())
+                except (AttributeError, NotImplementedError, RuntimeError, ValueError):
+                    pass
+            logger.info(
+                "[OUTPUT-QUEUE-DIAG] mono=%.6f stage=%s reqs=%s queue_wait_ms=%.3f qsize_after=%d",
+                time.monotonic(),
+                self.stage_id,
+                request_ids,
+                (time.monotonic() - received_mono) * 1000.0,
+                queue_size,
+            )
+
+    async def pd_cache_sync_async(self, request: EngineCoreRequest) -> Any:
+        """Run D's cache-only P/D import control operation."""
+        logger.debug(
+            "[%s] stage-%s [rep-%s] P/D cache sync: %s",
+            self.__class__.__name__,
+            self.stage_id,
+            self.replica_id,
+            request.request_id,
+        )
+        return await self.call_utility_async("start_pd_cache_sync", request)
 
     # ==================== Stage Methods ====================
 

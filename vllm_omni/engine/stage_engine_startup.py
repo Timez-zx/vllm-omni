@@ -130,6 +130,12 @@ class StageReplicaResources:
     manager: Any | None = None
     coordinator: Any | None = None
     addresses: EngineZmqAddresses | None = None
+    # Local API-server -> EngineCore tensor handles.  The P/D decode stage
+    # uses this for request-scoped conditioning snapshots.
+    input_tensor_queue: Any | None = None
+    # Local EngineCore -> API-server tensor IPC. Only the P/D prefill stage
+    # currently creates this reverse queue; remote replicas leave it unset.
+    output_tensor_queue: Any | None = None
     lock_fds: list[int] = field(default_factory=list)
     # When this replica HOSTS colocated sibling stage(s) (stage 2 -- and for
     # tri-colocation stage 0 -- ride inside stage 1's process so their kernels
@@ -1129,6 +1135,8 @@ def launch_stage_replica(
                 manager=engine_manager,
                 coordinator=coordinator,
                 addresses=addresses,
+                input_tensor_queue=getattr(engine_manager, "input_tensor_queue", None),
+                output_tensor_queue=getattr(engine_manager, "output_tensor_queue", None),
             )
         return
 
@@ -1194,6 +1202,8 @@ def launch_stage_replica(
         yield StageReplicaResources(
             manager=engine_manager,
             addresses=addresses,
+            input_tensor_queue=getattr(engine_manager, "input_tensor_queue", None),
+            output_tensor_queue=getattr(engine_manager, "output_tensor_queue", None),
             sibling_addresses=sibling_addresses,
         )
         wait_for_engine_startup(
@@ -1210,7 +1220,8 @@ def launch_stage_replica(
         for launch, guest_socket in sibling_sockets:
             logger.info(
                 "[colocate] host stage %s ready; waiting for sibling stage %s handshake",
-                stage_id, launch.stage_id,
+                stage_id,
+                launch.stage_id,
             )
             wait_for_engine_startup(
                 guest_socket,
@@ -1222,8 +1233,7 @@ def launch_stage_replica(
                 engine_manager,
                 None,  # coordinator_proc
             )
-            logger.info("[colocate] sibling stage %s ready in host stage %s process",
-                        launch.stage_id, stage_id)
+            logger.info("[colocate] sibling stage %s ready in host stage %s process", launch.stage_id, stage_id)
 
 
 def launch_headless_llm_replica(

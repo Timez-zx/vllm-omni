@@ -61,3 +61,69 @@ DUPLEXOMNI_PIPELINE = PipelineConfig(
         ),
     ),
 )
+
+
+# The application/session contract is identical to ``DUPLEXOMNI_PIPELINE``.
+# Only the Thinker engine is split: stage 0 materializes prompt KV and the two
+# Talker-conditioning layers, while stage 1 imports that KV and performs the
+# finite per-slot decode.
+DUPLEXOMNI_PD_PIPELINE = PipelineConfig(
+    model_type="duplexomni_pd",
+    default_deploy_config_name="duplexomni_pd_4gpu.yaml",
+    model_arch="Qwen3OmniMoeForConditionalGeneration",
+    endpoint_restrictions=DUPLEXOMNI_PIPELINE.endpoint_restrictions,
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="thinker",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            hf_config_name="thinker_config",
+            engine_output_type="latent",
+            sampling_constraints={"detokenize": True},
+            extras={"is_prefill_only": True, "pd_snapshot_hidden_layer": 48},
+        ),
+        StagePipelineConfig(
+            stage_id=1,
+            model_stage="thinker",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(0,),
+            final_output=True,
+            final_output_type="text",
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            hf_config_name="thinker_config",
+            engine_output_type="latent",
+            custom_process_next_stage_input_func=f"{_PROC}.thinker2talker_full_payload",
+            sampling_constraints={"detokenize": True},
+            extras={
+                "is_decode_only": True,
+                "pd_snapshot_hidden_layer": 48,
+            },
+        ),
+        StagePipelineConfig(
+            stage_id=2,
+            model_stage="talker",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(1,),
+            hf_config_name="talker_config",
+            engine_output_type="latent",
+            sync_process_input_func=f"{_PROC}.thinker2talker_token_only",
+            custom_process_next_stage_input_func=f"{_PROC}.talker2code2wav_full_payload",
+            sampling_constraints={"detokenize": False, "stop_token_ids": [2150]},
+        ),
+        StagePipelineConfig(
+            stage_id=3,
+            model_stage="code2wav",
+            execution_type=StageExecutionType.LLM_GENERATION,
+            input_sources=(2,),
+            final_output=True,
+            final_output_type="audio",
+            hf_config_name="thinker_config",
+            engine_output_type="audio",
+            sampling_constraints={"detokenize": True},
+        ),
+    ),
+)

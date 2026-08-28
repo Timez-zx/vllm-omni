@@ -249,7 +249,10 @@ def create_streaming_video_handler(
     The transport and application/engine boundary are shared, while each
     model adapter owns its actual turn/slot semantics.
     """
-    if getattr(engine_client, "pipeline_model_type", None) == "duplexomni":
+    if getattr(engine_client, "pipeline_model_type", None) in {
+        "duplexomni",
+        "duplexomni_pd",
+    }:
         from vllm_omni.entrypoints.openai.serving_duplexomni_stream import (
             DuplexOmniStreamingVideoHandler,
         )

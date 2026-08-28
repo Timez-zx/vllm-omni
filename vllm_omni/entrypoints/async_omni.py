@@ -588,7 +588,15 @@ class AsyncOmni(EngineClient, OmniBase):
             pd_pair = self._get_pd_separation_pair()
             if pd_pair is not None:
                 p_id = pd_pair[0]
-                req_sp_list[p_id] = self._prepare_prefill_sampling_params(request_id, req_sp_list[p_id])
+                req_sp_list[p_id] = self._prepare_prefill_sampling_params(
+                    request_id,
+                    req_sp_list[p_id],
+                    # A finite arrival-prefill warms P synchronously and D in
+                    # the background.  The client-visible completion marks P
+                    # snapshot readiness; D may import the same disposable KV
+                    # revision after the application starts its next request.
+                    transfer_kv=True,
+                )
 
             # Add request(s) to stage 0. For streaming inputs, submit
             # chunks incrementally through streaming_update.

@@ -153,7 +153,6 @@ class Qwen3OmniMoeForConditionalGeneration(
     # __init__; the first log writes a per-instance value over it.
     _talker_text_only_last_log: float = 0.0
 
-
     realtime_max_tokens = 64
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -191,6 +190,37 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         if self.model_stage == "thinker":
             self.use_async_omni_output = True
+            # The P stage in the finite-request P/D topology has no ordinary
+            # next-stage processor: its KV goes directly to D and its two
+            # Talker-conditioning layers are bridged by the orchestrator.
+            # Let that bridge request scheduled-tail rows on prefix hits,
+            # avoiding a full-context CPU reconstruction inside the P worker.
+            model_config = vllm_config.model_config
+            self.supports_delta_prefix_multimodal_outputs = bool(
+                getattr(model_config, "stage_id", -1) == 0
+                and getattr(model_config, "engine_output_type", None) == "latent"
+                and getattr(model_config, "custom_process_next_stage_input_func", None) is None
+            )
+            if self.supports_delta_prefix_multimodal_outputs:
+                # The finite-request P/D bridge retains only captured layer 0
+                # and layer 24 for Talker conditioning.  The generic final
+                # Thinker hidden payload is neither consumed by D nor stored
+                # in the orchestrator snapshot; emitting it duplicated tens
+                # to hundreds of MiB per P result.  It also does not need its
+                # own CPU prefix cache when the two captured layers already
+                # carry the exact lineage-aware snapshot.
+                self.omni_pooler_payload_include_hidden = False
+                self.requires_full_prefix_cached_hidden_states = False
+            # In the P/D topology, Thinker-D receives the complete prompt
+            # conditioning snapshot from P. Its D->Talker processor appends
+            # only newly decoded layer-0/layer-24 rows to that snapshot, so
+            # rebuilding the same full prefix from the runner's CPU tensor
+            # cache is redundant. Keep native KV prefix caching enabled; opt
+            # out only from the separate Omni output-tensor side-cache.
+            if getattr(model_config, "stage_id", -1) == 1:
+                self.omni_pooler_payload_include_hidden = False
+                self.requires_full_prefix_cached_hidden_states = False
+                self.requires_full_prefix_cached_multimodal_outputs = False
             # Initialize thinker model (multimodal processing + text generation)
             # Create a new vllm_config with thinker_config as the hf_config
             thinker_vllm_config = vllm_config.with_hf_config(
@@ -540,9 +570,11 @@ class Qwen3OmniMoeForConditionalGeneration(
                             # carry no runtime_additional_information, which is
                             # the gate; their D2H .tolist() during capture was
                             # also a boot-killer.
-                            req_id = (runtime_additional_information[idx] or {}).get("request_id", "?") if idx < len(
-                                runtime_additional_information
-                            ) else "?"
+                            req_id = (
+                                (runtime_additional_information[idx] or {}).get("request_id", "?")
+                                if idx < len(runtime_additional_information)
+                                else "?"
+                            )
                             logger.warning(
                                 "Code2Wav: request %s shipped %d codec tokens, not frame-aligned; "
                                 "its decoded frames will be scrambled. head=%s tail=%s",
@@ -551,9 +583,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                                 code[:8].tolist(),
                                 code[-(code.shape[0] % 16) :].tolist(),
                             )
-                        code = torch.cat(
-                            [code, code.new_zeros(16 - code.shape[0] % 16)]
-                        )
+                        code = torch.cat([code, code.new_zeros(16 - code.shape[0] % 16)])
                     seq_len = code.shape[0] // 16
                     codes[idx, :, :seq_len] = code.reshape(16, seq_len)
             elif input_ids.shape[0] % 16 == 0:
@@ -797,10 +827,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             lens = [talker_codes.shape[-1]] * batch
         lcs = left_context_size if left_context_size else [0] * batch
         dtype = next(self.code2wav.parameters()).dtype
-        return [
-            talker_codes.new_zeros((1, max(0, lens[i] - lcs[i]) * u), dtype=dtype)
-            for i in range(batch)
-        ]
+        return [talker_codes.new_zeros((1, max(0, lens[i] - lcs[i]) * u), dtype=dtype) for i in range(batch)]
 
     # ==================== Thinker-Talker Projection ====================
 
@@ -1085,8 +1112,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             if short or now - self._talker_text_only_last_log >= _TALKER_TEXT_ONLY_LOG_EVERY_S:
                 self._talker_text_only_last_log = now
                 (logger.warning if short else logger.info)(
-                    "[talker-text-only] built %d talker prefill rows, span wants [%d,%d) "
-                    "of them (%d requested)%s",
+                    "[talker-text-only] built %d talker prefill rows, span wants [%d,%d) of them (%d requested)%s",
                     req_embeds.shape[0],
                     start_index,
                     end_index,
@@ -1143,11 +1169,13 @@ class Qwen3OmniMoeForConditionalGeneration(
                 "[talker-text-only] prefill row shortfall: span [%d,%d) wants %d rows, "
                 "payload has %d total; padding %d zero row(s). Upstream segment-state "
                 "desync -- this segment's audio is degraded but the batch stays aligned.",
-                start_index, end_index, span, req_embeds.shape[0], missing,
+                start_index,
+                end_index,
+                span,
+                req_embeds.shape[0],
+                missing,
             )
-            pad_embeds = torch.zeros(
-                (missing, req_embeds.shape[-1]), dtype=req_embeds.dtype, device=req_embeds.device
-            )
+            pad_embeds = torch.zeros((missing, req_embeds.shape[-1]), dtype=req_embeds.dtype, device=req_embeds.device)
             out_embeds = torch.cat((out_embeds, pad_embeds), dim=0)
             pad_ids = torch.zeros((missing,), dtype=req_input_ids.dtype, device=req_input_ids.device)
             out_ids = torch.cat((out_ids.reshape(-1), pad_ids), dim=0)
@@ -1338,10 +1366,11 @@ class Qwen3OmniMoeForConditionalGeneration(
             # reports them: log the ids so the producing chunk is identifiable rather
             # than inferred. Cheap -- one line per rare chunk.
             logger.warning(
-                "[talker-prefill] chunk carries %d im_start token(s); prompt len=%d "
-                "head=%s tail=%s",
-                int(im_start_pos.numel()), int(input_ids.shape[-1]),
-                input_ids[0][:12].tolist(), input_ids[0][-12:].tolist(),
+                "[talker-prefill] chunk carries %d im_start token(s); prompt len=%d head=%s tail=%s",
+                int(im_start_pos.numel()),
+                int(input_ids.shape[-1]),
+                input_ids[0][:12].tolist(),
+                input_ids[0][-12:].tolist(),
             )
         im_start_indexes = torch.cat(
             (
@@ -1383,9 +1412,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                     # same one `compute_talker_prompt_ids_length` applies to the placeholder.
                     # All three must agree; the ids are clamped to the embedding rows below
                     # so a drift shortens both together rather than misaligning them.
-                    seg_ids = seg_ids[~multimodal_mask[im_start_index:segment_end_index]][
-                        : talker_user_part.shape[0]
-                    ]
+                    seg_ids = seg_ids[~multimodal_mask[im_start_index:segment_end_index]][: talker_user_part.shape[0]]
                 talker_input_ids.append(seg_ids)
             # Take assistant output (for now)
             elif (role_token == self.config.assistant_token_id).item() and i == len(im_start_indexes) - 2:
@@ -1622,10 +1649,19 @@ class Qwen3OmniMoeForConditionalGeneration(
             tts_pad_embed.device
         )  # [t, d]
 
+        assistant_prefix = assistant_hidden[:3]
+        if assistant_prefix.shape[0] < 3:
+            assistant_prefix = torch.cat(
+                (
+                    assistant_prefix,
+                    assistant_hidden.new_zeros((3 - assistant_prefix.shape[0], assistant_hidden.shape[1])),
+                ),
+                dim=0,
+            )
         # [3 tokens] + [4 pad] + [1 BOS] + [1 first text] = 9 tokens
         assistant_text_hidden = torch.cat(
             (
-                assistant_hidden[:3],
+                assistant_prefix,
                 tts_pad_embed.expand(4, -1),
                 tts_bos_embed,
                 assistant_hidden[3:4]

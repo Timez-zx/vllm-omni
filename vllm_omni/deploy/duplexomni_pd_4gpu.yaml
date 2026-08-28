@@ -1,0 +1,14 @@
+# Default DuplexOmni P/D deployment: online W8A8 FP8 for both Thinker
+# replicas and Talker, per-token/per-head FP8 KV, and BF16 Code2Wav.
+base_config: duplexomni_pd_bf16_4gpu.yaml
+
+stages:
+  - stage_id: 0
+    quantization: fp8
+    kv_cache_dtype: fp8_per_token_head
+  - stage_id: 1
+    quantization: fp8
+    kv_cache_dtype: fp8_per_token_head
+  - stage_id: 2
+    quantization: fp8
+    kv_cache_dtype: fp8_per_token_head

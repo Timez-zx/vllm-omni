@@ -128,6 +128,37 @@ def test_native_text_metrics_include_segment_generation_token_count(monkeypatch)
     assert processor.pop_native_text_metrics("r")["num_generation_tokens"] == 27
 
 
+def test_native_text_metrics_split_queue_and_prefill(monkeypatch):
+    monkeypatch.setattr(VLLMOutputProcessor, "_update_stats_from_output", lambda *args, **kwargs: None)
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor._native_text_metrics_by_request = {}
+    processor.lora_states = {}
+    state = _make_state(RequestOutputKind.DELTA)
+    state.is_prefilling = True
+    iteration_stats = MagicMock()
+
+    def update_native_stats(_output, _timestamp, _was_prefilling, native_stats, *_args):
+        native_stats.queued_ts = 10.0
+        native_stats.scheduled_ts = 10.025
+        native_stats.first_token_ts = 10.105
+        native_stats.first_token_latency = 0.125
+        native_stats.num_generation_tokens = 1
+
+    iteration_stats.update_from_output.side_effect = update_native_stats
+
+    processor._update_stats_from_output(
+        state,
+        SimpleNamespace(),
+        10.105,
+        iteration_stats,
+    )
+
+    metrics = processor.pop_native_text_metrics("r")
+    assert metrics["vllm_ttft_ms"] == pytest.approx(125.0)
+    assert metrics["vllm_queue_ms"] == pytest.approx(25.0)
+    assert metrics["vllm_prefill_ms"] == pytest.approx(80.0)
+
+
 def test_delta_drains_output_modality_per_step():
     """DELTA drains the mm_type key (output modality) but preserves hidden-state keys."""
     s = _make_state(RequestOutputKind.DELTA)

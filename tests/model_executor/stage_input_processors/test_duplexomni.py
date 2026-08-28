@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.engine import OmniPDPrefillPayload
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni import (
     Qwen3OmniMoeForConditionalGeneration,
 )
@@ -153,6 +154,53 @@ def test_full_payload_reads_materialized_runner_codec_history() -> None:
 
     assert payload is not None
     assert torch.equal(payload["codes"]["ref"], _history())
+
+
+def test_pd_full_payload_combines_layer48_prompt_snapshot_with_decode_rows() -> None:
+    prompt = _prompt_ids()
+    output = [301, 302, 303, duplex.IM_END]
+    prompt_layer_0 = torch.arange(len(prompt) * 2, dtype=torch.float32).reshape(len(prompt), 2)
+    prompt_layer_48 = prompt_layer_0 + 1000
+    decode_layer_0 = torch.arange(len(output) * 2, dtype=torch.float32).reshape(len(output), 2) + 2000
+    decode_layer_48 = decode_layer_0 + 1000
+    request = SimpleNamespace(
+        request_id="pd-slot",
+        prompt_token_ids=prompt,
+        # Remote-KV CachedRequestState may retain its pre-decode snapshot here.
+        all_token_ids=prompt,
+        output_token_ids=output,
+        additional_information_cpu={"codes": {"ref": _history()}},
+        pd_prefill_payload=OmniPDPrefillPayload(
+            prompt_layer_0_chunks=(prompt_layer_0[:10], prompt_layer_0[10:]),
+            # The legacy wire field carries DuplexOmni's selected layer 48.
+            prompt_layer_24_chunks=(prompt_layer_48,),
+        ),
+    )
+
+    payload = duplex.thinker2talker_full_payload(
+        None,
+        {
+            "hidden_states.layer_0": decode_layer_0,
+            f"hidden_states.layer_{duplex.FINAL_THINKER_LAYER}": decode_layer_48,
+        },
+        request,
+    )
+
+    assert payload is not None
+    expected_layer_0 = torch.cat(
+        (prompt_layer_0[[15, 16]], decode_layer_0[1:]),
+        dim=0,
+    )
+    expected_layer_48 = torch.cat(
+        (prompt_layer_48[[15, 16]], decode_layer_48[1:]),
+        dim=0,
+    )
+    assert torch.equal(payload["embed"]["duplex_conditioning"], expected_layer_0)
+    assert torch.equal(
+        payload["hidden_states"]["duplex_conditioning"],
+        expected_layer_48,
+    )
+    assert payload["ids"]["duplex_conditioning_lengths"] == [2, 3]
 
 
 def test_token_only_prompt_has_exact_official_history_scaffold() -> None:

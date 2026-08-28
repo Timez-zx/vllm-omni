@@ -1,6 +1,7 @@
-# DuplexOmni baseline
+# DuplexOmni serving
 
-This directory validates a three-stage, non-P/D deployment:
+This directory validates both the three-stage baseline and a four-stage P/D
+deployment. The baseline topology is:
 
 - GPU 0: Thinker
 - GPU 1: Talker and MTP
@@ -55,6 +56,40 @@ benchmarks/duplexomni/stop_server.sh
 
 `single_user.py` uses the same server-owned WebSocket session as the capacity
 runner; it is not a separate client-owned session implementation.
+
+## Run the P/D deployment
+
+The P/D mode preserves the same WebSocket/session/finite-request behavior and
+changes only the engine topology:
+
+| GPU | Stage | Role |
+| ---: | --- | --- |
+| 0 | Thinker-P | Multimodal prompt prefill and layer-0/layer-48 snapshot |
+| 1 | Thinker-D | Imported-KV text/control decode |
+| 2 | Talker + MTP | Six-frame, 16-codebook codec generation |
+| 3 | Code2Wav | Waveform generation |
+
+Thinker-P and Thinker-D use `NixlDeltaPushConnector`. After the first slot,
+the application lineage and engine prefix cache reuse the common prompt; P
+transfers only newly produced KV blocks to D. D is both the client-visible
+text stage and the producer of the hidden-state conditioning consumed by
+Talker.
+
+```bash
+DUPLEXOMNI_RESULTS_DIR=/tmp/duplexomni-pd-server \
+VLLM_OMNI_BIN=/home/ubuntu/miniconda3/envs/omni/bin/vllm-omni \
+bash benchmarks/duplexomni/run_server.sh pd
+
+/home/ubuntu/miniconda3/envs/omni/bin/python \
+  benchmarks/duplexomni/single_user.py \
+  --label fp8 --slots 12 --output /tmp/duplexomni-pd-1x12
+
+DUPLEXOMNI_RESULTS_DIR=/tmp/duplexomni-pd-server \
+bash benchmarks/duplexomni/stop_server.sh
+```
+
+Use `pd-bf16` for the BF16 regression topology. The formal FP8 and BF16
+configs are `deploy_pd_fp8_4gpu.yaml` and `deploy_pd_bf16_4gpu.yaml`.
 
 ## Multi-user latency workload
 
@@ -117,6 +152,22 @@ exact `16 x 6` codec shape, and waveform sanity. It does not require FP8 and
 BF16 waveforms to be bit-identical.
 
 ## Current result
+
+### P/D functional baseline
+
+A warmed 12-slot, one-user AV run on four RTX PRO 6000 Blackwell GPUs
+completed 12/12 valid codec/EOS turns. Every slot returned a `[16, 6]` codec
+tensor and 10,965 audio samples. E2E p50/p95/p99/max was
+`361/387/390/391 ms`; request p50/p95/p99/max was `357/383/387/387 ms`;
+Thinker p99 was `301 ms`. No slot missed the 480 ms deadline. P-to-D delta
+loads were about `54–81 ms`, with 3 or 17 new KV blocks after the first slot.
+
+The first request after process startup is not a latency sample: it paid NIXL
+handshake, hidden-state cache allocation, and inference-shape JIT. Run one
+warm-up session before a benchmark. Multi-user P/D capacity has not yet been
+measured on this branch.
+
+### Non-P/D baseline
 
 A warmed 300-slot, one-user AV run completed 300/300 valid codec/EOS turns
 with no 480 ms deadline miss. E2E p50/p95/p99/max was

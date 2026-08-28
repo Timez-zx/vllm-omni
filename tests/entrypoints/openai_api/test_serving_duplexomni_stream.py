@@ -325,6 +325,12 @@ async def test_canonical_prompt_processes_only_new_slot_blocks() -> None:
     assert handler.rendered_roles.count(("user",)) == 4  # two probes + two slots
     assert chat.engine_prompts[1]["cache_salt"] == "session-canonical:epoch-0"
     assert chat.engine_prompts[1]["additional_information"]["meta"][PIPELINE_SLOT] == 1
+    assert chat.engine_prompts[0]["kv_lineage_parent_revision"] == 0
+    assert chat.engine_prompts[0]["kv_lineage_revision"] == 1
+    assert chat.engine_prompts[0]["kv_lineage_prefix_tokens"] == 0
+    assert chat.engine_prompts[1]["kv_lineage_parent_revision"] == 1
+    assert chat.engine_prompts[1]["kv_lineage_revision"] == 2
+    assert chat.engine_prompts[1]["kv_lineage_prefix_tokens"] == 2
 
 
 def test_factory_selects_only_the_duplexomni_session_adapter() -> None:
@@ -336,3 +342,13 @@ def test_factory_selects_only_the_duplexomni_session_adapter() -> None:
 
     assert isinstance(duplex, DuplexOmniStreamingVideoHandler)
     assert isinstance(qwen, QwenOmniStreamingVideoHandler)
+
+
+def test_factory_selects_duplexomni_pd_adapter_and_decode_stage() -> None:
+    class Engine:
+        pipeline_model_type = "duplexomni_pd"
+
+    handler = create_streaming_video_handler(object(), engine_client=Engine())
+
+    assert isinstance(handler, DuplexOmniStreamingVideoHandler)
+    assert handler._thinker_output_stage_id == 1

@@ -1,0 +1,2 @@
+# Benchmark entry point for the four-GPU BF16 P/D baseline.
+base_config: ../../vllm_omni/deploy/duplexomni_pd_bf16_4gpu.yaml

@@ -173,6 +173,44 @@ bash benchmarks/duplexomni/run_server.sh fp8
 4. The 6,144-token compaction policy removes one-user long-session context growth. Thinker is the first capacity limit; Talker and Code2Wav are not the primary bottleneck.
 5. The application/session/finite-request boundary is sound. The next engine research target is deadline/QoS-aware batching and scheduling for continuous short decode plus small incremental multimodal prefill, not another cross-slot persistent request.
 
+## Phase 9: DuplexOmni P/D deployment
+
+`duplexomni-pd` preserves the Phase 2 application/session/finite-request design and splits only the Thinker engine:
+
+| Stage | GPU | Configuration and role |
+|---|---:|---|
+| Thinker-P | 0 | FP8 weights/KV; multimodal prompt prefill; layer-0 and layer-48 hidden snapshot |
+| Thinker-D | 1 | FP8 weights/KV; imports P KV and generates about 24 text/control tokens |
+| Talker + MTP | 2 | FP8 weights/KV; generates the `16×6` codec |
+| Code2Wav | 3 | BF16; generates the waveform |
+
+P/D uses `NixlDeltaPushConnector`. The first slot establishes the complete lineage. Later slots use the exact application-provided prefix lineage, so P transfers only new KV blocks to D. D is both the client-visible text stage and the Talker producer: its complete decode hidden rows are combined with P's prompt snapshot before Talker starts. The scheduler-to-runner contract therefore preserves `pd_prefill_payload`; without it, D can generate text but Talker lacks prompt hidden states.
+
+The formal config is `benchmarks/duplexomni/deploy_pd_fp8_4gpu.yaml`; `deploy_pd_bf16_4gpu.yaml` is the BF16 regression config.
+
+```bash
+DUPLEXOMNI_RESULTS_DIR=/tmp/duplexomni-pd-server \
+VLLM_OMNI_BIN=/home/ubuntu/miniconda3/envs/omni/bin/vllm-omni \
+bash benchmarks/duplexomni/run_server.sh pd
+
+/home/ubuntu/miniconda3/envs/omni/bin/python benchmarks/duplexomni/single_user.py \
+  --label fp8 --slots 12 --output /tmp/duplexomni-pd-1x12
+```
+
+Warmed one-user, 12-slot AV result:
+
+| Metric | Result |
+|---|---:|
+| Valid codec/EOS | 12/12 |
+| E2E p50/p95/p99/max | 361/387/390/391 ms |
+| Request p50/p95/p99/max | 357/383/387/387 ms |
+| Thinker p50/p95/p99/max | 273/298/301/301 ms |
+| Application queue p99 | 0.16 ms |
+| Deadline misses | 0 |
+| P-to-D delta load | 54–81 ms |
+
+Every slot traversed P, D, Talker, and Code2Wav and returned a `[16,6]` codec tensor plus 10,965 24 kHz audio samples. The first request pays NIXL handshake, hidden-cache initialization, and shape JIT, so it is not a steady-state latency sample. This result validates the four-stage deployment, delta KV handoff, and long-session lineage; multi-user P/D capacity has not yet been measured.
+
 ## Recovery map
 
 | Purpose | Path |
@@ -180,8 +218,8 @@ bash benchmarks/duplexomni/run_server.sh fp8
 | WebSocket session, slots, filtering, compaction | `vllm_omni/entrypoints/openai/serving_duplexomni_stream.py` |
 | Cross-slot Thinker/Talker ordering | `vllm_omni/engine/duplexomni_pipeline.py` |
 | Thinker-to-Talker protocol and cache identity | `vllm_omni/model_executor/stage_input_processors/duplexomni.py` |
-| Three-stage pipeline | `vllm_omni/model_executor/models/duplexomni/pipeline.py` |
-| Formal deployment | `benchmarks/duplexomni/deploy_fp8_3gpu.yaml` |
+| Three/four-stage pipelines | `vllm_omni/model_executor/models/duplexomni/pipeline.py` |
+| Non-P/D and P/D deployment | `benchmarks/duplexomni/deploy_fp8_3gpu.yaml`, `benchmarks/duplexomni/deploy_pd_fp8_4gpu.yaml` |
 | Single/multi-user workload | `benchmarks/duplexomni/single_user.py`, `benchmarks/duplexomni/multi_user.py` |
 | Capacity analysis | `benchmarks/duplexomni/analyze_capacity.py` |
 | Prefill causal analysis | `benchmarks/duplexomni/analyze_prefill_causal.py` |

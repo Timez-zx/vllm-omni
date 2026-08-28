@@ -467,6 +467,34 @@ def test_update_additional_information_deserializes_new_request_payload():
     )
 
 
+def test_decode_request_payloads_merges_snapshot_metadata_with_final_stage() -> None:
+    from vllm_omni.engine.serialization import serialize_additional_information
+
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[
+            SimpleNamespace(
+                req_id="r1",
+                prompt_embeds=None,
+                model_intermediate_buffer={
+                    "meta": {
+                        "pd_prefill_snapshot_mode": "delta",
+                        "pd_prefill_snapshot_parent_rows": 128,
+                    }
+                },
+                additional_information=serialize_additional_information({"omni_final_stage_id": 0}),
+            )
+        ]
+    )
+
+    OmniGPUModelRunner._decode_and_store_request_payloads(runner, scheduler_output)
+
+    info = runner.model_intermediate_buffer["r1"]
+    assert info["omni_final_stage_id"] == 0
+    assert info["meta"]["pd_prefill_snapshot_mode"] == "delta"
+    assert info["meta"]["pd_prefill_snapshot_parent_rows"] == 128
+
+
 def test_update_intermediate_buffer_skips_empty_update():
     """Validate that an empty update dict is a no-op."""
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
@@ -598,7 +626,13 @@ def test_full_payload_output_accumulation_hook_matrix():
     assert _make_full_payload_accumulation_runner(model_stage="thinker")._should_accumulate_full_payload_output()
     assert _make_full_payload_accumulation_runner(model_stage="talker")._should_accumulate_full_payload_output()
     assert not _make_full_payload_accumulation_runner(
-        model_stage="code2wav", final_output=True
+        model_stage="code2wav",
+        final_output=True,
+        custom_process_next_stage_input_func=None,
+    )._should_accumulate_full_payload_output()
+    assert _make_full_payload_accumulation_runner(
+        model_stage="thinker",
+        final_output=True,
     )._should_accumulate_full_payload_output()
     assert not _make_full_payload_accumulation_runner(
         model_stage="token2audio",

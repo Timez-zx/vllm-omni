@@ -207,7 +207,13 @@ class PDDisaggregationMixin:
 
         return info
 
-    def _prepare_prefill_sampling_params(self, req_id: str, sp: "SamplingParams") -> "SamplingParams":
+    def _prepare_prefill_sampling_params(
+        self,
+        req_id: str,
+        sp: "SamplingParams",
+        *,
+        transfer_kv: bool = True,
+    ) -> "SamplingParams":
         sp = sp.clone()
         sp.max_tokens = 1
         if hasattr(sp, "min_tokens"):
@@ -227,7 +233,10 @@ class PDDisaggregationMixin:
             merged.update(kv_params)
         merged.update(
             {
-                "do_remote_decode": True,
+                # A P-only cache warm-up has no decode consumer. Marking it
+                # as a producer would pin its KV blocks for the connector
+                # lease even though no D request can ever retrieve them.
+                "do_remote_decode": transfer_kv,
                 "do_remote_prefill": False,
                 "transfer_id": f"xfer-{req_id}",
             }

@@ -835,6 +835,15 @@ class OmniGPUModelRunner(GPUModelRunner):
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
             )
+            # P/D decode stages need the finite P snapshot in the runner when
+            # building the downstream full-payload output.  The scheduler's
+            # request object owns this payload; preserve it on the runner's
+            # cached request state just like additional_information_cpu.
+            setattr(
+                req_state,
+                "pd_prefill_payload",
+                getattr(new_req_data, "pd_prefill_payload", None),
+            )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
 
@@ -867,12 +876,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 if getattr(new_req_data, "additional_information", None) is not None:
                     info_dict = deserialize_additional_information(new_req_data.additional_information)
                     if info_dict:
-                        self.model_intermediate_buffer[req_id] = info_dict
-                        setattr(
-                            self.requests[req_id],
-                            "additional_information_cpu",
-                            info_dict,
-                        )
+                        self._update_intermediate_buffer(req_id, info_dict)
             except Exception as e:
                 logger.error(f"Error decoding additional information: {e}")
 
@@ -1534,8 +1538,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 )
             info_dict = deserialize_additional_information(info_payload)
             if info_dict:
-                self.model_intermediate_buffer[req_id] = info_dict
-                setattr(self.requests[req_id], "additional_information_cpu", info_dict)
+                self._update_intermediate_buffer(req_id, info_dict)
 
     def _gather_runtime_additional_information(self) -> list[dict]:
         """Gather per-request model_intermediate_buffer in batch order."""
