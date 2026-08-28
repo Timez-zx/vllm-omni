@@ -576,6 +576,12 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
         hidden_states, _ = self.norm(hidden_states, residual)
+        if captured_hidden_states is not None and capture_set is not None and self.end_layer in capture_set:
+            hs = captured_hidden_states.setdefault("hidden_states", {})
+            layers = hs.setdefault("layers", {})
+            # ``end_layer`` denotes the boundary after the final transformer
+            # block. Capture the normalized sampling hidden at that boundary.
+            layers[self.end_layer] = hidden_states.clone().view(-1, hidden_states.shape[-1])
         if captured_hidden_states is not None:
             return hidden_states, captured_hidden_states
         else:

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import time as _time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -32,6 +32,12 @@ from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
+from vllm_omni.engine.duplexomni_pipeline import (
+    DuplexOmniPipelineCoordinator,
+    DuplexOmniPipelineIdentity,
+    inject_codec_history,
+    pipeline_identity_from_prompt,
+)
 from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
@@ -191,7 +197,16 @@ class OrchestratorRequestState:
     duplex_identity: DuplexRequestIdentity | None = None
     duplex_stage_fences: dict[int, DuplexFence] = field(default_factory=dict)
     duplex_config_generation: int = -1
+    duplexomni_pipeline_identity: DuplexOmniPipelineIdentity | None = None
     running_counter_registered: bool = False
+
+
+@dataclass
+class _DuplexOmniPendingTalker:
+    output: Any
+    replica_id: int
+    is_streaming_session: bool
+    is_final_update: bool
 
 
 @dataclass
@@ -390,6 +405,8 @@ class Orchestrator:
 
         self._cfg_tracker = CfgCompanionTracker()
         self._stage_input_processors: dict[int, Any] = {}
+        self._duplexomni_pipeline = DuplexOmniPipelineCoordinator()
+        self._duplexomni_pending_talker: dict[str, _DuplexOmniPendingTalker] = {}
 
         self.duplex_control_plane: DuplexControlPlanePort | None = None
         self._duplex_reaper_interval_s = 1.0
@@ -674,6 +691,10 @@ class Orchestrator:
             request_timestamp=float(msg.request_timestamp or _time.time()),
             mm_features=getattr(prompt, "mm_features", None),
         )
+        pipeline_identity = pipeline_identity_from_prompt(original_prompt)
+        if pipeline_identity is not None:
+            self._duplexomni_pipeline.register(request_id, pipeline_identity, original_prompt)
+            req_state.duplexomni_pipeline_identity = pipeline_identity
         self.request_states[request_id] = req_state
         self._register_running_request(req_state)
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
@@ -767,7 +788,7 @@ class Orchestrator:
             affinity_request_id=parent_id,
         )
 
-        logger.info(
+        logger.debug(
             "[Orchestrator] CFG companion submitted: %s (role=%s, parent=%s, stage-0 replica-%s)",
             companion_id,
             role,
@@ -1162,6 +1183,8 @@ class Orchestrator:
             self._release_request_bindings(cleanup_ids)
             for request_id in cleanup_ids:
                 self._pd_kv_params.pop(request_id, None)
+                self._duplexomni_pending_talker.pop(request_id, None)
+                self._duplexomni_pipeline.release_request(request_id)
                 req_state = self.request_states.pop(request_id, None)
                 if req_state is not None and req_state.running_counter_registered and self._running_counter is not None:
                     self._running_counter.decrement()
@@ -1246,6 +1269,124 @@ class Orchestrator:
         self._running_counter.increment()
         req_state.running_counter_registered = True
 
+    @staticmethod
+    def _duplexomni_output_codec(output: Any) -> tuple[Any, bool]:
+        completions = getattr(output, "outputs", None)
+        completion = completions[0] if isinstance(completions, list) and completions else None
+        metadata = Orchestrator._completion_multimodal_output(output, completion)
+        codes = metadata.get("codec_codes")
+        if isinstance(codes, list) and len(codes) == 1:
+            codes = codes[0]
+        valid = metadata.get("duplexomni_valid_turn", False)
+        if isinstance(valid, list) and valid:
+            valid = valid[-1]
+        if hasattr(valid, "item"):
+            valid = valid.item()
+        return codes, bool(valid)
+
+    def _prepare_duplexomni_talker_prompt(self, req_state: OrchestratorRequestState) -> None:
+        identity = req_state.duplexomni_pipeline_identity
+        if identity is None:
+            return
+        history_indices, codec_history = self._duplexomni_pipeline.history_for(identity)
+        req_state.prompt = inject_codec_history(
+            req_state.prompt,
+            history_indices=history_indices,
+            codec_history=codec_history,
+        )
+        prompt_item = req_state.prompt[0] if isinstance(req_state.prompt, list) else req_state.prompt
+        logger.info(
+            "[DuplexOmni] prepared Talker req=%s slot=%d prompt_tokens=%d history_turns=%d",
+            req_state.request_id,
+            identity.slot,
+            len(prompt_item.get("prompt_token_ids", [])) if isinstance(prompt_item, dict) else -1,
+            len(history_indices),
+        )
+
+    async def _release_duplexomni_talker_successor(
+        self,
+        identity: DuplexOmniPipelineIdentity,
+    ) -> None:
+        successor_id = self._duplexomni_pipeline.successor_request_id(identity)
+        if successor_id is None:
+            return
+        pending = self._duplexomni_pending_talker.pop(successor_id, None)
+        if pending is None:
+            return
+        successor_state = self.request_states.get(successor_id)
+        if successor_state is None:
+            return
+        self._prepare_duplexomni_talker_prompt(successor_state)
+        await self._forward_to_next_stage(
+            successor_id,
+            0,
+            pending.output,
+            successor_state,
+            src_replica_id=pending.replica_id,
+            is_streaming_session=pending.is_streaming_session,
+            is_final_update=pending.is_final_update,
+        )
+
+    async def _complete_duplexomni_pipeline_slot(
+        self,
+        output: Any,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        identity = req_state.duplexomni_pipeline_identity
+        if identity is None:
+            return
+        codes, valid_turn = self._duplexomni_output_codec(output)
+        if valid_turn and codes is None:
+            raise RuntimeError("DuplexOmni pipeline received a valid Talker turn without codec history")
+        self._duplexomni_pipeline.complete(
+            identity,
+            codec_codes=codes,
+            valid_turn=valid_turn,
+        )
+        await self._release_duplexomni_talker_successor(identity)
+        self._duplexomni_pipeline.close_if_final(identity)
+
+    async def _forward_or_defer_duplexomni_talker(
+        self,
+        req_id: str,
+        output: Any,
+        req_state: OrchestratorRequestState,
+        *,
+        replica_id: int,
+        is_streaming_session: bool,
+        is_final_update: bool,
+    ) -> None:
+        identity = req_state.duplexomni_pipeline_identity
+        if identity is None:
+            await self._forward_to_next_stage(
+                req_id,
+                0,
+                output,
+                req_state,
+                src_replica_id=replica_id,
+                is_streaming_session=is_streaming_session,
+                is_final_update=is_final_update,
+            )
+            return
+        if not self._duplexomni_pipeline.talker_ready(identity):
+            self._duplexomni_pending_talker[req_id] = _DuplexOmniPendingTalker(
+                output=output,
+                replica_id=replica_id,
+                is_streaming_session=is_streaming_session,
+                is_final_update=is_final_update,
+            )
+            return
+        self._prepare_duplexomni_talker_prompt(req_state)
+        await self._forward_to_next_stage(
+            req_id,
+            0,
+            output,
+            req_state,
+            src_replica_id=replica_id,
+            is_streaming_session=is_streaming_session,
+            is_final_update=is_final_update,
+        )
+
     async def _route_output(
         self,
         stage_id: int,
@@ -1329,6 +1470,9 @@ class Orchestrator:
             )
             return
 
+        if finished and stage_id == 2 and req_state.duplexomni_pipeline_identity is not None:
+            await self._complete_duplexomni_pipeline_slot(output, req_state)
+
         if (
             (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
             and stage_id < req_state.final_stage_id
@@ -1348,15 +1492,25 @@ class Orchestrator:
                     and finished
                     and getattr(stage_params, "output_kind", None) == RequestOutputKind.FINAL_ONLY
                 )
-                await self._forward_to_next_stage(
-                    req_id,
-                    stage_id,
-                    output,
-                    req_state,
-                    src_replica_id=replica_id,
-                    is_streaming_session=req_state.streaming.enabled,
-                    is_final_update=final_only_finished,
-                )
+                if stage_id == 0 and req_state.duplexomni_pipeline_identity is not None:
+                    await self._forward_or_defer_duplexomni_talker(
+                        req_id,
+                        output,
+                        req_state,
+                        replica_id=replica_id,
+                        is_streaming_session=req_state.streaming.enabled,
+                        is_final_update=final_only_finished,
+                    )
+                else:
+                    await self._forward_to_next_stage(
+                        req_id,
+                        stage_id,
+                        output,
+                        req_state,
+                        src_replica_id=replica_id,
+                        is_streaming_session=req_state.streaming.enabled,
+                        is_final_update=final_only_finished,
+                    )
                 if (
                     req_state.streaming.enabled
                     and finished
@@ -1559,12 +1713,12 @@ class Orchestrator:
         )
 
     @staticmethod
-    def _completion_multimodal_output(output: Any, completion: Any) -> dict[str, Any]:
+    def _completion_multimodal_output(output: Any, completion: Any) -> Mapping[str, Any]:
         mm_output = getattr(output, "multimodal_output", None)
-        if isinstance(mm_output, dict):
+        if isinstance(mm_output, Mapping):
             return mm_output
         mm_output = getattr(completion, "multimodal_output", None) if completion is not None else None
-        return mm_output if isinstance(mm_output, dict) else {}
+        return mm_output if isinstance(mm_output, Mapping) else {}
 
     @classmethod
     def _coerce_int_list(cls, value: Any) -> list[int]:

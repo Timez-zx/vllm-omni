@@ -3,7 +3,7 @@ import base64
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -423,6 +423,33 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             return metrics
         return None
 
+    @staticmethod
+    def _duplexomni_stream_metadata(omni_output: OmniRequestOutput) -> dict[str, Any] | None:
+        final_audio = omni_output.request_output
+        if final_audio is None or not getattr(final_audio, "outputs", None):
+            return None
+        mm_output = getattr(final_audio.outputs[0], "multimodal_output", None)
+        if not isinstance(mm_output, Mapping):
+            return None
+        raw_codes = mm_output.get("codec_codes")
+        if isinstance(raw_codes, list) and raw_codes:
+            raw_codes = raw_codes[-1]
+        if not isinstance(raw_codes, torch.Tensor) or raw_codes.numel() == 0:
+            return None
+        codes = raw_codes.detach().cpu().to(torch.long).reshape(raw_codes.shape[0], -1).tolist()
+        raw_valid = mm_output.get("duplexomni_valid_turn")
+        if isinstance(raw_valid, list) and raw_valid:
+            raw_valid = raw_valid[-1]
+        raw_eos = mm_output.get("duplexomni_eos_emitted")
+        if isinstance(raw_eos, list) and raw_eos:
+            raw_eos = raw_eos[-1]
+        return {
+            "codec_codes": codes,
+            "codec_shape": [len(codes), len(codes[0])],
+            "valid_turn": bool(raw_valid.item() if hasattr(raw_valid, "item") else raw_valid),
+            "eos_emitted": bool(raw_eos.item() if hasattr(raw_eos, "item") else raw_eos),
+        }
+
     async def create_chat_completion(
         self,
         request: ChatCompletionRequest,
@@ -442,10 +469,39 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             self._create_chat_completion(request, raw_request), request, raw_request
         )
 
+    async def create_chat_completion_from_engine_prompt(
+        self,
+        request: ChatCompletionRequest,
+        engine_prompt: dict[str, Any],
+        raw_request: Request | None = None,
+    ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        """Serve an application-owned, already processed finite prompt.
+
+        This is an internal entrypoint for server-owned realtime sessions.  It
+        deliberately bypasses chat rendering while retaining the ordinary
+        request lifecycle, sampling, validation, streaming response formatting,
+        and KV-transfer cleanup used by Chat Completions.
+
+        External API callers cannot supply this argument.  The application is
+        responsible for constructing a complete canonical engine prompt; KV
+        cache entries remain optional and disposable.
+        """
+        return await self._with_kv_transfer_rejection_cleanup(
+            self._create_chat_completion(
+                request,
+                raw_request,
+                engine_prompt_override=engine_prompt,
+            ),
+            request,
+            raw_request,
+        )
+
     async def _create_chat_completion(
         self,
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
+        *,
+        engine_prompt_override: dict[str, Any] | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
         stage_configs = getattr(self.engine_client, "stage_configs", ()) or ()
         serves_diffusion = self._diffusion_mode or any(
@@ -538,7 +594,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             else:
                 tool_dicts = [tool.model_dump() for tool in request.tools]
 
-            if not self.use_harmony:
+            if engine_prompt_override is not None:
+                # The internal realtime-session caller already rendered and
+                # processed the complete canonical prompt.  Conversation is
+                # only used for optional echo/tool formatting below; those
+                # features are not enabled by this path.
+                conversation = []
+                engine_prompts = [engine_prompt_override]
+            elif not self.use_harmony:
                 error_check_ret = self.online_renderer.validate_chat_template(
                     request_chat_template=request.chat_template,
                     chat_template_kwargs=request.chat_template_kwargs,
@@ -2110,6 +2173,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             req_state.audio_chunk_bytes.append(chunk_bytes)
                             if req_state.audio_sample_rate is None:
                                 req_state.audio_sample_rate = audio_chunk_sample_rate(omni_res)
+                    stream_metrics = dict(omni_res.metrics or {})
+                    duplex_metadata = self._duplexomni_stream_metadata(omni_res)
+                    if duplex_metadata is not None:
+                        stream_metrics["duplexomni"] = duplex_metadata
                     chunk = OmniChatCompletionStreamResponse(
                         id=request_id,
                         object=chunk_object_type,
@@ -2117,7 +2184,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         choices=choices_data,
                         model=model_name,
                         modality=final_output_type,
-                        metrics=self._filter_stage_metrics_detail(omni_res.metrics, request),
+                        metrics=self._filter_stage_metrics_detail(stream_metrics, request),
                     )
                     chunk.usage = UsageInfo(
                         prompt_tokens=num_prompt_tokens,
@@ -2320,6 +2387,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         for omni_outputs in final_outputs:
             choices_data = []
+            duplex_codec_codes: list[list[int]] | None = None
+            duplex_valid_turn: bool | None = None
+            duplex_eos_emitted: bool | None = None
             if omni_outputs.request_output is not None and not getattr(omni_outputs.request_output, "finished", False):
                 continue
 
@@ -2364,6 +2434,27 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 choices_data = self._create_audio_choice(omni_outputs, role, request, stream=False)
                 if isinstance(choices_data, ErrorResponse):
                     return choices_data
+                final_audio = omni_outputs.request_output
+                if final_audio is not None and getattr(final_audio, "outputs", None):
+                    mm_output = getattr(final_audio.outputs[0], "multimodal_output", None)
+                    if isinstance(mm_output, Mapping):
+                        raw_codes = mm_output.get("codec_codes")
+                        if isinstance(raw_codes, list) and raw_codes:
+                            raw_codes = raw_codes[-1]
+                        if isinstance(raw_codes, torch.Tensor) and raw_codes.numel() > 0:
+                            duplex_codec_codes = (
+                                raw_codes.detach().cpu().to(torch.long).reshape(raw_codes.shape[0], -1).tolist()
+                            )
+                        raw_valid = mm_output.get("duplexomni_valid_turn")
+                        if isinstance(raw_valid, list) and raw_valid:
+                            raw_valid = raw_valid[-1]
+                        if raw_valid is not None:
+                            duplex_valid_turn = bool(raw_valid)
+                        raw_eos = mm_output.get("duplexomni_eos_emitted")
+                        if isinstance(raw_eos, list) and raw_eos:
+                            raw_eos = raw_eos[-1]
+                        if raw_eos is not None:
+                            duplex_eos_emitted = bool(raw_eos)
             elif omni_outputs.final_output_type == "image":
                 choices_data = self._create_image_choice(omni_outputs, role, request, stream=False)
             else:
@@ -2371,6 +2462,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 continue
             if omni_outputs.metrics:
                 response_metrics = dict(omni_outputs.metrics)
+            if duplex_codec_codes is not None:
+                if response_metrics is None:
+                    response_metrics = {}
+                response_metrics["duplexomni"] = {
+                    "codec_codes": duplex_codec_codes,
+                    "codec_shape": [len(duplex_codec_codes), len(duplex_codec_codes[0])],
+                    "valid_turn": duplex_valid_turn,
+                    "eos_emitted": duplex_eos_emitted,
+                }
             if omni_outputs.final_output_type == "image":
                 # Expose diffusion profiler metrics on the top-level response for benchmarks / clients.
                 if response_metrics is None:

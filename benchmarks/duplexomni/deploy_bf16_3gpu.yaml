@@ -1,0 +1,3 @@
+# Keep benchmark entry points next to the harness while sharing one canonical
+# BF16 configuration with the registered pipeline default.
+base_config: ../../vllm_omni/deploy/duplexomni_bf16_3gpu.yaml

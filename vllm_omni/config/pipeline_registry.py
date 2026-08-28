@@ -48,6 +48,7 @@ from vllm_omni.model_executor.models.bagel.pipeline import (
 from vllm_omni.model_executor.models.cosyvoice3.pipeline import COSYVOICE3_PIPELINE
 from vllm_omni.model_executor.models.covo_audio.pipeline import COVO_AUDIO_PIPELINE
 from vllm_omni.model_executor.models.dreamzero.pipeline import DREAMZERO_PIPELINE
+from vllm_omni.model_executor.models.duplexomni.pipeline import DUPLEXOMNI_PIPELINE
 from vllm_omni.model_executor.models.dynin_omni.pipeline import DYNIN_OMNI_PIPELINE
 from vllm_omni.model_executor.models.fish_speech.pipeline import FISH_SPEECH_PIPELINE
 from vllm_omni.model_executor.models.glm_image.pipeline import GLM_IMAGE_PIPELINE
@@ -110,6 +111,7 @@ PipelineResolverFunc: TypeAlias = Callable[[PretrainedConfig | None], PipelineCo
 
 # --- Multi-stage omni pipelines (LLM-centric; audio / video I/O) ---
 OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
+    "duplexomni": DUPLEXOMNI_PIPELINE,
     "aura_omni": AURA_OMNI_PIPELINE,
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,
     "qwen2_5_omni_thinker_only": QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,

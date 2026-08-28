@@ -1,0 +1,11 @@
+# Default DuplexOmni deployment. Thinker and Talker use online W8A8 FP8;
+# Code2Wav remains BF16 because it does not use the vLLM FP8 LLM path.
+base_config: duplexomni_bf16_3gpu.yaml
+
+stages:
+  - stage_id: 0
+    quantization: fp8
+    kv_cache_dtype: fp8_per_token_head
+  - stage_id: 1
+    quantization: fp8
+    kv_cache_dtype: fp8_per_token_head

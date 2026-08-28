@@ -1,0 +1,66 @@
+# DuplexOmni correctness baseline: one finite request per 480 ms slot.
+# The application owns dialogue and codec history; the engines retain only
+# disposable prefix/KV cache entries.
+pipeline: duplexomni
+async_chunk: false
+dtype: bfloat16
+trust_remote_code: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+
+stages:
+  - stage_id: 0
+    hf_overrides:
+      vllm_omni_duplexomni: true
+    max_model_len: 49152
+    max_num_batched_tokens: 32768
+    max_num_seqs: 16
+    async_scheduling: false
+    gpu_memory_utilization: 0.9
+    mm_processor_cache_gb: 8
+    enable_prefix_caching: true
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 999
+
+  - stage_id: 1
+    max_model_len: 16384
+    max_num_batched_tokens: 16384
+    max_num_seqs: 32
+    async_scheduling: false
+    gpu_memory_utilization: 0.7
+    # Cache-only conditioning token identities include the complete Thinker
+    # prefix and visible media hashes, so dynamic prompt embeddings cannot be
+    # confused with another turn in the same session lineage.
+    enable_prefix_caching: true
+    devices: "1"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.8
+      top_p: 0.8
+      top_k: 20
+      min_tokens: 6
+      # Six real frames plus one EOS-validation sample, matching the official
+      # Talker loop. A non-EOS seventh sample is discarded by the adapter.
+      max_tokens: 7
+
+  - stage_id: 2
+    max_num_batched_tokens: 65536
+    max_num_seqs: 32
+    gpu_memory_utilization: 0.2
+    enforce_eager: false
+    enable_prefix_caching: false
+    enable_chunked_prefill: false
+    async_scheduling: false
+    devices: "2"
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536

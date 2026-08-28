@@ -168,6 +168,10 @@ class Qwen3OmniMoeForConditionalGeneration(
         # Keep vllm_config for later submodule init
         self.vllm_config = vllm_config
         self.config = config
+        # DuplexOmni reuses Qwen3-Omni modules but trains its Talker bridge on
+        # the Thinker's final normalized sampling hidden, not Qwen3-Omni's
+        # configured intermediate ``accept_hidden_layer``.
+        self._duplexomni_mode = bool(getattr(config, "vllm_omni_duplexomni", False))
 
         # Initialize thinker components
         thinker_config: Qwen3OmniMoeThinkerConfig = config.thinker_config
@@ -440,6 +444,8 @@ class Qwen3OmniMoeForConditionalGeneration(
             # Run thinker forward
             # If talker expects a specific intermediate layer, capture it here
             accept_layer = getattr(self.talker_config, "accept_hidden_layer", None)
+            if self._duplexomni_mode:
+                accept_layer = int(self.thinker_config.text_config.num_hidden_layers)
             capture_kwargs = {}
             if accept_layer is not None:
                 capture_kwargs = {
@@ -583,6 +589,53 @@ class Qwen3OmniMoeForConditionalGeneration(
             else:
                 logger.debug("No additional_information provided to code2wav stage.")
             audio_tensors = self.generate_audio(codes, left_context_size, seq_token_counts)
+
+            # DuplexOmni keeps the six RVQ frames in application-owned session
+            # state.  Return them alongside the waveform only when its stage
+            # adapter explicitly requests it; ordinary Qwen responses remain
+            # unchanged and pay no extra device-to-host copy.
+            return_codec_codes = False
+            if runtime_additional_information is not None:
+                return_codec_codes = any(
+                    bool((info.get("meta", {}) or {}).get("return_codec_codes", False))
+                    for info in runtime_additional_information
+                )
+            if return_codec_codes:
+                codec_payloads: list[torch.Tensor] = []
+                if seq_token_counts is not None:
+                    declared_total = sum(seq_token_counts)
+                    for flat_codes in torch.split(input_ids[:declared_total], seq_token_counts, dim=0):
+                        frame_count = int(flat_codes.shape[0]) // 16
+                        codec_payloads.append(
+                            flat_codes[: frame_count * 16].reshape(16, frame_count).contiguous()
+                        )
+                else:
+                    frame_count = int(input_ids.shape[0]) // 16
+                    codec_payloads.append(
+                        input_ids[: frame_count * 16].reshape(16, frame_count).contiguous()
+                    )
+                sample_rate = defs.resolve_audio_sample_rate(self.code2wav_config)
+                sr_tensors = [torch.tensor(sample_rate, dtype=torch.int32) for _ in audio_tensors]
+                valid_turns: list[torch.Tensor] = []
+                eos_emitted: list[torch.Tensor] = []
+                for info in runtime_additional_information or []:
+                    meta = info.get("meta", {}) or {}
+                    valid_turns.append(
+                        torch.tensor(bool(meta.get("duplexomni_valid_turn", False)), dtype=torch.bool)
+                    )
+                    eos_emitted.append(
+                        torch.tensor(bool(meta.get("duplexomni_eos_emitted", False)), dtype=torch.bool)
+                    )
+                return OmniOutput(
+                    text_hidden_states=None,
+                    multimodal_outputs={
+                        "model_outputs": [audio.reshape(1, -1) for audio in audio_tensors],
+                        "sr": sr_tensors,
+                        "codec_codes": codec_payloads,
+                        "duplexomni_valid_turn": valid_turns,
+                        "duplexomni_eos_emitted": eos_emitted,
+                    },
+                )
 
             return audio_tensors
 
@@ -937,6 +990,9 @@ class Qwen3OmniMoeForConditionalGeneration(
         ids: Ids = payload.get("ids", {})
         meta: OmniPayloadMeta = payload.get("meta", {})
 
+        if meta.get("duplexomni", False) or embed.get("duplex_conditioning") is not None:
+            return self._duplexomni_talker_preprocess_prefill(input_ids, input_embeds, payload)
+
         # Containers to return per-request updates (e.g., code_predictor_hidden_per_request)
         update_dict: OmniPayload = {}
 
@@ -1096,6 +1152,136 @@ class Qwen3OmniMoeForConditionalGeneration(
             pad_ids = torch.zeros((missing,), dtype=req_input_ids.dtype, device=req_input_ids.device)
             out_ids = torch.cat((out_ids.reshape(-1), pad_ids), dim=0)
         return out_ids, out_embeds, update_dict
+
+    def _duplexomni_talker_preprocess_prefill(
+        self,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor,
+        payload: OmniPayload,
+    ):
+        """Build ``conditioning, BOS, prior RVQ, EOS, ..., current, BOS``.
+
+        This is the prompt used by the official DuplexOmni Talker.  Previous
+        codec frames arrive from the application, while projected Thinker rows
+        are reconstructed by Stage 0 from the complete canonical chat prompt.
+        """
+        hs: HiddenStates = payload.get("hidden_states", {})
+        embed: Embeddings = payload.get("embed", {})
+        ids: Ids = payload.get("ids", {})
+        codes = payload.get("codes", {})
+        meta: OmniPayloadMeta = payload.get("meta", {})
+        device = self._module_device(self.talker)
+
+        conditioning_embed = embed.get("duplex_conditioning")
+        conditioning_top = hs.get("duplex_conditioning")
+        lengths = ids.get("duplex_conditioning_lengths")
+        history_indices = ids.get("duplex_history_indices")
+        history = codes.get("ref")
+        if not isinstance(conditioning_embed, torch.Tensor) or not isinstance(conditioning_top, torch.Tensor):
+            raise ValueError("DuplexOmni Talker requires assistant conditioning embeddings and hidden states")
+        if conditioning_embed.shape != conditioning_top.shape:
+            raise ValueError(
+                "DuplexOmni conditioning shape mismatch: "
+                f"embed={tuple(conditioning_embed.shape)} hidden={tuple(conditioning_top.shape)}"
+            )
+        if not isinstance(lengths, list) or not lengths:
+            raise ValueError("DuplexOmni Talker requires per-turn conditioning lengths")
+        if meta.get("duplexomni_pipeline", False):
+            if not isinstance(history_indices, list):
+                raise ValueError("Pipelined DuplexOmni Talker requires explicit history indices")
+            historical_turns = len(lengths) - 1
+            normalized_indices = [int(index) for index in history_indices]
+            if any(index < 0 or index >= historical_turns for index in normalized_indices):
+                raise ValueError("Pipelined DuplexOmni history index is outside Thinker conditioning")
+            if any(left >= right for left, right in zip(normalized_indices, normalized_indices[1:])):
+                raise ValueError("Pipelined DuplexOmni history indices must be strictly increasing")
+            offsets = [0]
+            for length in lengths:
+                offsets.append(offsets[-1] + int(length))
+            selected_indices = [*normalized_indices, historical_turns]
+            conditioning_embed = torch.cat(
+                [conditioning_embed[offsets[index] : offsets[index + 1]] for index in selected_indices],
+                dim=0,
+            )
+            conditioning_top = torch.cat(
+                [conditioning_top[offsets[index] : offsets[index + 1]] for index in selected_indices],
+                dim=0,
+            )
+            lengths = [int(lengths[index]) for index in selected_indices]
+        history = (
+            history.to(device=device, dtype=torch.long)
+            if isinstance(history, torch.Tensor)
+            else torch.empty((0, 16, 6), device=device, dtype=torch.long)
+        )
+        if history.ndim != 3 or tuple(history.shape[1:]) != (16, 6):
+            raise ValueError(f"DuplexOmni codec history must have shape [turns,16,6], got {tuple(history.shape)}")
+        if len(lengths) != int(history.shape[0]) + 1:
+            raise ValueError(
+                "DuplexOmni conditioning/codec turn mismatch: "
+                f"conditioning={len(lengths) - 1}, codecs={history.shape[0]}"
+            )
+        if sum(int(length) for length in lengths) != int(conditioning_embed.shape[0]):
+            raise ValueError(
+                "DuplexOmni conditioning lengths do not cover the transferred rows: "
+                f"lengths={lengths}, rows={conditioning_embed.shape[0]}"
+            )
+
+        cond_embed = conditioning_embed.to(device=device, dtype=torch.bfloat16)
+        cond_top = conditioning_top.to(device=device, dtype=torch.bfloat16)
+        projected = self.talker.text_projection(cond_embed) + self.talker.hidden_projection(cond_top)
+        bos_embed = self.embed_codec_bos_token.reshape(1, -1).to(device=device, dtype=projected.dtype)
+        eos_embed = self.embed_codec_eos_token.reshape(1, -1).to(device=device, dtype=projected.dtype)
+        pad_id = int(self.talker_config.codec_pad_id)
+        bos_id = int(self.talker_config.codec_bos_id)
+        eos_id = int(self.talker_config.codec_eos_token_id)
+
+        prompt_embeds: list[torch.Tensor] = []
+        prompt_ids: list[torch.Tensor] = []
+        offset = 0
+        residual_embeddings = list(self.talker.code_predictor.model.codec_embedding)
+        if len(residual_embeddings) != 15:
+            raise ValueError(
+                f"DuplexOmni expects 16 RVQ groups, found {len(residual_embeddings) + 1}"
+            )
+        for turn, condition_len in enumerate(lengths[:-1]):
+            condition_len = int(condition_len)
+            prompt_embeds.append(projected[offset : offset + condition_len])
+            prompt_ids.append(torch.full((condition_len,), pad_id, dtype=torch.long, device=device))
+            offset += condition_len
+            prompt_embeds.append(bos_embed)
+            prompt_ids.append(torch.tensor([bos_id], dtype=torch.long, device=device))
+
+            turn_codes = history[turn]
+            codec_sum = self.talker.embed_input_ids(turn_codes[0])
+            for group_index, embedding_layer in enumerate(residual_embeddings, start=1):
+                codec_sum = codec_sum + embedding_layer(turn_codes[group_index])
+            prompt_embeds.append(codec_sum.to(dtype=projected.dtype))
+            prompt_ids.append(turn_codes[0])
+            prompt_embeds.append(eos_embed)
+            prompt_ids.append(torch.tensor([eos_id], dtype=torch.long, device=device))
+
+        current_len = int(lengths[-1])
+        prompt_embeds.append(projected[offset : offset + current_len])
+        prompt_ids.append(torch.full((current_len,), pad_id, dtype=torch.long, device=device))
+        prompt_embeds.append(bos_embed)
+        prompt_ids.append(torch.tensor([bos_id], dtype=torch.long, device=device))
+        full_embeds = torch.cat(prompt_embeds, dim=0)
+        full_ids = torch.cat(prompt_ids, dim=0)
+
+        start_index = int(meta.get("num_processed_tokens", 0))
+        end_index = start_index + int(input_embeds.shape[0])
+        if end_index > full_embeds.shape[0]:
+            raise RuntimeError(
+                "DuplexOmni Talker placeholder/payload length mismatch: "
+                f"requested [{start_index},{end_index}), built {full_embeds.shape[0]} rows"
+            )
+        update_dict: OmniPayload = {
+            "meta": {
+                "duplexomni": True,
+                "prefill_consumed_text_tokens": 0,
+            }
+        }
+        return full_ids[start_index:end_index], full_embeds[start_index:end_index], update_dict
 
     def _talker_cache_thinker_decode_embeds(
         self,
@@ -1330,7 +1516,15 @@ class Qwen3OmniMoeForConditionalGeneration(
         last_talker_hidden = None
         text_step = None
         try:
-            if self.vllm_config.model_config.async_chunk:
+            if payload.get("meta", {}).get("duplexomni", False):
+                # DuplexOmni conditions once per 480 ms slice.  Subsequent
+                # Talker positions consume only the summed previous RVQ frame.
+                text_step = torch.zeros(
+                    (1, self.talker_config.text_config.hidden_size),
+                    device=input_embeds.device,
+                    dtype=input_embeds.dtype,
+                )
+            elif self.vllm_config.model_config.async_chunk:
                 text_step = self._thinker_decode_to_talker_decode(payload, input_ids.device, update_dict)
             else:
                 q_tail = hs.get("trailing_text", None)

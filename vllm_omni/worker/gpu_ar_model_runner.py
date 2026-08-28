@@ -7,6 +7,7 @@ and also outputs sampled tokens.
 from __future__ import annotations
 
 import gc
+import json
 import os
 import threading
 import time
@@ -68,45 +69,194 @@ logger = init_logger(__name__)
 # cannot create the idleness it is meant to measure. Enable with
 # VLLM_OMNI_LOG_STEP_GPU=1.
 _LOG_STEP_GPU = os.environ.get("VLLM_OMNI_LOG_STEP_GPU", "0") not in ("0", "", "false", "False")
+_LOG_PD_ITER = os.environ.get("VLLM_OMNI_LOG_PD_ITER", "0") not in ("0", "", "false", "False")
+_PD_ITER_STAGE = os.environ.get("VLLM_OMNI_PD_ITER_STAGE", "0")
 _STEP_GPU_LAG = 8          # read an event pair this many steps after recording
 _STEP_GPU_EVERY = 1        # record every Nth step
 
 
-def _step_gpu_probe_begin(runner: Any):
-    if not _LOG_STEP_GPU or not torch.cuda.is_available():
+def _pd_iteration_metadata(
+    runner: Any,
+    scheduler_output: SchedulerOutput,
+    batch_entry_mono: float,
+) -> dict[str, Any] | None:
+    """Describe one scheduler batch without synchronizing the runner.
+
+    A new request and a cached request with zero output tokens are in their
+    context phase. Cached requests with output tokens are decoding. Keeping
+    this classification at the worker boundary lets the benchmark distinguish
+    D-only, P-only, and mixed batches using the scheduler's own state rather
+    than inferring phases from request-level latency.
+    """
+    if not _LOG_PD_ITER:
+        return None
+    stage = str(getattr(runner.vllm_config.model_config, "stage_id", "?"))
+    if _PD_ITER_STAGE and stage != _PD_ITER_STAGE:
+        return None
+
+    scheduled = scheduler_output.num_scheduled_tokens
+    prefill: list[dict[str, Any]] = []
+    decode: list[dict[str, Any]] = []
+    for request in scheduler_output.scheduled_new_reqs:
+        prefill.append(
+            {
+                "id": request.req_id,
+                "tokens": int(scheduled.get(request.req_id, 0)),
+                "computed": int(request.num_computed_tokens),
+            }
+        )
+
+    cached = scheduler_output.scheduled_cached_reqs
+    for req_id, computed, output_tokens in zip(
+        cached.req_ids,
+        cached.num_computed_tokens,
+        cached.num_output_tokens,
+        strict=True,
+    ):
+        item = {
+            "id": req_id,
+            "tokens": int(scheduled.get(req_id, 0)),
+            "computed": int(computed),
+            "output_tokens": int(output_tokens),
+        }
+        (prefill if output_tokens == 0 else decode).append(item)
+
+    encoder_inputs = [
+        {"id": req_id, "items": len(input_indices)}
+        for req_id, input_indices in scheduler_output.scheduled_encoder_inputs.items()
+    ]
+    has_prefill_work = bool(prefill or encoder_inputs)
+    if has_prefill_work and decode:
+        kind = "mixed"
+    elif has_prefill_work:
+        kind = "prefill_only"
+    elif decode:
+        kind = "decode_only"
+    else:
+        kind = "empty"
+    if prefill and encoder_inputs:
+        prefill_source = "tokens_and_encoder"
+    elif prefill:
+        prefill_source = "tokens"
+    elif encoder_inputs:
+        prefill_source = "encoder"
+    else:
+        prefill_source = "none"
+
+    state = getattr(runner, "_pd_iteration_state", None)
+    if state is None:
+        state = {"seq": 0, "last_decode": {}}
+        runner._pd_iteration_state = state
+    state["seq"] += 1
+    seq = int(state["seq"])
+
+    # The interval between two worker batches containing the same decode
+    # request is the engine-visible token cadence. The batches that ran in
+    # between can be recovered from the complete, sequence-numbered trace.
+    decode_gaps: list[dict[str, Any]] = []
+    last_decode = state["last_decode"]
+    for item in decode:
+        req_id = item["id"]
+        previous = last_decode.get(req_id)
+        if previous is not None:
+            decode_gaps.append(
+                {
+                    "id": req_id,
+                    "ms": (batch_entry_mono - previous["mono"]) * 1000.0,
+                    "after_seq": previous["seq"],
+                    "after_kind": previous["kind"],
+                    "after_prefill_tokens": previous["prefill_tokens"],
+                    "after_encoder_inputs": previous["encoder_inputs"],
+                }
+            )
+        last_decode[req_id] = {
+            "mono": batch_entry_mono,
+            "seq": seq,
+            "kind": kind,
+            "prefill_tokens": sum(entry["tokens"] for entry in prefill),
+            "encoder_inputs": sum(entry["items"] for entry in encoder_inputs),
+        }
+
+    return {
+        "seq": seq,
+        "stage": stage,
+        "mono": batch_entry_mono,
+        "kind": kind,
+        "prefill_source": prefill_source,
+        "prefill": prefill,
+        "encoder": encoder_inputs,
+        "decode": decode,
+        "prefill_tokens": sum(entry["tokens"] for entry in prefill),
+        "encoder_inputs": sum(entry["items"] for entry in encoder_inputs),
+        "decode_tokens": sum(entry["tokens"] for entry in decode),
+        "decode_gaps": decode_gaps,
+    }
+
+
+def _step_gpu_probe_begin(runner: Any, pd_metadata: dict[str, Any] | None = None):
+    if (not _LOG_STEP_GPU and pd_metadata is None) or not torch.cuda.is_available():
         return None
     state = getattr(runner, "_step_gpu_state", None)
     if state is None:
         state = {"n": 0, "pending": deque()}
         runner._step_gpu_state = state
     state["n"] += 1
-    if state["n"] % _STEP_GPU_EVERY:
+    if pd_metadata is None and state["n"] % _STEP_GPU_EVERY:
         return None
     start = torch.cuda.Event(enable_timing=True)
     start.record()
-    return start
+    return start, time.monotonic(), pd_metadata
 
 
-def _step_gpu_probe_end(runner: Any, start_event: Any, num_reqs: int, num_tokens: int) -> None:
+def _step_gpu_probe_end(
+    runner: Any,
+    probe: Any,
+    num_reqs: int,
+    num_tokens: int,
+) -> None:
     state = runner._step_gpu_state
+    start_event, forward_start_mono, pd_metadata = probe
     end = torch.cuda.Event(enable_timing=True)
     end.record()
-    state["pending"].append((start_event, end, time.monotonic(), int(num_reqs), int(num_tokens)))
+    state["pending"].append(
+        (
+            start_event,
+            end,
+            forward_start_mono,
+            (time.monotonic() - forward_start_mono) * 1000.0,
+            int(num_reqs),
+            int(num_tokens),
+            pd_metadata,
+        )
+    )
     if len(state["pending"]) <= _STEP_GPU_LAG:
         return
-    s, e, t_mono, nreq, ntok = state["pending"].popleft()
+    s, e, t_mono, forward_wall_ms, nreq, ntok, metadata = state["pending"].popleft()
     if not e.query():          # not finished yet: put it back, never block
-        state["pending"].appendleft((s, e, t_mono, nreq, ntok))
+        state["pending"].appendleft((s, e, t_mono, forward_wall_ms, nreq, ntok, metadata))
         return
     try:
         dur_ms = s.elapsed_time(e)
     except Exception:
         return
-    logger.info(
-        "[STEP-GPU] stage=%s mono=%.6f gpu_ms=%.3f nreq=%d ntok=%d",
-        getattr(runner.vllm_config.model_config, "stage_id", "?"),
-        t_mono, dur_ms, nreq, ntok,
-    )
+    if _LOG_STEP_GPU:
+        logger.info(
+            "[STEP-GPU] stage=%s mono=%.6f gpu_ms=%.3f nreq=%d ntok=%d",
+            getattr(runner.vllm_config.model_config, "stage_id", "?"),
+            t_mono,
+            dur_ms,
+            nreq,
+            ntok,
+        )
+    if metadata is not None:
+        metadata = dict(metadata)
+        metadata["forward_start_mono"] = t_mono
+        metadata["prepare_ms"] = (t_mono - metadata["mono"]) * 1000.0
+        metadata["forward_wall_ms"] = forward_wall_ms
+        metadata["gpu_ms"] = dur_ms
+        metadata["num_reqs"] = nreq
+        metadata["num_tokens_padded"] = ntok
+        logger.info("[PD-ITER] %s", json.dumps(metadata, separators=(",", ":")))
 
 
 def _to_cpu_contiguous(tensor: torch.Tensor) -> torch.Tensor:
@@ -1078,6 +1228,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
+        pd_batch_entry_mono = time.monotonic() if _LOG_PD_ITER else 0.0
 
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
@@ -1165,6 +1316,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        pd_iteration = (
+            _pd_iteration_metadata(self, scheduler_output, pd_batch_entry_mono)
+            if num_scheduled_tokens > 0
+            else None
+        )
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
@@ -1409,7 +1565,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     defer_finalize=defer_kv_connector_finalize,
                 ) as kv_connector_output,
             ):
-                _gpu_probe = _step_gpu_probe_begin(self)
+                _gpu_probe = _step_gpu_probe_begin(self, pd_iteration)
                 model_output = self._model_forward(
                     input_ids=input_ids,
                     positions=positions,

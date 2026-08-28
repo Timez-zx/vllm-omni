@@ -1,131 +1,188 @@
-# vLLM-Omni Realtime Multi-User Serving Workflow
+# DuplexOmni Realtime Multi-User Serving Workflow
 
 ## Goal and scope
 
-The goal is to serve more continuous audio-video sessions with fewer GPUs while meeting TTFA and playback-continuity targets. The research target is engine capacity, scheduling, KV cache behavior, and tail latency rather than model quality.
+The goal is to measure DuplexOmni multi-user capacity on its 480 ms realtime clock and identify the engine cause when capacity becomes unstable. The research target is latency, scheduling, batching, prefix/KV cache, and the stage pipeline rather than model quality.
 
-No locally deployable open model currently matches Seed Realtime or Gemini Live. This branch approximates continuous AV sessions with Qwen3-Omni's Thinker → Talker → Code2Wav pipeline. It targets concurrent continuous-video incremental compute and response decode, not native full duplex or semantic barge-in.
-
-## Phase 1: application baseline
-
-The application owns session state; the engine handles only ordinary finite requests:
+DuplexOmni does not have the same workload as `thinker-talker-vllm`. The latter mainly performs continuous video prefill and generates at query time. DuplexOmni performs a complete prediction every 480 ms slot:
 
 ```text
-video arrival → silent finite Thinker request warms prefix KV
-end of speech → complete canonical history + current complete WAV
-              → Thinker → Talker → Code2Wav
-response end  → destroy request and commit the turn in the application
+480 ms PCM + current image
+  → incremental Thinker prefill + about 24 text/control decode tokens
+  → Talker generates six 16-codebook codec frames and validates EOS
+  → Code2Wav generates about 457 ms of waveform
 ```
 
-- Every turn and arrival warm-up uses a new request ID. The engine holds no live request across turns.
-- Every submission contains the complete canonical prompt. Prefix/KV entries are disposable; a miss changes cost, not semantics.
-- The application caches processed canonical message blocks, renders only new blocks, and assembles the complete prompt.
-- Video is append-only within a turn after similarity/freshness filtering. There is no eight-frame sliding window or second sampling pass.
-- Each session runs at most one arrival request. It runs Thinker with `max_tokens=1`, emits no text, and never invokes Talker.
-- Frames accepted while an arrival runs remain separate images and enter the next cumulative prompt snapshot together. Coalescing reduces request count; it does not merge or discard image content.
-- Different sessions submit arrivals concurrently to native FCFS. There is no application-wide gate or request priority.
-- A final query waits for its session's admitted arrival, then submits the complete prompt, preserving ordered prefix lineage.
-- User audio is one complete WAV at query time, preserving Qwen whole-audio semantics. Only the final query invokes Talker.
-- Media received during a response belongs to the next turn, and each accepted item is consumed by one final query.
-- Thinker responses are capped at 256 tokens. Video is bounded to 640×352, and JPEG work runs in subprocesses.
-- Compaction starts only at 49,152 prompt tokens. It retains the newest two completed turns as user audio/text plus assistant text, removes historical images, and keeps only the newest current-turn image. If needed, it drops more complete old turns. It never generates a summary request.
+Each user therefore produces about `24 / 0.48 ≈ 50` Thinker decode tokens/s and continuously runs Talker. User capacity from the two branches is not directly comparable.
 
-The old cross-turn persistent request, resumable append, Talker rolling, shadow compression, and session ledger have been removed.
+## Phase 1: model-protocol integration
 
-## Phase 2: fixed deployment
+A dedicated `duplexomni` pipeline reuses the Qwen3-Omni Thinker, Talker, and Code2Wav module structure while connecting the stages with the DuplexOmni protocol:
 
-Formal experiments use only `benchmarks/thinker_talker/origin_deploy_3gpu.yaml`:
+- Capture the Thinker embedding and final normalized hidden state with training-position alignment. The last token, which has no successor hidden row, is not sent to Talker.
+- Build Talker prompts as `assistant conditioning → codec BOS → six RVQ frames → codec EOS`.
+- Each frame has 16 codebooks. Talker autoregressively generates layer 0, and MTP produces the other 15.
+- Commit a Talker turn to codec history only after six frames and EOS are both present.
+- Return structured Thinker controls, `16×6` codec data, EOS/valid flags, waveform, and per-stage metrics through the API.
+- Support online W8A8 FP8 and per-token/per-head FP8 KV for Thinker and Talker. Code2Wav remains BF16.
+
+This is not an ordinary Qwen3-Omni request under another name. The checkpoint, per-480 ms control output, and continuous codec generation jointly define the native Duplex workload.
+
+## Phase 2: application and engine boundary
+
+The application owns the WebSocket session and dialogue state. The engine handles one ordinary finite request per slot:
+
+```text
+continuous media → application assembles a 480 ms slot and canonical prompt
+                 → new finite request → engine prefix/KV cache
+                 → destroy the request after completion
+```
+
+- Each session seals one 24 kHz mono PCM slice every 480 ms. A slot carries only the newest image accepted by the filter.
+- Images pass a similarity/freshness filter. The default similarity threshold is 0.95, with forced retention after at most four rejected frames. The manifest records sent, acknowledged, and accepted frames separately.
+- The application caches processed canonical message blocks, renders only each new user/assistant block, and then assembles the complete prompt.
+- Every epoch uses a distinct `cache_salt`. Engine cache is disposable; a miss changes compute cost but not semantics.
+- When the prompt reaches 6,144 Thinker tokens, the application drains the epoch, retains only the newest complete slot, and starts a new cache lineage. This threshold comes from the measured one-user latency knee, not the model context limit.
+- A session permits at most four in-flight slots by default. Thinker waits only for the preceding Thinker, not for its Talker or Code2Wav:
+
+```text
+Thinker(t) ─────────→ Thinker(t+1)
+    └→ ordered Talker(t) → Code2Wav(t)
+```
+
+- Talker history remains ordered. After the predecessor Talker completes, the orchestrator submits the successor Talker with verified codec history. Different sessions are not globally serialized.
+- Dynamic Talker conditioning uses cache identities derived from the Thinker prefix and media hashes, preventing false prefix hits.
+
+The result is a stateful application with finite engine requests and only disposable prefix/KV reuse across slots. Duplex semantics do not depend on a persistent engine request.
+
+## Phase 3: fixed deployment
+
+The hardware is three NVIDIA RTX PRO 6000 Blackwell Server Edition GPUs with 96 GB each:
 
 | Stage | GPU | Configuration |
 |---|---:|---|
-| Thinker | 0 | FP8 weights/KV, prefix cache, synchronous scheduling, equal-priority requests |
-| Talker | 1 | FP8 weights/KV, conditioning prefix cache |
-| Code2Wav | 2 | separate process |
+| Thinker | 0 | FP8 weights, FP8 KV, prefix cache, `max_num_seqs=16` |
+| Talker + MTP | 1 | FP8 weights, FP8 KV, conditioning prefix cache, `max_num_seqs=32` |
+| Code2Wav | 2 | BF16, no prefix cache |
 
-`run_qwen_server.sh` verifies that Thinker selected FlashInfer and creates the stage-0 SHM multimodal cache before its worker starts. The API renderer and input processor share one sender; the worker reuses materialized media rather than restoring the complete media history for every finite request.
-
-## Phase 3: formal workload
-
-- Each user owns one long-lived WebSocket.
-- Video uploads continuously at 2 FPS; accepted frames trigger or queue for the next silent Thinker arrival prefill.
-- The microphone uploads PCM16 at 5 Hz, pausing during assistant playback plus a 300 ms echo guard.
-- Every turn uses a unique real 16 kHz mono SLURP recording followed by 700 ms endpoint silence, with empty query text.
-- Audio is appended as one complete WAV to the warmed video prefix at query time.
-- Each session keeps one speaker; DAVIS video uses a fixed sequence and different starting offsets.
-- The next turn starts after 1× response playback, producing a playback-paced closed loop.
-- Users start at deterministic offsets over 0–8 seconds.
-
-This is duplex-like rather than complete AV duplex. Video continues to trigger arrival prefill during user speech and assistant playback. Audio uploads at 5 Hz, but Qwen processes one complete WAV only at query time, and the microphone pauses during playback. The workload targets continuous visual incremental compute; it does not claim to reproduce Gemini Live or Seed Realtime model structure or absolute capacity.
-
-A formal cell has 30 turns per user and excludes the first two from metrics. The engine restarts for every cell. Synthetic media in `probe.py` is only for protocol validation.
+The stages use a shared-memory connector and synchronous scheduling. Formal runs use `benchmarks/duplexomni/deploy_fp8_3gpu.yaml`; BF16 is retained only for regression.
 
 ```bash
-MU_FRAMES_DIR=/home/ubuntu/data/workloads/continuous_av_v1/frames \
-MU_AUDIO_MANIFEST=/home/ubuntu/data/workloads/continuous_av_v1/audio_manifest.jsonl \
 VLLM_OMNI_BIN=/home/ubuntu/miniconda3/envs/omni/bin/vllm-omni \
-MU_PYTHON=/home/ubuntu/miniconda3/envs/omni/bin/python \
-RESULTS_DIR=/home/ubuntu/data/results/finite_request_capacity_<commit> \
-RESULT_PREFIX=finite_request USERS=16 SEEDS=7 TURNS=30 WARMUP_TURNS=2 \
-bash benchmarks/live_agent/web_client/run_av_session_ladder.sh
+DUPLEXOMNI_RESULTS_DIR=/tmp/duplexomni-server \
+bash benchmarks/duplexomni/run_server.sh fp8
 ```
 
-## Phase 4: metrics and pass rule
+## Phase 4: formal workload and metrics
 
-- **TTFT**: query to first text.
-- **TTFA / Audio-ready-500**: query until 500 ms of playable audio has accumulated. The current first packet exceeds 500 ms, so they are equal.
-- **Stall max**: largest single playback underflow at 1×.
-- **RTF deliver**: generated audio duration divided by delivery duration.
+- Each user owns one server-managed WebSocket session.
+- Every 480 ms, each user sends one PCM slice and one image: 2.08 requests/s and 2.08 FPS per user.
+- Session phases are sampled independently from `Uniform[0, 480 ms)`, avoiding an artificial synchronized burst.
+- Each user's PCM receives inaudible LSB dither, and each JPEG receives a tiny corner mark, preventing unrealistic cross-user multimodal cache hits.
+- The default speech input is `tests/assets/minicpmo_4_5/response_required_16k.wav`, resampled to 24 kHz. When `--image` is omitted, deterministic generated frames are used. The workload measures serving load, not semantic quality.
+- Capacity points use 60 slots/user. Each point uses new session IDs and cache lineages after kernel warm-up.
 
-A cell passes only when every measured turn completes, Audio-ready-500 p99 is below 1 second, Stall-max p99 is below 50 ms, and there are no client, protocol, or fatal engine errors.
+Primary metrics:
 
-Results must use workload schema 4 and run `benchmarks/live_agent/analysis/verify_run.py`. The verifier checks finite requests, arrival requests, the frame ledger, prefix-cache hits, and three separate stage processes.
+- **E2E slot latency**: scheduled arrival to the complete slot response.
+- **Request latency**: server submission of the finite request to complete response.
+- **Thinker latency**: server submission to completed Thinker control text.
+- **Application queue**: slot input readiness to server submission.
+- **Deadline miss**: E2E slot latency above 480 ms.
 
-## Phase 5: current 16-user result
+Strict realtime requires E2E p99 at or below 480 ms and a miss rate at or below 1%. Throughput collapse is declared when application-queue p50 grows by more than 480 ms from the first third to the final third.
 
-Setup:
+```bash
+/home/ubuntu/miniconda3/envs/omni/bin/python benchmarks/duplexomni/multi_user.py \
+  --users 2 --slots 60 --seed 8001 \
+  --session-prefix capacity-current-u2-long \
+  --output /tmp/duplexomni-capacity-current-2x60
 
-- source: dirty working tree on `726ebd90fe1120d8d0ce1d8c4d99dd54e6703912`;
-- deploy: `origin_deploy_3gpu.yaml`, measurement SHA256 `8cfcd31af59031ba20dc822632510a2de721dca9ede8a80070c8cf5647a7787f`;
-- workload: schema 4, seed 7, 16 users × 12 turns, two warm-up turns, 0–8 second stagger;
-- plan SHA256: `1dfd08e50710f188e5d83526358b9c3aecf4ad0e8616a5b0bb44d6b45d3b0a6f`;
-- result: `/home/ubuntu/data/results/nonpd_shm_sync_u16_t12_20260826/nonpd_shm_sync_seed7_u16`.
+/home/ubuntu/miniconda3/envs/omni/bin/python benchmarks/duplexomni/analyze_capacity.py \
+  1x60=/tmp/duplexomni-capacity-current-1x60 \
+  2x60=/tmp/duplexomni-capacity-current-2x60 \
+  3x60=/tmp/duplexomni-capacity-current-3x60
+```
+
+## Phase 5: functional and long-session validation
+
+FP8 is the default deployment. It preserves the structured-control, `16×6` codec, EOS, and waveform contracts, but no claim is made that its text or waveform is semantically equivalent to BF16.
+
+One-user, 300-slot AV result:
 
 | Metric | Result |
 |---|---:|
-| Completion | 160/160, zero timeouts, zero client errors |
-| TTFT p50/p99 | 341/2550 ms |
-| TTFA p50/p95/p99 | 1371/5371/8212 ms |
-| Stall-max p99 | 1972 ms |
-| Same-session arrival wait p50/p95/p99 | 0/662/1153 ms |
-| Prompt render p50/p95/p99 | 19/81/149 ms |
-| Thinker TTFT p50/p95/p99 | 268/1022/1392 ms |
-| Thinker ITL p50/p95/p99 | 87/345/544 ms |
-| Engine→first audio p50/p95/p99 | 1292/4664/7601 ms |
+| Completed and valid codec/EOS | 300/300 |
+| E2E p50/p95/p99/max | 376/442/462/463 ms |
+| Request p99/max | 456/459 ms |
+| Application queue p99 | 0.50 ms |
+| Prompt render p99 | 16.3 ms |
+| Deadline misses | 0 |
 
-Verification found 192 final requests, 2,196 arrival requests, 2,712 consumed frame occurrences, and 2,559 prefix-cache hits. There were zero preemptions, zero recomputes, and zero arrival failures.
+The run performed eight context compactions, with a maximum prompt of 6,217 tokens. Compaction produced no visible latency spike. The result is stored at `/tmp/duplexomni-fixed-long-300/manifest.json`.
 
-Tail conclusions:
+## Phase 6: current capacity
 
-1. Expanding stagger from 0–8 to 0–40 seconds still produced 7,794 ms TTFA p99; stagger is not the root cause. Control result: `/home/ubuntu/data/results/nonpd_shm_sync_stagger40_u16_t12_20260826/nonpd_shm_sync_stagger40_seed7_u16`.
-2. Prompt-render p99 is 149 ms, and same-session arrival-wait p99 is 1,153 ms. Both amplify the tail but cannot explain 8.2 seconds TTFA.
-3. Thinker dominates. Formal-request decode ITL reaches 544 ms p99: every generated token repeatedly waits for a heavy batch containing arrival prefills. Talker and Code2Wav chiefly wait for upstream tokens.
-4. The application permits one arrival per session, so 16 sessions can create 16 concurrent arrivals. vLLM schedules `running` requests before admitting requests from `waiting`; priority does not displace an existing `running` prefill. Admitted arrivals therefore share token budget and model forwards with formal decode. Continuous replenishment creates decode starvation.
+Same warmed FP8 server, seed 8001, and 60 slots/user:
 
-Conclusion: the current application/session implementation is an adequate engine-research baseline. The 16-user tail is not caused by stagger, prompt rendering, summaries, or Talker/Code2Wav saturation. It comes from multi-user fine-grained arrival prefill repeatedly slowing Thinker decode.
+| Users | E2E p50/p99 | Request p50/p99 | Thinker p50/p99 | Queue p99 | Miss | Queue growth | Result |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 1 | 373/462 ms | 368/457 ms | 282/354 ms | 0.46 ms | 0% | 0.00 ms | strict realtime |
+| 2 | 444/570 ms | 437/555 ms | 343/446 ms | 26.9 ms | 22.5% | 0.00 ms | throughput-stable, SLO failure |
+| 3 | 1067/1758 ms | 639/836 ms | 466/622 ms | 1202 ms | 100% | 569 ms | throughput collapse |
 
-## Phase 6: established architecture result
+Strict capacity is one user. If every slot is not required to finish within 480 ms, two users still keep pace with the input clock; three users are the capacity knee.
 
-Keep the design stateful in the application, finite at the engine request layer, and dependent only on disposable prefix/KV reuse. The formal workload must not add an application-wide cross-user gate; doing so changes the duplex-like engine load and hides contention. The next step is deadline/QoS-aware incremental-prefill scheduling under a fixed input trace, followed by a 16×30 formal run after the implementation is frozen.
+## Phase 7: causal validation of prefill interference
+
+The experiment fixes eight full Duplex probe sessions at 12 slots each and adds 0/4/8/16 prefill-only sessions with the same AV cadence. A prefill-only session materializes Thinker KV, generates no token, and never reaches Talker; its trace has `decode_entries=0`. The experiment was repeated twice.
+
+| Prefill-only users | Thinker p99, run 1 | Thinker p99, run 2 |
+|---:|---:|---:|
+| 0 | 879 ms | 851 ms |
+| 4 | 1123 ms | 1059 ms |
+| 8 | 1393 ms | 1435 ms |
+| 16 | 2168 ms | 2720 ms |
+
+With 16 prefill-only sessions:
+
+- Clean decode gaps with no prefill have a 16–17 ms p99.
+- Decode gaps exposed to background prefill have a 315–316 ms p99.
+- Decode-only GPU batches have an approximately 8.4 ms p50; mixed prefill/probe-decode batches have an approximately 52.7 ms p50.
+- Running the same 16×12 prefills to completion before the probes produces an 820 ms Thinker p99. Only concurrent execution raises it to 2.17–2.72 s.
+
+The added tail therefore comes from concurrent prefill stretching decode-token cadence. It is not hidden background decode and is not explained merely by adding the same amount of total work.
+
+Reproduction entry point:
+
+```bash
+VLLM_OMNI_LOG_PD_ITER=1 VLLM_OMNI_PD_ITER_STAGE=0 \
+DUPLEXOMNI_RESULTS_DIR=/tmp/duplexomni-prefill-causal-server \
+bash benchmarks/duplexomni/run_server.sh fp8
+
+/home/ubuntu/miniconda3/envs/omni/bin/python benchmarks/duplexomni/multi_user.py \
+  --users 8 --prefill-only-users 16 --slots 12 \
+  --output /tmp/duplexomni-prefill-causal-check
+```
+
+## Phase 8: current conclusions
+
+1. The first-order reason DuplexOmni capacity is lower than a query-driven Qwen workload is continuous decode: about 50 Thinker tokens/s/user plus Talker codec decode for every slot.
+2. Continuous AV prefill is a causal tail amplifier. It shares GPU batches with continuous Thinker decode and expands decode gaps from tens to hundreds of milliseconds.
+3. Per-request fixed costs, small batches, and context growth further reduce efficiency, but the system is not repeatedly prefilling the complete history; prefix cache follows the append-only lineage.
+4. The 6,144-token compaction policy removes one-user long-session context growth. Thinker is the first capacity limit; Talker and Code2Wav are not the primary bottleneck.
+5. The application/session/finite-request boundary is sound. The next engine research target is deadline/QoS-aware batching and scheduling for continuous short decode plus small incremental multimodal prefill, not another cross-slot persistent request.
 
 ## Recovery map
 
 | Purpose | Path |
 |---|---|
-| Session and finite-request lifecycle | `vllm_omni/entrypoints/openai/video_stream_base.py` |
-| Multi-user workload | `benchmarks/live_agent/web_client/mu_bench.py` |
-| Workload plan and media loading | `benchmarks/live_agent/web_client/continuous_av_workload.py` |
-| Capacity runner | `benchmarks/live_agent/web_client/run_av_session_ladder.sh` |
-| Fixed deployment | `benchmarks/thinker_talker/origin_deploy_3gpu.yaml` |
-| Result verification | `benchmarks/live_agent/analysis/verify_run.py` |
-| Tail attribution | `benchmarks/live_agent/analysis/p99_attribution.py`, `benchmarks/live_agent/analysis/stage_stats_v2.py` |
-| GPU sampling | `benchmarks/live_agent/harness/gpu_sampler.py` |
+| WebSocket session, slots, filtering, compaction | `vllm_omni/entrypoints/openai/serving_duplexomni_stream.py` |
+| Cross-slot Thinker/Talker ordering | `vllm_omni/engine/duplexomni_pipeline.py` |
+| Thinker-to-Talker protocol and cache identity | `vllm_omni/model_executor/stage_input_processors/duplexomni.py` |
+| Three-stage pipeline | `vllm_omni/model_executor/models/duplexomni/pipeline.py` |
+| Formal deployment | `benchmarks/duplexomni/deploy_fp8_3gpu.yaml` |
+| Single/multi-user workload | `benchmarks/duplexomni/single_user.py`, `benchmarks/duplexomni/multi_user.py` |
+| Capacity analysis | `benchmarks/duplexomni/analyze_capacity.py` |
+| Prefill causal analysis | `benchmarks/duplexomni/analyze_prefill_causal.py` |
+| Regression tests | `tests/model_executor/stage_input_processors/test_duplexomni.py`, `tests/engine/test_duplexomni_pipeline.py`, `tests/benchmarks/test_duplexomni_harness.py` |

@@ -27,6 +27,9 @@ class HiddenStates(TypedDict, total=False):
     trailing_text: torch.Tensor
     last: torch.Tensor
     layers: dict[int, torch.Tensor]
+    # DuplexOmni Talker conditioning, concatenated turn-by-turn.  Unlike the
+    # generic Qwen Talker payload this contains only assistant response rows.
+    duplex_conditioning: torch.Tensor
 
 
 class Embeddings(TypedDict, total=False):
@@ -42,6 +45,7 @@ class Embeddings(TypedDict, total=False):
     speech_token: torch.Tensor
     embedding: torch.Tensor
     thinker_reply: torch.Tensor
+    duplex_conditioning: torch.Tensor
 
 
 class Codes(TypedDict, total=False):
@@ -55,6 +59,8 @@ class Ids(TypedDict, total=False):
     output: list[int]
     speech_token: list[int]
     prior_image: list[int]
+    duplex_conditioning_lengths: list[int]
+    duplex_history_indices: list[int]
 
 
 class OmniPayloadMeta(TypedDict, total=False):
@@ -91,6 +97,16 @@ class OmniPayloadMeta(TypedDict, total=False):
     ref_context_included: bool
     talker_prefill_offset: int
     omni_final_stage_id: int
+    duplexomni: bool
+    return_codec_codes: bool
+    duplexomni_eos_emitted: bool
+    duplexomni_valid_turn: bool
+    duplexomni_pipeline: bool
+    duplexomni_pipeline_session_id: str
+    duplexomni_pipeline_epoch: int
+    duplexomni_pipeline_slot: int
+    duplexomni_pipeline_final: bool
+    duplexomni_pipeline_base_turns: int
 
 
 class OmniPayload(TypedDict, total=False):
@@ -121,6 +137,7 @@ class HiddenStatesStruct(_StructBase):
     trailing_text: torch.Tensor | None = None
     last: torch.Tensor | None = None
     layers: dict[int, torch.Tensor] | None = None
+    duplex_conditioning: torch.Tensor | None = None
 
 
 class EmbeddingsStruct(_StructBase):
@@ -140,6 +157,7 @@ class EmbeddingsStruct(_StructBase):
     speech_token_len: torch.Tensor | None = None
     embedding: torch.Tensor | None = None
     thinker_reply: torch.Tensor | None = None
+    duplex_conditioning: torch.Tensor | None = None
 
 
 class CodesStruct(_StructBase):
@@ -153,6 +171,8 @@ class IdsStruct(_StructBase):
     output: list[int] | None = None
     speech_token: list[int] | None = None
     prior_image: list[int] | None = None
+    duplex_conditioning_lengths: list[int] | None = None
+    duplex_history_indices: list[int] | None = None
 
 
 class MetaStruct(_StructBase):
@@ -189,6 +209,16 @@ class MetaStruct(_StructBase):
     codec_left_context_frames: int | None = None
     code_flat_numel: int | None = None
     omni_final_stage_id: int | None = None
+    duplexomni: bool | None = None
+    return_codec_codes: bool | None = None
+    duplexomni_eos_emitted: bool | None = None
+    duplexomni_valid_turn: bool | None = None
+    duplexomni_pipeline: bool | None = None
+    duplexomni_pipeline_session_id: str | None = None
+    duplexomni_pipeline_epoch: int | None = None
+    duplexomni_pipeline_slot: int | None = None
+    duplexomni_pipeline_final: bool | None = None
+    duplexomni_pipeline_base_turns: int | None = None
 
 
 class OmniPayloadStruct(_StructBase):

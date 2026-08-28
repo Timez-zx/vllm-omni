@@ -1,131 +1,188 @@
-# vLLM-Omni 实时多用户 Serving 工作流
+# DuplexOmni 实时多用户 Serving 工作流
 
 ## 目标与边界
 
-目标是在 TTFA 和语音连续性达标时，用更少 GPU 服务更多持续音视频会话。研究对象是 engine 的容量、调度、KV cache 和尾延迟，不是模型质量。
+目标是在 480 ms 实时时钟下测量 DuplexOmni 的多用户容量，并定位容量失稳时的 engine 根因。研究对象是延迟、调度、batching、prefix/KV cache 和 stage pipeline，不是模型质量。
 
-目前没有可本地部署、交互方式与 Seed Realtime 或 Gemini Live 等价的开源模型。本分支用 Qwen3-Omni 的 Thinker → Talker → Code2Wav 流水线近似持续 AV 会话。它重点模拟“持续视频增量计算与回答 decode 并发”，不代表原生全双工或语义级 barge-in。
-
-## 阶段一：应用基线
-
-应用维护 session；engine 每次只处理普通、有限生命周期的 request：
+DuplexOmni 与 `thinker-talker-vllm` 的 workload 不同。后者主要是持续视频 prefill、query 时集中生成；DuplexOmni 每个 480 ms slot 都执行完整预测：
 
 ```text
-视频到达 → 静默 Thinker finite request 预热 prefix KV
-用户说完 → 完整 canonical history + 当前完整 WAV
-          → Thinker → Talker → Code2Wav
-回答结束 → request 销毁，应用保存本轮
+480 ms PCM + 当前图像
+  → Thinker 增量 prefill + 约 24 个文本/控制 token decode
+  → Talker 生成 6 帧、16 codebook 的 codec，并验证 EOS
+  → Code2Wav 生成约 457 ms 波形
 ```
 
-- 每轮和每个 arrival warm-up 都使用新 request ID；engine 不保留跨轮 live request。
-- 每次提交完整 canonical prompt。prefix/KV cache 可淘汰；cache miss 只增加计算，不改变语义。
-- 应用缓存已处理的 canonical message block，只 render 新 block，再组装完整 prompt。
-- 视频通过 similarity/freshness filter 后在本轮 append-only；没有 8 帧滑动窗口或二次采样。
-- 每个 session 同时最多运行一个 arrival request。它运行 Thinker、`max_tokens=1`、不返回文字、不进入 Talker。
-- arrival 运行期间接受的新帧保留为独立图片，并一起进入下一次累计 prompt snapshot。“合并”只减少 request 次数，不合并或丢弃图片内容。
-- 不同 session 的 arrival 直接并发提交给原生 FCFS；没有全局 gate 或应用 priority。
-- final query 等待本 session 已提交的 arrival 完成，再提交完整 prompt，以保持 prefix lineage 有序。
-- 用户音频在 query 时作为一个完整 WAV 输入，以保持 Qwen 的整段音频语义。只有 final query 触发 Talker。
-- 回答期间新媒体属于下一轮；每个接受的媒体项只被一个 final query 消费。
-- Thinker 回答最多 256 tokens；视频不超过 640×352；JPEG 处理在子进程池执行。
-- prompt 达到 49,152 tokens 时才压缩：保留最近两个已完成 turn 的用户音频/文本和 assistant 文本，删除历史图片，当前 turn 只保留最新图片；如果仍超限，继续按完整旧 turn 丢弃。不会生成 summary request。
+因此每用户约产生 `24 / 0.48 ≈ 50` Thinker decode tokens/s，并持续运行 Talker。两个 branch 的用户数不能直接比较。
 
-旧的跨轮 persistent request、resumable append、Talker rolling、shadow compression 和 session ledger 已删除。
+## 阶段一：接入模型协议
 
-## 阶段二：固定部署
+新增独立 `duplexomni` pipeline，复用 Qwen3-Omni 的 Thinker、Talker 和 Code2Wav 权重结构，但按 DuplexOmni 协议连接三个 stage：
 
-正式实验只使用 `benchmarks/thinker_talker/origin_deploy_3gpu.yaml`：
+- 捕获 Thinker embedding 和最终归一化 hidden state，并按训练位置对齐；最后一个无后继 hidden 的 token 不传给 Talker。
+- Talker prompt 按 `assistant conditioning → codec BOS → 6 RVQ frames → codec EOS` 组织。
+- 每帧包含 16 个 codebook；Talker 自回归生成 layer-0，MTP 生成其余 15 个。
+- 只把完成 6 帧且产生 EOS 的 turn 写入 Talker codec history。
+- API 返回结构化 Thinker 控制字段、`16×6` codec、EOS/valid 标记、波形和各 stage 指标。
+- Thinker/Talker 支持在线 W8A8 FP8 和 per-token/per-head FP8 KV；Code2Wav 保持 BF16。
+
+这不是把普通 Qwen3-Omni 请求改名。checkpoint、每 480 ms 的控制输出和持续 codec 生成共同定义了原生 Duplex workload。
+
+## 阶段二：应用与 engine 边界
+
+应用维护 WebSocket session 和对话状态；engine 每个 slot 只处理一个普通、有限生命周期的 request：
+
+```text
+媒体持续到达 → 应用组成 480 ms slot 和 canonical prompt
+             → 新 finite request → engine prefix/KV cache
+             → request 完成并销毁
+```
+
+- 每个 session 每 480 ms 封装一段 24 kHz mono PCM；当前 slot 只携带最近一张通过 filter 的图片。
+- 图片按 similarity/freshness filter 处理，默认阈值 0.95，最多连续 4 帧后强制保留；manifest 分别记录 sent、acked 和 accepted。
+- 应用缓存已处理的 canonical message block，只 render 新 user/assistant block，再拼接完整 prompt。
+- 每个 epoch 使用独立 `cache_salt`。engine cache 可随时淘汰；cache miss 只增加计算，不改变语义。
+- prompt 达到 6,144 Thinker tokens 时，先 drain 当前 epoch，再只保留最近一个完整 slot，建立新 cache lineage。该阈值来自单用户延迟拐点，不是模型 context 上限。
+- 默认每个 session 最多 4 个 slot 在途。Thinker 只等待前一个 Thinker 完成，不等待其 Talker/Code2Wav：
+
+```text
+Thinker(t) ─────────→ Thinker(t+1)
+    └→ ordered Talker(t) → Code2Wav(t)
+```
+
+- Talker history 必须有序。orchestrator 在前一 Talker 完成后提交下一 Talker，并注入已验证的 codec history；不同 session 互不串行。
+- Talker 的动态 conditioning embedding 使用由 Thinker prefix 和媒体 hash 生成的 cache identity，避免错误 prefix 命中。
+
+结果是：应用有状态，engine request 有限，跨 slot 只依赖可丢弃的 prefix/KV cache；Duplex 语义不依赖 persistent engine request。
+
+## 阶段三：固定部署
+
+硬件为 3 张 NVIDIA RTX PRO 6000 Blackwell Server Edition，每张 96 GB：
 
 | Stage | GPU | 配置 |
 |---|---:|---|
-| Thinker | 0 | FP8 weight/KV、prefix cache、同步调度、等优先级请求 |
-| Talker | 1 | FP8 weight/KV、conditioning prefix cache |
-| Code2Wav | 2 | 独立进程 |
+| Thinker | 0 | FP8 weight、FP8 KV、prefix cache、`max_num_seqs=16` |
+| Talker + MTP | 1 | FP8 weight、FP8 KV、conditioning prefix cache、`max_num_seqs=32` |
+| Code2Wav | 2 | BF16、无 prefix cache |
 
-`run_qwen_server.sh` 检查 Thinker 使用 FlashInfer，并在 worker 启动前创建 stage-0 SHM 多模态缓存。API renderer 与 input processor 共享 sender；worker 复用已 materialize 的媒体，避免有限请求反复恢复完整媒体历史。
-
-## 阶段三：正式 workload
-
-- 每个用户维持一条长期 WebSocket。
-- 视频全程以 2 FPS 上传；通过 filter 的帧触发或排入下一次静默 Thinker arrival prefill。
-- 麦克风以 5 Hz 上传 PCM16；assistant 播放期间暂停，并保留 300 ms echo guard。
-- 每轮使用一条不重复的真实 16 kHz mono SLURP 录音，末尾追加 700 ms endpoint silence；query 文本为空。
-- 音频在 query 时作为完整 WAV 接到已 warm 的视频 prefix 后。
-- 每个 session 固定 speaker；DAVIS 视频使用固定序列和不同起点。
-- 下一轮在上一轮语音按 1× 播放结束后开始，形成 playback-paced closed loop。
-- 用户在 0–8 秒内确定性错开。
-
-这是 duplex-like 而非完整 AV duplex：视频在用户说话和 assistant 播放期间持续 arrival prefill；音频虽以 5 Hz 上传，但 Qwen 只在 query 时处理完整 WAV，播放期间麦克风暂停。它适合研究持续视觉增量负载，不用于声称复现 Gemini Live 或 Seed Realtime 的模型结构与绝对容量。
-
-正式 cell 为 30 轮/用户，前 2 轮不计分；每个 cell 重启 engine。`probe.py` 的合成媒体只验证协议，不能用于容量结论。
+三个 stage 使用 shared-memory connector；调度均为同步模式。正式配置为 `benchmarks/duplexomni/deploy_fp8_3gpu.yaml`，BF16 配置只用于回归。
 
 ```bash
-MU_FRAMES_DIR=/home/ubuntu/data/workloads/continuous_av_v1/frames \
-MU_AUDIO_MANIFEST=/home/ubuntu/data/workloads/continuous_av_v1/audio_manifest.jsonl \
 VLLM_OMNI_BIN=/home/ubuntu/miniconda3/envs/omni/bin/vllm-omni \
-MU_PYTHON=/home/ubuntu/miniconda3/envs/omni/bin/python \
-RESULTS_DIR=/home/ubuntu/data/results/finite_request_capacity_<commit> \
-RESULT_PREFIX=finite_request USERS=16 SEEDS=7 TURNS=30 WARMUP_TURNS=2 \
-bash benchmarks/live_agent/web_client/run_av_session_ladder.sh
+DUPLEXOMNI_RESULTS_DIR=/tmp/duplexomni-server \
+bash benchmarks/duplexomni/run_server.sh fp8
 ```
 
-## 阶段四：指标与通过条件
+## 阶段四：正式 workload 与指标
 
-- **TTFT**：query 到第一段文字。
-- **TTFA / Audio-ready-500**：query 到累计 500 ms 可播放音频。当前首包超过 500 ms，两者相同。
-- **Stall max**：按 1× 播放时最大的单次断流。
-- **RTF deliver**：生成音频时长 / 交付耗时。
+- 每用户一条 server-owned WebSocket session。
+- 每 480 ms 发送一段 PCM 和一张图，即每用户 2.08 requests/s、2.08 FPS。
+- 用户相位独立采样自 `Uniform[0, 480 ms)`，不制造同步 burst。
+- 不同用户的 PCM 加不可听 LSB dither，JPEG 加极小角标，避免不真实的跨用户多模态 cache 命中。
+- 默认语音来自 `tests/assets/minicpmo_4_5/response_required_16k.wav` 并重采样到 24 kHz；未指定 `--image` 时使用确定性生成帧。该 workload 测量 serving 负载，不用于评估语义质量。
+- 容量点使用 60 slots/user。每次使用新 session ID 和 cache lineage；测量前先 warm kernel。
 
-通过条件：所有计分 turn 完成、Audio-ready-500 p99 < 1 s、Stall-max p99 < 50 ms，并且没有 client、protocol 或 fatal engine error。
+核心指标：
 
-结果必须使用 workload schema 4，并运行 `benchmarks/live_agent/analysis/verify_run.py`。验证器检查 finite request、arrival request、frame ledger、prefix-cache 命中和三个独立 stage 进程。
+- **E2E slot latency**：计划到达时间到完整 slot 结果返回。
+- **Request latency**：服务端提交 finite request 到完整结果返回。
+- **Thinker latency**：服务端提交到 Thinker 控制文本完成。
+- **Application queue**：slot 输入就绪到服务端提交。
+- **Deadline miss**：E2E slot latency 超过 480 ms。
 
-## 阶段五：当前 16 用户结果
+Strict realtime 要求 E2E p99 ≤ 480 ms 且 miss rate ≤ 1%。若最后三分之一的 application-queue p50 比最初三分之一增加超过 480 ms，则判定 throughput collapse。
 
-Setup：
+```bash
+/home/ubuntu/miniconda3/envs/omni/bin/python benchmarks/duplexomni/multi_user.py \
+  --users 2 --slots 60 --seed 8001 \
+  --session-prefix capacity-current-u2-long \
+  --output /tmp/duplexomni-capacity-current-2x60
 
-- source：`726ebd90fe1120d8d0ce1d8c4d99dd54e6703912` 上的 dirty working tree；
-- deploy：`origin_deploy_3gpu.yaml`，测量时 SHA256 `8cfcd31af59031ba20dc822632510a2de721dca9ede8a80070c8cf5647a7787f`；
-- workload：schema 4、seed 7、16 用户×12 轮、前 2 轮预热、0–8 秒 stagger；
-- plan SHA256：`1dfd08e50710f188e5d83526358b9c3aecf4ad0e8616a5b0bb44d6b45d3b0a6f`；
-- 结果：`/home/ubuntu/data/results/nonpd_shm_sync_u16_t12_20260826/nonpd_shm_sync_seed7_u16`。
+/home/ubuntu/miniconda3/envs/omni/bin/python benchmarks/duplexomni/analyze_capacity.py \
+  1x60=/tmp/duplexomni-capacity-current-1x60 \
+  2x60=/tmp/duplexomni-capacity-current-2x60 \
+  3x60=/tmp/duplexomni-capacity-current-3x60
+```
+
+## 阶段五：功能与长 session 验证
+
+FP8 是当前默认部署。它保持结构化控制、`16×6` codec、EOS 和波形协议正确，但不声称与 BF16 文本或波形语义等价。
+
+单用户 300-slot AV 长测结果：
 
 | 指标 | 结果 |
 |---|---:|
-| 完成 | 160/160，0 timeout，0 client error |
-| TTFT p50/p99 | 341/2550 ms |
-| TTFA p50/p95/p99 | 1371/5371/8212 ms |
-| Stall-max p99 | 1972 ms |
-| same-session arrival wait p50/p95/p99 | 0/662/1153 ms |
-| prompt render p50/p95/p99 | 19/81/149 ms |
-| Thinker TTFT p50/p95/p99 | 268/1022/1392 ms |
-| Thinker ITL p50/p95/p99 | 87/345/544 ms |
-| engine→first audio p50/p95/p99 | 1292/4664/7601 ms |
+| 完成与有效 codec/EOS | 300/300 |
+| E2E p50/p95/p99/max | 376/442/462/463 ms |
+| Request p99/max | 456/459 ms |
+| Application queue p99 | 0.50 ms |
+| Prompt render p99 | 16.3 ms |
+| Deadline miss | 0 |
 
-验证结果：192 个 final request、2,196 个 arrival request、2,712 个已消费 frame occurrence、2,559 次 prefix-cache hit；0 preemption、0 recompute、0 arrival failure。
+测试发生 8 次 context compaction，prompt 最大 6,217 tokens；压缩没有造成可见延迟尖峰。结果保存在 `/tmp/duplexomni-fixed-long-300/manifest.json`。
 
-Tail 结论：
+## 阶段六：当前容量
 
-1. 将 stagger 从 0–8 秒扩大到 0–40 秒后，TTFA p99 仍为 7,794 ms；错峰不是根因。对照结果：`/home/ubuntu/data/results/nonpd_shm_sync_stagger40_u16_t12_20260826/nonpd_shm_sync_stagger40_seed7_u16`。
-2. prompt render p99 为 149 ms；same-session arrival wait p99 为 1,153 ms。两者会放大 tail，但都解释不了 8.2 秒 TTFA。
-3. 主要延迟在 Thinker。正式请求的 decode ITL p99 达到 544 ms，说明生成每个 token 都反复等待包含 arrival prefill 的重 batch；Talker 和 Code2Wav 主要在等上游 token。
-4. 当前每个 session 最多一个 arrival 在途，但 16 个 session 可同时形成 16 个 arrival。vLLM 每步先调度 `running` 请求，再从 `waiting` 队列接纳新请求；priority 不会抢占已有 `running` prefill。因此已进入 engine 的 arrival 会与正式 decode 共享 token budget 和 model forward，新 arrival 持续补充后形成 decode 饥饿。
+同一 warmed FP8 server、seed 8001、每用户 60 slots：
 
-结论：当前应用/session 实现可以作为 engine research 基线。16 用户 tail 的主要原因不是错峰、prompt render、summary、Talker 或 Code2Wav 饱和，而是多用户小粒度 arrival prefill 在 Thinker scheduler 中持续拖慢 decode。
+| Users | E2E p50/p99 | Request p50/p99 | Thinker p50/p99 | Queue p99 | Miss | Queue growth | 结论 |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 1 | 373/462 ms | 368/457 ms | 282/354 ms | 0.46 ms | 0% | 0.00 ms | strict realtime |
+| 2 | 444/570 ms | 437/555 ms | 343/446 ms | 26.9 ms | 22.5% | 0.00 ms | throughput 稳定，SLO 失败 |
+| 3 | 1067/1758 ms | 639/836 ms | 466/622 ms | 1202 ms | 100% | 569 ms | throughput collapse |
 
-## 阶段六：已验证的架构结论
+当前 strict capacity 为 1 用户；不要求每个 slot 都在 480 ms 内时，2 用户仍能持续跟上输入，3 用户是容量拐点。
 
-保留“应用有状态、engine request 有限、依靠可淘汰 prefix/KV cache”的设计。正式 workload 不加入跨用户全局 gate；否则应用会改变 duplex-like engine 负载并隐藏竞争。下一步应在固定输入 trace 下研究 engine 的 deadline/QoS-aware 增量 prefill 调度，并在实现冻结后补跑 16×30 正式长测。
+## 阶段七：Prefill 对 Thinker decode 的因果验证
+
+实验固定 8 个完整 Duplex probe session，每个 12 slots；另加入 0/4/8/16 个相同 AV cadence 的 prefill-only session。后者只建立 Thinker KV，不生成任何 token、不进入 Talker，trace 中 `decode_entries=0`。实验重复两次。
+
+| Prefill-only users | Thinker p99，run 1 | Thinker p99，run 2 |
+|---:|---:|---:|
+| 0 | 879 ms | 851 ms |
+| 4 | 1123 ms | 1059 ms |
+| 8 | 1393 ms | 1435 ms |
+| 16 | 2168 ms | 2720 ms |
+
+在 16 个 prefill-only session 下：
+
+- 不含任何 prefill 的 clean decode gap p99 为 16–17 ms。
+- 暴露于后台 prefill 的 decode gap p99 为 315–316 ms。
+- decode-only GPU batch p50 为约 8.4 ms；prefill 与 probe decode 混合 batch p50 为约 52.7 ms。
+- 将同样的 16×12 prefill 全部先完成，再运行 probes，Thinker p99 为 820 ms；只有并发时升至 2.17–2.72 s。
+
+因此增加的 tail 来自并发 prefill 拉长 decode token cadence，不是后台 session 偷做了 decode，也不是单纯增加了相同总工作量。
+
+复现入口：
+
+```bash
+VLLM_OMNI_LOG_PD_ITER=1 VLLM_OMNI_PD_ITER_STAGE=0 \
+DUPLEXOMNI_RESULTS_DIR=/tmp/duplexomni-prefill-causal-server \
+bash benchmarks/duplexomni/run_server.sh fp8
+
+/home/ubuntu/miniconda3/envs/omni/bin/python benchmarks/duplexomni/multi_user.py \
+  --users 8 --prefill-only-users 16 --slots 12 \
+  --output /tmp/duplexomni-prefill-causal-check
+```
+
+## 阶段八：当前结论
+
+1. DuplexOmni 容量低于 query-driven Qwen workload 的第一原因是持续 decode：每用户约 50 Thinker tokens/s，并且每 slot 都运行 Talker codec decode。
+2. 持续 AV prefill 是明确的 tail 放大器。它与持续 Thinker decode 共享 GPU batch，使 decode gap 从十几毫秒扩大到数百毫秒。
+3. 高频 finite request 的固定调度成本、小 batch 和 context 增长进一步降低效率，但不是完整历史重复 prefill；prefix cache 已按 append-only lineage 命中。
+4. 6144-token compaction 已解决单用户长 session 的 context 延迟增长。当前容量首先受 Thinker 限制，Talker/Code2Wav 不是第一瓶颈。
+5. 应用/session/finite-request 边界合理。下一步 engine research 应针对“持续短 decode + 小增量多模态 prefill”做 deadline/QoS-aware batching 和调度，而不是把跨 slot 生命周期重新塞回一个 persistent request。
 
 ## 快速恢复入口
 
 | 内容 | 路径 |
 |---|---|
-| Session 与 finite-request 生命周期 | `vllm_omni/entrypoints/openai/video_stream_base.py` |
-| 多用户 workload | `benchmarks/live_agent/web_client/mu_bench.py` |
-| Workload 计划与媒体加载 | `benchmarks/live_agent/web_client/continuous_av_workload.py` |
-| 容量脚本 | `benchmarks/live_agent/web_client/run_av_session_ladder.sh` |
-| 固定部署 | `benchmarks/thinker_talker/origin_deploy_3gpu.yaml` |
-| 结果验证 | `benchmarks/live_agent/analysis/verify_run.py` |
-| Tail 分解 | `benchmarks/live_agent/analysis/p99_attribution.py`、`benchmarks/live_agent/analysis/stage_stats_v2.py` |
-| GPU 采样 | `benchmarks/live_agent/harness/gpu_sampler.py` |
+| WebSocket session、slot、filter、压缩 | `vllm_omni/entrypoints/openai/serving_duplexomni_stream.py` |
+| Thinker/Talker 跨 slot 顺序 | `vllm_omni/engine/duplexomni_pipeline.py` |
+| Thinker→Talker 协议与 cache identity | `vllm_omni/model_executor/stage_input_processors/duplexomni.py` |
+| 三阶段 pipeline | `vllm_omni/model_executor/models/duplexomni/pipeline.py` |
+| 正式部署 | `benchmarks/duplexomni/deploy_fp8_3gpu.yaml` |
+| 单/多用户 workload | `benchmarks/duplexomni/single_user.py`、`benchmarks/duplexomni/multi_user.py` |
+| 容量分析 | `benchmarks/duplexomni/analyze_capacity.py` |
+| Prefill 因果分析 | `benchmarks/duplexomni/analyze_prefill_causal.py` |
+| 回归测试 | `tests/model_executor/stage_input_processors/test_duplexomni.py`、`tests/engine/test_duplexomni_pipeline.py`、`tests/benchmarks/test_duplexomni_harness.py` |

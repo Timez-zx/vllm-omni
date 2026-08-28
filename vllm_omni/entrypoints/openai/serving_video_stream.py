@@ -246,9 +246,20 @@ def create_streaming_video_handler(
 ) -> OmniStreamingVideoHandlerBase:
     """Create the handler for ``/v1/video/chat/stream``.
 
-    Returns :class:`QwenOmniStreamingVideoHandler` today. Additional pipelines
-    can be selected here in follow-up PRs.
+    The transport and application/engine boundary are shared, while each
+    model adapter owns its actual turn/slot semantics.
     """
+    if getattr(engine_client, "pipeline_model_type", None) == "duplexomni":
+        from vllm_omni.entrypoints.openai.serving_duplexomni_stream import (
+            DuplexOmniStreamingVideoHandler,
+        )
+
+        return DuplexOmniStreamingVideoHandler(
+            chat_service=chat_service,
+            idle_timeout=idle_timeout,
+            config_timeout=config_timeout,
+            engine_client=engine_client,
+        )
     return QwenOmniStreamingVideoHandler(
         chat_service=chat_service,
         idle_timeout=idle_timeout,

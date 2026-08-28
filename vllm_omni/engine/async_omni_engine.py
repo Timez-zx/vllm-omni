@@ -219,6 +219,9 @@ class AsyncOmniEngine:
             trust_remote_code=bool(trust_remote_code),
             deploy_config_path=deploy_config_path,
         )
+        # Serving adapters use this stable pipeline identity to select
+        # model-specific protocol semantics without inspecting stage internals.
+        self.pipeline_model_type = pipeline_config.model_type if pipeline_config is not None else None
         self.endpoint_restrictions = pipeline_config.endpoint_restrictions if pipeline_config is not None else ()
         self._duplex_runtime_extension_path = (
             pipeline_config.duplex_runtime_extension if pipeline_config is not None else None

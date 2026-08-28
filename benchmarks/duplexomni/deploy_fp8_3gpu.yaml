@@ -1,0 +1,2 @@
+# Benchmark entry point for the default W8A8 FP8 deployment.
+base_config: ../../vllm_omni/deploy/duplexomni_3gpu.yaml
