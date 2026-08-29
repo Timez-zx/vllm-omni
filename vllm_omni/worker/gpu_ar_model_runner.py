@@ -7,7 +7,11 @@ and also outputs sampled tokens.
 from __future__ import annotations
 
 import gc
+import json
+import os
 import threading
+import time
+from collections import deque
 from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from copy import copy
@@ -46,13 +50,240 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
     stage_sends_async_output,
 )
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
-from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.utils.mm_outputs import (
+    build_mm_cpu,
+    partition_payload_list,
+    to_payload_element,
+    to_shared_cpu_tensor,
+)
+from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner, _span_begin, _span_end
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
 
 logger = init_logger(__name__)
+
+_PD_SHARED_OUTPUT_KEYS = frozenset(
+    {
+        "hidden_states.layer_0",
+        "hidden_states.layer_24",
+        "hidden_states.layer_48",
+    }
+)
+
+# [GPU duty probe] How much of the wall clock does this stage's GPU actually
+# spend running kernels? nvidia-smi's utilization.gpu answers "was any kernel
+# resident", averaged over a sampling window it chooses, which cannot resolve
+# an 80 ms tick and cannot separate two stages sharing one card. CUDA events
+# around the forward measure the real span on the stream.
+#
+# The events are read LATE -- a fixed number of steps after they were recorded
+# -- so the probe never calls synchronize() on the critical path and therefore
+# cannot create the idleness it is meant to measure. Enable with
+# VLLM_OMNI_LOG_STEP_GPU=1.
+_LOG_STEP_GPU = os.environ.get("VLLM_OMNI_LOG_STEP_GPU", "0") not in ("0", "", "false", "False")
+_LOG_PD_ITER = os.environ.get("VLLM_OMNI_LOG_PD_ITER", "0") not in ("0", "", "false", "False")
+_PD_ITER_STAGE = os.environ.get("VLLM_OMNI_PD_ITER_STAGE", "0")
+_LOG_RUNNER_DIAG = os.environ.get("VLLM_OMNI_LOG_RUNNER_DIAG", "0") not in ("0", "", "false", "False")
+_DIAG_STAGE_RAW = os.environ.get("VLLM_OMNI_DIAG_STAGE")
+_DIAG_STAGES = (
+    None
+    if _DIAG_STAGE_RAW is None
+    else frozenset(stage.strip() for stage in _DIAG_STAGE_RAW.split(",") if stage.strip())
+)
+_STEP_GPU_LAG = 8  # read an event pair this many steps after recording
+_STEP_GPU_EVERY = 1  # record every Nth step
+
+
+def _runner_diag_enabled(runner: Any) -> bool:
+    if not _LOG_RUNNER_DIAG:
+        return False
+    stage_id = getattr(runner.vllm_config.model_config, "stage_id", "?")
+    return _DIAG_STAGES is None or str(stage_id) in _DIAG_STAGES
+
+
+def _pd_iteration_metadata(
+    runner: Any,
+    scheduler_output: SchedulerOutput,
+    batch_entry_mono: float,
+) -> dict[str, Any] | None:
+    """Describe one scheduler batch without synchronizing the runner.
+
+    A new request and a cached request with zero output tokens are in their
+    context phase. Cached requests with output tokens are decoding. Keeping
+    this classification at the worker boundary lets the benchmark distinguish
+    D-only, P-only, and mixed batches using the scheduler's own state rather
+    than inferring phases from request-level latency.
+    """
+    if not _LOG_PD_ITER:
+        return None
+    stage = str(getattr(runner.vllm_config.model_config, "stage_id", "?"))
+    if _PD_ITER_STAGE and stage != _PD_ITER_STAGE:
+        return None
+
+    scheduled = scheduler_output.num_scheduled_tokens
+    prefill: list[dict[str, Any]] = []
+    decode: list[dict[str, Any]] = []
+    for request in scheduler_output.scheduled_new_reqs:
+        prefill.append(
+            {
+                "id": request.req_id,
+                "tokens": int(scheduled.get(request.req_id, 0)),
+                "computed": int(request.num_computed_tokens),
+            }
+        )
+
+    cached = scheduler_output.scheduled_cached_reqs
+    for req_id, computed, output_tokens in zip(
+        cached.req_ids,
+        cached.num_computed_tokens,
+        cached.num_output_tokens,
+        strict=True,
+    ):
+        item = {
+            "id": req_id,
+            "tokens": int(scheduled.get(req_id, 0)),
+            "computed": int(computed),
+            "output_tokens": int(output_tokens),
+        }
+        (prefill if output_tokens == 0 else decode).append(item)
+
+    encoder_inputs = [
+        {"id": req_id, "items": len(input_indices)}
+        for req_id, input_indices in scheduler_output.scheduled_encoder_inputs.items()
+    ]
+    has_prefill_work = bool(prefill or encoder_inputs)
+    if has_prefill_work and decode:
+        kind = "mixed"
+    elif has_prefill_work:
+        kind = "prefill_only"
+    elif decode:
+        kind = "decode_only"
+    else:
+        kind = "empty"
+    if prefill and encoder_inputs:
+        prefill_source = "tokens_and_encoder"
+    elif prefill:
+        prefill_source = "tokens"
+    elif encoder_inputs:
+        prefill_source = "encoder"
+    else:
+        prefill_source = "none"
+
+    state = getattr(runner, "_pd_iteration_state", None)
+    if state is None:
+        state = {"seq": 0, "last_decode": {}}
+        runner._pd_iteration_state = state
+    state["seq"] += 1
+    seq = int(state["seq"])
+
+    # The interval between two worker batches containing the same decode
+    # request is the engine-visible token cadence. The batches that ran in
+    # between can be recovered from the complete, sequence-numbered trace.
+    decode_gaps: list[dict[str, Any]] = []
+    last_decode = state["last_decode"]
+    for item in decode:
+        req_id = item["id"]
+        previous = last_decode.get(req_id)
+        if previous is not None:
+            decode_gaps.append(
+                {
+                    "id": req_id,
+                    "ms": (batch_entry_mono - previous["mono"]) * 1000.0,
+                    "after_seq": previous["seq"],
+                    "after_kind": previous["kind"],
+                    "after_prefill_tokens": previous["prefill_tokens"],
+                    "after_encoder_inputs": previous["encoder_inputs"],
+                }
+            )
+        last_decode[req_id] = {
+            "mono": batch_entry_mono,
+            "seq": seq,
+            "kind": kind,
+            "prefill_tokens": sum(entry["tokens"] for entry in prefill),
+            "encoder_inputs": sum(entry["items"] for entry in encoder_inputs),
+        }
+
+    return {
+        "seq": seq,
+        "stage": stage,
+        "mono": batch_entry_mono,
+        "kind": kind,
+        "prefill_source": prefill_source,
+        "prefill": prefill,
+        "encoder": encoder_inputs,
+        "decode": decode,
+        "prefill_tokens": sum(entry["tokens"] for entry in prefill),
+        "encoder_inputs": sum(entry["items"] for entry in encoder_inputs),
+        "decode_tokens": sum(entry["tokens"] for entry in decode),
+        "decode_gaps": decode_gaps,
+    }
+
+
+def _step_gpu_probe_begin(runner: Any, pd_metadata: dict[str, Any] | None = None):
+    if (not _LOG_STEP_GPU and pd_metadata is None) or not torch.cuda.is_available():
+        return None
+    state = getattr(runner, "_step_gpu_state", None)
+    if state is None:
+        state = {"n": 0, "pending": deque()}
+        runner._step_gpu_state = state
+    state["n"] += 1
+    if pd_metadata is None and state["n"] % _STEP_GPU_EVERY:
+        return None
+    start = torch.cuda.Event(enable_timing=True)
+    start.record()
+    return start, time.monotonic(), pd_metadata
+
+
+def _step_gpu_probe_end(
+    runner: Any,
+    probe: Any,
+    num_reqs: int,
+    num_tokens: int,
+) -> None:
+    state = runner._step_gpu_state
+    start_event, forward_start_mono, pd_metadata = probe
+    end = torch.cuda.Event(enable_timing=True)
+    end.record()
+    state["pending"].append(
+        (
+            start_event,
+            end,
+            forward_start_mono,
+            (time.monotonic() - forward_start_mono) * 1000.0,
+            int(num_reqs),
+            int(num_tokens),
+            pd_metadata,
+        )
+    )
+    if len(state["pending"]) <= _STEP_GPU_LAG:
+        return
+    s, e, t_mono, forward_wall_ms, nreq, ntok, metadata = state["pending"].popleft()
+    if not e.query():  # not finished yet: put it back, never block
+        state["pending"].appendleft((s, e, t_mono, forward_wall_ms, nreq, ntok, metadata))
+        return
+    try:
+        dur_ms = s.elapsed_time(e)
+    except Exception:
+        return
+    if _LOG_STEP_GPU:
+        logger.info(
+            "[STEP-GPU] stage=%s mono=%.6f gpu_ms=%.3f nreq=%d ntok=%d",
+            getattr(runner.vllm_config.model_config, "stage_id", "?"),
+            t_mono,
+            dur_ms,
+            nreq,
+            ntok,
+        )
+    if metadata is not None:
+        metadata = dict(metadata)
+        metadata["forward_start_mono"] = t_mono
+        metadata["prepare_ms"] = (t_mono - metadata["mono"]) * 1000.0
+        metadata["forward_wall_ms"] = forward_wall_ms
+        metadata["gpu_ms"] = dur_ms
+        metadata["num_reqs"] = nreq
+        metadata["num_tokens_padded"] = ntok
+        logger.info("[PD-ITER] %s", json.dumps(metadata, separators=(",", ":")))
 
 
 def _to_cpu_contiguous(tensor: torch.Tensor) -> torch.Tensor:
@@ -121,11 +352,40 @@ class _AsyncCPUPayloadSnapshot:
         self._waited = True
 
 
+def _tri_colocation_keeps_payload_on_device() -> bool:
+    """True only under FULL tri-colocation (stages 0, 1, 2 in one process).
+
+    Then every connector edge is an in-process reference handoff and the
+    async snapshot's CPU stage is pure transport waste: the D2D clone in
+    _clone_cuda_tensor_payload already provides the buffer decoupling that
+    async scheduling needs, and the downstream stage consumes the tensor on
+    the same device anyway (its .to(device) becomes a no-op). The pair
+    config (2:1) keeps the CPU path: stage 0 lives in another process there
+    and its payloads must cross a SharedMemory hop.
+    """
+    raw = os.environ.get("VLLM_OMNI_COLOCATE_STAGES", "").strip()
+    if not raw:
+        return False
+    members: set[int] = set()
+    for pair in raw.split(","):
+        guest_s, _, host_s = pair.partition(":")
+        try:
+            members.add(int(guest_s.strip()))
+            members.add(int(host_s.strip()))
+        except ValueError:
+            return False
+    return {0, 1, 2} <= members
+
+
+_OMNI_PAYLOAD_KEEP_ON_DEVICE = _tri_colocation_keeps_payload_on_device()
+
+
 def _snapshot_tensor_payload_to_cpu_async(
     value: Any,
     *,
     copy_stream: torch.cuda.Stream,
     pin_memory: bool,
+    keep_on_device: bool = False,
 ) -> _AsyncCPUPayloadSnapshot:
     cuda_sources: list[torch.Tensor] = []
     cloned = _clone_cuda_tensor_payload(value, cuda_sources)
@@ -134,6 +394,12 @@ def _snapshot_tensor_payload_to_cpu_async(
 
     source_stream = torch.cuda.current_stream()
     ready_event = torch.cuda.Event()
+    if keep_on_device:
+        # Ship the decoupling clone itself; readiness = clone completion on
+        # the source stream. wait() still synchronizes the event before the
+        # payload leaves the builder, matching the CPU path's semantics.
+        ready_event.record(source_stream)
+        return _AsyncCPUPayloadSnapshot(cloned, ready_event, cuda_sources)
     with torch.cuda.stream(copy_stream):
         copy_stream.wait_stream(source_stream)
         cpu_payload = _copy_tensor_payload_to_cpu(cloned, pin_memory)
@@ -429,6 +695,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         return sampling_metadata
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> Callable | None:
+        # Preserve the prefix-cache position observed when a finite P request
+        # first enters the runner.  ``input_batch.num_computed_tokens_cpu``
+        # advances after every chunk, so it cannot by itself distinguish a
+        # native prefix hit from rows computed earlier by the same request.
+        self._pd_new_request_prefix_rows = {
+            request.req_id: int(request.num_computed_tokens) for request in scheduler_output.scheduled_new_reqs
+        }
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
         if self._resolve_duplex_sampling_hook() is None:
             return deferred_state_corrections_fn
@@ -439,18 +712,41 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
     def _request_final_stage_id(self, req_id: str) -> int | None:
         info = self.model_intermediate_buffer.get(req_id)
-        if not isinstance(info, dict):
+        val = info.get("omni_final_stage_id") if isinstance(info, dict) else None
+        if val is None:
             req_state = self.requests.get(req_id)
             info = getattr(req_state, "additional_information_cpu", None)
-        if not isinstance(info, dict):
-            return None
-        val = info.get("omni_final_stage_id")
+            val = info.get("omni_final_stage_id") if isinstance(info, dict) else None
         try:
             return int(val)
         except (TypeError, ValueError):
             return None
 
+    def _request_needs_pd_snapshot_payload(self, req_id: str) -> bool:
+        """Return whether P must expose hidden states for a lineage snapshot.
+
+        A prefill-only request intentionally has ``omni_final_stage_id == 0``:
+        it must not be forwarded to D, but the orchestrator still needs P's
+        hidden-state tail to advance the finite-request KV lineage.  Keep this
+        contract separate from downstream-stage routing.
+        """
+        info = self.model_intermediate_buffer.get(req_id)
+        meta = info.get("meta") if isinstance(info, dict) else None
+        mode = meta.get("pd_prefill_snapshot_mode") if isinstance(meta, dict) else None
+        if mode in ("full", "delta"):
+            return True
+
+        req_state = self.requests.get(req_id)
+        info = getattr(req_state, "additional_information_cpu", None)
+        meta = info.get("meta") if isinstance(info, dict) else None
+        mode = meta.get("pd_prefill_snapshot_mode") if isinstance(meta, dict) else None
+        return mode in ("full", "delta")
+
     def _request_needs_downstream_stage_payload(self, req_id: str) -> bool:
+        # Snapshot production is a local P output even when this finite request
+        # deliberately terminates at stage 0.
+        if self._request_needs_pd_snapshot_payload(req_id):
+            return True
         cached = self._downstream_payload_cache.get(req_id)
         if cached is not None:
             return cached
@@ -647,6 +943,92 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         model = getattr(self, "model", None)
         return bool(getattr(model, "requires_full_prefix_cached_hidden_states", True))
 
+    def _model_needs_full_prefix_multimodal_outputs(self) -> bool:
+        """Whether downstream output needs cached multimodal prefix rows.
+
+        The default preserves the generic Omni contract: a prefix-cache hit
+        reconstructs cached multimodal rows before the stage payload is sent
+        downstream. A stage whose downstream processor already owns an
+        equivalent prompt snapshot can opt out and emit only the rows produced
+        by the current scheduler step.
+        """
+        model = getattr(self, "model", None)
+        return bool(getattr(model, "requires_full_prefix_cached_multimodal_outputs", True))
+
+    def _model_supports_delta_prefix_multimodal_outputs(self) -> bool:
+        """Whether a model can emit only the newly scheduled MM rows.
+
+        Most Omni stages require the runner to reconstruct cached-prefix plus
+        new-tail tensors before their output is routed downstream.  A P/D
+        prefill stage may instead keep that disposable snapshot in the
+        orchestrator and ask for only the new rows on cache hits.
+        """
+        return self._runner_model_omni_flag(
+            "supports_delta_prefix_multimodal_outputs",
+            default=False,
+        )
+
+    def _request_needs_full_prefix_multimodal_output(self, req_id: str) -> bool:
+        parent_rows = self._pd_snapshot_parent_rows(req_id)
+        if parent_rows is None:
+            return True
+
+        # Reconstruct a cached gap only on the request's first scheduler step
+        # and only when native prefix caching skipped beyond the exact parent
+        # snapshot held by the orchestrator.  Later ``num_computed_tokens``
+        # values include chunks computed by this same request and must not be
+        # treated as a larger prefix hit.
+        initial_prefix = getattr(self, "_pd_new_request_prefix_rows", {}).get(req_id)
+        return initial_prefix is not None and initial_prefix > parent_rows
+
+    def _pd_snapshot_parent_rows(self, req_id: str) -> int | None:
+        if not self._model_supports_delta_prefix_multimodal_outputs():
+            return None
+        buffers = getattr(self, "model_intermediate_buffer", {})
+        info = buffers.get(req_id, {}) if isinstance(buffers, dict) else {}
+        meta = info.get("meta") if isinstance(info, dict) else None
+        if not isinstance(meta, dict) or meta.get("pd_prefill_snapshot_mode") != "delta":
+            return None
+        return max(0, int(meta.get("pd_prefill_snapshot_parent_rows", 0)))
+
+    def _batch_needs_full_prefix_multimodal_outputs(self) -> bool:
+        return any(self._request_needs_full_prefix_multimodal_output(req_id) for req_id in self.input_batch.req_ids)
+
+    def _snapshot_pd_prefix_multimodal_requirements(
+        self,
+    ) -> tuple[dict[str, int], dict[str, int], set[str]]:
+        """Freeze P/D prefix-output decisions before async bookkeeping.
+
+        The async output builder may run after ``input_batch`` has advanced or
+        removed a completed request.  Re-reading the live batch there can hide
+        a prefix-cache hit that extends beyond the orchestrator's saved parent
+        snapshot, dropping the cached gap from the P payload.
+        """
+        parent_rows_by_req: dict[str, int] = {}
+        trim_rows_by_req: dict[str, int] = {}
+        needs_full_prefix: set[str] = set()
+        req_ids = list(getattr(self.input_batch, "req_ids", ()))
+        req_to_index = getattr(self.input_batch, "req_id_to_index", {})
+        computed = getattr(self.input_batch, "num_computed_tokens_cpu", None)
+        for req_id in req_ids:
+            parent_rows = self._pd_snapshot_parent_rows(req_id)
+            if parent_rows is None:
+                needs_full_prefix.add(req_id)
+                continue
+            parent_rows_by_req[req_id] = parent_rows
+            req_idx = req_to_index.get(req_id) if isinstance(req_to_index, dict) else None
+            step_start = int(computed[req_idx]) if req_idx is not None and computed is not None else 0
+            initial_prefix = getattr(self, "_pd_new_request_prefix_rows", {}).get(req_id)
+            if initial_prefix is not None and initial_prefix > parent_rows:
+                needs_full_prefix.add(req_id)
+                # The merged payload starts at row zero.
+                trim_rows_by_req[req_id] = parent_rows
+            else:
+                # The normal payload starts at this scheduler step's first
+                # computed row.  Drop only the overlap with the parent.
+                trim_rows_by_req[req_id] = max(0, parent_rows - step_start)
+        return parent_rows_by_req, trim_rows_by_req, needs_full_prefix
+
     def _get_runner_assisted_full_attention_metadata_request(
         self,
         *,
@@ -761,6 +1143,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             # If this happens, it generally means the model is not following the correct
             # interface yet and is therefore currently not compatible with prefix cache.
             hs_for_cache = hidden_states if self._model_needs_full_prefix_hidden_states() else None
+            mm_for_cache = (
+                flatten_payload(multimodal_outputs)
+                if multimodal_outputs and self._model_needs_full_prefix_multimodal_outputs()
+                else None
+            )
+            # Native KV prefix caching is independent of this CPU tensor
+            # side-cache. If the model consumes neither cached hidden nor
+            # cached multimodal rows, avoid the slot-map D2H and cache writes.
+            if hs_for_cache is None and mm_for_cache is None:
+                return
             # FIX: The .cpu attribute of slot_mapping is stale (not updated by the Triton
             # _compute_slot_mapping_kernel which only writes to .gpu). We must use .gpu and
             # sync back to CPU to get the correctly computed slot mapping.
@@ -768,7 +1160,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             slot_mapping_cpu = slot_mapping_gpu[:num_tokens_padded].cpu()
             self.omni_prefix_cache.update_omni_tensor_prefix_cache(
                 hidden_states=hs_for_cache,
-                multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
+                multimodal_outputs=mm_for_cache,
                 num_tokens_unpadded=num_tokens_unpadded,
                 slot_mapping=slot_mapping_cpu,
                 num_tokens_padded=num_tokens_padded,
@@ -782,6 +1174,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         hidden_states_cpu: torch.Tensor | None,
         multimodal_outputs: dict,
         num_scheduled_tokens: dict[str, int],
+        pd_needs_full_prefix_mm: set[str] | None = None,
     ) -> tuple[dict[str, torch.Tensor] | None, dict | None]:
         """If prefix caching is enabled, extract the merged hidden states and multimodal outputs for
         all requests in the batch (including those that aren't a hit on Prefix cache).
@@ -795,12 +1188,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if self.omni_prefix_cache is not None:
             if not is_last_pp_rank:
                 raise RuntimeError("Omni prefix-cache tensor merge is only valid on the last pipeline parallel rank.")
-            if (
-                not self._model_needs_full_prefix_hidden_states()
-                and not self.omni_prefix_cache.has_prefix_cached_new_req_ids()
-            ):
+            needs_full_hidden = self._model_needs_full_prefix_hidden_states()
+            needs_full_mm = self._model_needs_full_prefix_multimodal_outputs()
+            if not needs_full_hidden and not needs_full_mm:
                 return None, None
-            if self._model_needs_full_prefix_hidden_states():
+            if not needs_full_hidden and not self.omni_prefix_cache.has_prefix_cached_new_req_ids():
+                return None, None
+            if needs_full_hidden:
                 combined_hidden_states = self.omni_prefix_cache.get_merged_hidden_states(
                     query_start_loc=self.query_start_loc.cpu,
                     input_batch=self.input_batch,
@@ -808,12 +1202,20 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     hidden_states_cpu=hidden_states_cpu,
                     num_scheduled_tokens=num_scheduled_tokens,
                 )
-            combined_multimodal_outputs = self.omni_prefix_cache.get_merged_multimodal_states(
-                query_start_loc=self.query_start_loc.cpu,
-                input_batch=self.input_batch,
-                multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
-                num_scheduled_tokens=num_scheduled_tokens,
+            needs_full_prefix_mm = needs_full_mm and (
+                bool(pd_needs_full_prefix_mm)
+                if pd_needs_full_prefix_mm is not None
+                else self._batch_needs_full_prefix_multimodal_outputs()
             )
+            if needs_full_prefix_mm:
+                combined_multimodal_outputs = self.omni_prefix_cache.get_merged_multimodal_states(
+                    query_start_loc=self.query_start_loc.cpu,
+                    input_batch=self.input_batch,
+                    multimodal_outputs=(
+                        flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
+                    ),
+                    num_scheduled_tokens=num_scheduled_tokens,
+                )
         return combined_hidden_states, combined_multimodal_outputs
 
     def _stage_deferred_prefix_cache_mm_outputs(
@@ -846,6 +1248,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         multimodal_outputs: Any,
         scheduler_output: SchedulerOutput,
         needs_scheduled_hidden_payload: bool,
+        pd_needs_full_prefix_mm: set[str] | None = None,
     ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor] | None, dict | None]:
         hidden_states_cpu = None
         if needs_scheduled_hidden_payload:
@@ -858,15 +1261,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             staged_hidden_states_cpu,
             multimodal_outputs,
             scheduler_output.num_scheduled_tokens,
+            pd_needs_full_prefix_mm,
         )
         return hidden_states_cpu, combined_hidden_states, combined_multimodal_outputs
 
-    @staticmethod
     def _build_combined_prefix_cache_mm_payload(
+        self,
         combined_multimodal_outputs: dict,
         *,
         rid: str,
         idx: int,
+        pd_parent_rows_by_req: dict[str, int] | None = None,
     ) -> dict[str, object]:
         def _unwrap_lists(v):
             if isinstance(v, list):
@@ -875,10 +1280,33 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 return {k: _unwrap_lists(sv) for k, sv in v.items()}
             return v
 
-        return {
+        payload = {
             mm_key: _unwrap_lists(combined_multimodal_outputs[mm_key][rid])
             for mm_key in combined_multimodal_outputs.keys()
         }
+        parent_rows = (
+            pd_parent_rows_by_req.get(rid) if pd_parent_rows_by_req is not None else self._pd_snapshot_parent_rows(rid)
+        )
+        if parent_rows is not None and parent_rows > 0:
+            # The two captured Thinker layers are row-aligned with the prompt.
+            # Other entries (for example the three TTS embeddings) are small
+            # request metadata and must remain intact.
+            for key in _PD_SHARED_OUTPUT_KEYS:
+                value = payload.get(key)
+                if isinstance(value, torch.Tensor) and value.shape[0] >= parent_rows:
+                    # Materialize only the lineage delta.  A view would keep
+                    # the complete cached-prefix backing storage alive and
+                    # TensorIpcSender.share_memory_() would copy that full
+                    # storage after EngineCore marks the output ready.
+                    payload[key] = to_shared_cpu_tensor(value[parent_rows:])
+        elif self._model_supports_delta_prefix_multimodal_outputs():
+            # A zero-row parent is still a finite-request P snapshot.  Keep
+            # the same direct-shared contract as later delta requests.
+            for key in _PD_SHARED_OUTPUT_KEYS:
+                value = payload.get(key)
+                if isinstance(value, torch.Tensor):
+                    payload[key] = to_shared_cpu_tensor(value)
+        return payload
 
     def _build_omni_mm_payload(
         self,
@@ -893,12 +1321,20 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         sparse_mm_index: dict[str, int],
         hidden_seq_len: int,
         scheduled_seq_len: int,
+        pd_parent_rows_by_req: dict[str, int] | None = None,
+        pd_trim_rows_by_req: dict[str, int] | None = None,
+        pd_needs_full_prefix_mm: set[str] | None = None,
     ) -> dict[str, object]:
-        if combined_multimodal_outputs:
+        is_delta_request = pd_parent_rows_by_req is not None and rid in pd_parent_rows_by_req
+        use_combined = bool(combined_multimodal_outputs) and (
+            not is_delta_request or (pd_needs_full_prefix_mm is not None and rid in pd_needs_full_prefix_mm)
+        )
+        if use_combined:
             return self._build_combined_prefix_cache_mm_payload(
                 combined_multimodal_outputs,
                 rid=rid,
                 idx=idx,
+                pd_parent_rows_by_req=pd_parent_rows_by_req,
             )
 
         mm_payload: dict[str, object] = {}
@@ -932,6 +1368,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 seq_len=hidden_seq_len,
                 scheduled_seq_len=scheduled_seq_len,
             )
+        if is_delta_request:
+            trim_rows = max(0, int((pd_trim_rows_by_req or {}).get(rid, 0)))
+            for key in _PD_SHARED_OUTPUT_KEYS:
+                value = mm_payload.get(key)
+                if isinstance(value, torch.Tensor):
+                    mm_payload[key] = to_shared_cpu_tensor(value[min(trim_rows, int(value.shape[0])) :])
         return mm_payload
 
     def _build_omni_pooler_payload(
@@ -950,6 +1392,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         sparse_mm_index: dict[str, int],
         hidden_seq_len: int,
         scheduled_seq_len: int,
+        pd_parent_rows_by_req: dict[str, int] | None = None,
+        pd_trim_rows_by_req: dict[str, int] | None = None,
+        pd_needs_full_prefix_mm: set[str] | None = None,
     ) -> dict[str, object]:
         payload: dict[str, object] = {}
         if not audio_sparse_output:
@@ -977,6 +1422,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             sparse_mm_index=sparse_mm_index,
             hidden_seq_len=hidden_seq_len,
             scheduled_seq_len=scheduled_seq_len,
+            pd_parent_rows_by_req=pd_parent_rows_by_req,
+            pd_trim_rows_by_req=pd_trim_rows_by_req,
+            pd_needs_full_prefix_mm=pd_needs_full_prefix_mm,
         )
         payload.update(mm_payload)
         return payload
@@ -987,8 +1435,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         scheduler_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        diag_enabled = _runner_diag_enabled(self)
+        diag_start = time.monotonic() if diag_enabled else 0.0
+        diag_req_ids = list(scheduler_output.num_scheduled_tokens) if diag_enabled else []
+        diag_scheduled = (
+            [int(scheduler_output.num_scheduled_tokens[req_id]) for req_id in diag_req_ids] if diag_enabled else []
+        )
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
+        pd_batch_entry_mono = time.monotonic() if _LOG_PD_ITER else 0.0
 
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
@@ -1076,6 +1531,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        pd_iteration = (
+            _pd_iteration_metadata(self, scheduler_output, pd_batch_entry_mono)
+            if num_scheduled_tokens > 0
+            else None
+        )
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
@@ -1254,6 +1714,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 for_cudagraph_capture=runner_assisted_full_attn_capture,
             )
 
+            _span = _span_begin()
             (
                 input_ids,
                 inputs_embeds,
@@ -1262,6 +1723,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 model_kwargs,
                 ec_connector_output,
             ) = self._preprocess(scheduler_output, num_tokens_padded, intermediate_tensors)
+            _span_end(self, _span, "preprocess", num_reqs)
 
         # Let the model adjust inputs before forward (e.g. restore input_ids
         # for multimodal position detection, fix decode position offsets).
@@ -1299,6 +1761,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        diag_forward_start = time.monotonic() if diag_enabled else 0.0
+        diag_gpu_start = None
+        diag_gpu_end = None
+        if diag_enabled:
+            diag_gpu_start = torch.cuda.Event(enable_timing=True)
+            diag_gpu_start.record()
         try:
             with (
                 nullcontext(),
@@ -1318,6 +1786,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     defer_finalize=defer_kv_connector_finalize,
                 ) as kv_connector_output,
             ):
+                _gpu_probe = _step_gpu_probe_begin(self, pd_iteration)
                 model_output = self._model_forward(
                     input_ids=input_ids,
                     positions=positions,
@@ -1328,6 +1797,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     logits_index=logits_indices,
                     sampler=self.sampler,
                 )
+                if diag_enabled:
+                    diag_gpu_end = torch.cuda.Event(enable_timing=True)
+                    diag_gpu_end.record()
+                if _gpu_probe is not None:
+                    _step_gpu_probe_end(self, _gpu_probe, num_reqs, num_tokens_padded)
 
                 # [Omni] Map pending ropes metadata to req_ids.
                 flush_pending_metadata = getattr(self.model, "flush_pending_metadata", None)
@@ -1336,6 +1810,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         finally:
             if runner_assisted_context_enabled:
                 self._set_runner_assisted_full_attention_metadata_context(enabled=False)
+        diag_forward_end = time.monotonic() if diag_enabled else 0.0
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -1453,6 +1928,21 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         if self._should_return_omni_routed_experts() and hasattr(self, "_positions_cpu"):
             self._omni_routed_experts_d2h(scheduler_output)
+
+        if diag_enabled:
+            computed = [int(value) for value in num_computed_tokens_cpu[:num_reqs]]
+            self._runner_diag_state = {
+                "mono": diag_start,
+                "req_ids": diag_req_ids,
+                "scheduled": diag_scheduled,
+                "computed": computed,
+                "execute_start": diag_start,
+                "forward_start": diag_forward_start,
+                "forward_end": diag_forward_end,
+                "execute_end": time.monotonic(),
+                "gpu_start": diag_gpu_start,
+                "gpu_end": diag_gpu_end,
+            }
 
         return None
 
@@ -1592,10 +2082,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     def _model_omni_pooler_payload_include_hidden(self) -> bool:
         return self._runner_model_omni_flag("omni_pooler_payload_include_hidden", default=True)
 
-    def _should_use_async_omni_output(self) -> bool:
+    def _should_use_async_omni_output(
+        self,
+        *,
+        allow_pd_delta: bool = False,
+    ) -> bool:
         if not self.use_async_scheduling:
             return False
-        if self.omni_prefix_cache is not None:
+        if self.omni_prefix_cache is not None and not allow_pd_delta:
             return False
         if self.speculative_config is not None:
             return False
@@ -1603,7 +2097,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         model_config = getattr(self, "model_config", None)
         if model_config is None:
             model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
-        if not bool(getattr(model_config, "async_chunk", False)):
+        if not bool(getattr(model_config, "async_chunk", False)) and not allow_pd_delta:
             return False
         if bool(getattr(model_config, "enable_return_routed_experts", False)):
             return False
@@ -1664,6 +2158,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 # on the 17.5k-token Thinker prefill). Resolve pinning from the
                 # platform helper so the copy is a true async cudaMemcpyAsync.
                 pin_memory=is_pin_memory_available(),
+                keep_on_device=_OMNI_PAYLOAD_KEEP_ON_DEVICE,
             )
 
         payload = async_payload_snapshot.payload
@@ -1689,6 +2184,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         scheduler_output: SchedulerOutput,
         req_ids_output_copy: list[str],
         query_start_loc_cpu: Any,
+        resolved_pooler_payload: tuple[str, list[str]] | None = None,
     ) -> bool:
         """Apply model postprocess on live GPU tensors before async payload D2H."""
         model = getattr(self, "model", None)
@@ -1697,7 +2193,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if not self._model_omni_flag(model, "eager_omni_postprocess_before_async_output"):
             return False
 
-        _, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
+        if resolved_pooler_payload is None:
+            _, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
+        else:
+            _, downstream_req_ids = resolved_pooler_payload
         if not downstream_req_ids:
             return False
 
@@ -1741,12 +2240,19 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         kv_extracted_req_ids: list[str] | None,
         num_scheduled_tokens_np: np.ndarray,
         query_start_loc_cpu: Any,
+        pd_parent_rows_by_req: dict[str, int] | None = None,
+        pd_trim_rows_by_req: dict[str, int] | None = None,
+        pd_needs_full_prefix_mm: set[str] | None = None,
         postprocess_already_applied: bool = False,
+        resolved_pooler_payload: tuple[str, list[str]] | None = None,
     ) -> OmniModelRunnerOutput:
         combined_hidden_states = None
         combined_multimodal_outputs = None
 
-        engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
+        if resolved_pooler_payload is None:
+            engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
+        else:
+            engine_output_type, downstream_req_ids = resolved_pooler_payload
         downstream_req_ids, sparse_mm_index, audio_sparse_output = self._resolve_sparse_mm_routing(
             engine_output_type=engine_output_type,
             req_ids_output_copy=req_ids_output_copy,
@@ -1808,11 +2314,24 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     multimodal_outputs=multimodal_outputs,
                     scheduler_output=scheduler_output,
                     needs_scheduled_hidden_payload=needs_scheduled_hidden_payload,
+                    pd_needs_full_prefix_mm=pd_needs_full_prefix_mm,
                 )
-            if combined_multimodal_outputs is None:
+            # A mixed batch can contain a request that needs a reconstructed
+            # full prefix and delta requests that must emit only their raw
+            # scheduled tail.  Building only the merged source in that case
+            # leaves every delta request with an empty payload.
+            full_prefix_req_ids = pd_needs_full_prefix_mm or set()
+            needs_raw_scheduled_mm = any(
+                rid in (pd_parent_rows_by_req or {}) and rid not in full_prefix_req_ids
+                for rid in downstream_req_ids
+            )
+            if combined_multimodal_outputs is None or needs_raw_scheduled_mm:
                 with record_function_or_nullcontext("omni_output_builder:build_mm_cpu"):
                     mm_cpu = build_mm_cpu(
-                        flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
+                        flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
+                        shared_tensor_keys=(
+                            _PD_SHARED_OUTPUT_KEYS if self._model_supports_delta_prefix_multimodal_outputs() else None
+                        ),
                     )
 
             with record_function_or_nullcontext("omni_output_builder:process_additional_information"):
@@ -1853,6 +2372,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         sparse_mm_index=sparse_mm_index,
                         hidden_seq_len=hidden_seq_len,
                         scheduled_seq_len=scheduled_seq_len,
+                        pd_parent_rows_by_req=pd_parent_rows_by_req,
+                        pd_trim_rows_by_req=pd_trim_rows_by_req,
+                        pd_needs_full_prefix_mm=pd_needs_full_prefix_mm,
                     )
                     pooler_output.append(flatten_payload(payload))
 
@@ -1906,6 +2428,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self,
         grammar_output: GrammarOutput | None,
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        diag_state = getattr(self, "_runner_diag_state", None)
+        if diag_state is not None:
+            self._runner_diag_state = None
+        diag_sample_start = time.monotonic() if diag_state is not None else 0.0
         kv_extracted_req_ids = getattr(self, "kv_extracted_req_ids", None)
         self.kv_extracted_req_ids = None
 
@@ -1962,6 +2488,20 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
+        # Freeze these decisions while the request is still present in the
+        # live input batch. Async output construction can run after bookkeeping
+        # advances or removes it.
+        (
+            pd_parent_rows_by_req,
+            pd_trim_rows_by_req,
+            pd_needs_full_prefix_mm,
+        ) = self._snapshot_pd_prefix_multimodal_requirements()
+        # The async output builder may run after a finished request has been
+        # removed from ``requests`` and ``model_intermediate_buffer``. Resolve
+        # the P snapshot/downstream payload contract while metadata is live.
+        pooler_payload_type, pooler_payload_req_ids = self._resolve_pooler_payload_req_ids(
+            list(self.input_batch.req_ids)
+        )
         self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 
         self._draft_token_ids = None
@@ -2035,6 +2575,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
             )
+        diag_bookkeep_end = time.monotonic() if diag_state is not None else 0.0
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
@@ -2073,8 +2614,30 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         num_nans_in_logits_snapshot = (
             dict(num_nans_in_logits) if isinstance(num_nans_in_logits, dict) else num_nans_in_logits
         )
+        frozen_payload_req_ids = set(pooler_payload_req_ids)
+        resolved_pooler_payload = (
+            pooler_payload_type,
+            [req_id for req_id in req_ids_output_snapshot if req_id in frozen_payload_req_ids],
+        )
 
-        use_async_omni_output = self._should_use_async_omni_output()
+        # Reconstruct a cache-hit gap while the request still owns its live
+        # prefix-cache bookkeeping. Deferring this rare path lets the next
+        # scheduler step remove the request before the async builder reads the
+        # cached rows. The common exact-parent delta path remains async.
+        pd_has_prefix_gap = bool(pd_needs_full_prefix_mm.intersection(pd_parent_rows_by_req))
+        # Prefix-cached Omni output normally has to read live cache/request
+        # state and therefore stays synchronous.  Finite P/D exact-parent
+        # deltas are different: lineage decisions and raw scheduled rows were
+        # frozen above, so their conditioning payload can use the existing
+        # pinned async snapshot path safely.  Full snapshots and cache-hit gaps
+        # still require live prefix reconstruction and remain synchronous.
+        pd_exact_delta_output = bool(resolved_pooler_payload[1]) and all(
+            req_id in pd_parent_rows_by_req and req_id not in pd_needs_full_prefix_mm
+            for req_id in resolved_pooler_payload[1]
+        )
+        use_async_omni_output = self._should_use_async_omni_output(
+            allow_pd_delta=pd_exact_delta_output,
+        ) and not pd_has_prefix_gap
         omni_postprocess_already_applied = False
         if use_async_omni_output:
             omni_postprocess_already_applied = self._maybe_run_eager_omni_postprocess_before_async_output(
@@ -2084,20 +2647,66 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 scheduler_output=scheduler_output,
                 req_ids_output_copy=req_ids_output_copy,
                 query_start_loc_cpu=query_start_loc_cpu,
+                resolved_pooler_payload=resolved_pooler_payload,
             )
+        diag_snapshot_start = time.monotonic() if diag_state is not None else 0.0
         output_tensor_snapshot = self._snapshot_omni_output_tensors_for_async_output(
             use_async_omni_output=use_async_omni_output,
             hidden_states=hidden_states,
             staged_hidden_states_cpu=staged_hidden_states_cpu,
             multimodal_outputs=multimodal_outputs,
         )
+        diag_snapshot_end = time.monotonic() if diag_state is not None else 0.0
+
+        def log_runner_diag(
+            *,
+            output_wait_ms: float,
+            output_build_start: float,
+            output_build_end: float,
+        ) -> None:
+            if diag_state is None:
+                return
+            gpu_ms = -1.0
+            gpu_start = diag_state.get("gpu_start")
+            gpu_end = diag_state.get("gpu_end")
+            if gpu_start is not None and gpu_end is not None and gpu_end.query():
+                try:
+                    gpu_ms = float(gpu_start.elapsed_time(gpu_end))
+                except Exception:
+                    gpu_ms = -1.0
+            execute_start = float(diag_state["execute_start"])
+            forward_start = float(diag_state["forward_start"])
+            forward_end = float(diag_state["forward_end"])
+            execute_end = float(diag_state["execute_end"])
+            logger.info(
+                "[RUNNER-DIAG] stage=%s mono=%.6f reqs=%s computed=%s scheduled=%s "
+                "prepare_ms=%.3f forward_wall_ms=%.3f forward_gpu_ms=%.3f "
+                "execute_post_ms=%.3f sample_pre_snapshot_ms=%.3f "
+                "snapshot_ms=%.3f output_wait_ms=%.3f output_build_ms=%.3f total_ms=%.3f",
+                getattr(self.vllm_config.model_config, "stage_id", "?"),
+                execute_start,
+                ",".join(diag_state["req_ids"]),
+                ",".join(str(value) for value in diag_state["computed"]),
+                ",".join(str(value) for value in diag_state["scheduled"]),
+                (forward_start - execute_start) * 1000.0,
+                (forward_end - forward_start) * 1000.0,
+                gpu_ms,
+                (execute_end - forward_end) * 1000.0,
+                (diag_bookkeep_end - diag_sample_start) * 1000.0,
+                (diag_snapshot_end - diag_snapshot_start) * 1000.0,
+                output_wait_ms,
+                (output_build_end - output_build_start) * 1000.0,
+                (output_build_end - execute_start) * 1000.0,
+            )
 
         def output_builder() -> OmniModelRunnerOutput:
+            output_wait_start = time.monotonic() if diag_state is not None else 0.0
             if output_tensor_snapshot.async_payload is not None:
                 with record_function_or_nullcontext("omni_async_output:wait_cpu_payload"):
                     output_tensor_snapshot.async_payload.wait()
+            output_build_start = time.monotonic() if diag_state is not None else 0.0
             with record_function_or_nullcontext("omni_output_builder:total"):
-                return self._build_omni_model_runner_output_from_snapshot(
+                output = self._build_omni_model_runner_output_from_snapshot(
                     scheduler_output=scheduler_output_snapshot,
                     hidden_states=output_tensor_snapshot.hidden_states,
                     staged_hidden_states_cpu=output_tensor_snapshot.staged_hidden_states_cpu,
@@ -2114,11 +2723,31 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     kv_extracted_req_ids=kv_extracted_req_ids,
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     query_start_loc_cpu=query_start_loc_cpu,
+                    pd_parent_rows_by_req=pd_parent_rows_by_req,
+                    pd_trim_rows_by_req=pd_trim_rows_by_req,
+                    pd_needs_full_prefix_mm=pd_needs_full_prefix_mm,
                     postprocess_already_applied=omni_postprocess_already_applied,
+                    resolved_pooler_payload=resolved_pooler_payload,
                 )
+            output_build_end = time.monotonic() if diag_state is not None else 0.0
+            if use_async_omni_output:
+                log_runner_diag(
+                    output_wait_ms=(output_build_start - output_wait_start) * 1000.0,
+                    output_build_start=output_build_start,
+                    output_build_end=output_build_end,
+                )
+            return output
 
         if not use_async_omni_output:
+            diag_build_start = time.monotonic() if diag_state is not None else 0.0
             output = output_builder()
+            diag_build_end = time.monotonic() if diag_state is not None else 0.0
+
+            log_runner_diag(
+                output_wait_ms=0.0,
+                output_build_start=diag_build_start,
+                output_build_end=diag_build_end,
+            )
 
             if not self.use_async_scheduling:
                 return output

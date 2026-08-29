@@ -151,14 +151,69 @@ GPU 0 的 NVML busy p95 为 83%，memory-I/O busy p95 为 57%。这些是设备�
 
 下一步 engine 研究应在固定输入 trace 下优化 mixed multimodal-prefill/decode batching 或 deadline/QoS 调度，并比较相同实时 SLO 下的用户容量。
 
+## 阶段八：MiniCPM P/D 分离
+
+`minicpm-pd` 将 Thinker 拆为四个独立 stage：
+
+| Stage | GPU | 生命周期 |
+|---|---:|---|
+| Thinker-P | 0 | 每个 session 一条 resumable KV lineage；每秒追加 211 个 AV tokens，只执行 prefill 并采样边界 token |
+| Thinker-D | 1 | 每个 model unit 一个 finite request；载入 P 的 KV delta 后继续 decode |
+| Talker | 2 | 每个 session 串行续接；不同 session 并发 |
+| Code2Wav | 3 | 消费 Talker 的流式 codec chunks |
+
+- P 和 D 使用 `NixlDeltaPushConnector`。D 保留已接收的 prefix KV，每轮只传输新的 block-aligned suffix，不复制完整历史。
+- D 生成的 Thinker token 回写到下一轮 P lineage，保持模型递归状态一致。
+- 同一 session 的下一次 Thinker-P 不等待 Talker/Code2Wav；Talker 自身保持有序，防止同一用户两段语音重叠。
+- Context rollover、AV 输入节奏和应用层 session 语义与非 P/D 基线相同。
+
+部署：
+
+```bash
+VLLM_OMNI_LOG_DUPLEX_CADENCE=1 \
+python -m vllm_omni.entrypoints.cli.main serve openbmb/MiniCPM-o-4_5 \
+  --omni --deploy-config benchmarks/minicpmo/deploy_capacity_pd_4gpu.yaml \
+  --trust-remote-code --host 127.0.0.1 --port 8113
+```
+
+P/D 的严格容量除要求 P、D、Talker 的每个 unit 都低于 1 秒外，还要求同一 slot 从输入就绪到 D 完成低于 1 秒。正式测试关闭逐请求 handoff 诊断，只保留 cadence trace，避免日志 I/O 干扰容量。
+
+30 秒正式结果：
+
+| Users | P-ready→D p50/p95/p99/max | 超时 slot | P p95/p99 | D p95/p99 | Talker p95/p99 | 结果 |
+|---:|---:|---:|---:|---:|---:|:---:|
+| 8 | 416/614/717/747 ms | 0/247 | 341/411 ms | 319/383 ms | 404/447 ms | 通过 |
+| 9 | 620/1289/1431/1515 ms | 71/288 | 678/742 ms | 512/592 ms | 471/541 ms | 失败 |
+
+严格容量为 8 用户；9 用户是首个失败点。P/D 没有提高整数容量上限，但把非 P/D 的 8 用户最大 Thinker 延迟从约 991 ms 降至 747 ms 的完整 P→D 延迟，因此 8 用户从不足 10 ms 余量变为约 253 ms 余量。
+
+9 用户最慢 5% 的分解：
+
+| 路径 | service | 应用→Core | scheduler/KV 等待 | runner | 结果暴露 |
+|---|---:|---:|---:|---:|---:|
+| Thinker-P | 714 ms | 304 ms | 0.5 ms | 359 ms | 50 ms |
+| Thinker-D | 541 ms | 37 ms | 326 ms | 142 ms | 34 ms |
+
+结论：
+
+1. P 上完全没有 decode，D 上也没有 multimodal prefill，因此非 P/D 的 prefill/decode 同 batch 竞争已被消除。
+2. 9 用户失败时，P 的 211-token 多模态增量会在随机相位碰撞时形成 3–4 request batch。P runner 和应用到 Core 的输入路径共同拉长；P 是限制 stage。
+3. D 的模型计算不是主要瓶颈。最慢 D unit 中 runner 仅 142 ms，326 ms 位于有序 KV 可用与 scheduler queue；这是当前 P/D connector/progress 路径的工程优化空间。
+4. 同一 slot 必须先 P 后 D。两个 stage 各自都低于 1 秒，并不保证串行总延迟低于 1 秒；9 用户的 burst 使完整路径越过 deadline，并产生下一 slot 等待。
+5. GPU busy p95 为 P/D `72%/71%`。该指标不是 SM occupancy，不能据此宣称硬件算力或显存带宽饱和。
+
+归档结果：`benchmarks/minicpmo/results/capacity_pd_hd4_4gpu_20260829.json`。
+
 ## 快速恢复入口
 
 | 内容 | 路径 |
 |---|---|
 | 固定部署 | `benchmarks/minicpmo/deploy_capacity_3gpu.yaml` |
+| P/D 部署 | `benchmarks/minicpmo/deploy_capacity_pd_4gpu.yaml` |
 | 多用户 workload | `benchmarks/minicpmo/continuous_av.py` |
 | RTF 与 tail 分析 | `benchmarks/minicpmo/analyze_rtf.py` |
 | 当前容量归档 | `benchmarks/minicpmo/results/capacity_hd4_3gpu_20260829.json` |
+| P/D 容量归档 | `benchmarks/minicpmo/results/capacity_pd_hd4_4gpu_20260829.json` |
 | 长 context 归档 | `benchmarks/minicpmo/results/long_context_hd4_3gpu_20260829.json` |
 | MiniCPM 输入聚合 | `vllm_omni/experimental/fullduplex/minicpmo45/input.py` |
 | Context rollover | `vllm_omni/experimental/fullduplex/minicpmo45/runtime.py` |

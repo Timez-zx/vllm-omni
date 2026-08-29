@@ -1,0 +1,16 @@
+# Formal MiniCPM-o 4.5 native-duplex P/D capacity topology.
+base_config: ../../vllm_omni/deploy/minicpmo_4_5_pd_4gpu.yaml
+pipeline: minicpmo_4_5_pd
+session_mode: duplex
+active_stream_window: 0
+
+duplex_session:
+  idle_ttl_s: 300
+  disconnect_grace_s: 30
+  reaper_interval_s: 5
+  resume_replay_ttl_s: 60
+  resume_replay_max_bytes_per_session: 8388608
+  max_pending_input_bytes_per_session: 16777216
+  max_pending_turns_per_session: 4
+  max_sessions: 64
+  completed_append_cache_size: 256

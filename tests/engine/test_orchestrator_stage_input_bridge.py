@@ -344,3 +344,44 @@ async def test_streaming_segment_does_not_complete_final_output_stage() -> None:
     orchestrator._cleanup_request_ids.assert_not_awaited()
     routed = orchestrator.output_async_queue.get_nowait()
     assert routed.finished is False
+
+
+@pytest.mark.asyncio
+async def test_native_pd_decode_finish_keeps_talker_request_resumable() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.async_chunk = True
+    orchestrator._pd_pair = (0, 1)
+    orchestrator._cfg_tracker = SimpleNamespace(
+        is_companion=lambda _request_id: False,
+        has_companions=lambda _request_id: False,
+        cleanup_parent=lambda _request_id: [],
+    )
+    orchestrator.stage_pools = [
+        SimpleNamespace(final_output=False),
+        SimpleNamespace(final_output=True),
+        SimpleNamespace(final_output=False),
+    ]
+    orchestrator._ensure_native_duplex_pd_talker_metadata = MagicMock()
+    orchestrator._is_duplex_session_request = lambda _state: True
+    orchestrator._duplexomni_thinker_output_stage = lambda: 1
+    orchestrator._duplex_output_decision = lambda *_args: None
+    orchestrator._stage_receives_async_chunks = lambda _stage: False
+    orchestrator._forward_to_next_stage = AsyncMock()
+
+    req_state = OrchestratorRequestState(
+        request_id="req-pd-segment",
+        sampling_params_list=[SamplingParams(max_tokens=1) for _ in range(3)],
+        final_stage_id=2,
+        duplex_identity=SimpleNamespace(),
+    )
+    req_state.streaming.enabled = True
+    req_state.streaming.segment_finished = True
+    output = SimpleNamespace(request_id=req_state.request_id, finished=True)
+
+    await orchestrator._route_output(1, 0, output, req_state, None)
+
+    orchestrator._forward_to_next_stage.assert_awaited_once()
+    assert (
+        orchestrator._forward_to_next_stage.await_args.kwargs["is_final_update"]
+        is False
+    )

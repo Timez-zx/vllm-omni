@@ -11,6 +11,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import json
+import os
 import queue
 import threading
 import time
@@ -218,6 +219,9 @@ class AsyncOmniEngine:
             trust_remote_code=bool(trust_remote_code),
             deploy_config_path=deploy_config_path,
         )
+        # Serving adapters use this stable pipeline identity to select
+        # model-specific protocol semantics without inspecting stage internals.
+        self.pipeline_model_type = pipeline_config.model_type if pipeline_config is not None else None
         self.endpoint_restrictions = pipeline_config.endpoint_restrictions if pipeline_config is not None else ()
         self._duplex_runtime_extension_path = (
             pipeline_config.duplex_runtime_extension if pipeline_config is not None else None
@@ -242,8 +246,7 @@ class AsyncOmniEngine:
         )
 
         self.num_stages = len(self.stage_configs)
-        stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
-        self.async_chunk = bool(getattr(stage0_args, "async_chunk", False))
+        self.async_chunk = self._pipeline_uses_async_chunks(self.stage_configs)
         self.stage_pools: list[StagePool] = []
         self.stage_clients: list[StageClient] = []  # logical-stage view for external readers
         self.input_processor: InputProcessor | None = None
@@ -259,6 +262,29 @@ class AsyncOmniEngine:
         self.request_queue: janus.Queue[EngineQueueMessage] = janus.Queue(maxsize=_REQUEST_QUEUE_MAXSIZE)
         self.output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
         self.rpc_output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
+        # [live-vllm CPU-plane] input preprocessing (tokenization + multimodal,
+        # inside _build_add_request_message) used to run SYNCHRONOUSLY on the
+        # serving event loop -- measured as a top GIL load at 56 users, each
+        # frame append stalling audio delivery for every session. The async
+        # add_request/add_streaming_update wrappers now run the whole sync body
+        # on this dedicated pool; janus.sync_q.put is thread-safe by design.
+        # VLLM_OMNI_INPUT_THREADS=0 restores the inline behavior.
+        _n_inp = os.environ.get("VLLM_OMNI_INPUT_THREADS", "")
+        try:
+            _n_inp = int(_n_inp) if _n_inp.strip() != "" else 4
+        except ValueError:
+            _n_inp = 4
+        self._input_executor = (
+            concurrent.futures.ThreadPoolExecutor(max_workers=_n_inp, thread_name_prefix="omni-input")
+            if _n_inp > 0
+            else None
+        )
+        # vLLM's mirrored multimodal sender/receiver caches require requests
+        # to reach EngineCore in the same order in which the sender cache was
+        # updated. Input preprocessing may run on several worker threads, so
+        # make cache mutation plus orchestrator enqueue one ordered operation.
+        # Expensive prompt rendering remains outside this lock.
+        self._stage0_input_submission_lock = threading.Lock()
         self._shutdown_called = False
         self._weak_finalizer: weakref.finalize | None = None
         self._correlated_rpc_client: CorrelatedRpcClient | None = None
@@ -299,6 +325,22 @@ class AsyncOmniEngine:
 
         logger.info(f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages")
 
+    @staticmethod
+    def _pipeline_uses_async_chunks(stage_configs: Sequence[Any]) -> bool:
+        """Return whether any pipeline edge uses the async chunk data plane.
+
+        ``async_chunk`` is materialized on every stage, but a stage-local
+        override may disable it for an edge that uses another transport.  In
+        particular, a P/D prefiller has no Omni payload edge while the later
+        D -> Talker -> Code2Wav edges still stream chunks.  Deriving the
+        orchestrator-wide switch from stage 0 alone serializes those later
+        edges, so aggregate the resolved stage settings instead.
+        """
+        return any(
+            bool(getattr(getattr(stage_config, "engine_args", None), "async_chunk", False))
+            for stage_config in stage_configs
+        )
+
     def get_diffusion_od_config(self) -> Any:
         """Expose the diffusion ``model_class_name`` to client-side model-extras.
 
@@ -324,6 +366,7 @@ class AsyncOmniEngine:
             diffusion_batch_size=self.diffusion_batch_size,
             async_chunk=self.async_chunk,
             tokenizer=self.tokenizer,
+            log_stats=self._log_stats,
             single_stage_id_filter=self._single_stage_id_filter,
             omni_master_address=self._omni_master_address,
             omni_master_port=self._omni_master_port,
@@ -332,6 +375,7 @@ class AsyncOmniEngine:
             omni_lb_policy=self._omni_lb_policy,
             request_queue=self.request_queue,
         )
+        self._runtime.set_stage_plans_ready_hook(self._initialize_stage0_input_processor)
         self._runtime.initialize()
 
         self.num_stages = len(self.stage_configs)
@@ -341,11 +385,12 @@ class AsyncOmniEngine:
         ]
         self.stage_vllm_configs = [pool.stage_vllm_config for pool in self.stage_pools]
         self.output_processors = [pool.output_processor for pool in self.stage_pools]
-        self.input_processor = (
-            build_stage0_input_processor(self.stage_vllm_configs[0])
-            if self.stage_vllm_configs and self.stage_vllm_configs[0] is not None
-            else None
-        )
+        if self.input_processor is None:
+            self.input_processor = (
+                build_stage0_input_processor(self.stage_vllm_configs[0])
+                if self.stage_vllm_configs and self.stage_vllm_configs[0] is not None
+                else None
+            )
         self.prompt_expand_func = next(
             (
                 getattr(client, "prompt_expand_func", None)
@@ -370,6 +415,26 @@ class AsyncOmniEngine:
         if any(meta.final_output_type == "audio" for meta in self.stage_metadata):
             supported_tasks.add("speech")
         self.supported_tasks = tuple(supported_tasks) if supported_tasks else ("generate",)
+
+    def _initialize_stage0_input_processor(self, stage_plans: Sequence[Any]) -> None:
+        """Create the stage-0 sender cache before its worker tries to attach."""
+        if not stage_plans or not stage_plans[0].replicas:
+            return
+        stage0_config = stage_plans[0].replicas[0].stage_vllm_config
+        if stage0_config is None:
+            return
+
+        use_shm_cache = os.environ.get("VLLM_OMNI_STAGE0_SHM_MM_CACHE", "0").lower() not in {
+            "",
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        if use_shm_cache:
+            mm_config = stage0_config.model_config.get_multimodal_config()
+            mm_config.mm_processor_cache_type = "shm"
+        self.input_processor = build_stage0_input_processor(stage0_config)
 
     def _bootstrap_orchestrator(
         self,
@@ -421,6 +486,27 @@ class AsyncOmniEngine:
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
+
+            # [live-vllm diagnosis] orchestrator-loop lag probe: every audio
+            # chunk's timestamp -- and its delivery -- rides THIS thread's
+            # event loop, which shares the process GIL with the input-
+            # preprocessing threads. If this loop starves during input
+            # bursts, chunks are stamped (and shipped) late while every
+            # engine-side instrument stays green. Same probe as the serving
+            # loop's [loop-lag].
+            async def _orch_lag_probe() -> None:
+                lags: list[float] = []
+                _loop = asyncio.get_running_loop()
+                while True:
+                    _t0 = _loop.time()
+                    await asyncio.sleep(0.1)
+                    lags.append(max(0.0, (_loop.time() - _t0 - 0.1) * 1000.0))
+                    if len(lags) >= 100:
+                        lags.sort()
+                        logger.info("[orch-lag] p50=%.1fms p99=%.1fms max=%.1fms", lags[50], lags[99], lags[-1])
+                        lags = []
+
+            asyncio.get_running_loop().create_task(_orch_lag_probe())
             await orchestrator.run()
 
         try:
@@ -877,6 +963,14 @@ class AsyncOmniEngine:
         if pd_pair is None:
             return None
         prefill_idx, decode_idx = pd_pair
+        snapshot_hidden_layer = int(
+            getattr(self.stage_configs[prefill_idx], "pd_snapshot_hidden_layer", 24)
+        )
+        if snapshot_hidden_layer <= 0:
+            raise ValueError(
+                "P/D snapshot hidden layer must be positive, got "
+                f"{snapshot_hidden_layer}"
+            )
 
         # Extract bootstrap address from prefill stage engine_args
         bootstrap_addr: str | None = None
@@ -898,17 +992,38 @@ class AsyncOmniEngine:
             bootstrap_addr,
         )
         prefill_engine_id: str | None = None
+        prefill_remote: dict[str, Any] | None = None
         try:
             prefill_client = self.stage_clients[prefill_idx]
-            kv_cfg = getattr(getattr(prefill_client, "vllm_config", None), "kv_transfer_config", None)
+            prefill_vllm_config = getattr(prefill_client, "vllm_config", None)
+            kv_cfg = getattr(prefill_vllm_config, "kv_transfer_config", None)
             prefill_engine_id = getattr(kv_cfg, "engine_id", None)
+            extra_cfg = getattr(kv_cfg, "kv_connector_extra_config", None) or {}
+            if not isinstance(extra_cfg, Mapping):
+                try:
+                    extra_cfg = dict(extra_cfg)
+                except (TypeError, ValueError):
+                    extra_cfg = {}
+            remote_host = extra_cfg.get("orchestrator_remote_host")
+            remote_port = extra_cfg.get("orchestrator_remote_port")
+            parallel_config = getattr(prefill_vllm_config, "parallel_config", None)
+            if prefill_engine_id and remote_host and remote_port is not None:
+                prefill_remote = {
+                    "remote_engine_id": str(prefill_engine_id),
+                    "remote_host": str(remote_host),
+                    "remote_port": int(remote_port),
+                    "tp_size": int(getattr(parallel_config, "tensor_parallel_size", 1)),
+                    "pp_size": int(getattr(parallel_config, "pipeline_parallel_size", 1)),
+                }
         except Exception as exc:
-            logger.warning("[AsyncOmniEngine] Could not extract prefill engine_id: %s", exc)
+            logger.warning("[AsyncOmniEngine] Could not extract P/D pre-registration endpoint: %s", exc)
 
         return {
             "pd_pair": (prefill_idx, decode_idx),
             "bootstrap_addr": bootstrap_addr,
             "prefill_engine_id": prefill_engine_id,
+            "prefill_remote": prefill_remote,
+            "snapshot_hidden_layer": snapshot_hidden_layer,
         }
 
     @staticmethod
@@ -1315,32 +1430,33 @@ class AsyncOmniEngine:
         a queue + coroutine-switch round-trip.  The Orchestrator receives a
         ready-to-submit OmniEngineCoreRequest.
         """
-        msg = self._build_add_request_message(
-            request_id=request_id,
-            prompt=prompt,
-            prompt_text=prompt_text,
-            sampling_params_list=sampling_params_list,
-            final_stage_id=final_stage_id,
-            final_output_stage_ids=final_output_stage_ids,
-            arrival_time=arrival_time,
-            lora_request=lora_request,
-            tokenization_kwargs=tokenization_kwargs,
-            trace_headers=trace_headers,
-            priority=priority,
-            data_parallel_rank=data_parallel_rank,
-            reasoning_ended=reasoning_ended,
-            resumable=resumable,
-        )
-        self.request_queue.sync_q.put(msg)
+        with self._stage0_input_submission_lock:
+            msg = self._build_add_request_message(
+                request_id=request_id,
+                prompt=prompt,
+                prompt_text=prompt_text,
+                sampling_params_list=sampling_params_list,
+                final_stage_id=final_stage_id,
+                final_output_stage_ids=final_output_stage_ids,
+                arrival_time=arrival_time,
+                lora_request=lora_request,
+                tokenization_kwargs=tokenization_kwargs,
+                trace_headers=trace_headers,
+                priority=priority,
+                data_parallel_rank=data_parallel_rank,
+                reasoning_ended=reasoning_ended,
+                resumable=resumable,
+            )
+            self.request_queue.sync_q.put(msg)
 
-        # CFG companion expansion: create and enqueue companion requests
-        # so the AR stage also generates their KV caches.
-        if self.prompt_expand_func is not None and final_stage_id > 0:
-            original_prompt = msg.original_prompt
-            effective_spl = msg.sampling_params_list
-            stage0_params = effective_spl[0] if effective_spl else None
-            if stage0_params is not None:
-                self._enqueue_cfg_companions(request_id, original_prompt, stage0_params, effective_spl)
+            # CFG companions use the same input processor/cache and must stay
+            # adjacent to their parent in the mirrored-cache order.
+            if self.prompt_expand_func is not None and final_stage_id > 0:
+                original_prompt = msg.original_prompt
+                effective_spl = msg.sampling_params_list
+                stage0_params = effective_spl[0] if effective_spl else None
+                if stage0_params is not None:
+                    self._enqueue_cfg_companions(request_id, original_prompt, stage0_params, effective_spl)
 
     async def add_request_async(
         self,
@@ -1360,23 +1476,37 @@ class AsyncOmniEngine:
         *,
         resumable: bool = False,
     ) -> None:
-        """Async add_request API."""
-        self.add_request(
-            request_id=request_id,
-            prompt=prompt,
-            prompt_text=prompt_text,
-            sampling_params_list=sampling_params_list,
-            final_stage_id=final_stage_id,
-            final_output_stage_ids=final_output_stage_ids,
-            arrival_time=arrival_time,
-            lora_request=lora_request,
-            tokenization_kwargs=tokenization_kwargs,
-            trace_headers=trace_headers,
-            priority=priority,
-            data_parallel_rank=data_parallel_rank,
-            reasoning_ended=reasoning_ended,
-            resumable=resumable,
-        )
+        """Async add_request API.
+
+        [live-vllm CPU-plane] The sync body runs tokenization + multimodal
+        preprocessing; off-loop on the input pool so a big prefill can never
+        stall audio delivery. Ordering note: the SAME session's first chunk is
+        awaited before any update is submitted (handle_inputs awaits each
+        chunk in turn), so per-request ordering is preserved.
+        """
+
+        def _submit() -> None:
+            self.add_request(
+                request_id=request_id,
+                prompt=prompt,
+                prompt_text=prompt_text,
+                sampling_params_list=sampling_params_list,
+                final_stage_id=final_stage_id,
+                final_output_stage_ids=final_output_stage_ids,
+                arrival_time=arrival_time,
+                lora_request=lora_request,
+                tokenization_kwargs=tokenization_kwargs,
+                trace_headers=trace_headers,
+                priority=priority,
+                data_parallel_rank=data_parallel_rank,
+                reasoning_ended=reasoning_ended,
+                resumable=resumable,
+            )
+
+        if self._input_executor is None:
+            _submit()
+        else:
+            await asyncio.get_running_loop().run_in_executor(self._input_executor, _submit)
 
     def add_streaming_update(
         self,
@@ -1391,18 +1521,19 @@ class AsyncOmniEngine:
         resumable: bool = True,
     ) -> None:
         """Send an incremental streaming update for an existing request."""
-        msg = self._build_add_request_message(
-            request_id=request_id,
-            prompt=prompt,
-            prompt_text=prompt_text,
-            sampling_params_list=sampling_params_list,
-            final_stage_id=final_stage_id,
-            final_output_stage_ids=final_output_stage_ids,
-            arrival_time=arrival_time,
-            resumable=resumable,
-            message_type="streaming_update",
-        )
-        self.request_queue.sync_q.put(msg)
+        with self._stage0_input_submission_lock:
+            msg = self._build_add_request_message(
+                request_id=request_id,
+                prompt=prompt,
+                prompt_text=prompt_text,
+                sampling_params_list=sampling_params_list,
+                final_stage_id=final_stage_id,
+                final_output_stage_ids=final_output_stage_ids,
+                arrival_time=arrival_time,
+                resumable=resumable,
+                message_type="streaming_update",
+            )
+            self.request_queue.sync_q.put(msg)
 
     async def add_streaming_update_async(
         self,
@@ -1416,17 +1547,30 @@ class AsyncOmniEngine:
         *,
         resumable: bool = True,
     ) -> None:
-        """Async wrapper for add_streaming_update()."""
-        self.add_streaming_update(
-            request_id=request_id,
-            prompt=prompt,
-            prompt_text=prompt_text,
-            sampling_params_list=sampling_params_list,
-            final_stage_id=final_stage_id,
-            final_output_stage_ids=final_output_stage_ids,
-            arrival_time=arrival_time,
-            resumable=resumable,
-        )
+        """Async wrapper for add_streaming_update().
+
+        [live-vllm CPU-plane] Same off-loop treatment as add_request_async;
+        same per-session ordering guarantee (handle_inputs awaits chunks
+        sequentially, and cross-thread put order into janus.sync_q follows
+        the executor submission the await serializes).
+        """
+
+        def _submit() -> None:
+            self.add_streaming_update(
+                request_id=request_id,
+                prompt=prompt,
+                prompt_text=prompt_text,
+                sampling_params_list=sampling_params_list,
+                final_stage_id=final_stage_id,
+                final_output_stage_ids=final_output_stage_ids,
+                arrival_time=arrival_time,
+                resumable=resumable,
+            )
+
+        if self._input_executor is None:
+            _submit()
+        else:
+            await asyncio.get_running_loop().run_in_executor(self._input_executor, _submit)
 
     def open_duplex_session(
         self,

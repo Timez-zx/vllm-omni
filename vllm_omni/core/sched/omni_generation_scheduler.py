@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -38,6 +39,15 @@ from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.outputs import OmniConnectorOutput, OmniModelRunnerOutput
 
 logger = init_logger(__name__)
+
+# One [SCHED-STEP] line per non-idle scheduler pass: batch size and token count
+# per pass are what verify that a change actually reached the scheduler, and the
+# pass INTERVAL is the quantity that decides whether each session can be served
+# often enough for realtime audio. VLLM_OMNI_LOG_SCHED_STEPS=1.
+_LOG_SCHED_STEPS = os.environ.get("VLLM_OMNI_LOG_SCHED_STEPS", "0") not in ("0", "", "false", "False")
+# Per-request version of the above, for attributing one slow turn.
+# VLLM_OMNI_LOG_REQ_STEPS=1.
+_LOG_REQ_STEPS = os.environ.get("VLLM_OMNI_LOG_REQ_STEPS", "0") not in ("0", "", "false", "False")
 
 
 class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
@@ -83,6 +93,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self._pause_state == PauseState.PAUSED_ALL:
             token_budget = 0
         scheduled_timestamp = time.monotonic()
+        # Safe default for the tick-engine idle hint; the assembly tail sets
+        # the real value. Fallback/early-return paths must never leave a
+        # stale True behind (the loop would sleep on schedulable work).
 
         self.kv_cache_manager.new_step_starts()
 
@@ -284,6 +297,38 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
 
+        # Same evidence line the AR stages emit (omni_ar_scheduler): batch
+        # size per non-idle pass on THIS stage, i.e. how many sessions' codec
+        # chunks the vocoder turned into one forward.
+        if _LOG_SCHED_STEPS and total_num_scheduled_tokens:
+            logger.info(
+                "[SCHED-STEP] stage=%s mono=%.6f nreq=%d ntok=%d held=%d run=%d wait=%d",
+                getattr(self.vllm_config.model_config, "stage_id", -1),
+                scheduled_timestamp,
+                len(num_scheduled_tokens),
+                total_num_scheduled_tokens,
+                0,
+                len(self.running),
+                len(self.waiting),
+            )
+
+        # [REQ-STEP] The same pass, but named per request. SCHED-STEP is an
+        # aggregate: it can say "this pass carried 3345 tokens" but not which
+        # session's turn those belonged to, so a slow first-token cannot be
+        # attributed to waiting, to its own prefill, or to somebody else's.
+        # Pairs with the API server's [turnprobe] recv/first-text lines, which
+        # carry the same request id and a monotonic stamp. Only requests that
+        # actually got tokens appear; a request in `running` with nothing to do
+        # is absent, which is itself the signal for "waiting on input".
+        # Off by default -- one line per pass, ~9k lines per AV cell.
+        if _LOG_REQ_STEPS and total_num_scheduled_tokens:
+            logger.info(
+                "[REQ-STEP] stage=%s mono=%.6f reqs=%s",
+                getattr(self.vllm_config.model_config, "stage_id", -1),
+                scheduled_timestamp,
+                ",".join(f"{r}:{n}" for r, n in num_scheduled_tokens.items()),
+            )
+
         # Record the request ids scheduled in this step (v0.14.0 behavior).
         self.prev_step_scheduled_req_ids.clear()
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
@@ -344,6 +389,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     model_intermediate_buffer=(
                         getattr(request, "model_intermediate_buffer", None) if request else None
                     ),
+                    pd_prefill_payload=(getattr(request, "pd_prefill_payload", None) if request else None),
                 )
                 new_list.append(omni_nr)
 
@@ -606,6 +652,15 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             finish_reason = request.get_finished_reason()
             finished = self._handle_stopped_request(request)
             is_segment_finished = not finished
+            # [Boundary-loss fix, drop point D] the MAIN stop path discards
+            # the adapter's segment_finished flag when it consumes a segment
+            # boundary; this path did not -- a request finished here kept a
+            # stale "done receiving" flag, and the NEXT segment on the same
+            # resumable request stopped instantly with a junk finish_reason,
+            # permanently desyncing the serving layer's owner FIFO (the exact
+            # "zero audio for every later turn" signature).
+            if self.chunk_transfer_adapter is not None:
+                self.chunk_transfer_adapter.segment_finished_requests.discard(request.request_id)
             kv_transfer_params = None
             if finished:
                 kv_transfer_params, _ = self._free_request(request)

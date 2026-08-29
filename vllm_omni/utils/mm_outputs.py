@@ -2,7 +2,7 @@
 payloads, most of which are shared by the prefix cache / no prefix cache path.
 """
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 
 import torch
 from vllm.logger import init_logger
@@ -78,7 +78,53 @@ def partition_payload_list(
     )
 
 
-def build_mm_cpu(multimodal_outputs: dict) -> dict[str, object]:
+def new_shared_cpu_tensor(
+    shape: torch.Size | tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Allocate a CPU tensor directly on torch multiprocessing storage.
+
+    ``Tensor.share_memory_()`` first materializes ordinary CPU storage and
+    then copies it into shared storage.  Large inter-stage tensors should use
+    this helper as their destination so the model runner writes the payload
+    only once before EngineCore sends its handle to the API process.
+
+    The returned storage is request-owned.  It is intentionally not reused by
+    an explicit ring because the receiving process may retain the tensor as a
+    cross-turn prefix snapshot after the EngineCore message is consumed.
+    PyTorch/OS reclaim it when the last cross-process reference is released.
+    """
+    concrete_shape = tuple(int(dim) for dim in shape)
+    numel = 1
+    for dim in concrete_shape:
+        numel *= dim
+    storage = torch.UntypedStorage._new_shared(
+        numel * torch.empty((), dtype=dtype).element_size(),
+        device="cpu",
+    )
+    return torch.empty(0, dtype=dtype, device="cpu").set_(
+        storage,
+        0,
+        concrete_shape,
+    )
+
+
+def to_shared_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Detach and copy ``tensor`` directly into contiguous shared storage."""
+    tensor = tensor.detach()
+    if tensor.device.type == "cpu" and tensor.is_shared() and tensor.is_contiguous():
+        return tensor
+    output = new_shared_cpu_tensor(tensor.shape, dtype=tensor.dtype)
+    output.copy_(tensor)
+    return output
+
+
+def build_mm_cpu(
+    multimodal_outputs: dict,
+    *,
+    shared_tensor_keys: Collection[str] | None = None,
+) -> dict[str, object]:
     """Pre-copies multimodal tensor to CPU once (not per-request) to avoid
     redundant D2H transfers when gpu_resident_buffer_keys keeps them on GPU.
 
@@ -99,8 +145,13 @@ def build_mm_cpu(multimodal_outputs: dict) -> dict[str, object]:
     if not isinstance(multimodal_outputs, Mapping):
         logger.warning("Multimodal outputs are not a dict and will not be passed")
 
+    shared_keys = frozenset(shared_tensor_keys or ())
     for k, v in multimodal_outputs.items():
-        cpu_v = _to_cpu(v)
+        cpu_v = (
+            to_shared_cpu_tensor(v)
+            if k in shared_keys and isinstance(v, torch.Tensor)
+            else _to_cpu(v)
+        )
         if cpu_v is not None:
             mm_cpu[k] = cpu_v
     return mm_cpu

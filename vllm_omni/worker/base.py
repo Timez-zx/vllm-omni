@@ -122,9 +122,16 @@ class OmniGPUWorkerBase(GPUWorker):
         self.non_torch_memory = profile_result.non_torch_increase
         self.peak_activation_memory = profile_result.torch_peak_increase
 
+        # Colocated engines share one PID, so the per-process NVML reading
+        # includes every engine already built in this process: the second
+        # KV-bearing engine's pool would collapse to ~0 (fraction*total minus
+        # EVERYONE's bytes). The profiling fallback below is per-ENGINE
+        # (this runner's weights + its own peaks), which is what the yaml
+        # fractions actually mean -- force it whenever colocation is active.
+        colocated = bool(os.environ.get("VLLM_OMNI_COLOCATE_STAGES", "").strip())
         process_memory = (
             get_process_gpu_memory(self.local_rank)
-            if is_process_scoped_memory_available() and detect_pid_host()
+            if not colocated and is_process_scoped_memory_available() and detect_pid_host()
             else None
         )
 

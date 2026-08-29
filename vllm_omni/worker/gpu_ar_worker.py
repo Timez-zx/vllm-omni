@@ -2,6 +2,7 @@ import gc
 import os
 
 import torch
+from vllm.distributed.kv_transfer import get_kv_transfer_group
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.tracing import instrument
@@ -142,3 +143,32 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         if isinstance(task, dict):
             task = OmniWakeTask(**task)
         return super().handle_wake_task(task)
+
+    def start_pd_cache_sync(self, metadata) -> bool:
+        """Start a D-side NIXL import without entering execute_model()."""
+        from vllm_omni.engine.nixl_delta_push_connector import (
+            NixlDeltaPushConnectorWorker,
+        )
+
+        connector = get_kv_transfer_group()
+        worker = getattr(connector, "connector_worker", None)
+        if not isinstance(worker, NixlDeltaPushConnectorWorker):
+            raise RuntimeError(
+                "Direct P/D cache sync requires NixlDeltaPushConnectorWorker"
+            )
+        worker.start_direct_cache_sync(metadata)
+        return True
+
+    def poll_pd_cache_sync(self) -> set[str]:
+        """Poll cache-only imports without consuming inference completions."""
+        from vllm_omni.engine.nixl_delta_push_connector import (
+            NixlDeltaPushConnectorWorker,
+        )
+
+        connector = get_kv_transfer_group()
+        worker = getattr(connector, "connector_worker", None)
+        if not isinstance(worker, NixlDeltaPushConnectorWorker):
+            raise RuntimeError(
+                "Direct P/D cache sync requires NixlDeltaPushConnectorWorker"
+            )
+        return worker.poll_direct_cache_sync()

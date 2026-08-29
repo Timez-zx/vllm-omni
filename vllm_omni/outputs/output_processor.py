@@ -406,6 +406,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             {
                 "num_generation_tokens": 0,
                 "vllm_ttft_ms": 0.0,
+                "vllm_queue_ms": 0.0,
+                "vllm_prefill_ms": 0.0,
                 "vllm_tpot_ms": 0.0,
                 "vllm_itl_ms": 0.0,
                 "vllm_itls_ms": [],
@@ -621,6 +623,16 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         record["num_generation_tokens"] = int(native_stats.num_generation_tokens)
         if was_prefilling:
             record["vllm_ttft_ms"] = max(float(native_stats.first_token_latency) * 1000.0, 0.0)
+            if native_stats.queued_ts > 0 and native_stats.scheduled_ts > 0:
+                record["vllm_queue_ms"] = max(
+                    float(native_stats.scheduled_ts - native_stats.queued_ts) * 1000.0,
+                    0.0,
+                )
+            if native_stats.scheduled_ts > 0 and native_stats.first_token_ts > 0:
+                record["vllm_prefill_ms"] = max(
+                    float(native_stats.first_token_ts - native_stats.scheduled_ts) * 1000.0,
+                    0.0,
+                )
             return
 
         if previous_last_token_ts > 0:

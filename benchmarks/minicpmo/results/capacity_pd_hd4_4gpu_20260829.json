@@ -1,0 +1,127 @@
+{
+  "model": "openbmb/MiniCPM-o-4_5",
+  "precision": "bf16",
+  "hardware": "4x RTX PRO 6000 Blackwell 96 GB",
+  "topology": {
+    "thinker_prefill_gpu": 0,
+    "thinker_decode_gpu": 1,
+    "talker_gpu": 2,
+    "code2wav_gpu": 3,
+    "pd_disaggregation": true,
+    "kv_connector": "NixlDeltaPushConnector"
+  },
+  "workload": {
+    "duration_s": 30,
+    "audio_chunk_ms": 200,
+    "model_unit_ms": 1000,
+    "video_fps": 1,
+    "source_resolution": "960x540",
+    "frame_max_side": 0,
+    "max_slice_nums": 4,
+    "actual_vision_blocks_per_frame": 3,
+    "steady_scheduler_tokens_per_unit": 211,
+    "phase_window_s": 1.0,
+    "seed": 20260828,
+    "slo": "every P, D, and Talker unit is below 1000 ms and every input-ready-to-D slot latency is below 1000 ms"
+  },
+  "runs": [
+    {
+      "users": 8,
+      "capacity_pass": true,
+      "failed_sessions": 0,
+      "input_units": 240,
+      "pd_slots": 247,
+      "pd_slot_e2e_ms": {
+        "p50": 415.593,
+        "p95": 613.508,
+        "p99": 716.568,
+        "max": 747.402
+      },
+      "pd_slot_misses": 0,
+      "prefill_service_ms": {
+        "p50": 240.151,
+        "p95": 340.798,
+        "p99": 411.345,
+        "max": 455.397
+      },
+      "decode_service_ms": {
+        "p50": 185.334,
+        "p95": 318.676,
+        "p99": 382.932,
+        "max": 398.811
+      },
+      "talker_service_ms": {
+        "p50": 270.301,
+        "p95": 404.418,
+        "p99": 447.498,
+        "max": 450.710
+      },
+      "gpu_busy_pct": {
+        "prefill": {"mean": 52.74, "p95": 79.0},
+        "decode": {"mean": 28.00, "p95": 65.0},
+        "talker": {"mean": 10.41, "p95": 26.0},
+        "code2wav": {"mean": 17.18, "p95": 53.0}
+      }
+    },
+    {
+      "users": 9,
+      "capacity_pass": false,
+      "failed_sessions": 0,
+      "input_units": 270,
+      "pd_slots": 288,
+      "pd_slot_e2e_ms": {
+        "p50": 619.967,
+        "p95": 1289.376,
+        "p99": 1431.258,
+        "max": 1515.187
+      },
+      "pd_slot_misses": 71,
+      "prefill_service_ms": {
+        "p50": 343.994,
+        "p95": 678.280,
+        "p99": 742.387,
+        "max": 747.920
+      },
+      "decode_service_ms": {
+        "p50": 283.400,
+        "p95": 511.645,
+        "p99": 592.094,
+        "max": 601.722
+      },
+      "talker_service_ms": {
+        "p50": 281.664,
+        "p95": 471.407,
+        "p99": 541.092,
+        "max": 545.981
+      },
+      "gpu_busy_pct": {
+        "prefill": {"mean": 50.48, "p95": 72.0},
+        "decode": {"mean": 28.30, "p95": 71.0},
+        "talker": {"mean": 11.55, "p95": 25.0},
+        "code2wav": {"mean": 21.11, "p95": 56.0}
+      },
+      "slowest_prefill_5pct_ms": {
+        "service_mean": 713.863,
+        "application_to_core_mean": 304.256,
+        "scheduler_queue_mean": 0.518,
+        "runner_mean": 358.965,
+        "result_exposure_mean": 50.124
+      },
+      "slowest_decode_5pct_ms": {
+        "service_mean": 540.667,
+        "application_to_core_mean": 37.014,
+        "kv_and_scheduler_queue_mean": 326.258,
+        "runner_mean": 141.550,
+        "result_exposure_mean": 33.944
+      }
+    }
+  ],
+  "capacity_conclusion": {
+    "strict_capacity_users": 8,
+    "first_failed_users": 9,
+    "limiting_stage_at_failure": "Thinker prefill",
+    "root_cause": "At nine users, bursty 211-token multimodal prefills lengthen both the P runner and its application-to-Core path. D compute remains shorter, but finite D requests then queue for ordered delta-KV availability. The serial P-to-D slot path crosses one second even though no individual stage unit does.",
+    "engineering_overhead": "The failing tail also contains about 304 ms of P dispatch and 326 ms of D KV/scheduler wait in the slowest 5%; these are interface/progress costs rather than irreducible model compute.",
+    "not_supported": "NVML busy counters do not show raw GPU saturation and must not be interpreted as SM occupancy or proof of memory-bandwidth exhaustion."
+  }
+}

@@ -156,6 +156,7 @@ class AsyncOmni(EngineClient, OmniBase):
         self.config_path = self.engine.config_path
         self.tts_max_instructions_length = kwargs.get("tts_max_instructions_length", None)
         self.input_processor = self.engine.input_processor
+        self.pipeline_model_type = self.engine.pipeline_model_type
         self.endpoint_restrictions = self.engine.endpoint_restrictions
         self.duplex_session_config = self.engine.duplex_session_config
         self.duplex_serving_adapter_path = self.engine.duplex_serving_adapter_path
@@ -587,7 +588,15 @@ class AsyncOmni(EngineClient, OmniBase):
             pd_pair = self._get_pd_separation_pair()
             if pd_pair is not None:
                 p_id = pd_pair[0]
-                req_sp_list[p_id] = self._prepare_prefill_sampling_params(request_id, req_sp_list[p_id])
+                req_sp_list[p_id] = self._prepare_prefill_sampling_params(
+                    request_id,
+                    req_sp_list[p_id],
+                    # A finite arrival-prefill warms P synchronously and D in
+                    # the background.  The client-visible completion marks P
+                    # snapshot readiness; D may import the same disposable KV
+                    # revision after the application starts its next request.
+                    transfer_kv=True,
+                )
 
             # Add request(s) to stage 0. For streaming inputs, submit
             # chunks incrementally through streaming_update.
@@ -599,6 +608,7 @@ class AsyncOmni(EngineClient, OmniBase):
                     final_stage_id=final_stage_id_for_e2e,
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
+                    priority=priority,
                 )
             else:
                 await self.engine.add_request_async(
@@ -608,6 +618,7 @@ class AsyncOmni(EngineClient, OmniBase):
                     final_stage_id=final_stage_id_for_e2e,
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
+                    priority=priority,
                 )
             submit_ts = time.time()
             req_state.metrics.stage_first_ts[0] = submit_ts
@@ -659,6 +670,7 @@ class AsyncOmni(EngineClient, OmniBase):
         final_stage_id: int,
         final_output_stage_ids: Sequence[int],
         arrival_time: float,
+        priority: int,
     ) -> asyncio.Task:
         """Submit a streaming input generator as incremental stage-0 updates."""
         if not sampling_params_list:
@@ -696,6 +708,7 @@ class AsyncOmni(EngineClient, OmniBase):
                             final_stage_id=final_stage_id,
                             final_output_stage_ids=final_output_stage_ids,
                             arrival_time=arrival_time,
+                            priority=priority,
                             resumable=True,
                         )
                         has_submitted_first_chunk = True

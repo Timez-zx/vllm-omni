@@ -63,6 +63,19 @@ def test_stage_chunk_direction_helpers(role, stage_id, receives, sends):
     assert stage_sends_async_output(model_config) is sends
 
 
+def test_explicit_receiver_keeps_nonzero_stage_output_on_orchestrator_path():
+    model_config = SimpleNamespace(
+        stage_id=1,
+        stage_connector_config={
+            "name": "SharedMemoryConnector",
+            "extra": {"role": "receiver"},
+        },
+    )
+
+    assert stage_receives_chunks(model_config) is True
+    assert stage_sends_async_output(model_config) is False
+
+
 @pytest.mark.skipif(len(config_files) == 0, reason="No config files found or directory missing")
 @pytest.mark.parametrize("yaml_file", config_files, ids=lambda p: p.name)
 def test_load_qwen_yaml_configs(yaml_file):

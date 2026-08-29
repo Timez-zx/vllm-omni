@@ -38,6 +38,8 @@ class _MiniCPMO45Stage0SessionState:
     pending_speech_response_open: bool = False
     generated_tokens: list[int] = field(default_factory=list)
     current_segment_output_tokens: list[int] = field(default_factory=list)
+    pd_feedback_token_ids: list[int] = field(default_factory=list)
+    pd_feedback_append_identity: tuple[int | None, int] | None = None
     last_unit_inputs_embeds: Any | None = None
     last_unit_input_token_ids: list[int] = field(default_factory=list)
     context_rollovers: int = 0
@@ -218,6 +220,16 @@ class MiniCPMO45Stage0DuplexRuntime:
             embed_parts.extend(state.context_embeds)
             token_ids.extend(state.context_token_ids)
 
+        # In a split Thinker, D owns generation.  Before P prefills the next
+        # unit, replay every D-generated token whose KV D retained.  The final
+        # sampled terminator is injected below with </unit>, exactly like the
+        # native non-split scheduler.  On rollover these rows are already in
+        # retained_output_token_ids and must not be duplicated.
+        if state.pd_feedback_token_ids and not context_rollover:
+            feedback_prefix = state.pd_feedback_token_ids[:-1]
+            embed_parts.extend(self._embed_token(token_id) for token_id in feedback_prefix)
+            token_ids.extend(feedback_prefix)
+
         # Consume every complete processor chunk in the buffer so the appended
         # span and the scheduler's slot reservation agree exactly. The serving
         # PCM buffer pads a final real residual before it reaches Stage0. Do not
@@ -351,6 +363,7 @@ class MiniCPMO45Stage0DuplexRuntime:
             )
             state.last_unit_input_token_ids = latest_unit_token_ids
         state.current_segment_output_tokens.clear()
+        state.pd_feedback_token_ids.clear()
         if is_speech and (append_identity is None or state.pending_speech_append_identity != append_identity):
             state.pending_speech_context = True
             state.pending_speech_append_identity = append_identity
@@ -360,6 +373,51 @@ class MiniCPMO45Stage0DuplexRuntime:
             state.prepared_input_token_ids = list(token_ids)
             state.prepared_result = {k: v for k, v in result.items() if k not in {"inputs_embeds", "input_token_ids"}}
         return result
+
+    def apply_pd_decode_feedback(
+        self,
+        state: _MiniCPMO45Stage0SessionState,
+        token_ids: list[int],
+        *,
+        epoch: int | None,
+        seq: int,
+        force_listen: bool = False,
+    ) -> None:
+        """Align P's next prompt with the authoritative D segment.
+
+        D retains all generated tokens except its final sampled terminator in
+        KV.  P therefore prefills those retained tokens before the next media
+        unit and re-injects the terminator at the native unit boundary.  The
+        append identity makes retries idempotent.
+        """
+        identity = (epoch, seq)
+        if state.pd_feedback_append_identity == identity:
+            return
+        state.pd_feedback_append_identity = identity
+        state.pd_feedback_token_ids = [int(token_id) for token_id in token_ids]
+        state.current_segment_output_tokens = list(state.pd_feedback_token_ids)
+        if not state.pd_feedback_token_ids:
+            return
+
+        terminator = state.pd_feedback_token_ids[-1]
+        terminators = {
+            self.listen_token_id,
+            self.chunk_eos_token_id,
+            self.chunk_tts_eos_token_id,
+            self.turn_eos_token_id,
+        }
+        if terminator in terminators:
+            state.pending_terminator_token = terminator
+            state.last_terminator_token = terminator
+            if terminator == self.turn_eos_token_id or (
+                terminator == self.listen_token_id and force_listen
+            ):
+                state.current_turn_ended = True
+                state.pending_speech_response_open = False
+            return
+        state.pending_terminator_token = None
+        state.last_terminator_token = None
+        state.current_turn_ended = False
 
     @staticmethod
     def _stage_prefill_result(success: bool, start_time: float, reason: str = "") -> dict[str, Any]:

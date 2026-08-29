@@ -12,7 +12,7 @@ from io import BytesIO
 from typing import Any
 
 from PIL import Image
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
     DuplexAppendPlan,
@@ -369,15 +369,41 @@ class MiniCPMO45DuplexRuntimeExtension:
         runtime_config: dict[str, Any],
         defaults: tuple[object, ...],
     ) -> tuple[object, ...]:
+        # The serving adapter stores MiniCPM's model-level policy under the
+        # original three-stage topology: stage 0 is Thinker and stage 1 is
+        # Talker.  A four-stage deployment splits Thinker into P/D, so map the
+        # same policy onto P, D, Talker, Code2Wav instead of accidentally
+        # giving D the Talker's 8192-token budget.  P only samples one token to
+        # terminate the prefill segment; D owns the real model decision and
+        # response generation.
+        pd_stage_policy = (0, 0, 1, 2) if len(defaults) == 4 else None
         configured: list[object] = []
         for stage_id, default in enumerate(defaults):
-            max_tokens = _coerce_int(_stage_config_value(runtime_config, "duplex_stage_max_tokens", stage_id))
-            raw_overrides = _stage_config_value(runtime_config, "duplex_stage_sampling_params", stage_id)
+            policy_stage_id = pd_stage_policy[stage_id] if pd_stage_policy is not None else stage_id
+            max_tokens = _coerce_int(
+                _stage_config_value(runtime_config, "duplex_stage_max_tokens", policy_stage_id)
+            )
+            raw_overrides = _stage_config_value(
+                runtime_config,
+                "duplex_stage_sampling_params",
+                policy_stage_id,
+            )
             overrides = dict(raw_overrides) if isinstance(raw_overrides, dict) else {}
+            if pd_stage_policy is not None and stage_id == 0:
+                max_tokens = 1
+                # P must finish by length after the prompt forward so the KV
+                # connector observes a deterministic segment boundary.  Stop
+                # tokens belong to D, where the model decision is authoritative.
+                overrides.pop("stop_token_ids", None)
             if not isinstance(default, SamplingParams) or (not overrides and (max_tokens is None or max_tokens <= 0)):
                 configured.append(default)
                 continue
             params = default.clone()
+            if pd_stage_policy is not None and stage_id in (0, 1):
+                # P and D expose one complete model-unit boundary at a time.
+                # Keeping the cumulative latent rows until that boundary is
+                # required for MiniCPM's synchronous Thinker->Talker bridge.
+                params.output_kind = RequestOutputKind.FINAL_ONLY
             if max_tokens is not None and max_tokens > 0:
                 params.max_tokens = max_tokens
             for name, value in overrides.items():

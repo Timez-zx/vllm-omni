@@ -1,0 +1,129 @@
+# MiniCPM-o 4.5 native-duplex P/D deployment.
+# GPU 0: Thinker-P; GPU 1: Thinker-D; GPU 2: Talker; GPU 3: Code2Wav.
+pipeline: minicpmo_4_5_pd
+session_mode: duplex
+async_chunk: true
+trust_remote_code: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 3
+
+stages:
+  - stage_id: 0
+    hf_overrides:
+      vllm_omni_minicpmo_pd_prefill: true
+    max_model_len: 40960
+    max_num_batched_tokens: 32768
+    max_num_seqs: 64
+    async_scheduling: false
+    gpu_memory_utilization: 0.9
+    enable_prefix_caching: true
+    devices: "0"
+    limit_mm_per_prompt:
+      video: 1
+    env:
+      VLLM_NIXL_SIDE_CHANNEL_PORT: "5600"
+    engine_extras:
+      # P/D handoff uses the KV connector, not Omni async-chunk payloads.
+      async_chunk: false
+      kv_transfer_config:
+        kv_connector: NixlDeltaPushConnector
+        kv_connector_module_path: vllm_omni.engine.nixl_delta_push_connector
+        kv_role: kv_producer
+        kv_rank: 0
+        kv_parallel_size: 2
+        kv_load_failure_policy: fail
+        kv_connector_extra_config:
+          orchestrator_remote_host: 127.0.0.1
+          orchestrator_remote_port: 5600
+          enable_cross_layers_blocks: true
+          kv_lease_duration: 300
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.1
+
+  - stage_id: 1
+    hf_overrides:
+      vllm_omni_minicpmo_pd_decode: true
+    max_model_len: 40960
+    max_num_batched_tokens: 32768
+    max_num_seqs: 64
+    async_scheduling: false
+    gpu_memory_utilization: 0.9
+    enable_prefix_caching: true
+    devices: "1"
+    env:
+      VLLM_NIXL_SIDE_CHANNEL_PORT: "5601"
+    engine_extras:
+      # D is a complete finite request.  Only Talker -> Code2Wav uses the
+      # async-chunk data plane in this topology.
+      async_chunk: false
+      kv_transfer_config:
+        kv_connector: NixlDeltaPushConnector
+        kv_connector_module_path: vllm_omni.engine.nixl_delta_push_connector
+        kv_role: kv_consumer
+        kv_rank: 1
+        kv_parallel_size: 2
+        kv_load_failure_policy: fail
+        kv_connector_extra_config:
+          enable_cross_layers_blocks: true
+          kv_lease_duration: 300
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.1
+
+  - stage_id: 2
+    max_model_len: 4096
+    max_num_batched_tokens: 8192
+    max_num_seqs: 64
+    async_scheduling: false
+    gpu_memory_utilization: 0.9
+    devices: "2"
+    output_connectors:
+      to_stage_3: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      min_tokens: 50
+      max_tokens: 2048
+      stop_token_ids: [1]
+      seed: 42
+      detokenize: false
+
+  - stage_id: 3
+    max_model_len: 65536
+    max_num_batched_tokens: 65536
+    max_num_seqs: 64
+    async_scheduling: false
+    gpu_memory_utilization: 0.9
+    enforce_eager: true
+    enable_chunked_prefill: false
+    devices: "3"
+    input_connectors:
+      from_stage_2: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      detokenize: true
+
+platforms: {}

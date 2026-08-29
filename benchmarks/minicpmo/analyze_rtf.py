@@ -31,7 +31,20 @@ DONE = re.compile(
     r"output_units=(\d+) audio_s=([0-9]+(?:\.[0-9]+)?) "
     r"ttft_ms=([0-9]+(?:\.[0-9]+)?) tpot_ms=([0-9]+(?:\.[0-9]+)?)"
 )
+PD_SLOT_DONE = re.compile(
+    r"\[minicpm_pd_slot\] req=(\S+) seq=(\S+) "
+    r"ready_epoch=([0-9]+(?:\.[0-9]+)?) done_epoch=([0-9]+(?:\.[0-9]+)?) "
+    r"e2e_ms=([0-9]+(?:\.[0-9]+)?) wait_previous_d_ms=([0-9]+(?:\.[0-9]+)?)"
+)
 MODEL_UNIT_MS = 1000.0
+PD_DECODE_REQUEST = re.compile(r"^(?P<logical>.+)-(?P<slot>[0-9a-f]{8})$")
+
+
+def _cadence_identity(stage: int, request_id: str, generation: int) -> tuple[str, int]:
+    """Map MiniCPM's per-slot physical D id back to its logical session id."""
+    if stage == 1 and (match := PD_DECODE_REQUEST.fullmatch(request_id)) is not None:
+        return match.group("logical"), int(match.group("slot"), 16)
+    return request_id, generation
 
 
 def _percentile(values: list[float], q: float) -> float | None:
@@ -72,23 +85,48 @@ def _parse(
     dict[tuple[int, str, int], float],
     dict[tuple[int, str, int], dict[int, dict[str, Any]]],
     list[dict[str, Any]],
+    list[dict[str, Any]],
 ]:
     admits: dict[tuple[int, str, int], float] = {}
     schedules: dict[tuple[int, str, int], dict[int, dict[str, Any]]] = defaultdict(dict)
     runner_results: dict[tuple[int, str, int], dict[int, float]] = defaultdict(dict)
     completions: list[dict[str, Any]] = []
+    pd_slots: list[dict[str, Any]] = []
     for line in log_path.read_text(errors="replace").splitlines():
+        pd_slot = PD_SLOT_DONE.search(line)
+        if pd_slot is not None:
+            done_epoch = float(pd_slot.group(4))
+            if started <= done_epoch <= ended:
+                pd_slots.append(
+                    {
+                        "request_id": pd_slot.group(1),
+                        "seq": pd_slot.group(2),
+                        "ready_epoch": float(pd_slot.group(3)),
+                        "done_epoch": done_epoch,
+                        "e2e_ms": float(pd_slot.group(5)),
+                        "wait_previous_d_ms": float(pd_slot.group(6)),
+                    }
+                )
+            continue
         admit = ADMIT.search(line)
         if admit is not None:
             timestamp = float(admit.group(4))
             if started <= timestamp <= ended:
-                admits[(int(admit.group(1)), admit.group(2), int(admit.group(3)))] = timestamp
+                stage = int(admit.group(1))
+                request_id, generation = _cadence_identity(
+                    stage, admit.group(2), int(admit.group(3))
+                )
+                admits[(stage, request_id, generation)] = timestamp
             continue
         schedule = SCHEDULE.search(line)
         if schedule is not None:
             timestamp = float(schedule.group(5))
             if started <= timestamp <= ended:
-                key = (int(schedule.group(1)), schedule.group(2), int(schedule.group(3)))
+                stage = int(schedule.group(1))
+                request_id, generation = _cadence_identity(
+                    stage, schedule.group(2), int(schedule.group(3))
+                )
+                key = (stage, request_id, generation)
                 schedules[key][int(schedule.group(4))] = {
                     "schedule_epoch": timestamp,
                     "scheduled_tokens": int(schedule.group(6)),
@@ -100,7 +138,11 @@ def _parse(
         if runner_done is not None:
             timestamp = float(runner_done.group(5))
             if started <= timestamp <= ended:
-                key = (int(runner_done.group(1)), runner_done.group(2), int(runner_done.group(3)))
+                stage = int(runner_done.group(1))
+                request_id, generation = _cadence_identity(
+                    stage, runner_done.group(2), int(runner_done.group(3))
+                )
+                key = (stage, request_id, generation)
                 runner_results[key][int(runner_done.group(4))] = timestamp
             continue
         done = DONE.search(line)
@@ -140,7 +182,7 @@ def _parse(
         for step, runner_done_epoch in runner_results.get(key, {}).items():
             if step in steps:
                 steps[step]["runner_done_epoch"] = runner_done_epoch
-    return admits, schedules, list(latest.values())
+    return admits, schedules, list(latest.values()), pd_slots
 
 
 def _pair_admits(
@@ -243,12 +285,17 @@ def _pair_admits(
             )
 
 
-def _stage_summary(stage: int, completions: list[dict[str, Any]]) -> dict[str, Any]:
+def _stage_summary(
+    stage: int,
+    completions: list[dict[str, Any]],
+    *,
+    periodic: bool,
+) -> dict[str, Any]:
     records = [item for item in completions if item["stage"] == stage]
     service_ms = [item["service_ms"] for item in records]
     unit_rtf = (
         [MODEL_UNIT_MS / value for value in service_ms if value > 0]
-        if stage in (0, 1)
+        if periodic
         else []
     )
     audio_rtf = [item["audio_s"] * 1000.0 / item["service_ms"] for item in records if item["audio_s"] > 0]
@@ -392,13 +439,28 @@ def main() -> None:
     run = json.loads(Path(args.run_json).read_text())
     started = float(run["started_epoch_s"]) - 0.25
     ended = float(run["ended_epoch_s"]) + 0.25
-    admits, schedules, completions = _parse(Path(args.server_log), started, ended)
+    admits, schedules, completions, pd_slots = _parse(
+        Path(args.server_log),
+        started,
+        ended,
+    )
     _pair_admits(admits, schedules, completions)
+    stage_ids = sorted({item["stage"] for item in completions})
+    is_pd = bool(pd_slots) or 3 in stage_ids
+    periodic_stage_ids = (0, 1, 2) if is_pd else (0, 1)
     stages = {
-        str(stage): _stage_summary(stage, completions)
-        for stage in sorted({item["stage"] for item in completions})
+        str(stage): _stage_summary(
+            stage,
+            completions,
+            periodic=stage in periodic_stage_ids,
+        )
+        for stage in stage_ids
     }
-    periodic_stages = {stage: stages[stage] for stage in ("0", "1") if stage in stages}
+    periodic_stages = {
+        str(stage): stages[str(stage)]
+        for stage in periodic_stage_ids
+        if str(stage) in stages
+    }
     periodic_stage_p05 = {
         stage: (summary.get("unit_rtf", {}).get("p05") or 0.0)
         for stage, summary in periodic_stages.items()
@@ -409,12 +471,30 @@ def main() -> None:
     p95_pass = bool(periodic_stage_p05) and all(
         value > 1.0 for value in periodic_stage_p05.values()
     )
+    pd_slot_e2e = [slot["e2e_ms"] for slot in pd_slots]
+    pd_slot_summary = {
+        "count": len(pd_slot_e2e),
+        "e2e_ms": _latency_summary(pd_slot_e2e),
+        "e2e_over_1000ms": sum(value >= MODEL_UNIT_MS for value in pd_slot_e2e),
+        "wait_previous_d_ms": _latency_summary(
+            [slot["wait_previous_d_ms"] for slot in pd_slots]
+        ),
+    }
+    if is_pd:
+        strict_pass = strict_pass and bool(pd_slot_e2e) and all(
+            value < MODEL_UNIT_MS for value in pd_slot_e2e
+        )
+        p95_e2e = _percentile(pd_slot_e2e, 0.95)
+        p95_pass = p95_pass and p95_e2e is not None and p95_e2e < MODEL_UNIT_MS
     result = {
         "run_json": str(Path(args.run_json).resolve()),
         "definition": "RTF = 1 second model unit / stage service time; RTF > 1 is real-time",
         "capacity_slo": (
-            "every observed stage0 and stage1 unit has RTF > 1; "
-            "stage2 persistent-session wall time is excluded"
+            "every P, D, and Talker unit has RTF > 1 and every input-ready-to-D "
+            "slot latency is below 1 second; Code2Wav persistent-session wall time is excluded"
+            if is_pd
+            else "every observed Thinker and Talker unit has RTF > 1; "
+            "Code2Wav persistent-session wall time is excluded"
         ),
         "capacity_pass": strict_pass,
         "p95_capacity_pass": p95_pass,
@@ -423,6 +503,8 @@ def main() -> None:
         else None,
         "stages": stages,
     }
+    if is_pd:
+        result["pd_slot"] = pd_slot_summary
     output = Path(args.out)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")

@@ -61,6 +61,7 @@ def _run_resumable_segment_stop(
     session: Request,
     *,
     session_finished: bool = False,
+    pd_segment: bool = False,
 ):
     sched = MagicMock()
     sched.requests = {session.request_id: session}
@@ -82,7 +83,19 @@ def _run_resumable_segment_stop(
     sched.transfer_triggered_requests = set()
     sched.active_kv_transfers = set()
     sched.pending_stop_after_extraction = set()
-    sched.connector = None
+    sched.connector = MagicMock() if pd_segment else None
+    if pd_segment:
+        session.kv_transfer_params = {
+            "do_remote_decode": True,
+            "do_remote_prefill": False,
+        }
+        sched._connector_finished.return_value = (
+            True,
+            {
+                "remote_request_id": session.request_id,
+                "remote_num_tokens": session.num_computed_tokens,
+            },
+        )
     sched.kv_cache_manager.take_events.return_value = None
     sched.finished_req_ids_dict = {}
     sched.make_stats.return_value = None
@@ -104,6 +117,40 @@ def _run_resumable_segment_stop(
     model_runner_output.routed_experts = None
 
     return OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
+
+
+def test_resumable_pd_segment_publishes_cumulative_prompt_identity() -> None:
+    session = _make_request()
+    session.status = RequestStatus.RUNNING
+    session.resumable = True
+    session.num_computed_tokens = session.num_prompt_tokens
+
+    outputs = _run_resumable_segment_stop(session, pd_segment=True)
+
+    output = outputs[session.client_index].outputs[0]
+    assert output.is_segment_finished is True
+    assert output.kv_transfer_params["remote_request_id"] == session.request_id
+    assert output.kv_transfer_params["remote_prompt_token_ids"] == [1, 2, 3]
+
+
+def test_pd_send_completion_retains_live_resumable_request_blocks() -> None:
+    scheduler = MagicMock()
+    scheduler.connector = MagicMock()
+    session = _make_request()
+    session.resumable = True
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    scheduler.requests = {session.request_id: session}
+    connector_output = SimpleNamespace(
+        finished_recving=None,
+        finished_sending={session.request_id},
+    )
+
+    OmniARScheduler._update_from_kv_xfer_finished(scheduler, connector_output)
+
+    scheduler.connector.update_connector_output.assert_called_once_with(
+        connector_output
+    )
+    scheduler._free_blocks.assert_not_called()
 
 
 @pytest.mark.parametrize("outstanding_async_tokens", [0, 1, 2])

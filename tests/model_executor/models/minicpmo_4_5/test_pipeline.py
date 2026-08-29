@@ -33,6 +33,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 _PIPELINE_KEY = "minicpmo_4_5"
+_PD_PIPELINE_KEY = "minicpmo_4_5_pd"
 _DEPLOY_DIR = Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy"
 _DEPLOY_LAYOUTS = {
     "minicpmo_4_5.yaml": ["0", "0", "0"],
@@ -52,6 +53,37 @@ class TestRegistryDeclaration:
         assert isinstance(pipeline, PipelineConfig)
         assert pipeline.model_type == _PIPELINE_KEY
         assert pipeline.model_arch == "MiniCPMO45OmniForConditionalGeneration"
+
+    def test_pd_pipeline_declares_four_stage_thinker_split(self) -> None:
+        pipeline = OMNI_PIPELINES[_PD_PIPELINE_KEY]
+        assert pipeline.validate() == []
+        assert [stage.model_stage for stage in pipeline.stages] == [
+            "llm",
+            "llm",
+            "tts",
+            "code2wav",
+        ]
+        assert pipeline.get_stage(0).extras["is_prefill_only"] is True
+        assert pipeline.get_stage(1).extras["is_decode_only"] is True
+
+    def test_pd_deploy_uses_one_gpu_per_stage(self) -> None:
+        deploy = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5_pd_4gpu.yaml")
+        pipeline = OMNI_PIPELINES[deploy.pipeline]
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        assert [stage.yaml_runtime["devices"] for stage in stages] == [
+            "0",
+            "1",
+            "2",
+            "3",
+        ]
+        assert stages[0].yaml_engine_args["hf_overrides"]["vllm_omni_minicpmo_pd_prefill"] is True
+        assert stages[1].yaml_engine_args["hf_overrides"]["vllm_omni_minicpmo_pd_decode"] is True
+        assert stages[0].yaml_engine_args["async_chunk"] is False
+        assert stages[1].yaml_engine_args["async_chunk"] is False
+        assert stages[2].yaml_engine_args["async_chunk"] is True
+        assert stages[3].yaml_engine_args["async_chunk"] is True
+        assert "output_connectors" not in stages[1].yaml_extras
+        assert "input_connectors" not in stages[2].yaml_extras
 
     def test_native_duplex_control_is_explicit_without_a_fixed_session_cap(self) -> None:
         pipeline = OMNI_PIPELINES[_PIPELINE_KEY]

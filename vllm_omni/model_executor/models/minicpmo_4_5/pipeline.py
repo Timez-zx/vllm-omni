@@ -78,3 +78,68 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
         ),
     ),
 )
+
+
+# Four-stage native-duplex topology. Stage 0 owns multimodal prefill and
+# exports KV only; stage 1 resumes generation from that KV, reconstructs the
+# Talker conditioning rows, and remains the client-visible Thinker stage.
+MINICPMO_4_5_PD_PIPELINE = PipelineConfig(
+    model_type="minicpmo_4_5_pd",
+    default_deploy_config_name="minicpmo_4_5_pd_4gpu.yaml",
+    model_arch=MINICPMO_4_5_PIPELINE.model_arch,
+    duplex_runtime_extension=MINICPMO_4_5_PIPELINE.duplex_runtime_extension,
+    duplex_serving_adapter=MINICPMO_4_5_PIPELINE.duplex_serving_adapter,
+    duplex_control_enabled=True,
+    hf_architectures=MINICPMO_4_5_PIPELINE.hf_architectures,
+    hf_config_predicate=MINICPMO_4_5_PIPELINE.hf_config_predicate,
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="llm",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            engine_output_type="latent",
+            sampling_constraints={"detokenize": True},
+            extras={"is_prefill_only": True, "pd_snapshot_hidden_layer": 36},
+        ),
+        StagePipelineConfig(
+            stage_id=1,
+            model_stage="llm",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(0,),
+            final_output=True,
+            final_output_type="text",
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            engine_output_type="latent",
+            sampling_constraints={"detokenize": True},
+            extras={"is_decode_only": True, "pd_snapshot_hidden_layer": 36},
+        ),
+        StagePipelineConfig(
+            stage_id=2,
+            model_stage="tts",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(1,),
+            hf_config_name="tts_config",
+            engine_output_type="latent",
+            custom_process_input_func=f"{_PROC}.llm2tts",
+            custom_process_next_stage_input_func=f"{_PROC}.tts2code2wav_full_payload",
+            async_chunk_process_next_stage_input_func=f"{_PROC}.tts2code2wav_async_chunk",
+            sampling_constraints={"detokenize": False},
+        ),
+        StagePipelineConfig(
+            stage_id=3,
+            model_stage="code2wav",
+            execution_type=StageExecutionType.LLM_GENERATION,
+            input_sources=(2,),
+            final_output=True,
+            final_output_type="audio",
+            engine_output_type="audio",
+            model_arch="MiniCPMO45Code2Wav",
+            sync_process_input_func=f"{_PROC}.tts2code2wav_token_only",
+            sampling_constraints={"detokenize": True},
+        ),
+    ),
+)

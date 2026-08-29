@@ -4,6 +4,7 @@
 import importlib
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
+from copy import copy
 from typing import Any
 
 import torch
@@ -187,9 +188,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return
 
         self.requests_num_chunks_sent[request.external_req_id] = confirmed_num_computed_tokens
+        output_token_ids = getattr(request, "output_token_ids", None)
+        if hasattr(output_token_ids, "_x"):
+            output_token_ids = output_token_ids._x
         task = {
             "multimodal_output": multimodal_output,
             "request": request,
+            # ``request`` remains owned by the engine and may advance while
+            # this task waits for the background sender.  Snapshot the token
+            # view that produced this exact multimodal output.
+            "output_token_ids_snapshot": list(output_token_ids) if output_token_ids is not None else None,
             "is_finished": is_finished,
             "is_segment_finished": is_segment_finished,
         }
@@ -305,6 +313,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         raw_mm = task["multimodal_output"]
         multimodal_output = unflatten_payload(raw_mm) if isinstance(raw_mm, Mapping) else raw_mm
         request = task["request"]
+        request_for_processor = request
+        output_token_ids_snapshot = task.get("output_token_ids_snapshot")
+        if output_token_ids_snapshot is not None:
+            request_for_processor = copy(request)
+            request_for_processor._output_token_ids = list(output_token_ids_snapshot)
+            request_for_processor.output_token_ids = list(output_token_ids_snapshot)
         is_finished = task["is_finished"]
         is_segment_finished = task["is_segment_finished"]
         stage_id = self.connector.stage_id
@@ -319,7 +333,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 payload_data = self.custom_process_next_stage_input_func(
                     transfer_manager=self,
                     multimodal_output=multimodal_output,
-                    request=request,
+                    request=request_for_processor,
                     # Existing processors use is_finished as a flush signal.
                     # Terminal stops no longer count as segment boundaries
                     # (is_segment_finished is False when the request finishes,

@@ -19,6 +19,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
 
 from vllm.logger import init_logger
+from vllm.renderers import renderer_from_config
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.usage.usage_lib import UsageContext
@@ -952,10 +953,16 @@ def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
     """Build the shared stage-0 input processor."""
 
     patch_generation_config_if_needed(stage_vllm_config.model_config)
-    input_processor = InputProcessor(vllm_config=stage_vllm_config)
+    # Both preprocessors must share one renderer. Constructing a second
+    # renderer also constructs a second SHM sender for the same buffer name.
+    renderer = renderer_from_config(stage_vllm_config)
+    input_processor = InputProcessor(
+        vllm_config=stage_vllm_config,
+        renderer=renderer,
+    )
     input_processor.input_preprocessor = OmniInputPreprocessor(
         vllm_config=stage_vllm_config,
-        renderer=input_processor.renderer,
+        renderer=renderer,
     )
     return input_processor
 
@@ -1181,7 +1188,16 @@ def get_stage_connector_spec(
             extra = dict(spec.extra or {})
             extra.setdefault("role", "sender")
             return {"name": spec.name, "extra": extra}
-    return {}
+    # No connector edge means this stage's payload must return through the
+    # orchestrator.  Make that direction explicit.  Leaving the role unset
+    # triggers the legacy ``stage_id != 0`` heuristic in
+    # ``stage_sends_async_output`` and incorrectly diverts synchronous output
+    # from a non-zero stage (for example a split Thinker-D) into an
+    # inter-stage connector that does not exist.
+    return {
+        "name": "SharedMemoryConnector",
+        "extra": {"role": "receiver"},
+    }
 
 
 def build_diffusion_config(
@@ -1239,6 +1255,160 @@ def initialize_diffusion_stage(
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
     return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
+
+
+def make_forward_context_thread_local() -> None:
+    """Route vllm's active ForwardContext through a threading.local.
+
+    Colocated stages (speech-pair merge) step TWO engine cores from two
+    threads in one process, but vllm stores the in-flight forward context in
+    a module GLOBAL. The two engines' concurrent forwards overwrite each
+    other's context mid-step -- measured on the first 32-user cell: the
+    talker's MoE layer looked itself up in code2wav's ``no_compile_layers``
+    and died with ``KeyError: 'talker...experts'``, and the secondary
+    cleanup then killed the sibling thread on destroyed parallel groups.
+
+    The accessor FUNCTIONS are imported by value all over vllm, so
+    rebinding module attributes would miss every existing reference.
+    Instead the fix transplants ``__code__`` onto the existing function
+    objects (same objects everywhere), switching their storage to a
+    threading.local injected into the module's dict. Semantics for a
+    single-threaded process are unchanged, and the patch is only applied
+    in colocated mode.
+
+    Known non-covered writer: ``vllm/v1/worker/ubatching.py`` pokes the raw
+    global directly, but micro-batch overlap is inactive in this deployment
+    (single GPU, DP=1); if ubatching is ever enabled together with
+    colocation, that path needs the same treatment.
+    """
+    import threading
+
+    import vllm.forward_context as fc
+
+    if getattr(fc, "_omni_forward_context_tls", None) is not None:
+        return
+    fc._omni_forward_context_tls = threading.local()
+
+    def get_forward_context():  # noqa: ANN202
+        ctx = getattr(_omni_forward_context_tls, "ctx", None)  # noqa: F821
+        assert ctx is not None, (
+            "Forward context is not set. "
+            "Please use `set_forward_context` to set the forward context."
+        )
+        return ctx
+
+    def is_forward_context_available():  # noqa: ANN202
+        return getattr(_omni_forward_context_tls, "ctx", None) is not None  # noqa: F821
+
+    def override_forward_context(forward_context):  # noqa: ANN001, ANN202
+        prev_context = getattr(_omni_forward_context_tls, "ctx", None)  # noqa: F821
+        _omni_forward_context_tls.ctx = forward_context  # noqa: F821
+        try:
+            yield
+        finally:
+            _omni_forward_context_tls.ctx = prev_context  # noqa: F821
+
+    fc.get_forward_context.__code__ = get_forward_context.__code__
+    fc.is_forward_context_available.__code__ = is_forward_context_available.__code__
+    wrapped = getattr(fc.override_forward_context, "__wrapped__", None)
+    if wrapped is None:
+        raise RuntimeError(
+            "override_forward_context has no __wrapped__ generator; "
+            "vllm's forward_context layout changed -- re-audit before colocating"
+        )
+    wrapped.__code__ = override_forward_context.__code__
+    logger.warning(
+        "[colocate] vllm forward context storage switched to threading.local "
+        "(two engine cores will step concurrently in this process)"
+    )
+
+
+def make_workspace_manager_colocation_safe() -> None:
+    """Stop the second engine's init from destroying the first's MoE workspace.
+
+    vllm's WorkspaceManager is a process-global singleton. In a colocated
+    process, the GUEST engine's GPUModelRunner.__init__ calls
+    init_workspace_manager again -- which REPLACES the manager (dropping the
+    host talker's grown buffers) -- and its post-warmup lock_workspace() then
+    locks the fresh EMPTY manager. The talker's next new-shape allocation dies:
+    "Workspace is locked but allocation requires 1.99 MB, current size is
+    0.00 MB" (boot_coloc6, first 128-user turn).
+
+    Two surgical changes, colocated mode only:
+      * init_workspace_manager becomes idempotent (keep the existing manager;
+        the second caller shares it) -- __code__ transplant because callers
+        import it by value;
+      * WorkspaceManager.lock becomes a no-op via class-attribute rebind
+        (method lookup goes through the class, no transplant needed). Growth
+        after "lock" is a perf-hygiene guard, not a correctness invariant;
+        with two engines sharing one manager the sizes are only final after
+        BOTH have warmed, so the guard cannot be kept as-is anyway.
+    """
+    import vllm.v1.worker.workspace as ws
+
+    if getattr(ws, "_omni_colocation_safe", False):
+        return
+
+    def init_workspace_manager(device, num_ubatches=None):  # noqa: ANN001, ANN202
+        global _manager  # noqa: PLW0603
+        if _manager is not None:
+            logger.info(
+                "WorkspaceManager already initialized on device %s; keeping it "
+                "(colocated engines share one manager)",
+                _manager._device,
+            )
+            return
+        _manager = WorkspaceManager(device, num_ubatches)  # noqa: F821
+
+    ws.init_workspace_manager.__code__ = init_workspace_manager.__code__
+
+    def _lock_noop(self) -> None:
+        logger.debug("[colocate] workspace lock skipped (growth stays allowed)")
+
+    ws.WorkspaceManager.lock = _lock_noop
+
+    # Tri-colocation upgrade: the manager's single arena is handed out WHOLE
+    # from offset 0 on every get_simultaneous() call. That is safe with ONE
+    # MoE engine per process (the speech pair: only the talker allocates), but
+    # two MoE engines (thinker + talker) stepping concurrently from their own
+    # threads/streams would scribble over the same scratch bytes -- silent
+    # numerical corruption, no crash. Key the arena by the CURRENT CUDA STREAM
+    # instead: every colocated engine both constructs (graph capture) and runs
+    # its busy loop inside its own private stream scope, so the stream is the
+    # engine's identity across threads. Non-colocated processes never install
+    # this patch.
+    import torch as _torch
+
+    def _ensure_workspace_size_stream_keyed(self, required_bytes: int):  # noqa: ANN001, ANN202
+        from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
+        stream_key = _torch.cuda.current_stream().cuda_stream
+        arenas = getattr(self, "_omni_stream_arenas", None)
+        if arenas is None:
+            arenas = {}
+            self._omni_stream_arenas = arenas
+        key = (stream_key, dbo_current_ubatch_id())
+        current_workspace = arenas.get(key)
+        current_size = 0 if current_workspace is None else current_workspace.numel()
+        if current_size < required_bytes:
+            arenas[key] = None
+            del current_workspace
+            _torch.accelerator.empty_cache()
+            arenas[key] = _torch.empty((required_bytes,), dtype=_torch.uint8, device=self._device)
+            current_workspace = arenas[key]
+            logger.info(
+                "[colocate] workspace arena for stream %s grown to %.2f MB",
+                hex(stream_key),
+                required_bytes / (1024**2),
+            )
+        return current_workspace
+
+    ws.WorkspaceManager._ensure_workspace_size = _ensure_workspace_size_stream_keyed
+    ws._omni_colocation_safe = True
+    logger.warning(
+        "[colocate] WorkspaceManager made colocation-safe: init is idempotent, "
+        "lock is a no-op, and arenas are keyed by CUDA stream (one per engine)"
+    )
 
 
 def maybe_apply_audex_cfg_patches(vllm_config: Any) -> None:

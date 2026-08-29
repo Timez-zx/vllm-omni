@@ -85,6 +85,16 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # Store configs
         self.config = config
         self.multimodal_config = multimodal_config
+        self._minicpmo_pd_prefill = bool(
+            getattr(config, "vllm_omni_minicpmo_pd_prefill", False)
+        )
+        self._minicpmo_pd_decode = bool(
+            getattr(config, "vllm_omni_minicpmo_pd_decode", False)
+        )
+        # Native P/D needs P's KV, not an O(context) hidden-state payload on
+        # the Core->orchestrator IPC path.  D reconstructs the generated
+        # conditioning rows from the imported KV and its local suffix.
+        self.omni_pooler_payload_include_hidden = not self._minicpmo_pd_prefill
         from vllm_omni.experimental.fullduplex.minicpmo45.compat import (
             patch_minicpmo_remote_config,
         )
@@ -103,6 +113,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 architectures=["MiniCPMO45OmniLLMForConditionalGeneration"],
             )
             self.model = self.thinker
+            if self._minicpmo_pd_prefill:
+                # Some runner paths query the inner registered model rather
+                # than this pipeline wrapper.
+                self.thinker.omni_pooler_payload_include_hidden = False
             self.talker = None
 
         elif self.model_stage == "tts":
@@ -309,6 +323,23 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
             return input_ids, embeds, {}
 
+        if self._minicpmo_pd_decode:
+            # P already encoded the cumulative AV prompt and D loads its KV.
+            # P's first sampled decision token is D's sole local prompt
+            # suffix, so a normal token embedding is exact. Re-running the AV
+            # processor here would both duplicate prefill and defeat P/D.
+            embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
+            decode_info = {
+                key: value
+                for key, value in duplex.items()
+                if key != "payload"
+            }
+            decode_info.setdefault(
+                "special_token_ids",
+                self._minicpmo45_native_duplex_token_ids(),
+            )
+            return input_ids, embeds, {"duplex": decode_info}
+
         prompt_len_meta = kwargs.get("duplex_prompt_len")
         token_offset_meta = kwargs.get("duplex_token_offset", 0)
         if (
@@ -369,6 +400,15 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             epoch = int(epoch) if epoch is not None else None
         except (TypeError, ValueError):
             epoch = None
+        pd_feedback = duplex.get("pd_feedback_token_ids")
+        if isinstance(pd_feedback, list) and seq is not None:
+            helper.apply_pd_decode_feedback(
+                state,
+                [int(token_id) for token_id in pd_feedback],
+                epoch=epoch,
+                seq=seq,
+                force_listen=bool(payload.get("force_listen", False)),
+            )
         result = helper._stage_prefill_embeddings_only(
             state,
             audio_waveform,
@@ -548,8 +588,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 **kwargs,
             )
 
+            input_embedding_states = None
             if isinstance(thinker_output, tuple):
-                embeds, text_hidden_states = thinker_output
+                input_embedding_states, text_hidden_states = thinker_output
             else:
                 text_hidden_states = thinker_output
 
@@ -558,8 +599,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if added_batch_dim:
                 text_hidden_states = text_hidden_states.squeeze(0)
 
-            # Return hidden states with latent in multimodal_outputs for stage_input_processors
-            multimodal_outputs = {"latent": text_hidden_states}
+            # D's generated hidden rows are sufficient for MiniCPM's native
+            # duplex Thinker->Talker bridge. P therefore exports KV only; an
+            # O(context) hidden-state snapshot would duplicate host memory and
+            # copy work every 1 s unit without affecting native audio output.
+            multimodal_outputs = (
+                {} if self._minicpmo_pd_prefill else {"latent": text_hidden_states}
+            )
             runtime_info = kwargs.get("runtime_additional_information")
             if runtime_info and isinstance(runtime_info, list) and len(runtime_info) > 0:
                 duplex_rows = []

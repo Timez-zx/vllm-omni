@@ -113,6 +113,50 @@ comparable.
 The trace flag adds observation-only admission, scheduling, runner-completion,
 and stage-completion timestamps. It does not change scheduling policy.
 
+## P/D deployment and capacity
+
+The P/D variant uses four GPUs: Thinker-P on GPU 0, Thinker-D on GPU 1,
+Talker on GPU 2, and Code2Wav on GPU 3. P keeps one resumable lineage per
+session. D runs one finite request per model unit and imports only the new
+block-aligned KV suffix. D output tokens feed the next P unit. Talker remains
+ordered within each session while the next Thinker unit may overlap it.
+
+```bash
+VLLM_OMNI_LOG_DUPLEX_CADENCE=1 \
+python -m vllm_omni.entrypoints.cli.main serve openbmb/MiniCPM-o-4_5 \
+  --omni --deploy-config benchmarks/minicpmo/deploy_capacity_pd_4gpu.yaml \
+  --trust-remote-code --host 127.0.0.1 --port 8113
+
+python benchmarks/minicpmo/continuous_av.py \
+  --users 8 --duration-s 30 --phase-window-s 1 --seed 20260828 \
+  --connect-stagger-s 0.5 --post-stream-s 4 --gpus 0 1 2 3 \
+  --media /path/to/MiniCPM-o-4_5/assets/omni_duplex1.mp4 \
+  --ref-audio /path/to/MiniCPM-o-4_5/assets/HT_ref_audio.wav \
+  --frame-max-side 0 --max-slice-nums 4 \
+  --out /tmp/minicpm-pd-u8-30s.json
+
+python benchmarks/minicpmo/analyze_rtf.py \
+  --server-log /tmp/minicpm-pd-server.log \
+  --run-json /tmp/minicpm-pd-u8-30s.json \
+  --out /tmp/minicpm-pd-u8-30s-rtf.json
+```
+
+P/D adds an end-to-end slot criterion: input-ready through D completion must
+also remain below one second. Formal 30-second HD4 runs give:
+
+| Users | P-ready→D p50/p95/p99/max | Late slots | P p95/p99 | D p95/p99 | Result |
+|---:|---:|---:|---:|---:|:---:|
+| 8 | 416/614/717/747 ms | 0/247 | 341/411 ms | 319/383 ms | pass |
+| 9 | 620/1289/1431/1515 ms | 71/288 | 678/742 ms | 512/592 ms | fail |
+
+At nine users, the slowest 5% of P units average 714 ms: 304 ms before Core
+admission, 359 ms in the multimodal-prefill runner, and 50 ms exposing the
+result. The slowest D units average 541 ms, of which 326 ms is ordered
+KV/scheduler wait and only 142 ms is runner work. P/D removes mixed
+prefill/decode batches, but bursty P work plus the current P/D progress path
+still pushes the serial P-to-D slot over its deadline. The archive is
+`results/capacity_pd_hd4_4gpu_20260829.json`.
+
 ## HD-slicing capacity result
 
 With the 960x540 source preserved and `max_slice_nums=4`, the official grid
