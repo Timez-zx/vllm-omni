@@ -6,6 +6,7 @@ import asyncio
 import time as _time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from os import getenv
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
@@ -42,6 +43,7 @@ if TYPE_CHECKING:
     from vllm_omni.engine.orchestrator import OrchestratorRequestState
 
 logger = init_logger(__name__)
+LOG_DUPLEX_CADENCE = getenv("VLLM_OMNI_LOG_DUPLEX_CADENCE", "0") == "1"
 
 
 @dataclass
@@ -664,7 +666,7 @@ class StagePool:
         metrics.agg_total_tokens += num_tokens_out
         metrics.agg_total_gen_time_ms += stage_gen_time_ms
 
-        return StageRequestMetrics(
+        result = StageRequestMetrics(
             num_tokens_in=num_tokens_in,
             num_tokens_out=num_tokens_out,
             stage_gen_time_ms=stage_gen_time_ms,
@@ -696,6 +698,24 @@ class StagePool:
             vllm_itl_ms=float(native_text_metrics.get("vllm_itl_ms") or 0.0),
             vllm_itls_ms=list(native_text_metrics.get("vllm_itls_ms") or []),
         )
+        if LOG_DUPLEX_CADENCE:
+            logger.info(
+                "[duplex_stage] stage=%s DONE req=%s submit_epoch=%.6f "
+                "done_epoch=%.6f service_ms=%.3f tokens_in=%s tokens_out=%s "
+                "output_units=%s audio_s=%.6f ttft_ms=%.3f tpot_ms=%.3f",
+                self.stage_id,
+                request_id,
+                submit_ts,
+                now,
+                stage_gen_time_ms,
+                num_tokens_in,
+                num_tokens_out,
+                output_unit_count,
+                audio_duration_s,
+                result.vllm_ttft_ms,
+                result.vllm_tpot_ms,
+            )
+        return result
 
     def _infer_output_unit_type(self, request_outputs: list[Any], *, token_count: int) -> str:
         final_output_type = getattr(self.stage_client, "final_output_type", None)

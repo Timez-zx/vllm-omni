@@ -34,6 +34,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
             "duplex_stage0_max_tokens",
             "duplex_scheduler_token_id",
             "duplex_first_append_context_tokens",
+            "duplex_context_window_trigger_tokens",
             "ref_audio_data",
             "ref_audio_format",
             "ref_audio_sample_rate_hz",
@@ -81,6 +82,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
         stage0["temperature"] = config.temperature if config.temperature is not None else 0.7
         stage_sampling["0"] = stage0
         runtime_config["duplex_stage_sampling_params"] = stage_sampling
+        cls._apply_context_window_policy(runtime_config, config.extra_body)
         return runtime_config
 
     @classmethod
@@ -91,6 +93,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
         cls.validate_client_config(config)
         runtime_config: dict[str, object] = {"instructions": config.instructions}
         cls._apply_default_scheduler_policy(runtime_config, config=config, model_config=model_config)
+        cls._apply_context_window_policy(runtime_config, extra_body)
 
         ref_audio = config.ref_audio
         if ref_audio is None and isinstance(extra_body.get("ref_audio"), str):
@@ -135,6 +138,22 @@ class MiniCPMO45NativeDuplexServingAdapter:
         config.extra_body = extra_body
         config.ref_audio = None
         return runtime_config
+
+    @staticmethod
+    def _apply_context_window_policy(
+        runtime_config: dict[str, object],
+        extra_body: object,
+    ) -> None:
+        raw = extra_body.get("context_window_trigger_tokens") if isinstance(extra_body, dict) else None
+        if raw is None:
+            runtime_config.setdefault("duplex_context_window_trigger_tokens", 36_000)
+            return
+        if not isinstance(raw, int) or isinstance(raw, bool) or raw < 1024:
+            raise MiniCPMO45ClientRuntimeConfigError(
+                "context_window_trigger_tokens must be an integer >= 1024",
+                code="invalid_context_window_trigger_tokens",
+            )
+        runtime_config["duplex_context_window_trigger_tokens"] = raw
 
     @classmethod
     def _apply_default_scheduler_policy(

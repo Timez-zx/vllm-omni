@@ -1,0 +1,116 @@
+{
+  "model": "openbmb/MiniCPM-o-4_5",
+  "precision": "bf16",
+  "hardware": "3x RTX PRO 6000 Blackwell 96 GB",
+  "topology": {
+    "thinker_gpu": 0,
+    "talker_gpu": 1,
+    "code2wav_gpu": 2,
+    "pd_disaggregation": false
+  },
+  "workload": {
+    "duration_s": 30,
+    "audio_chunk_ms": 200,
+    "video_fps": 1,
+    "source_resolution": "960x540",
+    "frame_max_side": 0,
+    "max_slice_nums": 4,
+    "actual_vision_blocks_per_frame": 3,
+    "steady_scheduler_tokens_per_unit": 211,
+    "phase_window_s": 1.0,
+    "slo": "every observed Thinker and Talker model unit has service time below 1000 ms"
+  },
+  "runs": [
+    {
+      "users": 7,
+      "seed": 20260829,
+      "capacity_pass": true,
+      "thinker": {
+        "units": 220,
+        "service_ms": {"p50": 284.44, "p95": 613.11, "p99": 706.001, "max": 731.458},
+        "rtf_le_1": 0
+      },
+      "talker": {
+        "units": 189,
+        "service_ms": {"p50": 167.678, "p95": 473.884, "p99": 687.257, "max": 700.777},
+        "rtf_le_1": 0
+      }
+    },
+    {
+      "users": 8,
+      "seed": 20260829,
+      "capacity_pass": true,
+      "thinker": {
+        "units": 237,
+        "service_ms": {"p50": 464.027, "p95": 888.011, "p99": 959.355, "max": 991.011},
+        "rtf_le_1": 0
+      },
+      "talker": {
+        "units": 208,
+        "service_ms": {"p50": 219.118, "p95": 459.864, "p99": 608.919, "max": 668.17},
+        "rtf_le_1": 0
+      }
+    },
+    {
+      "users": 8,
+      "seed": 20260828,
+      "capacity_pass": true,
+      "thinker": {
+        "units": 242,
+        "service_ms": {"p50": 407.099, "p95": 922.91, "p99": 981.451, "max": 993.963},
+        "rtf_le_1": 0
+      },
+      "talker": {
+        "units": 207,
+        "service_ms": {"p50": 200.329, "p95": 575.235, "p99": 737.358, "max": 838.042},
+        "rtf_le_1": 0
+      }
+    },
+    {
+      "users": 9,
+      "seed": 20260829,
+      "capacity_pass": false,
+      "thinker": {
+        "units": 228,
+        "service_ms": {"p50": 565.686, "p95": 1007.348, "p99": 1850.673, "max": 2070.602},
+        "rtf_le_1": 13,
+        "rtf_le_1_rate": 0.057
+      },
+      "talker": {
+        "units": 230,
+        "service_ms": {"p50": 198.843, "p95": 626.113, "p99": 1224.283, "max": 1449.526},
+        "rtf_le_1": 5,
+        "rtf_le_1_rate": 0.0217
+      },
+      "thinker_slowest_5pct_mean_ms": {
+        "service": 1492.615,
+        "dispatch": 132.896,
+        "scheduler_queue": 0.303,
+        "runner": 1302.454,
+        "first_av_prefill_runner": 279.75,
+        "decode_runner": 1022.704,
+        "mixed_prefill_decode_runner": 981.164,
+        "inter_forward": 2.824,
+        "result_exposure": 54.138
+      },
+      "thinker_decode_forward_ms": {
+        "mixed_with_prefill": {"count": 284, "p50": 159.138, "p95": 414.395},
+        "decode_only": {"count": 91, "p50": 23.612, "p95": 42.252}
+      },
+      "gpu_busy_p95_pct": {"thinker": 83.0, "talker": 27.0, "code2wav": 65.0},
+      "gpu_memory_io_busy_p95_pct": {"thinker": 57.0, "talker": 9.0, "code2wav": 8.0}
+    }
+  ],
+  "prefill_only_control": {
+    "users": 9,
+    "seed": 20260829,
+    "units": 270,
+    "policy": "force every model unit to terminate at the listen decision",
+    "preserved_work": "all HD4 video and streaming audio prefills",
+    "removed_work": "multi-step Thinker decode, Talker, and Code2Wav",
+    "thinker_service_ms": {"p50": 215.28, "p95": 385.025, "p99": 405.292, "max": 436.353},
+    "rtf_le_1": 0
+  },
+  "capacity_conclusion": "8 measured sessions pass in two seeded runs with less than 10 ms max-latency headroom; 9 is the first clear failure; 7 is the safer operating point",
+  "root_cause": "Thinker decode repeatedly shares runner iterations with other sessions' multimodal prefills. Mixed decode forwards are 6.7x slower at p50 and 9.8x slower at p95 than decode-only forwards, while the same nine-user AV prefill workload passes when multi-step decode is removed."
+}

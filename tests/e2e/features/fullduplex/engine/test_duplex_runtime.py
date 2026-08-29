@@ -1,7 +1,11 @@
+import base64
 from dataclasses import FrozenInstanceError
+from io import BytesIO
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+from PIL import Image
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.experimental.fullduplex.engine import duplex_runtime
@@ -22,6 +26,7 @@ from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
     MiniCPMO45DuplexRuntimeExtension,
     build_duplex_data_plane_prompt,
     duplex_scheduler_token_budget,
+    duplex_vision_block_counts,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -396,6 +401,61 @@ def test_duplex_scheduler_token_budget_ignores_client_budget_fields():
         )
         == 16
     )
+
+
+def test_duplex_scheduler_token_budget_counts_official_hd_slices():
+    image = Image.new("RGB", (960, 540), color="white")
+    encoded = BytesIO()
+    image.save(encoded, format="JPEG")
+    payload = {
+        "audio": base64.b64encode(np.zeros(16_000, dtype=np.float32).tobytes()).decode(),
+        "format": "pcm_f32le",
+        "video_frames": [base64.b64encode(encoded.getvalue()).decode()],
+        "max_slice_nums": 4,
+    }
+
+    # Official grid selection uses one global image plus a 2x1 crop grid.
+    assert duplex_vision_block_counts(payload) == [3]
+    assert duplex_scheduler_token_budget(payload) == 12 + 3 * 66
+
+
+def test_minicpmo_context_window_starts_fresh_lineage_with_one_retained_unit():
+    extension = MiniCPMO45DuplexRuntimeExtension()
+    fence = DuplexFence("sid-context-window")
+    payload = {
+        "audio": base64.b64encode(np.zeros(16_000, dtype=np.float32).tobytes()).decode(),
+        "format": "pcm_f32le",
+    }
+    runtime_config = {
+        "duplex_first_append_context_tokens": 48,
+        "duplex_context_window_trigger_tokens": 1024,
+        "duplex_stage_max_tokens": {"0": 20},
+    }
+
+    rollover = None
+    for seq in range(1, 80):
+        plan = extension.plan_append(
+            request_id="req-context-window",
+            fence=fence,
+            session_config={},
+            runtime_config=runtime_config,
+            seq=seq,
+            turn_seq=seq,
+            mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+            payload=payload,
+            final=False,
+            sampling_params=SamplingParams(max_tokens=20),
+        )
+        meta = plan.prompt["model_intermediate_buffer"].get("meta")
+        if isinstance(meta, dict) and meta.get("replace_streaming_prompt") is True:
+            rollover = plan.prompt
+            break
+
+    assert rollover is not None
+    assert rollover["model_intermediate_buffer"]["duplex"]["payload"]["duplex_context_rollover"] is True
+    assert rollover["model_intermediate_buffer"]["meta"]["retain_streaming_output_tokens"] is True
+    # 48 context + 11 retained-unit rows + 13 rows for the current steady unit.
+    assert len(rollover["prompt_token_ids"]) == 72
 
 
 def test_resource_state_rejects_fence_regression_and_requires_explicit_fence():

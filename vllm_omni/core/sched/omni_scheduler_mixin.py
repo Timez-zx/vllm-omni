@@ -52,13 +52,42 @@ class OmniSchedulerMixin:
             input_coordinator.free_finished_request(request_id)
 
     def _replace_streaming_session(self, session: Request, update: StreamingUpdate) -> None:
-        """Replace a downstream stage's placeholder with its next payload."""
+        """Replace a streaming prompt and start a fresh disposable KV lineage."""
         adapter = getattr(self, "chunk_transfer_adapter", None)
         if adapter is not None:
             adapter.segment_finished_requests.discard(session.request_id)
+
+        replacement_meta: dict[str, Any] = {}
+        for info in (
+            getattr(update, "model_intermediate_buffer", None),
+            getattr(update, "additional_information", None),
+        ):
+            if isinstance(info, dict) and isinstance(info.get("meta"), dict):
+                replacement_meta.update(info["meta"])
+
+        retained_output_tokens: list[int] = []
+        if replacement_meta.get("retain_streaming_output_tokens") is True:
+            retained_output_tokens = list(
+                session._all_token_ids[session.num_prompt_tokens : session.num_computed_tokens]
+            )
+
+        # A prompt replacement starts a new logical KV lineage. Release every
+        # block owned by the old lineage before resetting the request object;
+        # otherwise a shorter compacted prompt keeps the old tail blocks pinned.
+        kv_cache_manager = getattr(self, "kv_cache_manager", None)
+        if kv_cache_manager is not None:
+            kv_cache_manager.free(session)
         session._output_token_ids.clear()
         session._all_token_ids.clear()
-        new_prompt = update.prompt_token_ids or ()
+        new_prompt = list(update.prompt_token_ids or ())
+        if retained_output_tokens:
+            raw_offset = replacement_meta.get("retained_output_insert_offset", len(new_prompt))
+            try:
+                insert_offset = int(raw_offset)
+            except (TypeError, ValueError):
+                insert_offset = len(new_prompt)
+            insert_offset = max(0, min(insert_offset, len(new_prompt)))
+            new_prompt[insert_offset:insert_offset] = retained_output_tokens
         session._all_token_ids.extend(new_prompt)
         session.num_computed_tokens = 0
         session.prompt_token_ids = new_prompt
@@ -68,8 +97,23 @@ class OmniSchedulerMixin:
             "model_intermediate_buffer",
             None,
         )
+        session.block_hashes.clear()
+        prompt_embed_hashes = getattr(session, "_prompt_embeds_per_block_hashes", None)
+        if isinstance(prompt_embed_hashes, dict):
+            prompt_embed_hashes.clear()
+        cache_salt = replacement_meta.get("streaming_cache_salt")
+        if isinstance(cache_salt, str) and cache_salt:
+            session.cache_salt = cache_salt
+        session.skip_reading_prefix_cache = session.get_skip_reading_prefix_cache()
         session.update_block_hashes()
         session.num_prompt_tokens = len(new_prompt)
+        if replacement_meta.get("retain_streaming_output_tokens") is True:
+            logger.info(
+                "[duplex_context] ROLLOVER req=%s retained_output_tokens=%d compacted_prompt_tokens=%d",
+                session.request_id,
+                len(retained_output_tokens),
+                len(new_prompt),
+            )
         session.arrival_time = update.arrival_time
         session.sampling_params = update.sampling_params
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:

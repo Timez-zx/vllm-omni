@@ -25,7 +25,7 @@ class MiniCPMO45PcmAppendReservation:
         "_sample_rate_hz",
         "_spans",
         "_turn_had_speech",
-        "_video_frames",
+        "_video_entries",
         "operation_id",
         "payload",
     )
@@ -42,7 +42,7 @@ class MiniCPMO45PcmAppendReservation:
         is_speech: bool,
         spans: list[_PcmSpan] | None = None,
         turn_had_speech: bool = False,
-        video_frames: list[str] | None = None,
+        video_entries: list[tuple[str, int]] | None = None,
     ) -> None:
         self._owner = owner
         self.operation_id = operation_id
@@ -53,7 +53,7 @@ class MiniCPMO45PcmAppendReservation:
         self._is_speech = is_speech
         self._spans = list(spans or [])
         self._turn_had_speech = turn_had_speech
-        self._video_frames = list(video_frames or [])
+        self._video_entries = list(video_entries or [])
         self._active = True
 
     @property
@@ -113,9 +113,9 @@ class MiniCPMO45PcmAppendBuffer:
         self._turn_had_speech = False
         self._reservation_seq = 0
         self._reservations: list[MiniCPMO45PcmAppendReservation] = []
-        # Omni duplex: queued camera frames (base64 JPEG), consumed FIFO at
-        # one frame per emitted model unit alongside the unit's audio.
-        self._frame_queue: list[str] = []
+        # Omni duplex: queued camera frames and their HD-slice policies,
+        # consumed FIFO at one frame per emitted model unit.
+        self._frame_queue: list[tuple[str, int]] = []
 
     def clear(self) -> None:
         for reservation in self._reservations:
@@ -200,7 +200,11 @@ class MiniCPMO45PcmAppendBuffer:
         if isinstance(payload, dict) and "video_frames" in payload:
             # Frames align to whole audio units; a passthrough payload has no
             # unit framing for Stage0 to interleave against.
-            payload = {key: value for key, value in payload.items() if key != "video_frames"}
+            payload = {
+                key: value
+                for key, value in payload.items()
+                if key not in {"video_frames", "max_slice_nums"}
+            }
         reservation = MiniCPMO45PcmAppendReservation(
             owner=self,
             operation_id=operation_id,
@@ -248,7 +252,18 @@ class MiniCPMO45PcmAppendBuffer:
         )
         frames_in = payload.get("video_frames")
         if isinstance(frames_in, list):
-            self._frame_queue.extend(frame for frame in frames_in if isinstance(frame, str) and frame)
+            frames = [frame for frame in frames_in if isinstance(frame, str) and frame]
+            raw_max_slices = payload.get("max_slice_nums", 1)
+            if isinstance(raw_max_slices, int) and not isinstance(raw_max_slices, bool):
+                max_slices = [max(1, raw_max_slices)] * len(frames)
+            elif isinstance(raw_max_slices, list) and len(raw_max_slices) == len(frames):
+                max_slices = [
+                    max(1, value) if isinstance(value, int) and not isinstance(value, bool) else 1
+                    for value in raw_max_slices
+                ]
+            else:
+                max_slices = [1] * len(frames)
+            self._frame_queue.extend(zip(frames, max_slices, strict=True))
         self._turn_had_speech = self._turn_had_speech or bool(payload.get("is_speech", False))
         if not allow_emit:
             return None
@@ -279,6 +294,7 @@ class MiniCPMO45PcmAppendBuffer:
         out = dict(payload)
         out.pop("force_speak", None)
         out.pop("video_frames", None)
+        out.pop("max_slice_nums", None)
         out["audio"] = base64.b64encode(emit_raw).decode("ascii")
         out["sample_rate_hz"] = sample_rate_hz
         # Omni duplex: attach at most one queued camera frame per emitted
@@ -288,10 +304,11 @@ class MiniCPMO45PcmAppendBuffer:
         # append consumes extra samples (1035 ms first window), so per-unit
         # attachment could outrun the units Stage0 actually builds. Attach at
         # most ONE frame per emitted payload; the rest stay queued.
-        attached_frames: list[str] = []
+        attached_entries: list[tuple[str, int]] = []
         if emit_samples + pad_samples >= min_samples and self._frame_queue:
-            attached_frames = [self._frame_queue.pop(0)]
-            out["video_frames"] = attached_frames
+            attached_entries = [self._frame_queue.pop(0)]
+            out["video_frames"] = [entry[0] for entry in attached_entries]
+            out["max_slice_nums"] = [entry[1] for entry in attached_entries]
         out["force_listen"] = any(span.force_listen for span in reserved_spans)
         out["is_speech"] = any(span.is_speech for span in reserved_spans)
         reservation = MiniCPMO45PcmAppendReservation(
@@ -304,7 +321,7 @@ class MiniCPMO45PcmAppendBuffer:
             is_speech=bool(out.get("is_speech", False)),
             spans=reserved_spans,
             turn_had_speech=self._turn_had_speech,
-            video_frames=attached_frames,
+            video_entries=attached_entries,
         )
         self._reservations.append(reservation)
         return reservation
@@ -397,9 +414,9 @@ class MiniCPMO45PcmAppendBuffer:
         restored = b"".join(item._raw for item in rolled_back)
         self._buffer[:0] = restored
         self._prepend_spans([span for item in rolled_back for span in item._spans])
-        restored_frames = [frame for item in rolled_back for frame in item._video_frames]
-        if restored_frames:
-            self._frame_queue[:0] = restored_frames
+        restored_entries = [entry for item in rolled_back for entry in item._video_entries]
+        if restored_entries:
+            self._frame_queue[:0] = restored_entries
         self._sample_rate_hz = self._sample_rate_hz or reservation._sample_rate_hz
         self._turn_had_speech = self._turn_had_speech or any(item._turn_had_speech for item in rolled_back)
         for item in rolled_back:

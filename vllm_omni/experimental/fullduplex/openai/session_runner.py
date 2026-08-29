@@ -1243,6 +1243,8 @@ class DuplexSessionRunnerMixin:
                         frames = [frame for frame in video_frames if isinstance(frame, str) and frame]
                         if frames:
                             payload["video_frames"] = frames
+                            if "max_slice_nums" in event:
+                                payload["max_slice_nums"] = event["max_slice_nums"]
                     # Speech/silence tag for the Stage0 turn-ended latch.
                     payload["is_speech"] = self._input_looks_like_speech(event, payload, session=session)
                     defer_native_append = False

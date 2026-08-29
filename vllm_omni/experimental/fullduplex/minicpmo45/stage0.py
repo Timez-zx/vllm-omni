@@ -37,6 +37,10 @@ class _MiniCPMO45Stage0SessionState:
     pending_speech_append_identity: tuple[int | None, int] | None = None
     pending_speech_response_open: bool = False
     generated_tokens: list[int] = field(default_factory=list)
+    current_segment_output_tokens: list[int] = field(default_factory=list)
+    last_unit_inputs_embeds: Any | None = None
+    last_unit_input_token_ids: list[int] = field(default_factory=list)
+    context_rollovers: int = 0
 
 
 class MiniCPMO45Stage0DuplexRuntime:
@@ -148,10 +152,12 @@ class MiniCPMO45Stage0DuplexRuntime:
         audio_waveform: Any,
         *,
         video_frames: list[Any] | None = None,
+        max_slice_nums: int | list[int] = 1,
         epoch: int | None = None,
         seq: int | None = None,
         is_speech: bool = False,
         final: bool = False,
+        context_rollover: bool = False,
     ) -> dict[str, Any]:
         """Build scheduler-owned Stage0 input embeddings for one audio append.
 
@@ -177,12 +183,17 @@ class MiniCPMO45Stage0DuplexRuntime:
         # Omni duplex: encode this append's camera frames up front so the unit
         # loop can interleave one <image> block per unit, mirroring official
         # streaming_prefill (feed <unit>, then image embeds, then audio).
-        frame_blocks: list[Any] = []
+        frame_blocks: list[list[Any]] = []
         if video_frames:
-            self._require_vision_token_ids()
-            frame_blocks = self._stage_vision_embeddings(video_frames)
+            frame_blocks = self._stage_vision_embeddings(
+                video_frames,
+                max_slice_nums=max_slice_nums,
+            )
             if frame_blocks is None or len(frame_blocks) != len(video_frames):
                 return self._stage_prefill_result(False, start_time, "streaming vision embedding failed")
+            self._require_vision_token_ids(
+                include_slices=any(len(blocks) > 1 for blocks in frame_blocks),
+            )
         state.audio_buffer = np.concatenate([state.audio_buffer, np.asarray(audio_waveform, dtype=np.float32)])
         chunk_size = self._streaming_chunk_size(processor)
         self._pad_first_audio_chunk_if_needed(state, processor)
@@ -192,6 +203,14 @@ class MiniCPMO45Stage0DuplexRuntime:
                 start_time,
                 f"audio not enough: need {chunk_size} samples, only {len(state.audio_buffer)}",
             )
+
+        retained_unit_embeds = state.last_unit_inputs_embeds
+        retained_unit_token_ids = list(state.last_unit_input_token_ids)
+        retained_output_token_ids = (
+            list(state.current_segment_output_tokens[:-1]) if state.current_segment_output_tokens else []
+        )
+        if context_rollover and retained_unit_embeds is None:
+            return self._stage_prefill_result(False, start_time, "context rollover has no complete retained unit")
 
         embed_parts: list[Any] = []
         token_ids: list[int] = []
@@ -205,6 +224,8 @@ class MiniCPMO45Stage0DuplexRuntime:
         # pad again here: the first processor chunk is hop-aligned below 1035ms
         # and intentionally leaves a small carry that is not another model unit.
         units_built = 0
+        latest_unit_embed_parts: list[Any] = []
+        latest_unit_token_ids: list[int] = []
         while True:
             if len(state.audio_buffer) < chunk_size:
                 break
@@ -242,23 +263,37 @@ class MiniCPMO45Stage0DuplexRuntime:
                     token_ids.append(int(pending_terminator))
                 embed_parts.append(self._embed_token(self.unit_end_token_id))
                 token_ids.append(self.unit_end_token_id)
+            unit_embed_offset = len(embed_parts)
+            unit_token_offset = len(token_ids)
             embed_parts.append(self._embed_token(self.unit_token_id))
             token_ids.append(self.unit_token_id)
             if frame_blocks:
-                # Official order inside a unit: <image> + 64 resampler
-                # embeddings + </image> ahead of the unit's audio embeddings
-                # (max_slice_nums=1 in streaming, one frame per unit).
-                vision_block = self._as_2d_tensor(frame_blocks.pop(0))
+                # Official order inside a unit: one source-image block followed
+                # by zero or more HD crop blocks, all ahead of audio.
+                image_blocks = frame_blocks.pop(0)
+                vision_block = self._as_2d_tensor(image_blocks[0])
                 embed_parts.append(self._embed_token(self.image_start_token_id))
                 token_ids.append(int(self.image_start_token_id))
                 embed_parts.append(vision_block)
                 token_ids.extend([self._vision_embedding_placeholder_token_id()] * int(vision_block.shape[0]))
                 embed_parts.append(self._embed_token(self.image_end_token_id))
                 token_ids.append(int(self.image_end_token_id))
+                for crop in image_blocks[1:]:
+                    crop_block = self._as_2d_tensor(crop)
+                    embed_parts.append(self._embed_token(self.slice_start_token_id))
+                    token_ids.append(int(self.slice_start_token_id))
+                    embed_parts.append(crop_block)
+                    token_ids.extend(
+                        [self._vision_embedding_placeholder_token_id()] * int(crop_block.shape[0])
+                    )
+                    embed_parts.append(self._embed_token(self.slice_end_token_id))
+                    token_ids.append(int(self.slice_end_token_id))
             embed_parts.append(audio_embeds)
             token_ids.extend(
                 [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
             )
+            latest_unit_embed_parts = list(embed_parts[unit_embed_offset:])
+            latest_unit_token_ids = list(token_ids[unit_token_offset:])
             state.audio_buffer = state.audio_buffer[consumed_samples:]
             state.audio_chunk_idx += 1
             units_built += 1
@@ -279,6 +314,20 @@ class MiniCPMO45Stage0DuplexRuntime:
 
         import torch
 
+        if context_rollover:
+            retained_parts = list(state.context_embeds)
+            retained_parts.append(retained_unit_embeds)
+            retained_parts.extend(self._embed_token(token_id) for token_id in retained_output_token_ids)
+            embed_parts = retained_parts + embed_parts
+            token_ids = (
+                list(state.context_token_ids)
+                + retained_unit_token_ids
+                + retained_output_token_ids
+                + token_ids
+            )
+            state.generated_tokens = retained_output_token_ids[-MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE :]
+            state.context_rollovers += 1
+
         inputs_embeds = torch.cat([self._as_2d_tensor(embed) for embed in embed_parts], dim=0)
         result = self._stage_prefill_result(True, start_time)
         result.update(
@@ -291,8 +340,17 @@ class MiniCPMO45Stage0DuplexRuntime:
                 "uses_model_runner_scheduler": True,
                 "runner_kv_backed": True,
                 "runtime_impl": "scheduler_data_plane",
+                "context_rollover": context_rollover,
+                "context_rollovers": state.context_rollovers,
             }
         )
+        if latest_unit_embed_parts:
+            state.last_unit_inputs_embeds = torch.cat(
+                [self._as_2d_tensor(embed) for embed in latest_unit_embed_parts],
+                dim=0,
+            )
+            state.last_unit_input_token_ids = latest_unit_token_ids
+        state.current_segment_output_tokens.clear()
         if is_speech and (append_identity is None or state.pending_speech_append_identity != append_identity):
             state.pending_speech_context = True
             state.pending_speech_append_identity = append_identity
@@ -751,10 +809,13 @@ class MiniCPMO45Stage0DuplexRuntime:
             raise ValueError(f"MiniCPM-o 4.5 missing required special token id for {token}")
         return token_id
 
-    def _require_vision_token_ids(self) -> None:
+    def _require_vision_token_ids(self, *, include_slices: bool = False) -> None:
+        fields = ["image_start_token_id", "image_end_token_id"]
+        if include_slices:
+            fields.extend(["slice_start_token_id", "slice_end_token_id"])
         missing = [
             _MINICPMO45_OPTIONAL_TOKEN_FIELDS[field_name]
-            for field_name in ("image_start_token_id", "image_end_token_id")
+            for field_name in fields
             if not isinstance(getattr(self, field_name, None), int) or getattr(self, field_name) < 0
         ]
         if missing:
@@ -763,19 +824,42 @@ class MiniCPMO45Stage0DuplexRuntime:
                 f"missing or unknown: {', '.join(missing)}"
             )
 
-    def _stage_vision_embeddings(self, frames: list[Any]) -> list[Any] | None:
+    def _stage_vision_embeddings(
+        self,
+        frames: list[Any],
+        *,
+        max_slice_nums: int | list[int] = 1,
+    ) -> list[list[Any]] | None:
         """Encode camera frames for omni duplex via the loaded vision tower.
 
-        Semantics mirror ``MiniCPMODuplex.streaming_prefill`` (one 64-embedding
-        block per frame at ``max_slice_nums=1``), executed through the vLLM
-        wrapper's ``get_vision_hidden_states`` (vpm + resampler) since the
-        stage model does not expose the remote-code ``get_vision_embedding``.
+        Semantics mirror ``MiniCPMODuplex.streaming_prefill``: every frame has
+        one 64-row source-image block and may have additional 64-row HD crops.
+        The vLLM wrapper's ``get_vision_hidden_states`` runs vpm + resampler.
         """
         process_image = getattr(self.processor, "process_image", None)
         if not callable(process_image):
             return None
+        if isinstance(max_slice_nums, int) and not isinstance(max_slice_nums, bool):
+            slice_limits = [max(1, max_slice_nums)] * len(frames)
+        elif isinstance(max_slice_nums, list) and len(max_slice_nums) == len(frames):
+            slice_limits = [
+                max(1, value) if isinstance(value, int) and not isinstance(value, bool) else 1
+                for value in max_slice_nums
+            ]
+        else:
+            return None
+        if len(set(slice_limits)) != 1:
+            # Official code permits a per-frame list. Process separately here
+            # so the nested slice grouping remains explicit for the runner.
+            groups: list[list[Any]] = []
+            for frame, limit in zip(frames, slice_limits, strict=True):
+                encoded = self._stage_vision_embeddings([frame], max_slice_nums=limit)
+                if encoded is None:
+                    return None
+                groups.extend(encoded)
+            return groups
         try:
-            processed = process_image(frames, max_slice_nums=1)
+            processed = process_image(frames, max_slice_nums=slice_limits[0])
         except Exception:  # noqa: BLE001 - prefill fails with a reason
             return None
         targets = (self.stage_model, self.thinker, getattr(self.stage_model, "model", None))
@@ -793,6 +877,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                 device, dtype = vpm_param.device, vpm_param.dtype
                 pixel_nested = processed["pixel_values"]
                 tgt_nested = processed["tgt_sizes"]
+                slice_counts = [len(image_slices) for image_slices in pixel_nested]
                 flat_pixels: list[Any] = []
                 flat_tgt: list[Any] = []
                 for image_slices, image_tgt in zip(pixel_nested, tgt_nested):
@@ -805,12 +890,19 @@ class MiniCPMO45Stage0DuplexRuntime:
                     hidden = get_hidden({"pixel_values": flat_pixels, "tgt_sizes": tgt_sizes})
             except Exception:  # noqa: BLE001 - prefill fails with a reason
                 return None
-            expected = MiniCPMO45DuplexPolicy.VISION_EMBEDS_PER_FRAME
-            out: list[Any] = []
+            expected = MiniCPMO45DuplexPolicy.VISION_EMBEDS_PER_BLOCK
+            flat_blocks: list[Any] = []
             for block in hidden:
                 block_2d = self._as_2d_tensor(block)
                 if int(block_2d.shape[0]) != expected:
                     return None
-                out.append(block_2d)
+                flat_blocks.append(block_2d)
+            if len(flat_blocks) != sum(slice_counts):
+                return None
+            out: list[list[Any]] = []
+            offset = 0
+            for count in slice_counts:
+                out.append(flat_blocks[offset : offset + count])
+                offset += count
             return out
         return None

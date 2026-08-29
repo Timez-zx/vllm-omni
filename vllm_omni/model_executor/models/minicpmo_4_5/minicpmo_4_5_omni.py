@@ -373,10 +373,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             state,
             audio_waveform,
             video_frames=video_frames,
+            max_slice_nums=payload.get("max_slice_nums", 1),
             epoch=epoch,
             seq=seq,
             is_speech=bool(payload.get("is_speech", False)),
             final=bool(duplex.get("final")),
+            context_rollover=bool(payload.get("duplex_context_rollover", False)),
         )
         update_result = dict(result)
         update_result.pop("inputs_embeds", None)
@@ -927,6 +929,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         state = self._minicpmo45_duplex_state_for_row(row_idx)
         if state is None:
             return
+        segment_tokens = getattr(state, "current_segment_output_tokens", None)
+        if not isinstance(segment_tokens, list):
+            segment_tokens = []
+            state.current_segment_output_tokens = segment_tokens
+        segment_tokens.append(int(sampled))
         payload = self._minicpmo45_duplex_payload_for_row(row_idx)
         force_listen = isinstance(payload, dict) and payload.get("force_listen") is True
         listen_id = token_ids.get("listen_token_id", -1)

@@ -311,3 +311,28 @@ def test_model_intermediate_streaming_payload_replaces_computed_prompt() -> None
     assert session.additional_information is None
     assert session.model_intermediate_buffer == update.model_intermediate_buffer
     assert session.status == RequestStatus.WAITING
+
+
+def test_context_rollover_retains_latest_segment_output_and_releases_old_kv() -> None:
+    sched = _make_scheduler(stage_id=0)
+    sched.kv_cache_manager = MagicMock()
+    session = _make_request()
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.append_output_token_ids([7, 8, 9])
+    session.num_computed_tokens = 6
+    update = _make_update([10, 20, 30, 40])
+    update.model_intermediate_buffer = {
+        "meta": {
+            "replace_streaming_prompt": True,
+            "retain_streaming_output_tokens": True,
+            "retained_output_insert_offset": 2,
+            "streaming_cache_salt": "context-1",
+        }
+    }
+
+    sched._update_request_as_session(session, update)
+
+    sched.kv_cache_manager.free.assert_called_once_with(session)
+    assert session.prompt_token_ids == [10, 20, 7, 8, 9, 30, 40]
+    assert session.num_computed_tokens == 0
+    assert session.cache_salt == "context-1"

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Iterable
+from os import getenv
 from time import time
 from typing import Any
 
@@ -35,6 +36,7 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.outputs import OmniConnectorOutput
 
 logger = init_logger(__name__)
+LOG_DUPLEX_CADENCE = getenv("VLLM_OMNI_LOG_DUPLEX_CADENCE", "0") == "1"
 
 
 class SampledLogprobContractError(RuntimeError):
@@ -127,6 +129,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
+        # Observation-only generation counters for duplex latency traces.
+        self._duplex_admit_generation: dict[str, int] = defaultdict(int)
+        self._duplex_schedule_step: dict[tuple[str, int], int] = defaultdict(int)
+        self._duplex_inflight_steps: dict[str, deque[tuple[int, int]]] = defaultdict(deque)
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -243,6 +249,27 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return False
 
+    def add_request(self, request: Request) -> None:
+        """Expose resumable-unit admission cadence for duplex benchmarks.
+
+        A MiniCPM duplex session re-admits resumable AR-stage requests for each
+        model unit. Client events cannot recover the corresponding service
+        time because one unit may emit zero, one, or several protocol deltas.
+        This timestamp is observation-only and leaves admission unchanged.
+        """
+        if LOG_DUPLEX_CADENCE:
+            self._duplex_admit_generation[request.request_id] += 1
+            logger.info(
+                "[duplex_cadence] stage=%s ADMIT req=%s generation=%s "
+                "admit_epoch=%.6f prompt_tokens=%s",
+                self.vllm_config.model_config.stage_id,
+                request.request_id,
+                self._duplex_admit_generation[request.request_id],
+                time(),
+                getattr(request, "num_prompt_tokens", "?"),
+            )
+        super().add_request(request)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
@@ -281,6 +308,28 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 )
             if self.input_coordinator:
                 self.input_coordinator.restore_queues(self.waiting)
+        if LOG_DUPLEX_CADENCE and scheduler_output.num_scheduled_tokens:
+            scheduled_epoch = time()
+            batch_reqs = len(scheduler_output.num_scheduled_tokens)
+            batch_tokens = scheduler_output.total_num_scheduled_tokens
+            for req_id, scheduled_tokens in scheduler_output.num_scheduled_tokens.items():
+                generation = self._duplex_admit_generation.get(req_id, 0)
+                key = (req_id, generation)
+                self._duplex_schedule_step[key] += 1
+                step = self._duplex_schedule_step[key]
+                self._duplex_inflight_steps[req_id].append((generation, step))
+                logger.info(
+                    "[duplex_cadence] stage=%s SCHEDULE req=%s generation=%s step=%s "
+                    "schedule_epoch=%.6f scheduled_tokens=%s batch_reqs=%s batch_tokens=%s",
+                    self.vllm_config.model_config.stage_id,
+                    req_id,
+                    generation,
+                    step,
+                    scheduled_epoch,
+                    scheduled_tokens,
+                    batch_reqs,
+                    batch_tokens,
+                )
         try:
             # Late import to avoid circulars in some launch modes
             from .output import OmniNewRequestData
@@ -333,6 +382,24 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        if LOG_DUPLEX_CADENCE and scheduler_output.num_scheduled_tokens:
+            runner_done_epoch = time()
+            for req_id in scheduler_output.num_scheduled_tokens:
+                inflight = self._duplex_inflight_steps.get(req_id)
+                if inflight:
+                    generation, step = inflight.popleft()
+                else:
+                    generation = self._duplex_admit_generation.get(req_id, 0)
+                    step = self._duplex_schedule_step.get((req_id, generation), 0)
+                logger.info(
+                    "[duplex_cadence] stage=%s RUNNER_DONE req=%s generation=%s "
+                    "step=%s runner_done_epoch=%.6f",
+                    self.vllm_config.model_config.stage_id,
+                    req_id,
+                    generation,
+                    step,
+                    runner_done_epoch,
+                )
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict

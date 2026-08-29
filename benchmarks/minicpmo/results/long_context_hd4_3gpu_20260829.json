@@ -1,0 +1,59 @@
+{
+  "model": "openbmb/MiniCPM-o-4_5",
+  "precision": "bf16",
+  "hardware": "3x RTX PRO 6000 Blackwell 96 GB",
+  "topology": {
+    "thinker_gpu": 0,
+    "talker_gpu": 1,
+    "code2wav_gpu": 2,
+    "pd_disaggregation": false
+  },
+  "workload": {
+    "users": 1,
+    "duration_s": 180,
+    "audio_chunk_ms": 200,
+    "video_fps": 1,
+    "source_resolution": "960x540",
+    "frame_max_side": 0,
+    "max_slice_nums": 4,
+    "actual_vision_blocks_per_frame": 3,
+    "steady_scheduler_tokens_per_unit": 211,
+    "media_looped_for_context_stress": true,
+    "context_window_trigger_tokens": 36000,
+    "model_max_tokens": 40960,
+    "seed": 20260828
+  },
+  "result": {
+    "units_sent": 180,
+    "failed_users": 0,
+    "server_errors": 0,
+    "context_rollovers": 1,
+    "rollover_unit": 157,
+    "rollover_compacted_prompt_tokens": 494,
+    "rollover_retained_output_tokens": 4,
+    "thinker": {
+      "units": 181,
+      "service_ms": {
+        "p50": 174.839,
+        "p95": 406.889,
+        "p99": 567.424,
+        "max": 572.126
+      },
+      "rtf_le_1": 0,
+      "pre_rollover_20_mean_ms": 394.2,
+      "rollover_service_ms": 174.632,
+      "post_rollover_20_mean_ms": 199.4
+    },
+    "talker": {
+      "units": 165,
+      "service_ms": {
+        "p50": 230.681,
+        "p95": 591.415,
+        "p99": 621.007,
+        "max": 722.461
+      },
+      "rtf_le_1": 0
+    }
+  },
+  "measurement_note": "Protocol progress and gaps are excluded from the rollover verdict because native duplex may listen silently or emit multiple speech deltas per model unit. The verdict uses scheduler and per-stage service traces."
+}

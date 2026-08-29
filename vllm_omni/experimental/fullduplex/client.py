@@ -333,6 +333,7 @@ class RealtimeDuplexClient:
         output_audio_format: str = "pcm16",
         ref_audio: str | None = None,
         session_id: str | None = None,
+        extra_body: dict[str, object] | None = None,
         timeout_s: float = 20.0,
     ) -> None:
         session: dict[str, object] = {
@@ -349,6 +350,11 @@ class RealtimeDuplexClient:
                 "force_listen_count": 0,
             },
         }
+        if extra_body:
+            session["extra_body"] = {
+                **session["extra_body"],  # type: ignore[dict-item]
+                **extra_body,
+            }
         if ref_audio is not None:
             session["ref_audio"] = ref_audio
         if session_id:

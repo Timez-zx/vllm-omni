@@ -718,8 +718,26 @@ class OmniDuplexSessionHandler(
         ]
         if merged_frames:
             merged["video_frames"] = merged_frames
+            merged_slice_limits: list[int] = []
+            for source in (first, second):
+                source_frames = source.get("video_frames")
+                if not isinstance(source_frames, list):
+                    continue
+                valid_frames = [frame for frame in source_frames if isinstance(frame, str) and frame]
+                raw_limits = source.get("max_slice_nums", 1)
+                if isinstance(raw_limits, int) and not isinstance(raw_limits, bool):
+                    merged_slice_limits.extend([max(1, raw_limits)] * len(valid_frames))
+                elif isinstance(raw_limits, list) and len(raw_limits) == len(valid_frames):
+                    merged_slice_limits.extend(
+                        max(1, value) if isinstance(value, int) and not isinstance(value, bool) else 1
+                        for value in raw_limits
+                    )
+                else:
+                    merged_slice_limits.extend([1] * len(valid_frames))
+            merged["max_slice_nums"] = merged_slice_limits
         else:
             merged.pop("video_frames", None)
+            merged.pop("max_slice_nums", None)
         merged["force_listen"] = bool(first.get("force_listen", False)) or bool(second.get("force_listen", False))
         merged.pop("force_speak", None)
         merged["is_speech"] = bool(first.get("is_speech", False)) or bool(second.get("is_speech", False))

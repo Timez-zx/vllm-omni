@@ -43,6 +43,19 @@ def test_append_emits_one_model_unit_when_multiple_units_are_buffered():
     assert buffer.pending_byte_count == 16_000 * 4
 
 
+def test_append_preserves_frame_hd_slice_policy_until_model_unit_emits():
+    buffer = MiniCPMO45PcmAppendBuffer()
+    payload = pcm_payload(16_000)
+    payload["video_frames"] = ["jpeg-b64"]
+    payload["max_slice_nums"] = 4
+
+    emitted = buffer.append(payload, chunk_period_ms=1_000)
+
+    assert emitted is not None
+    assert emitted["video_frames"] == ["jpeg-b64"]
+    assert emitted["max_slice_nums"] == [4]
+
+
 def test_speech_marker_does_not_leak_across_irregular_chunk_boundaries():
     buffer = MiniCPMO45PcmAppendBuffer()
 

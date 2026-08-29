@@ -305,6 +305,8 @@ class RealtimeInputTranslator:
                     )
                     return None
                 payload["video_frames"] = [frame for frame in video_frames if isinstance(frame, str) and frame]
+                if "max_slice_nums" in event:
+                    payload["max_slice_nums"] = event["max_slice_nums"]
             self._copy_realtime_input_hints(event, payload)
             if not looks_like_speech:
                 payload["is_speech"] = False
@@ -967,17 +969,27 @@ class RealtimeInputTranslator:
         """Validate omni-duplex camera frames on input_audio_buffer.append.
 
         Wire contract matches the official MiniCPM-o-Demo omni client: one
-        base64 JPEG per ~1 s audio chunk. HD slicing (max_slice_nums > 1) is
-        not implemented by the duplex adapter yet and is rejected explicitly
-        rather than silently ignored.
+        base64 JPEG per ~1 s audio chunk, with an optional HD-slice limit per
+        frame. The official checkpoint supports at most nine local crops.
         """
-        if max_slice_nums not in (None, 1):
-            return "max_slice_nums > 1 (HD slicing) is not implemented by the duplex Realtime adapter"
         if not isinstance(video_frames, list):
             return "video_frames must be a list of base64-encoded images"
         frames = [frame for frame in video_frames if frame is not None]
         if len(frames) > 2:
             return "video_frames carries more than 2 frames for one append; send ~1 frame per 1 s chunk"
+        if max_slice_nums is None:
+            slice_limits = [1] * len(frames)
+        elif isinstance(max_slice_nums, int) and not isinstance(max_slice_nums, bool):
+            slice_limits = [max_slice_nums] * len(frames)
+        elif isinstance(max_slice_nums, list) and len(max_slice_nums) == len(frames):
+            slice_limits = max_slice_nums
+        else:
+            return "max_slice_nums must be an integer or a list matching video_frames"
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 1 or value > 9
+            for value in slice_limits
+        ):
+            return "max_slice_nums entries must be integers in [1, 9]"
         for frame in frames:
             if not isinstance(frame, str) or not frame:
                 return "video_frames entries must be non-empty base64 strings"
