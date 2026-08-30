@@ -153,9 +153,7 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         connector = get_kv_transfer_group()
         worker = getattr(connector, "connector_worker", None)
         if not isinstance(worker, NixlDeltaPushConnectorWorker):
-            raise RuntimeError(
-                "Direct P/D cache sync requires NixlDeltaPushConnectorWorker"
-            )
+            raise RuntimeError("Direct P/D cache sync requires NixlDeltaPushConnectorWorker")
         worker.start_direct_cache_sync(metadata)
         return True
 
@@ -168,7 +166,17 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         connector = get_kv_transfer_group()
         worker = getattr(connector, "connector_worker", None)
         if not isinstance(worker, NixlDeltaPushConnectorWorker):
-            raise RuntimeError(
-                "Direct P/D cache sync requires NixlDeltaPushConnectorWorker"
-            )
+            raise RuntimeError("Direct P/D cache sync requires NixlDeltaPushConnectorWorker")
         return worker.poll_direct_cache_sync()
+
+    @torch.inference_mode()
+    def preencode_minicpmo45_vision(
+        self,
+        jobs: list[dict[str, object]],
+    ) -> dict[str, object]:
+        """Run MiniCPM arrival-side vision encoding without an LLM request."""
+        model = getattr(self.model_runner, "model", None)
+        preencode = getattr(model, "preencode_duplex_vision", None)
+        if not callable(preencode):
+            return {"supported": False, "encoded_frames": 0}
+        return preencode(jobs)

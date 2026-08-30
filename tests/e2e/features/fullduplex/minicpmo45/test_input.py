@@ -48,12 +48,35 @@ def test_append_preserves_frame_hd_slice_policy_until_model_unit_emits():
     payload = pcm_payload(16_000)
     payload["video_frames"] = ["jpeg-b64"]
     payload["max_slice_nums"] = 4
+    payload["video_preencode_ids"] = ["frame-cache-1"]
 
     emitted = buffer.append(payload, chunk_period_ms=1_000)
 
     assert emitted is not None
     assert emitted["video_frames"] == ["jpeg-b64"]
     assert emitted["max_slice_nums"] == [4]
+    assert emitted["video_preencode_ids"] == ["frame-cache-1"]
+
+
+def test_frame_preencode_identity_survives_append_rollback() -> None:
+    buffer = MiniCPMO45PcmAppendBuffer()
+    payload = pcm_payload(16_000)
+    payload["video_frames"] = ["jpeg-b64"]
+    payload["max_slice_nums"] = 4
+    payload["video_preencode_ids"] = ["frame-cache-rollback"]
+
+    reservation = buffer.prepare_append(
+        payload,
+        operation_id="frame-append",
+        chunk_period_ms=1_000,
+    )
+
+    assert reservation is not None
+    reservation.rollback()
+    retried = buffer.flush(chunk_period_ms=1_000)
+    assert retried is not None
+    assert retried["video_frames"] == ["jpeg-b64"]
+    assert retried["video_preencode_ids"] == ["frame-cache-rollback"]
 
 
 def test_speech_marker_does_not_leak_across_irregular_chunk_boundaries():

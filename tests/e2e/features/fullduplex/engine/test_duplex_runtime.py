@@ -63,6 +63,52 @@ def test_duplex_runtime_tracks_stage_bindings_and_barge_in_epoch():
     assert session.stage_bindings == {}
 
 
+def test_duplex_append_commit_accepts_same_epoch_fence_advance_to_target():
+    manager = DuplexSessionRuntimeManager()
+    base = DuplexFence("sid-append-fence-advance")
+    target = DuplexFence(base.session_id, turn_id=1)
+    session = manager.open_session(
+        base,
+        capabilities=DuplexRuntimeCapabilities(
+            input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK},
+        ),
+    )
+    reservation = session.prepare_append(
+        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+        fence=target,
+    )
+
+    # A model/control event may publish the append's target fence while the
+    # data-plane submission is in flight.  No input sequence was consumed.
+    session.accept_fence(target)
+    update = session.commit_append(reservation)
+
+    assert update.seq == 1
+    assert update.turn_seq == 1
+    assert session.fence == target
+
+
+def test_duplex_append_commit_rejects_fence_advance_beyond_target():
+    manager = DuplexSessionRuntimeManager()
+    base = DuplexFence("sid-append-fence-stale")
+    target = DuplexFence(base.session_id, turn_id=1)
+    session = manager.open_session(
+        base,
+        capabilities=DuplexRuntimeCapabilities(
+            input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK},
+        ),
+    )
+    reservation = session.prepare_append(
+        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+        fence=target,
+    )
+
+    session.accept_fence(DuplexFence(base.session_id, turn_id=2))
+
+    with pytest.raises(RuntimeError, match="changed=fence"):
+        session.commit_append(reservation)
+
+
 def test_duplex_runtime_tracks_same_request_id_for_each_pipeline_stage():
     manager = DuplexSessionRuntimeManager()
     fence = DuplexFence("sid-shared-pipeline-request")

@@ -82,6 +82,9 @@ class TestRegistryDeclaration:
         assert stages[1].yaml_engine_args["async_chunk"] is False
         assert stages[2].yaml_engine_args["async_chunk"] is True
         assert stages[3].yaml_engine_args["async_chunk"] is True
+        talker_sampling = stages[2].yaml_extras["default_sampling_params"]
+        assert talker_sampling["min_tokens"] == 0
+        assert talker_sampling["stop_token_ids"] == [1]
         assert "output_connectors" not in stages[1].yaml_extras
         assert "input_connectors" not in stages[2].yaml_extras
 

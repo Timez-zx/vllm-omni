@@ -1,5 +1,6 @@
 import base64
 import wave
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -42,6 +43,28 @@ def test_realtime_client_builds_resume_only_url_when_autostart_disabled():
     query = parse_qs(urlsplit(url).query)
     assert query["autostart"] == ["0"]
     assert query["minicpmo45_native_duplex"] == ["1"]
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_passes_configured_open_timeout(mocker):
+    websocket = SimpleNamespace(
+        recv=mocker.AsyncMock(),
+        close=mocker.AsyncMock(),
+    )
+    connect = mocker.patch(
+        "vllm_omni.experimental.fullduplex.client.websockets.connect",
+        new=mocker.AsyncMock(return_value=websocket),
+    )
+    client = RealtimeDuplexClient("ws://unused", open_timeout_s=45.0)
+
+    await client.__aenter__()
+    await client.__aexit__(None, None, None)
+
+    connect.assert_awaited_once_with(
+        "ws://unused",
+        max_size=64 * 1024 * 1024,
+        open_timeout=45.0,
+    )
 
 
 @pytest.mark.asyncio

@@ -10,6 +10,85 @@ import torch
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_gpu_ar_worker_routes_minicpmo_vision_preencode_to_loaded_model():
+    from vllm_omni.worker.gpu_ar_worker import GPUARWorker
+
+    calls = []
+    model = SimpleNamespace(
+        preencode_duplex_vision=lambda jobs: calls.append(jobs) or {"supported": True, "encoded_frames": len(jobs)}
+    )
+    worker = GPUARWorker.__new__(GPUARWorker)
+    worker.model_runner = SimpleNamespace(model=model)
+    jobs = [{"preencode_ids": ["frame-a"]}]
+
+    result = worker.preencode_minicpmo45_vision(jobs)
+
+    assert result == {"supported": True, "encoded_frames": 1}
+    assert calls == [jobs]
+
+
+@pytest.mark.parametrize(
+    (
+        "pd_prefill",
+        "pd_decode",
+        "expects_hidden_payload",
+        "expects_side_cache",
+    ),
+    [
+        (True, False, False, False),
+        (False, True, True, False),
+        (False, False, True, True),
+    ],
+)
+def test_minicpmo_pd_thinker_disables_redundant_prefix_tensor_cache(
+    monkeypatch,
+    pd_prefill: bool,
+    pd_decode: bool,
+    expects_hidden_payload: bool,
+    expects_side_cache: bool,
+):
+    from vllm_omni.model_executor.models.minicpmo_4_5 import (
+        minicpmo_4_5_omni as model_module,
+    )
+
+    class DummyThinker:
+        def make_empty_intermediate_tensors(self):
+            return None
+
+    monkeypatch.setattr(
+        model_module,
+        "init_vllm_registered_model",
+        lambda **_: DummyThinker(),
+    )
+    hf_config = SimpleNamespace(
+        vllm_omni_minicpmo_pd_prefill=pd_prefill,
+        vllm_omni_minicpmo_pd_decode=pd_decode,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=hf_config,
+            multimodal_config=SimpleNamespace(),
+            model_stage="llm",
+        )
+    )
+
+    model = model_module.MiniCPMO45OmniForConditionalGeneration(vllm_config=vllm_config)
+
+    assert model.omni_pooler_payload_include_hidden is expects_hidden_payload
+    assert getattr(model.thinker, "omni_pooler_payload_include_hidden", True) is expects_hidden_payload
+    assert model.requires_full_prefix_cached_hidden_states is expects_side_cache
+    assert model.requires_full_prefix_cached_multimodal_outputs is expects_side_cache
+    assert getattr(model.thinker, "requires_full_prefix_cached_hidden_states", True) is expects_side_cache
+    assert (
+        getattr(
+            model.thinker,
+            "requires_full_prefix_cached_multimodal_outputs",
+            True,
+        )
+        is expects_side_cache
+    )
+
+
 def _minicpmo_duplex_policy_case(
     state: SimpleNamespace,
     payload: dict[str, object],
@@ -887,7 +966,7 @@ def test_minicpmo_stage0_data_plane_prefill_matches_official_hd_slice_format():
     runtime.processor = SimpleNamespace(get_streaming_chunk_size=lambda: 4)
     runtime.device = "cpu"
     runtime._init_token_ids()
-    runtime._stage_vision_embeddings = lambda frames, max_slice_nums=1: [
+    runtime._stage_vision_embeddings = lambda frames, max_slice_nums=1, **_kwargs: [
         [torch.ones((64, 2)), torch.full((64, 2), 2.0)]
     ]
     state = _MiniCPMO45Stage0SessionState(session_id="sid-hd-slice")
@@ -901,13 +980,7 @@ def test_minicpmo_stage0_data_plane_prefill_matches_official_hd_slice_format():
     )
 
     assert result["success"] is True
-    assert result["input_token_ids"] == (
-        [1, 12]
-        + [0] * 64
-        + [13, 14]
-        + [0] * 64
-        + [15, 11]
-    )
+    assert result["input_token_ids"] == ([1, 12] + [0] * 64 + [13, 14] + [0] * 64 + [15, 11])
 
     # Subsequent units must close the previous unit with </unit> first,
     # mirroring the official finalize_unit() feed.
@@ -916,6 +989,234 @@ def test_minicpmo_stage0_data_plane_prefill_matches_official_hd_slice_format():
     assert result["success"] is True
     assert result["input_token_ids"] == [2, 1, 11]
     assert result["prompt_suffix_len"] == 0
+
+    runtime._stage_vision_embeddings = lambda *_args, **_kwargs: pytest.fail(
+        "preencoded frame blocks must bypass request-at-a-time vision encoding"
+    )
+    preencoded_state = _MiniCPMO45Stage0SessionState(session_id="sid-hd-preencoded")
+    preencoded = runtime._stage_prefill_embeddings_only(
+        preencoded_state,
+        np.zeros(4, dtype=np.float32),
+        video_frames=[object()],
+        max_slice_nums=4,
+        preencoded_vision=[[torch.ones((64, 2)), torch.full((64, 2), 2.0)]],
+        seq=1,
+    )
+    assert preencoded["success"] is True
+    assert preencoded["input_token_ids"] == ([1, 12] + [0] * 64 + [13, 14] + [0] * 64 + [15, 11])
+
+
+def test_minicpmo_native_duplex_preprocess_batch_prepares_vision_across_sessions():
+    import torch
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        _MINICPMO45_BATCHED_VISION_KEY,
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    class _Helper:
+        def __init__(self):
+            self.sessions = {}
+            self.calls = []
+            self.batch_calls = []
+            self.processor = self
+
+        @staticmethod
+        def _decode_video_frames_payload(payload):
+            return list(payload.get("video_frames", []))
+
+        def process_image(self, frames, *, max_slice_nums=1):
+            self.calls.append((list(frames), max_slice_nums))
+            return {"processed": list(frames)}
+
+        def _stage_vision_embeddings_batch(self, processed_batch, *, microbatch_size=8):
+            self.batch_calls.append((list(processed_batch), microbatch_size))
+            return [[[f"encoded-{processed['processed'][0]}"]] for processed in processed_batch]
+
+    helper = _Helper()
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.model_stage = "llm"
+    model._minicpmo_pd_decode = False
+    model._duplex_data_plane_helper = lambda: helper
+
+    infos = {
+        "req-a": {
+            "duplex": {
+                "data_plane": True,
+                "session_id": "session-a",
+                "incarnation": 2,
+                "epoch": 3,
+                "seq": 4,
+                "payload": {"video_frames": [1], "max_slice_nums": [4]},
+            }
+        },
+        "req-b": {
+            "duplex": {
+                "data_plane": True,
+                "session_id": "session-b",
+                "incarnation": 5,
+                "epoch": 6,
+                "seq": 7,
+                "payload": {"video_frames": [2], "max_slice_nums": [4]},
+            }
+        },
+    }
+
+    model.preprocess_batch(
+        req_ids=["req-a", "req-b"],
+        model_intermediate_buffer=infos,
+        device=torch.device("cpu"),
+    )
+
+    assert sorted(helper.calls) == [([1], 4), ([2], 4)]
+    cached_a = infos["req-a"][_MINICPMO45_BATCHED_VISION_KEY]
+    cached_b = infos["req-b"][_MINICPMO45_BATCHED_VISION_KEY]
+    assert cached_a["identity"] == ("session-a", 2, 3, 4)
+    assert cached_b["identity"] == ("session-b", 5, 6, 7)
+    assert cached_a["video_frames"] == [1]
+    assert cached_b["video_frames"] == [2]
+    assert cached_a["processed"] == {"processed": [1]}
+    assert cached_b["processed"] == {"processed": [2]}
+    assert cached_a["frame_blocks"] == [["encoded-1"]]
+    assert cached_b["frame_blocks"] == [["encoded-2"]]
+    assert helper.batch_calls == [([{"processed": [1]}, {"processed": [2]}], 8)]
+
+    helper._stage_vision_embeddings_batch = lambda *_args, **_kwargs: None
+    model.preprocess_batch(
+        req_ids=["req-a", "req-b"],
+        model_intermediate_buffer=infos,
+        device=torch.device("cpu"),
+    )
+    assert "frame_blocks" not in infos["req-a"][_MINICPMO45_BATCHED_VISION_KEY]
+    assert "frame_blocks" not in infos["req-b"][_MINICPMO45_BATCHED_VISION_KEY]
+    assert infos["req-a"][_MINICPMO45_BATCHED_VISION_KEY]["processed"] == {"processed": [1]}
+
+
+def test_minicpmo_arrival_preencode_bypasses_request_local_vision_encoder():
+    import torch
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        _MINICPMO45_BATCHED_VISION_KEY,
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    class _Helper:
+        def __init__(self):
+            self.sessions = {}
+            self.processor = self
+            self.process_calls = []
+            self.batch_calls = []
+            self.cache = {}
+
+        @staticmethod
+        def _decode_video_frames_payload(payload):
+            return list(payload.get("video_frames", []))
+
+        def process_image(self, frames, *, max_slice_nums=1):
+            self.process_calls.append((list(frames), max_slice_nums))
+            return {"processed": list(frames)}
+
+        def _stage_vision_embeddings_batch(self, processed_batch, *, microbatch_size=8):
+            self.batch_calls.append((list(processed_batch), microbatch_size))
+            return [[[f"arrival-encoded-{processed['processed'][0]}"]] for processed in processed_batch]
+
+        def cache_arrival_vision_embeddings(
+            self,
+            *,
+            session_id,
+            incarnation,
+            epoch,
+            preencode_ids,
+            frame_blocks,
+        ):
+            for preencode_id, blocks in zip(preencode_ids, frame_blocks, strict=True):
+                self.cache[(session_id, incarnation, epoch, preencode_id)] = blocks
+            return len(frame_blocks)
+
+        def take_arrival_vision_embeddings(
+            self,
+            *,
+            session_id,
+            incarnation,
+            epoch,
+            preencode_ids,
+        ):
+            keys = [(session_id, incarnation, epoch, preencode_id) for preencode_id in preencode_ids]
+            if any(key not in self.cache for key in keys):
+                return None
+            return [self.cache.pop(key) for key in keys]
+
+    helper = _Helper()
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.model_stage = "llm"
+    model._minicpmo_pd_decode = False
+    model._duplex_data_plane_helper = lambda: helper
+    jobs = [
+        {
+            "session_id": "session-a",
+            "incarnation": 1,
+            "epoch": 2,
+            "preencode_ids": ["frame-a"],
+            "video_frames": [1],
+            "max_slice_nums": [4],
+        },
+        {
+            "session_id": "session-b",
+            "incarnation": 3,
+            "epoch": 4,
+            "preencode_ids": ["frame-b"],
+            "video_frames": [2],
+            "max_slice_nums": [4],
+        },
+    ]
+
+    result = model.preencode_duplex_vision(jobs)
+
+    assert result["encoded_frames"] == 2
+    assert sorted(helper.process_calls) == [([1], 4), ([2], 4)]
+    process_call_count = len(helper.process_calls)
+    infos = {
+        "req-a": {
+            "duplex": {
+                "data_plane": True,
+                "session_id": "session-a",
+                "incarnation": 1,
+                "epoch": 2,
+                "seq": 5,
+                "payload": {
+                    "video_frames": [1],
+                    "max_slice_nums": [4],
+                    "video_preencode_ids": ["frame-a"],
+                },
+            }
+        },
+        "req-b": {
+            "duplex": {
+                "data_plane": True,
+                "session_id": "session-b",
+                "incarnation": 3,
+                "epoch": 4,
+                "seq": 6,
+                "payload": {
+                    "video_frames": [2],
+                    "max_slice_nums": [4],
+                    "video_preencode_ids": ["frame-b"],
+                },
+            }
+        },
+    }
+
+    model.preprocess_batch(
+        req_ids=["req-a", "req-b"],
+        model_intermediate_buffer=infos,
+        device=torch.device("cpu"),
+    )
+
+    assert len(helper.process_calls) == process_call_count
+    assert infos["req-a"][_MINICPMO45_BATCHED_VISION_KEY]["frame_blocks"] == [["arrival-encoded-1"]]
+    assert infos["req-b"][_MINICPMO45_BATCHED_VISION_KEY]["frame_blocks"] == [["arrival-encoded-2"]]
 
 
 def test_minicpmo_stage0_speech_append_sets_pending_context_once():
@@ -2606,3 +2907,53 @@ def test_minicpmo_stage0_session_context_includes_resolved_ref_audio():
 
     assert state.context_token_ids == [1, 2, 3, 151683, 151683, 4, 5]
     assert len(state.context_embeds) == 6
+
+
+def test_minicpmo_stage0_reuses_identical_session_context_embeddings():
+    from collections import OrderedDict
+
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    runtime = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
+    runtime.unit_token_id = 151683
+    runtime.processor = SimpleNamespace(process_audio=lambda _audio: None)
+    runtime.stage_model = SimpleNamespace(get_audio_hidden_states=lambda _audio: None)
+    runtime.thinker = SimpleNamespace()
+    runtime.device = "cpu"
+    runtime._session_context_cache = OrderedDict()
+    runtime._stage_runtime_ready = lambda: True
+    runtime._require_special_token_ids = lambda: None
+    runtime._decode_ref_audio_from_session_config = lambda _config: np.array(
+        [0.1, -0.1],
+        dtype=np.float32,
+    )
+    runtime._encode_text = lambda text: [1] if "audio_start" in text else [2]
+    runtime._embed_token = lambda token_id: torch.full((1, 2), float(token_id))
+    ref_calls = []
+
+    def encode_ref_audio(ref_audio, state=None):
+        ref_calls.append((ref_audio, state))
+        return torch.tensor([[10.0, 11.0], [12.0, 13.0]])
+
+    runtime._stage_ref_audio_embeddings = encode_ref_audio
+    first = _MiniCPMO45Stage0SessionState(session_id="first")
+    second = _MiniCPMO45Stage0SessionState(session_id="second")
+    config = {"instructions": "Use speech."}
+
+    runtime._prepare_session_context(first, config)
+    runtime._prepare_session_context(second, config)
+
+    assert len(ref_calls) == 1
+    assert first.context_token_ids == second.context_token_ids
+    assert all(
+        first_embed is second_embed
+        for first_embed, second_embed in zip(
+            first.context_embeds,
+            second.context_embeds,
+            strict=True,
+        )
+    )
+    assert first.context_embeds is not second.context_embeds

@@ -13,7 +13,7 @@ import signal
 import threading
 import time
 from collections import deque
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack
 from typing import Any
 
@@ -214,6 +214,51 @@ class StageEngineCoreProc(EngineCoreProc):
         # orchestrator wait for a utility result on D's busy output socket.
         self._pd_pending_decode_adds: dict[str, tuple[Any, int]] = {}
         self._pd_cache_sync_last_poll = 0.0
+        self._vision_preencode_executor: ThreadPoolExecutor | None = None
+
+    def collective_rpc(
+        self,
+        method: Any,
+        timeout: float | None = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        """Keep an auxiliary-GPU vision RPC out of the P scheduling loop.
+
+        vLLM utility calls normally execute synchronously on the EngineCore
+        thread.  That is correct when the vision tower shares the P GPU, but
+        defeats auxiliary placement: a slower Encoder call on the Code2Wav GPU
+        would still stop P from admitting and scheduling LLM work.  EngineCore
+        already understands ``Future`` utility results, so run only this
+        stateless, single-flight sidecar RPC on a dedicated host thread.
+        """
+        if (
+            method == "preencode_minicpmo45_vision"
+            and os.environ.get("MINICPMO45_VISION_ENCODER_DEVICE", "").strip()
+        ):
+            executor = self._vision_preencode_executor
+            if executor is None:
+                executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="minicpmo-vision-sidecar",
+                )
+                self._vision_preencode_executor = executor
+            collective_rpc = super().collective_rpc
+            return executor.submit(
+                collective_rpc,
+                method,
+                timeout,
+                args,
+                kwargs,
+            )
+        return super().collective_rpc(method, timeout, args, kwargs)
+
+    def shutdown(self) -> None:
+        executor = self._vision_preencode_executor
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+            self._vision_preencode_executor = None
+        super().shutdown()
 
     def _install_materialized_mm_receiver_cache(self) -> None:
         """Avoid repeatedly decoding full-history SHM media on stage workers."""
@@ -534,13 +579,22 @@ class StageEngineCoreProc(EngineCoreProc):
         if prepared is not None:
             held_ms = (time.monotonic() - prepared["ready_mono"]) * 1000.0
             prepared_request = prepared["request"]
-            if request.prompt_token_ids != prepared_request.prompt_token_ids:
+            prepared_prompt = list(prepared_request.prompt_token_ids)
+            request_prompt = list(request.prompt_token_ids)
+            prefix_matches = (
+                len(request_prompt) >= len(prepared_prompt)
+                and request_prompt[: len(prepared_prompt)] == prepared_prompt
+            )
+            if not prefix_matches:
                 if prepared.get("owns_blocks", False):
                     self.scheduler.release_direct_pd_cache_sync(prepared_request)
-                raise RuntimeError(
-                    "Prepared P/D cache prompt changed before activation for "
-                    f"{request.request_id}"
+                logger.warning(
+                    "Prepared P/D prefix changed before activation for %s; "
+                    "falling back to the request's ordinary remote-prefill path",
+                    request.request_id,
                 )
+                super().add_request(request, request_wave)
+                return
             self._strip_remote_prefill_params(request)
             # A loading import owns the exact (possibly non-block-aligned)
             # block table under this request id. A full local hit owns no
@@ -827,6 +881,52 @@ class StageEngineCoreProc(EngineCoreProc):
                 if client_index == -1:
                     assert coord_socket is not None
                     coord_socket.send_multipart(encoder.encode(outputs))
+                    continue
+
+                # Stage-0's large latent tensors already travel through the
+                # reverse torch-shm queue.  What remains in the ZMQ message is
+                # a small control frame (plus, at most, small ordinary tensor
+                # frames).  Do not reuse a zero-copy ``bytearray`` for this
+                # path: under a sustained output rate pyzmq can report the
+                # tracker complete while a queued frame still observes a
+                # later ``encode_into`` mutation, leaving a valid msgpack
+                # object followed by stale bytes.  A fresh, copied control
+                # message is cheap here and gives the receiver stable frame
+                # ownership.  Stages without reverse tensor IPC retain
+                # vLLM's zero-copy/reuse path below.
+                if self._output_tensor_ipc_sender is not None:
+                    encode_start = time.monotonic()
+                    buffers = encoder.encode(outputs)
+                    encode_done = time.monotonic()
+                    stage_id = getattr(
+                        self.vllm_config.model_config,
+                        "stage_id",
+                        "?",
+                    )
+                    if _LOG_INGRESS_DIAG and (
+                        _DIAG_STAGES is None or str(stage_id) in _DIAG_STAGES
+                    ):
+                        req_ids = ",".join(
+                            str(getattr(item, "request_id", "?"))
+                            for item in getattr(outputs, "outputs", ())
+                        )
+                        shared_bytes, fallback_bytes, ipc_send_ms = (
+                            self._output_tensor_ipc_sender.message_stats()
+                        )
+                        logger.info(
+                            "[HANDOFF-DIAG] event=core-output-encoded stage=%s "
+                            "wall=%.6f reqs=%s encode_ms=%.3f ipc_send_ms=%.3f "
+                            "shared_mib=%.3f fallback_mib=%.3f frames=%d",
+                            stage_id,
+                            time.time(),
+                            req_ids,
+                            (encode_done - encode_start) * 1000.0,
+                            ipc_send_ms,
+                            shared_bytes / float(1 << 20),
+                            fallback_bytes / float(1 << 20),
+                            len(buffers),
+                        )
+                    sockets[client_index].send_multipart(buffers, copy=True)
                     continue
 
                 while pending and pending[-1][0].done:

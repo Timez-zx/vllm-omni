@@ -14,6 +14,7 @@ import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 
+import vllm_omni.engine.orchestrator as orchestrator_module
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
     OrchestratorRequestState,
@@ -275,6 +276,44 @@ async def test_async_prewarm_skips_outgoing_only_stage() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pd_only_diagnostic_does_not_prewarm_downstream_stages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_MINICPMO_PD_ONLY_DIAGNOSTIC",
+        True,
+    )
+    orchestrator = object.__new__(Orchestrator)
+    stage0 = FakePrewarmPool("sender")
+    stage1 = FakePrewarmPool("sender")
+    stage2 = FakePrewarmPool("receiver")
+    orchestrator.stage_pools = [stage0, stage1, stage2]
+    orchestrator._pd_pair = (0, 1)
+    orchestrator._is_duplex_session_request = lambda _state: True
+    orchestrator._emit_tx_edge = lambda **_kwargs: None
+    orchestrator._record_duplex_stage_submission = MagicMock()
+    req_state = OrchestratorRequestState(
+        request_id="req-pd-only-prewarm",
+        prompt={"prompt_token_ids": [1, 2]},
+        sampling_params_list=[SamplingParams(max_tokens=1) for _ in range(3)],
+        final_stage_id=2,
+        duplex_identity=SimpleNamespace(),
+    )
+
+    await orchestrator._prewarm_async_chunk_stages(
+        req_state.request_id,
+        SimpleNamespace(prompt_token_ids=[1, 2], resumable=True),
+        req_state,
+    )
+
+    assert stage1.submitted == []
+    assert stage2.submitted == []
+    assert req_state.stage_submit_ts == {}
+    orchestrator._record_duplex_stage_submission.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_duplex_prewarm_runs_after_first_stage0_submission() -> None:
     port, stage_pools, request_states, prewarm, submission = _duplex_stage_port_submission()
 
@@ -283,6 +322,61 @@ async def test_duplex_prewarm_runs_after_first_stage0_submission() -> None:
     assert result.stage_id == 0
     stage_pools[0].submit_initial.assert_awaited_once()
     prewarm.assert_awaited_once_with("req-duplex", ANY, request_states["req-duplex"])
+
+
+@pytest.mark.asyncio
+async def test_native_pd_preregisters_physical_d_slot_during_p() -> None:
+    port, stage_pools, request_states, _prewarm, submission = (
+        _duplex_stage_port_submission()
+    )
+    schedule_early = MagicMock()
+    port._pd_pair = (0, 1)
+    port._schedule_pd_early_cache_sync = schedule_early
+    submission = DuplexStageSubmission(
+        context=submission.context,
+        prompt={
+            "prompt_token_ids": [1, 2],
+            "model_intermediate_buffer": {"duplex": {"seq": 7}},
+        },
+        already_submitted=False,
+    )
+
+    await port.submit(submission)
+
+    stage_pools[0].submit_initial.assert_awaited_once()
+    schedule_early.assert_called_once_with(
+        "req-duplex",
+        request_states["req-duplex"],
+        engine_request_id="req-duplex-00000007",
+        prompt_token_ids=[1, 2],
+    )
+
+
+def test_native_pd_prefix_prediction_tracks_append_and_rollover() -> None:
+    bridge = {
+        "pd_duplex_remote_prompt_token_ids": [1, 2],
+        "pd_duplex_prefill_sample_token_ids": [9],
+    }
+
+    assert _OrchestratorDuplexStagePort._native_pd_prefix_prediction(
+        {"prompt_token_ids": [3, 4]},
+        bridge,
+        already_submitted=True,
+    ) == [1, 2, 3, 4]
+    assert _OrchestratorDuplexStagePort._native_pd_prefix_prediction(
+        {
+            "prompt_token_ids": [5, 6, 7],
+            "model_intermediate_buffer": {
+                "meta": {
+                    "replace_streaming_prompt": True,
+                    "retain_streaming_output_tokens": True,
+                    "retained_output_insert_offset": 1,
+                }
+            },
+        },
+        bridge,
+        already_submitted=True,
+    ) == [5, 9, 6, 7]
 
 
 @pytest.mark.asyncio
@@ -385,3 +479,51 @@ async def test_native_pd_decode_finish_keeps_talker_request_resumable() -> None:
         orchestrator._forward_to_next_stage.await_args.kwargs["is_final_update"]
         is False
     )
+
+
+@pytest.mark.asyncio
+async def test_pd_only_diagnostic_terminates_after_complete_d_segment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_MINICPMO_PD_ONLY_DIAGNOSTIC",
+        True,
+    )
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.async_chunk = True
+    orchestrator._pd_pair = (0, 1)
+    orchestrator._cfg_tracker = SimpleNamespace(
+        is_companion=lambda _request_id: False,
+        has_companions=lambda _request_id: False,
+        cleanup_parent=lambda _request_id: [],
+    )
+    orchestrator.stage_pools = [
+        SimpleNamespace(final_output=False),
+        SimpleNamespace(final_output=True),
+        SimpleNamespace(final_output=False),
+    ]
+    orchestrator._ensure_native_duplex_pd_talker_metadata = MagicMock()
+    orchestrator._is_duplex_session_request = lambda _state: True
+    orchestrator._duplexomni_thinker_output_stage = lambda: 1
+    orchestrator._duplex_output_decision = lambda *_args: None
+    orchestrator._stage_receives_async_chunks = lambda _stage: False
+    orchestrator._emit_duplex_direct_output = AsyncMock()
+    orchestrator._forward_to_next_stage = AsyncMock()
+
+    req_state = OrchestratorRequestState(
+        request_id="req-pd-only-segment",
+        sampling_params_list=[SamplingParams(max_tokens=1) for _ in range(3)],
+        final_stage_id=2,
+        duplex_identity=SimpleNamespace(),
+    )
+    req_state.streaming.enabled = True
+    req_state.streaming.segment_finished = True
+    output = SimpleNamespace(request_id=req_state.request_id, finished=True)
+
+    await orchestrator._route_output(1, 0, output, req_state, None)
+
+    orchestrator._emit_duplex_direct_output.assert_awaited_once()
+    decision = orchestrator._emit_duplex_direct_output.await_args.args[3]
+    assert decision.metadata["duplex_pd_only_diagnostic"] is True
+    orchestrator._forward_to_next_stage.assert_not_awaited()

@@ -221,8 +221,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         for req_id in kv_connector_output.finished_recving or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
-            assert req_id in self.requests
-            request = self.requests[req_id]
+            request = self.requests.get(req_id)
+            if request is None:
+                # A session may be aborted while an already-submitted NIXL
+                # operation is completing. Its scheduler blocks were released
+                # by abort; this late connector acknowledgement owns no live
+                # request state and must not terminate the EngineCore.
+                logger.debug(
+                    "Ignoring late KV receive completion for removed request %s",
+                    req_id,
+                )
+                continue
             if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
             elif RequestStatus.is_finished(request.status):
@@ -230,8 +239,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            assert req_id in self.requests
-            request = self.requests[req_id]
+            request = self.requests.get(req_id)
+            if request is None:
+                logger.debug(
+                    "Ignoring late KV send completion for removed request %s",
+                    req_id,
+                )
+                continue
             if RequestStatus.is_finished(request.status):
                 self._free_blocks(request)
             else:

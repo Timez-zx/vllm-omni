@@ -153,6 +153,23 @@ def test_pd_send_completion_retains_live_resumable_request_blocks() -> None:
     scheduler._free_blocks.assert_not_called()
 
 
+def test_pd_completion_after_session_abort_is_ignored() -> None:
+    scheduler = MagicMock()
+    scheduler.connector = MagicMock()
+    scheduler.requests = {}
+    connector_output = SimpleNamespace(
+        finished_recving={"aborted-d-request"},
+        finished_sending={"aborted-p-request"},
+    )
+
+    OmniARScheduler._update_from_kv_xfer_finished(scheduler, connector_output)
+
+    scheduler.connector.update_connector_output.assert_called_once_with(
+        connector_output
+    )
+    scheduler._free_blocks.assert_not_called()
+
+
 @pytest.mark.parametrize("outstanding_async_tokens", [0, 1, 2])
 def test_resumable_segment_stop_reconciles_async_placeholders(
     outstanding_async_tokens: int,

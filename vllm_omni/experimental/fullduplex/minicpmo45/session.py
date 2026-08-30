@@ -1,12 +1,27 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from vllm_omni.experimental.fullduplex.minicpmo45.input import (
     MiniCPMO45PcmAppendBuffer,
 )
+
+_DEFAULT_MAX_PENDING_VISION_PREENCODES_PER_SESSION = 2
+
+
+def _max_pending_vision_preencodes_per_session() -> int:
+    """Return the bounded arrival-vision lookahead used by this process."""
+    raw = os.environ.get(
+        "MINICPMO45_MAX_PENDING_VISION_PREENCODES_PER_SESSION",
+        str(_DEFAULT_MAX_PENDING_VISION_PREENCODES_PER_SESSION),
+    )
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return _DEFAULT_MAX_PENDING_VISION_PREENCODES_PER_SESSION
 
 
 @dataclass(slots=True)
@@ -28,6 +43,7 @@ class MiniCPMO45ServingSessionState:
     pending_silence_task: asyncio.Task[bool] | None = None
     pending_silence_owner_id: str | None = None
     silence_continuation_scheduler: Callable[..., Awaitable[bool]] | None = None
+    vision_preencode_tasks: dict[str, tuple[int, asyncio.Task[bool]]] = field(default_factory=dict)
 
     def retain_committed_audio(
         self,
@@ -54,3 +70,73 @@ class MiniCPMO45ServingSessionState:
         self.continuation_units = 0
         self.pending_silence_task = None
         self.pending_silence_owner_id = None
+
+    def can_start_vision_preencode(
+        self,
+        *,
+        frame_count: int,
+        epoch: int,
+    ) -> bool:
+        """Bound speculative work that is ahead of the formal append chain."""
+        stale_ids = [
+            preencode_id
+            for preencode_id, (task_epoch, _task) in self.vision_preencode_tasks.items()
+            if task_epoch != epoch
+        ]
+        stale_tasks = {self.vision_preencode_tasks[preencode_id][1] for preencode_id in stale_ids}
+        for preencode_id in stale_ids:
+            self.vision_preencode_tasks.pop(preencode_id, None)
+        for task in stale_tasks:
+            if not task.done():
+                task.cancel()
+        return (
+            frame_count > 0
+            and len(self.vision_preencode_tasks) + frame_count
+            <= _max_pending_vision_preencodes_per_session()
+        )
+
+    def track_vision_preencode(
+        self,
+        preencode_ids: list[str],
+        *,
+        epoch: int,
+        task: asyncio.Task[bool],
+    ) -> bool:
+        # Completed tasks still own cached GPU embeddings until the matching
+        # formal append reaches the head of the per-session wire-order chain.
+        # Do not remove them merely because the RPC has completed: doing so
+        # allowed speculative work to run arbitrarily far ahead, evict its own
+        # cache entries, and force a second request-local vision encode.
+        if not self.can_start_vision_preencode(
+            frame_count=len(preencode_ids),
+            epoch=epoch,
+        ):
+            return False
+        for preencode_id in preencode_ids:
+            self.vision_preencode_tasks[preencode_id] = (epoch, task)
+        return True
+
+    def pop_vision_preencode_tasks(
+        self,
+        preencode_ids: list[str],
+        *,
+        epoch: int,
+    ) -> list[asyncio.Task[bool]]:
+        tasks: list[asyncio.Task[bool]] = []
+        seen: set[int] = set()
+        for preencode_id in preencode_ids:
+            item = self.vision_preencode_tasks.pop(preencode_id, None)
+            if item is None or item[0] != epoch:
+                continue
+            task = item[1]
+            if id(task) not in seen:
+                seen.add(id(task))
+                tasks.append(task)
+        return tasks
+
+    def cancel_vision_preencode_tasks(self) -> None:
+        tasks = {task for _, task in self.vision_preencode_tasks.values()}
+        self.vision_preencode_tasks.clear()
+        for task in tasks:
+            if not task.done():
+                task.cancel()

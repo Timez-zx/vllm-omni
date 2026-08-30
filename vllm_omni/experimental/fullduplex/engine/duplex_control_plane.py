@@ -136,6 +136,12 @@ class DuplexControlPlane:
         self._pending_request_cleanups: dict[tuple[str, int, int], _PendingRequestCleanup] = {}
         self._request_cleanup_tasks: dict[tuple[str, int, int], asyncio.Task[None]] = {}
         self._request_cleanups_in_progress: set[tuple[str, int, int]] = set()
+        # ``dispatch`` preserves order for queue-driven production traffic,
+        # but the control plane also exposes ``handle`` as part of its public
+        # contract.  Keep the invariant at the state owner so concurrent
+        # callers cannot prepare the same append sequence while the first
+        # stage submission is still in flight.
+        self._session_operation_locks: dict[str, asyncio.Lock] = {}
         self._session_control_tails: dict[str, asyncio.Task[None]] = {}
         self._dispatched_control_tasks: set[asyncio.Task[None]] = set()
 
@@ -151,6 +157,13 @@ class DuplexControlPlane:
         return isinstance(message, self._MESSAGE_TYPES)
 
     async def handle(self, message: object) -> None:
+        if not self.accepts(message):
+            raise TypeError(f"Unsupported duplex control message: {type(message).__name__}")
+        lock = self._session_operation_locks.setdefault(message.session_id, asyncio.Lock())
+        async with lock:
+            await self._handle_serialized(message)
+
+    async def _handle_serialized(self, message: object) -> None:
         if isinstance(message, OpenDuplexSessionMessage):
             await self.handle_open(message)
         elif isinstance(message, AppendDuplexInputMessage):

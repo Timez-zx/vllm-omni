@@ -17,7 +17,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import time
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from functools import cached_property
 from typing import Any
@@ -47,6 +50,9 @@ from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+_MINICPMO45_BATCHED_VISION_KEY = "_minicpmo45_batched_vision"
+_MINICPMO45_LOG_PREP_DIAG = os.environ.get("MINICPMO45_LOG_PREP_DIAG", "0") not in ("0", "", "false", "False")
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -85,16 +91,20 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # Store configs
         self.config = config
         self.multimodal_config = multimodal_config
-        self._minicpmo_pd_prefill = bool(
-            getattr(config, "vllm_omni_minicpmo_pd_prefill", False)
-        )
-        self._minicpmo_pd_decode = bool(
-            getattr(config, "vllm_omni_minicpmo_pd_decode", False)
-        )
-        # Native P/D needs P's KV, not an O(context) hidden-state payload on
-        # the Core->orchestrator IPC path.  D reconstructs the generated
-        # conditioning rows from the imported KV and its local suffix.
-        self.omni_pooler_payload_include_hidden = not self._minicpmo_pd_prefill
+        self._minicpmo_pd_prefill = bool(getattr(config, "vllm_omni_minicpmo_pd_prefill", False))
+        self._minicpmo_pd_decode = bool(getattr(config, "vllm_omni_minicpmo_pd_decode", False))
+        # Native P/D transfers the reusable prompt through the model KV cache.
+        # P has no downstream tensor consumer. D->Talker needs the hidden rows
+        # produced by every finite decode step, but only for that step: the
+        # output processor accumulates those scheduled tails into one segment.
+        # Keep D's generic ``hidden`` payload enabled for that purpose while
+        # disabling the separate O(context) CPU tensor cache on both stages.
+        # Native KV prefix caching remains enabled and authoritative for model
+        # execution.
+        self._minicpmo_pd_thinker = self._minicpmo_pd_prefill or self._minicpmo_pd_decode
+        self.omni_pooler_payload_include_hidden = self._minicpmo_pd_decode or not self._minicpmo_pd_thinker
+        self.requires_full_prefix_cached_hidden_states = not self._minicpmo_pd_thinker
+        self.requires_full_prefix_cached_multimodal_outputs = not self._minicpmo_pd_thinker
         from vllm_omni.experimental.fullduplex.minicpmo45.compat import (
             patch_minicpmo_remote_config,
         )
@@ -113,10 +123,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 architectures=["MiniCPMO45OmniLLMForConditionalGeneration"],
             )
             self.model = self.thinker
-            if self._minicpmo_pd_prefill:
+            if self._minicpmo_pd_thinker:
                 # Some runner paths query the inner registered model rather
                 # than this pipeline wrapper.
-                self.thinker.omni_pooler_payload_include_hidden = False
+                self.thinker.omni_pooler_payload_include_hidden = self._minicpmo_pd_decode
+                self.thinker.requires_full_prefix_cached_hidden_states = False
+                self.thinker.requires_full_prefix_cached_multimodal_outputs = False
             self.talker = None
 
         elif self.model_stage == "tts":
@@ -329,11 +341,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             # suffix, so a normal token embedding is exact. Re-running the AV
             # processor here would both duplicate prefill and defeat P/D.
             embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
-            decode_info = {
-                key: value
-                for key, value in duplex.items()
-                if key != "payload"
-            }
+            decode_info = {key: value for key, value in duplex.items() if key != "payload"}
             decode_info.setdefault(
                 "special_token_ids",
                 self._minicpmo45_native_duplex_token_ids(),
@@ -366,30 +374,20 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
             return input_ids, embeds, {"duplex": {"prefill_success": False, "reason": "bad_duplex_payload"}}
 
-        session_key = (session_id, incarnation)
-        state = helper.sessions.get(session_key)
-        if state is None:
-            from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
-                _MiniCPMO45Stage0SessionState,
-            )
+        session_config = duplex.get("session_config")
+        session_config = dict(session_config) if isinstance(session_config, dict) else {}
+        runtime_config = duplex.get("runtime_config")
+        runtime_config = dict(runtime_config) if isinstance(runtime_config, dict) else {}
+        state = helper.get_or_create_session_state(
+            session_id,
+            incarnation,
+            session_config=session_config,
+            runtime_config=runtime_config,
+        )
 
-            state = _MiniCPMO45Stage0SessionState(session_id=session_id)
-            helper.sessions[session_key] = state
-            session_config = duplex.get("session_config")
-            session_config = dict(session_config) if isinstance(session_config, dict) else {}
-            runtime_config = duplex.get("runtime_config")
-            runtime_config = dict(runtime_config) if isinstance(runtime_config, dict) else {}
-            if hasattr(helper.thinker, "audio_past_key_values"):
-                helper.thinker.audio_past_key_values = None
-            helper._configure_streaming_processor(state)
-            helper._prepare_session_context(state, session_config, runtime_config=runtime_config)
-
+        audio_decode_start = time.perf_counter() if _MINICPMO45_LOG_PREP_DIAG else 0.0
         audio_waveform = helper._decode_audio_payload(payload)
-        try:
-            video_frames = helper._decode_video_frames_payload(payload)
-        except ValueError as exc:
-            embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
-            return input_ids, embeds, {"duplex": {"prefill_success": False, "reason": str(exc)}}
+        audio_decode_ms = (time.perf_counter() - audio_decode_start) * 1000.0 if _MINICPMO45_LOG_PREP_DIAG else 0.0
         seq = duplex.get("seq")
         try:
             seq = int(seq) if seq is not None else None
@@ -409,11 +407,45 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 seq=seq,
                 force_listen=bool(payload.get("force_listen", False)),
             )
+        video_frames = None
+        preprocessed_vision = None
+        preencoded_vision = None
+        preprocessed_audio = None
+        batched_vision = kwargs.get(_MINICPMO45_BATCHED_VISION_KEY)
+        if isinstance(batched_vision, dict):
+            identity = (
+                session_id,
+                incarnation,
+                epoch,
+                seq,
+            )
+            if batched_vision.get("identity") == identity:
+                candidate_frames = batched_vision.get("video_frames")
+                if isinstance(candidate_frames, list):
+                    video_frames = candidate_frames
+                    preprocessed_vision = batched_vision.get("processed")
+                    candidate_blocks = batched_vision.get("frame_blocks")
+                    if isinstance(candidate_blocks, list):
+                        preencoded_vision = candidate_blocks
+                    preprocessed_audio = batched_vision.get("audio_plan")
+            # The runner calls preprocess_batch() immediately before the
+            # per-request preprocess loop. Release the CPU image tensors after
+            # this request consumes (or rejects) them; a retry prepares them again.
+            batched_vision.clear()
+        if video_frames is None:
+            try:
+                video_frames = helper._decode_video_frames_payload(payload)
+            except ValueError as exc:
+                embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
+                return input_ids, embeds, {"duplex": {"prefill_success": False, "reason": str(exc)}}
         result = helper._stage_prefill_embeddings_only(
             state,
             audio_waveform,
             video_frames=video_frames,
             max_slice_nums=payload.get("max_slice_nums", 1),
+            preprocessed_vision=preprocessed_vision,
+            preencoded_vision=preencoded_vision,
+            preprocessed_audio=preprocessed_audio,
             epoch=epoch,
             seq=seq,
             is_speech=bool(payload.get("is_speech", False)),
@@ -425,6 +457,21 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if result.get("success") is not True:
             embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
             return input_ids, embeds, {"duplex": update_result}
+        if _MINICPMO45_LOG_PREP_DIAG:
+            diag = result.get("prep_diag")
+            if isinstance(diag, dict):
+                logger.info(
+                    "[MINICPM-PREP] req=%s audio_decode_ms=%.3f "
+                    "vision_consume_ms=%.3f audio_feature_ms=%.3f "
+                    "audio_encoder_ms=%.3f assembly_ms=%.3f stage_total_ms=%.3f",
+                    kwargs.get("request_id", "?"),
+                    audio_decode_ms,
+                    float(diag.get("vision_consume_ms", 0.0)),
+                    float(diag.get("audio_feature_ms", 0.0)),
+                    float(diag.get("audio_encoder_ms", 0.0)),
+                    float(diag.get("assembly_ms", 0.0)),
+                    float(diag.get("stage_total_ms", 0.0)),
+                )
 
         target_dtype = (
             input_embeds.dtype if input_embeds is not None else self.get_input_embeddings(input_ids[:1]).dtype
@@ -493,6 +540,449 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         else:
             req_input_ids = torch.full_like(input_ids, helper._required_token_id("unit_token_id"))
         return req_input_ids, req_embeds, {"duplex": update_result}
+
+    @torch.inference_mode()
+    def preencode_duplex_vision(
+        self,
+        jobs: list[dict[str, object]],
+    ) -> dict[str, object]:
+        """Encode arrival-side camera frames without running the Thinker LLM."""
+        total_start = time.perf_counter() if _MINICPMO45_LOG_PREP_DIAG else 0.0
+        if self.model_stage != "llm" or self._minicpmo_pd_decode:
+            return {"supported": False, "encoded_frames": 0}
+        helper = self._duplex_data_plane_helper()
+        process_image = getattr(helper.processor, "process_image", None)
+        encode_batch = getattr(helper, "_stage_vision_embeddings_batch", None)
+        cache_embeddings = getattr(helper, "cache_arrival_vision_embeddings", None)
+        if not callable(process_image) or not callable(encode_batch) or not callable(cache_embeddings):
+            return {"supported": False, "encoded_frames": 0}
+
+        def prepare(job: dict[str, object]):
+            session_id = job.get("session_id")
+            raw_frames = job.get("video_frames")
+            raw_ids = job.get("preencode_ids")
+            if (
+                not isinstance(session_id, str)
+                or not session_id
+                or not isinstance(raw_frames, list)
+                or not raw_frames
+                or not isinstance(raw_ids, list)
+                or len(raw_ids) != len(raw_frames)
+                or not all(isinstance(value, str) and value for value in raw_ids)
+            ):
+                return None
+            try:
+                incarnation = int(job.get("incarnation", 0))
+                epoch = int(job.get("epoch", 0))
+            except (TypeError, ValueError):
+                return None
+            raw_limits = job.get("max_slice_nums", 1)
+            if isinstance(raw_limits, int) and not isinstance(raw_limits, bool):
+                max_slice_nums = max(1, raw_limits)
+            elif (
+                isinstance(raw_limits, list)
+                and len(raw_limits) == len(raw_frames)
+                and raw_limits
+                and all(isinstance(value, int) and not isinstance(value, bool) for value in raw_limits)
+                and len({max(1, value) for value in raw_limits}) == 1
+            ):
+                max_slice_nums = max(1, raw_limits[0])
+            else:
+                return None
+            payload = {
+                "video_frames": list(raw_frames),
+                "max_slice_nums": max_slice_nums,
+            }
+            try:
+                frames = helper._decode_video_frames_payload(payload)
+                if not frames:
+                    return None
+                processed = process_image(frames, max_slice_nums=max_slice_nums)
+                if processed is None:
+                    return None
+            except Exception:  # noqa: BLE001 - speculative fallback is request-local
+                return None
+            return (
+                session_id,
+                incarnation,
+                epoch,
+                list(raw_ids),
+                processed,
+            )
+
+        executor = getattr(self, "_minicpmo45_vision_prepare_executor", None)
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=8,
+                thread_name_prefix="minicpmo-vision-prepare",
+            )
+            self._minicpmo45_vision_prepare_executor = executor
+        cpu_start = time.perf_counter() if _MINICPMO45_LOG_PREP_DIAG else 0.0
+        prepared = [item for item in executor.map(prepare, jobs) if item is not None]
+        cpu_prepare_ms = (
+            (time.perf_counter() - cpu_start) * 1000.0
+            if _MINICPMO45_LOG_PREP_DIAG
+            else 0.0
+        )
+        if not prepared:
+            return {"supported": True, "encoded_frames": 0}
+        try:
+            microbatch_size = max(
+                1,
+                int(os.environ.get("MINICPMO45_VISION_ENCODER_BATCH_SIZE", "8")),
+            )
+        except ValueError:
+            microbatch_size = 8
+        vision_device = None
+        if _MINICPMO45_LOG_PREP_DIAG:
+            thinker = getattr(self, "thinker", None)
+            vision_module = getattr(thinker, "vpm", None)
+            if vision_module is not None:
+                vision_device = next(vision_module.parameters()).device
+            torch.cuda.synchronize(vision_device)
+            vision_start = time.perf_counter()
+        encoded_batch = encode_batch(
+            [item[4] for item in prepared],
+            microbatch_size=microbatch_size,
+        )
+        if _MINICPMO45_LOG_PREP_DIAG:
+            torch.cuda.synchronize(vision_device)
+            vision_encoder_ms = (time.perf_counter() - vision_start) * 1000.0
+        else:
+            vision_encoder_ms = 0.0
+        if not isinstance(encoded_batch, list) or len(encoded_batch) != len(prepared):
+            return {"supported": True, "encoded_frames": 0}
+        cache_start = time.perf_counter() if _MINICPMO45_LOG_PREP_DIAG else 0.0
+        encoded_frames = 0
+        for item, frame_blocks in zip(prepared, encoded_batch, strict=True):
+            session_id, incarnation, epoch, preencode_ids, _ = item
+            if not isinstance(frame_blocks, list):
+                continue
+            encoded_frames += cache_embeddings(
+                session_id=session_id,
+                incarnation=incarnation,
+                epoch=epoch,
+                preencode_ids=preencode_ids,
+                frame_blocks=frame_blocks,
+            )
+        if _MINICPMO45_LOG_PREP_DIAG:
+            cache_ms = (time.perf_counter() - cache_start) * 1000.0
+            logger.info(
+                "[MINICPM-PREP-ARRIVAL] jobs=%d encoded_frames=%d "
+                "cpu_prepare_ms=%.3f vision_encoder_ms=%.3f cache_ms=%.3f "
+                "total_ms=%.3f done_epoch=%.6f",
+                len(prepared),
+                encoded_frames,
+                cpu_prepare_ms,
+                vision_encoder_ms,
+                cache_ms,
+                (time.perf_counter() - total_start) * 1000.0,
+                time.time(),
+            )
+        return {
+            "supported": True,
+            "encoded_jobs": len(prepared),
+            "encoded_frames": encoded_frames,
+        }
+
+    @torch.inference_mode()
+    def preprocess_batch(
+        self,
+        *,
+        req_ids: list[str],
+        model_intermediate_buffer: dict[str, dict[str, Any]],
+        device: torch.device,
+    ) -> None:
+        """Parallelize native-duplex vision preparation across requests.
+
+        The generic Omni runner invokes ``preprocess`` once per request. That
+        is required for stateful streaming audio. JPEG decode and the PIL/CPU
+        image processor are independent across sessions, so run those parts in
+        parallel. Then encode equal-shaped source/crop tensors together on the
+        GPU; this avoids both request-at-a-time launches and the padding cost of
+        a heterogeneous all-frame batch.
+        """
+        del device
+        batch_start = time.perf_counter() if _MINICPMO45_LOG_PREP_DIAG else 0.0
+        if self.model_stage != "llm" or self._minicpmo_pd_decode:
+            return
+
+        helper = self._duplex_data_plane_helper()
+        sessions = getattr(helper, "sessions", None)
+        get_or_create_state = getattr(helper, "get_or_create_session_state", None)
+        pending: list[tuple[dict[str, Any], tuple[Any, ...], dict[str, Any], int, Any]] = []
+        arrival_hits: list[tuple[dict[str, Any], tuple[Any, ...], dict[str, Any], int, Any]] = []
+
+        for req_id in req_ids:
+            info = model_intermediate_buffer.get(req_id)
+            if not isinstance(info, dict):
+                continue
+            # Drop a value left by an interrupted preprocess pass before
+            # considering the current append.
+            info.pop(_MINICPMO45_BATCHED_VISION_KEY, None)
+            duplex = info.get("duplex")
+            if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
+                continue
+            payload = duplex.get("payload")
+            if not isinstance(payload, dict):
+                continue
+
+            session_id = str(duplex.get("session_id") or "")
+            if not session_id:
+                continue
+            try:
+                incarnation = int(duplex.get("incarnation", 0))
+            except (TypeError, ValueError):
+                incarnation = 0
+            try:
+                epoch_raw = duplex.get("epoch")
+                epoch = int(epoch_raw) if epoch_raw is not None else None
+            except (TypeError, ValueError):
+                epoch = None
+            try:
+                seq_raw = duplex.get("seq")
+                seq = int(seq_raw) if seq_raw is not None else None
+            except (TypeError, ValueError):
+                seq = None
+
+            append_identity = (epoch, seq) if seq is not None else None
+            session_config = duplex.get("session_config")
+            session_config = dict(session_config) if isinstance(session_config, dict) else {}
+            runtime_config = duplex.get("runtime_config")
+            runtime_config = dict(runtime_config) if isinstance(runtime_config, dict) else {}
+            if callable(get_or_create_state):
+                state = get_or_create_state(
+                    session_id,
+                    incarnation,
+                    session_config=session_config,
+                    runtime_config=runtime_config,
+                )
+            else:
+                state = sessions.get((session_id, incarnation)) if isinstance(sessions, dict) else None
+            if (
+                append_identity is not None
+                and state is not None
+                and getattr(state, "prepared_append_identity", None) == append_identity
+            ):
+                continue
+
+            raw_frames = payload.get("video_frames")
+            if not isinstance(raw_frames, list) or not raw_frames:
+                continue
+
+            raw_limits = payload.get("max_slice_nums", 1)
+            if isinstance(raw_limits, int) and not isinstance(raw_limits, bool):
+                uniform_limit = max(1, raw_limits)
+            elif (
+                isinstance(raw_limits, list)
+                and len(raw_limits) == len(raw_frames)
+                and raw_limits
+                and all(isinstance(value, int) and not isinstance(value, bool) for value in raw_limits)
+                and len({max(1, value) for value in raw_limits}) == 1
+            ):
+                # The live protocol carries one entry per frame even when all
+                # frames use the same HD-slicing limit.  Preserve heterogeneous
+                # per-frame limits on the exact serial fallback path.
+                uniform_limit = max(1, raw_limits[0])
+            else:
+                continue
+            raw_preencode_ids = payload.get("video_preencode_ids")
+            if (
+                isinstance(raw_preencode_ids, list)
+                and len(raw_preencode_ids) == len(raw_frames)
+                and all(isinstance(preencode_id, str) and preencode_id for preencode_id in raw_preencode_ids)
+                and len(set(raw_preencode_ids)) == len(raw_preencode_ids)
+            ):
+                take_preencoded = getattr(helper, "take_arrival_vision_embeddings", None)
+                frame_blocks = (
+                    take_preencoded(
+                        session_id=session_id,
+                        incarnation=incarnation,
+                        epoch=epoch,
+                        preencode_ids=list(raw_preencode_ids),
+                    )
+                    if callable(take_preencoded)
+                    else None
+                )
+                if isinstance(frame_blocks, list) and len(frame_blocks) == len(raw_frames):
+                    identity = (session_id, incarnation, epoch, seq)
+                    info[_MINICPMO45_BATCHED_VISION_KEY] = {
+                        "identity": identity,
+                        "video_frames": list(raw_frames),
+                        "frame_blocks": frame_blocks,
+                    }
+                    arrival_hits.append((info, identity, payload, uniform_limit, state))
+                    continue
+            pending.append(
+                (
+                    info,
+                    (session_id, incarnation, epoch, seq),
+                    payload,
+                    uniform_limit,
+                    state,
+                )
+            )
+
+        batch_items = [*pending, *arrival_hits]
+        if _MINICPMO45_LOG_PREP_DIAG and arrival_hits:
+            logger.info(
+                "[MINICPM-PREP-ARRIVAL-HIT] requests=%d",
+                len(arrival_hits),
+            )
+        # A singleton has no CPU/audio parallelism to exploit. An arrival hit
+        # has already installed its vision blocks and will still skip the
+        # request-local encoder on the ordinary per-request path.
+        if len(batch_items) < 2:
+            return
+
+        def prepare_vision(
+            item: tuple[
+                dict[str, Any],
+                tuple[Any, ...],
+                dict[str, Any],
+                int,
+                Any,
+            ],
+        ):
+            info, identity, payload, max_slice_nums, state = item
+            try:
+                frames = helper._decode_video_frames_payload(payload)
+                if not frames:
+                    return None
+                process_image = getattr(helper.processor, "process_image", None)
+                if not callable(process_image):
+                    return None
+                processed = process_image(frames, max_slice_nums=max_slice_nums)
+                if processed is None:
+                    return None
+            except Exception:  # noqa: BLE001 - preserve serial error handling
+                # Preserve the existing per-request error path and do not let
+                # one malformed frame poison other sessions.
+                return None
+            return info, identity, frames, processed, state
+
+        def prepare_audio(
+            item: tuple[
+                dict[str, Any],
+                tuple[Any, ...],
+                dict[str, Any],
+                int,
+                Any,
+            ],
+        ):
+            _info, identity, payload, _max_slice_nums, state = item
+            if state is None:
+                return identity, None
+            try:
+                audio_waveform = helper._decode_audio_payload(payload)
+                return identity, helper._prepare_streaming_audio_append(
+                    state,
+                    audio_waveform,
+                )
+            except Exception:  # noqa: BLE001 - preserve serial fallback
+                return identity, None
+
+        executor = getattr(self, "_minicpmo45_vision_prepare_executor", None)
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=8,
+                thread_name_prefix="minicpmo-vision-prepare",
+            )
+            self._minicpmo45_vision_prepare_executor = executor
+        audio_executor = getattr(self, "_minicpmo45_audio_prepare_executor", None)
+        if audio_executor is None:
+            audio_executor = ThreadPoolExecutor(
+                max_workers=8,
+                thread_name_prefix="minicpmo-audio-prepare",
+            )
+            self._minicpmo45_audio_prepare_executor = audio_executor
+        # Audio Mel extraction and image decoding are independent. Submit the
+        # former first, then let it continue on CPU while the main thread runs
+        # the batched vision tower on GPU.
+        audio_futures = {item[1]: audio_executor.submit(prepare_audio, item) for item in batch_items}
+        cpu_prepare_start = time.perf_counter() if _MINICPMO45_LOG_PREP_DIAG else 0.0
+        prepared_items = [prepared for prepared in executor.map(prepare_vision, pending) if prepared is not None]
+        if not prepared_items and not arrival_hits:
+            return
+        cpu_prepare_ms = (time.perf_counter() - cpu_prepare_start) * 1000.0 if _MINICPMO45_LOG_PREP_DIAG else 0.0
+
+        frame_blocks_batch = None
+        vision_batch_ms = 0.0
+        encode_batch = getattr(helper, "_stage_vision_embeddings_batch", None)
+        if callable(encode_batch) and prepared_items:
+            try:
+                microbatch_size = max(
+                    1,
+                    int(os.environ.get("MINICPMO45_VISION_ENCODER_BATCH_SIZE", "8")),
+                )
+            except ValueError:
+                microbatch_size = 8
+            if _MINICPMO45_LOG_PREP_DIAG:
+                torch.cuda.synchronize()
+                vision_batch_start = time.perf_counter()
+            frame_blocks_batch = encode_batch(
+                [prepared[3] for prepared in prepared_items],
+                microbatch_size=microbatch_size,
+            )
+            if _MINICPMO45_LOG_PREP_DIAG:
+                torch.cuda.synchronize()
+                vision_batch_ms = (time.perf_counter() - vision_batch_start) * 1000.0
+            if not isinstance(frame_blocks_batch, list) or len(frame_blocks_batch) != len(prepared_items):
+                frame_blocks_batch = None
+
+        audio_wait_start = time.perf_counter() if _MINICPMO45_LOG_PREP_DIAG else 0.0
+        audio_plans: dict[tuple[Any, ...], Any] = {}
+        for identity, future in audio_futures.items():
+            try:
+                _returned_identity, audio_plan = future.result()
+            except Exception:  # noqa: BLE001 - preserve serial fallback
+                audio_plan = None
+            audio_plans[identity] = audio_plan
+        audio_wait_ms = (time.perf_counter() - audio_wait_start) * 1000.0 if _MINICPMO45_LOG_PREP_DIAG else 0.0
+        audio_batch_start = time.perf_counter() if _MINICPMO45_LOG_PREP_DIAG else 0.0
+        prepared_audio = [
+            (audio_plans.get(item[1]), item[4])
+            for item in batch_items
+            if audio_plans.get(item[1]) is not None and item[4] is not None
+        ]
+        if len(prepared_audio) >= 2:
+            helper._stage_audio_embeddings_batch(prepared_audio)
+        if _MINICPMO45_LOG_PREP_DIAG:
+            torch.cuda.synchronize()
+            audio_batch_ms = (time.perf_counter() - audio_batch_start) * 1000.0
+
+        for index, prepared in enumerate(prepared_items):
+            info, identity, frames, processed, _state = prepared
+            audio_plan = audio_plans.get(identity)
+            cached = {
+                "identity": identity,
+                "video_frames": frames,
+                "processed": processed,
+            }
+            if audio_plan is not None:
+                cached["audio_plan"] = audio_plan
+            if frame_blocks_batch is not None:
+                request_blocks = frame_blocks_batch[index]
+                if isinstance(request_blocks, list) and len(request_blocks) == len(frames):
+                    cached["frame_blocks"] = request_blocks
+            info[_MINICPMO45_BATCHED_VISION_KEY] = cached
+        for info, identity, _payload, _max_slice_nums, _state in arrival_hits:
+            cached = info.get(_MINICPMO45_BATCHED_VISION_KEY)
+            audio_plan = audio_plans.get(identity)
+            if isinstance(cached, dict) and audio_plan is not None:
+                cached["audio_plan"] = audio_plan
+        if _MINICPMO45_LOG_PREP_DIAG:
+            logger.info(
+                "[MINICPM-PREP-BATCH] reqs=%d cpu_image_ms=%.3f "
+                "vision_batch_ms=%.3f audio_wait_ms=%.3f "
+                "audio_batch_ms=%.3f total_ms=%.3f",
+                len(batch_items),
+                cpu_prepare_ms,
+                vision_batch_ms,
+                audio_wait_ms,
+                audio_batch_ms,
+                (time.perf_counter() - batch_start) * 1000.0,
+            )
 
     def _duplex_data_plane_helper(self):
         helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
@@ -603,9 +1093,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             # duplex Thinker->Talker bridge. P therefore exports KV only; an
             # O(context) hidden-state snapshot would duplicate host memory and
             # copy work every 1 s unit without affecting native audio output.
-            multimodal_outputs = (
-                {} if self._minicpmo_pd_prefill else {"latent": text_hidden_states}
-            )
+            # In native P/D, D's generic scheduled-hidden payload is the
+            # canonical delta.  Emitting the same tensor again as ``latent``
+            # duplicates every D->Core IPC payload; the output processor maps
+            # generic ``hidden`` to the stage's latent modality.
+            multimodal_outputs = {} if getattr(self, "_minicpmo_pd_thinker", False) else {"latent": text_hidden_states}
             runtime_info = kwargs.get("runtime_additional_information")
             if runtime_info and isinstance(runtime_info, list) and len(runtime_info) > 0:
                 duplex_rows = []
@@ -695,6 +1187,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 session_key = request_sessions.pop(request_id, None)
                 if session_key is not None and isinstance(sessions, dict):
                     sessions.pop(session_key, None)
+                    discard_preencoded = getattr(helper, "discard_arrival_vision_session", None)
+                    if callable(discard_preencoded):
+                        discard_preencoded(*session_key)
         forced_segments = getattr(self, "_minicpmo45_force_listen_applied_segments", None)
         if isinstance(forced_segments, set):
             finished = set(finished_req_ids)

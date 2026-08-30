@@ -955,6 +955,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         model = getattr(self, "model", None)
         return bool(getattr(model, "requires_full_prefix_cached_multimodal_outputs", True))
 
+    def _multimodal_outputs_for_prefix_cache(self, multimodal_outputs: Any) -> dict | None:
+        """Return MM rows for the CPU side-cache only when the model consumes it."""
+        if not multimodal_outputs or not self._model_needs_full_prefix_multimodal_outputs():
+            return None
+        return flatten_payload(multimodal_outputs)
+
     def _model_supports_delta_prefix_multimodal_outputs(self) -> bool:
         """Whether a model can emit only the newly scheduled MM rows.
 
@@ -1839,9 +1845,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 if hs_for_cache is None and self._model_omni_pooler_payload_include_hidden():
                     hidden_states_cpu = hidden_states[:num_tokens_unpadded].detach().to("cpu").contiguous()
                 slot_mapping_gpu = self.input_batch.block_table[0].slot_mapping.gpu
+                mm_for_cache = self._multimodal_outputs_for_prefix_cache(
+                    multimodal_outputs
+                )
                 self.omni_prefix_cache.schedule_async_write(
                     hidden_states_gpu=hs_for_cache,
-                    multimodal_outputs_gpu=(flatten_payload(multimodal_outputs) if multimodal_outputs else None),
+                    multimodal_outputs_gpu=mm_for_cache,
                     slot_mapping_gpu=slot_mapping_gpu,
                     num_tokens_unpadded=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded,

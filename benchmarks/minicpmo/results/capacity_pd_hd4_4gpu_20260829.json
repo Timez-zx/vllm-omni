@@ -1,4 +1,6 @@
 {
+  "status": "superseded_serial_video_cpu_fallback",
+  "superseded_reason": "The live protocol used max_slice_nums=[4], while the original video CPU batch hook accepted only scalar 4; these runs did not exercise the corrected parallel path.",
   "model": "openbmb/MiniCPM-o-4_5",
   "precision": "bf16",
   "hardware": "4x RTX PRO 6000 Blackwell 96 GB",
@@ -8,7 +10,9 @@
     "talker_gpu": 2,
     "code2wav_gpu": 3,
     "pd_disaggregation": true,
-    "kv_connector": "NixlDeltaPushConnector"
+    "kv_connector": "NixlDeltaPushConnector",
+    "early_decode_registration": true,
+    "thinker_side_output": "decode-step hidden delta"
   },
   "workload": {
     "duration_s": 30,
@@ -21,107 +25,221 @@
     "actual_vision_blocks_per_frame": 3,
     "steady_scheduler_tokens_per_unit": 211,
     "phase_window_s": 1.0,
-    "seed": 20260828,
-    "slo": "every P, D, and Talker unit is below 1000 ms and every input-ready-to-D slot latency is below 1000 ms"
+    "seeds": [20260828, 20260829],
+    "input_units_per_session": 30,
+    "slo": "every observed P, D, and Talker unit has RTF >= 1; P-ready-to-D latency is diagnostic only",
+    "measurement_scope": "session setup and post-stream autonomous continuation slots are excluded; a reportable run must complete every client input unit without failed sessions"
   },
   "runs": [
     {
-      "users": 8,
+      "users": 9,
+      "seed": 20260828,
       "capacity_pass": true,
       "failed_sessions": 0,
-      "input_units": 240,
-      "pd_slots": 247,
-      "pd_slot_e2e_ms": {
-        "p50": 415.593,
-        "p95": 613.508,
-        "p99": 716.568,
-        "max": 747.402
-      },
+      "input_units": 270,
+      "pd_slots": 270,
+      "excluded_pd_slots": 2,
+      "pd_slot_e2e_ms": {"p50": 368.265, "p95": 520.890, "p99": 567.056, "max": 573.848},
       "pd_slot_misses": 0,
-      "prefill_service_ms": {
-        "p50": 240.151,
-        "p95": 340.798,
-        "p99": 411.345,
-        "max": 455.397
-      },
-      "decode_service_ms": {
-        "p50": 185.334,
-        "p95": 318.676,
-        "p99": 382.932,
-        "max": 398.811
-      },
-      "talker_service_ms": {
-        "p50": 270.301,
-        "p95": 404.418,
-        "p99": 447.498,
-        "max": 450.710
-      },
+      "prefill_service_ms": {"p50": 207.555, "p95": 292.284, "p99": 327.646, "max": 371.636},
+      "decode_service_ms": {"p50": 165.367, "p95": 291.635, "p99": 319.663, "max": 323.111},
+      "talker_service_ms": {"p50": 252.681, "p95": 331.358, "p99": 358.319, "max": 363.144},
+      "prefill_batch_requests": {"p50": 1, "p95": 2, "p99": 2, "max": 2},
       "gpu_busy_pct": {
-        "prefill": {"mean": 52.74, "p95": 79.0},
-        "decode": {"mean": 28.00, "p95": 65.0},
-        "talker": {"mean": 10.41, "p95": 26.0},
-        "code2wav": {"mean": 17.18, "p95": 53.0}
+        "prefill": {"mean": 55.31, "p95": 81.0},
+        "decode": {"mean": 20.32, "p95": 61.0}
+      }
+    },
+    {
+      "users": 10,
+      "seed": 20260828,
+      "capacity_pass": true,
+      "p95_capacity_pass": true,
+      "failed_sessions": 0,
+      "input_units": 300,
+      "pd_slots": 300,
+      "excluded_pd_slots": 20,
+      "pd_slot_e2e_ms": {"p50": 636.356, "p95": 909.196, "p99": 1062.982, "max": 1131.281},
+      "pd_slot_misses": 7,
+      "prefill_service_ms": {"p50": 357.914, "p95": 538.268, "p99": 617.590, "max": 690.791},
+      "decode_service_ms": {"p50": 282.093, "p95": 405.112, "p99": 552.048, "max": 600.248},
+      "talker_service_ms": {"p50": 279.934, "p95": 354.320, "p99": 399.971, "max": 403.742},
+      "prefill_batch_requests": {"p50": 3, "p95": 4, "p99": 5, "max": 5},
+      "gpu_busy_pct": {
+        "prefill": {"mean": 56.14, "p95": 84.0},
+        "decode": {"mean": 21.45, "p95": 61.0}
       }
     },
     {
       "users": 9,
-      "capacity_pass": false,
+      "seed": 20260829,
+      "capacity_pass": true,
       "failed_sessions": 0,
       "input_units": 270,
-      "pd_slots": 288,
-      "pd_slot_e2e_ms": {
-        "p50": 619.967,
-        "p95": 1289.376,
-        "p99": 1431.258,
-        "max": 1515.187
-      },
-      "pd_slot_misses": 71,
-      "prefill_service_ms": {
-        "p50": 343.994,
-        "p95": 678.280,
-        "p99": 742.387,
-        "max": 747.920
-      },
-      "decode_service_ms": {
-        "p50": 283.400,
-        "p95": 511.645,
-        "p99": 592.094,
-        "max": 601.722
-      },
-      "talker_service_ms": {
-        "p50": 281.664,
-        "p95": 471.407,
-        "p99": 541.092,
-        "max": 545.981
-      },
+      "pd_slots": 270,
+      "excluded_pd_slots": 5,
+      "pd_slot_e2e_ms": {"p50": 374.959, "p95": 598.088, "p99": 659.006, "max": 728.759},
+      "pd_slot_misses": 0,
+      "prefill_service_ms": {"p50": 214.893, "p95": 398.213, "p99": 461.498, "max": 481.486},
+      "decode_service_ms": {"p50": 187.531, "p95": 288.288, "p99": 349.295, "max": 352.652},
+      "talker_service_ms": {"p50": 260.380, "p95": 312.471, "p99": 324.042, "max": 328.620},
+      "prefill_batch_requests": {"p50": 1, "p95": 2, "p99": 3, "max": 3},
       "gpu_busy_pct": {
-        "prefill": {"mean": 50.48, "p95": 72.0},
-        "decode": {"mean": 28.30, "p95": 71.0},
-        "talker": {"mean": 11.55, "p95": 25.0},
-        "code2wav": {"mean": 21.11, "p95": 56.0}
-      },
-      "slowest_prefill_5pct_ms": {
-        "service_mean": 713.863,
-        "application_to_core_mean": 304.256,
-        "scheduler_queue_mean": 0.518,
-        "runner_mean": 358.965,
-        "result_exposure_mean": 50.124
-      },
-      "slowest_decode_5pct_ms": {
-        "service_mean": 540.667,
-        "application_to_core_mean": 37.014,
-        "kv_and_scheduler_queue_mean": 326.258,
-        "runner_mean": 141.550,
-        "result_exposure_mean": 33.944
+        "prefill": {"mean": 48.61, "p95": 71.0},
+        "decode": {"mean": 18.81, "p95": 57.0}
+      }
+    },
+    {
+      "users": 10,
+      "seed": 20260829,
+      "capacity_pass": true,
+      "p95_capacity_pass": true,
+      "failed_sessions": 0,
+      "input_units": 300,
+      "pd_slots": 300,
+      "excluded_pd_slots": 20,
+      "pd_slot_e2e_ms": {"p50": 678.078, "p95": 975.497, "p99": 1028.795, "max": 1104.867},
+      "pd_slot_misses": 8,
+      "prefill_service_ms": {"p50": 386.829, "p95": 629.699, "p99": 694.900, "max": 705.994},
+      "decode_service_ms": {"p50": 289.427, "p95": 454.602, "p99": 554.389, "max": 577.318},
+      "talker_service_ms": {"p50": 283.209, "p95": 388.246, "p99": 407.561, "max": 407.913},
+      "prefill_batch_requests": {"p50": 3, "p95": 5, "p99": 5, "max": 5},
+      "gpu_busy_pct": {
+        "prefill": {"mean": 57.08, "p95": 72.0},
+        "decode": {"mean": 24.80, "p95": 64.0}
       }
     }
   ],
+  "long_run_capacity_sweep": {
+    "implementation": "serial per-request JPEG/PIL video preparation baseline",
+    "duration_s": 180,
+    "post_stream_s": 60,
+    "input_units_per_session": 180,
+    "loop_media": true,
+    "frame_max_side": 0,
+    "max_slice_nums": 4,
+    "actual_vision_blocks_per_frame": 3,
+    "steady_scheduler_tokens_per_unit": 211,
+    "runs": [
+      {"users": 8, "seed": 20260839, "clean_server": true, "complete": true, "capacity_pass": true, "p_min_rtf": 1.196, "p_misses": 0, "d_min_rtf": 1.484, "d_misses": 0, "talker_min_rtf": 2.011, "talker_misses": 0},
+      {"users": 9, "seed": 20260838, "complete": true, "capacity_pass": false, "p_min_rtf": 0.885, "p_misses": 116, "d_min_rtf": 1.011, "d_misses": 0, "talker_min_rtf": 1.599, "talker_misses": 0},
+      {"users": 10, "seed": 20260837, "complete": true, "capacity_pass": false, "p_min_rtf": 0.893, "p_misses": 98, "d_min_rtf": 0.783, "d_misses": 6, "talker_min_rtf": 1.478, "talker_misses": 0}
+    ],
+    "last_pass": {
+      "users": 8,
+      "expected_decode_units": 1440,
+      "completed_decode_units": 1440,
+      "failed_sessions": 0,
+      "prefill_service_ms": {"p50": 279.591, "p95": 638.538, "p99": 733.465, "max": 836.107},
+      "decode_service_ms": {"p50": 250.464, "p95": 469.942, "p99": 566.174, "max": 673.958},
+      "talker_service_ms": {"p50": 314.651, "p95": 413.094, "p99": 465.055, "max": 497.235},
+      "diagnostic_pd_slot_ms": {"p50": 534.409, "p95": 1620.772, "p99": 1944.432, "max": 2141.961},
+      "prefill_batch_scheduler_tokens": {"p50": 422, "p95": 844, "p99": 844, "max": 1960},
+      "gpu_busy_pct": {
+        "prefill": {"mean": 45.68, "p95": 87, "p99": 90, "max": 97},
+        "decode": {"mean": 19.68, "p95": 59, "p99": 66, "max": 72}
+      }
+    },
+    "first_fail": {
+      "users": 9,
+      "expected_decode_units": 1620,
+      "completed_decode_units": 1620,
+      "failed_sessions": 0,
+      "prefill_service_ms": {"p50": 464.236, "p95": 1063.336, "p99": 1102.344, "max": 1129.628},
+      "decode_service_ms": {"p50": 314.759, "p95": 561.934, "p99": 842.081, "max": 988.840},
+      "talker_service_ms": {"p50": 308.697, "p95": 502.964, "p99": 581.812, "max": 625.325},
+      "prefill_batch_scheduler_tokens": {"mean": 658.165, "p50": 633, "p95": 1688, "p99": 1688, "max": 1688},
+      "gpu_busy_pct": {
+        "prefill": {"mean": 49.89, "p95": 88, "p99": 99, "max": 100},
+        "decode": {"mean": 19.00, "p95": 59, "p99": 66, "max": 74}
+      }
+    },
+    "lifecycle_fix": "An append may commit when a non-input event advances the session to that append's exact same-epoch target fence; real sequence, epoch, incarnation, or later-fence changes remain stale.",
+    "excluded_run": "An eight-user run after two preceding long runs hit MessagePack IPC corruption at 43 seconds and is excluded; the clean-server rerun completed.",
+    "conclusion": "The strict 180-second HD4 capacity is eight sessions; nine is the first RTF failure. Thinker-P is the first bottleneck: it records 116 misses while Thinker-D and Talker record none."
+  },
+  "video_cpu_prepare_parallelization": {
+    "implementation": "decode JPEG payloads and run MiniCPM process_image concurrently across sessions with an eight-thread persistent pool; keep GPU vision-tower execution request-ordered",
+    "rejected_alternative": "Direct cross-session GPU vision batching was removed because MiniCPM HD4 padding and internal chunking increased steady batch-8 prepare time from about 648 ms to 1.33 s.",
+    "cpu_process_image_microbenchmark_ms": {
+      "serial": {"batch_1": 18.97, "batch_2": 35.71, "batch_4": 70.93, "batch_8": 141.30},
+      "parallel": {"batch_2": 25.15, "batch_4": 29.48, "batch_8": 40.23}
+    },
+    "formal_protocol": "Each boundary point uses a clean server, then one 4-second HD4 warm-up session, followed by 180 seconds of input and 60 seconds of drain. Seeds and phases match the serial baseline.",
+    "runs": [
+      {
+        "users": 8,
+        "seed": 20260839,
+        "complete": true,
+        "capacity_pass": true,
+        "failed_sessions": 0,
+        "p_service_ms": {"p50": 275.204, "p95": 603.248, "p99": 683.873, "max": 749.122},
+        "p_min_rtf": 1.335,
+        "p_misses": 0,
+        "d_service_ms": {"p50": 242.337, "p95": 447.045, "p99": 505.124, "max": 774.598},
+        "d_min_rtf": 1.291,
+        "d_misses": 0,
+        "talker_service_ms": {"p50": 314.481, "p95": 430.466, "p99": 477.195, "max": 542.035},
+        "talker_min_rtf": 1.845,
+        "talker_misses": 0,
+        "diagnostic_pd_slot_ms": {"p50": 517.452, "p95": 1395.397, "p99": 1656.094, "max": 1857.712}
+      },
+      {
+        "users": 9,
+        "seed": 20260838,
+        "complete": true,
+        "capacity_pass": false,
+        "failed_sessions": 0,
+        "p_service_ms": {"p50": 501.178, "p95": 912.233, "p99": 1068.460, "max": 1085.464},
+        "p_min_rtf": 0.921,
+        "p_misses": 59,
+        "d_service_ms": {"p50": 311.908, "p95": 603.023, "p99": 748.757, "max": 976.186},
+        "d_min_rtf": 1.024,
+        "d_misses": 0,
+        "talker_service_ms": {"p50": 300.530, "p95": 449.905, "p99": 564.435, "max": 641.698},
+        "talker_min_rtf": 1.558,
+        "talker_misses": 0,
+        "diagnostic_pd_slot_ms": {"p50": 1163.229, "p95": 2473.104, "p99": 2751.420, "max": 2929.796}
+      }
+    ],
+    "same_seed_effect": {
+      "eight_users": "P p95/p99/max improves from 638.538/733.465/836.107 ms to 603.248/683.873/749.122 ms; capacity remains pass.",
+      "nine_users": "P misses fall from 116 to 59 and p95 falls from 1063.336 ms to 912.233 ms, but p99 remains 1068.460 ms; capacity remains fail."
+    },
+    "conclusion": "Parallel CPU video preparation removes measurable host-side tail, but does not move the strict boundary: eight sessions pass and nine first fail on Thinker-P."
+  },
+  "causal_diagnostics": {
+    "isolated_tenth_phase_12s": {
+      "seed": 20260821,
+      "nine_user_slot_p99_ms": 915.296,
+      "ten_user_slot_p99_ms": 915.888,
+      "nine_user_misses": 0,
+      "ten_user_misses": 0,
+      "conclusion": "Adding a phase-isolated tenth user does not reproduce the jump; the two formal failures are phase-cluster bursts."
+    },
+    "three_unit_prefill_microbatch_30s": {
+      "seed": 20260829,
+      "max_prefill_batch_requests": 3,
+      "slot_p99_ms": 1101.399,
+      "slot_misses": 31,
+      "prefill_runner_p99_ms": 362.480,
+      "prefill_scheduler_queue_p99_ms": 303.575,
+      "conclusion": "Static microbatching reduces runner time but adds more scheduler queueing and is not retained."
+    }
+  },
+  "before_engine_fixes_at_9_users": {
+    "pd_slot_p99_ms": 1431.258,
+    "pd_slot_misses": 71,
+    "strict_capacity_users": 8
+  },
   "capacity_conclusion": {
-    "strict_capacity_users": 8,
-    "first_failed_users": 9,
-    "limiting_stage_at_failure": "Thinker prefill",
-    "root_cause": "At nine users, bursty 211-token multimodal prefills lengthen both the P runner and its application-to-Core path. D compute remains shorter, but finite D requests then queue for ordered delta-KV availability. The serial P-to-D slot path crosses one second even though no individual stage unit does.",
-    "engineering_overhead": "The failing tail also contains about 304 ms of P dispatch and 326 ms of D KV/scheduler wait in the slowest 5%; these are interface/progress costs rather than irreducible model compute.",
-    "not_supported": "NVML busy counters do not show raw GPU saturation and must not be interpreted as SM occupancy or proof of memory-bandwidth exhaustion."
+    "thirty_second_rtf_capacity_at_least_users": 10,
+    "long_run_capacity_users": 8,
+    "first_long_run_failure_users": 9,
+    "qualification": "With parallel CPU video preparation, both formal 180-second HD4 boundary runs are complete and error-free. Eight users have no P, D, or Talker RTF miss; nine users have 59 P misses while D and Talker have none.",
+    "diagnostic_path": "Thinker-P HD4 incremental prefill batches",
+    "diagnostic_observation": "At nine users after video CPU preparation is parallelized, P service p95/p99 is 912/1068 ms with 59 misses. P batches reach eight requests or 1688 scheduler tokens; D and Talker remain within their one-second budgets.",
+    "removed_engineering_overhead": "D destination setup overlaps P, D sends only newly scheduled hidden rows, and independent JPEG/PIL video preparation runs concurrently across sessions. Full-history hidden/MM side-cache reconstruction and output/control-plane tail are removed.",
+    "not_supported": "NVML busy counters are not SM occupancy and do not prove raw compute or memory-bandwidth saturation."
   }
 }

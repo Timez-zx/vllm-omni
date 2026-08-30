@@ -1435,10 +1435,128 @@ def test_minicpmo_pcm_append_buffer_drops_serving_new_user_turn_marker():
 def test_minicpmo_merge_native_audio_payloads_preserves_speech_marker():
     first = _native_audio_payload(samples=8000)
     second = _native_audio_payload(samples=8000, value=0.0, is_speech=False)
+    first.update(
+        video_frames=["frame-a"],
+        max_slice_nums=[4],
+        video_preencode_ids=["cache-a"],
+    )
+    second.update(
+        video_frames=["frame-b"],
+        max_slice_nums=[4],
+        video_preencode_ids=["cache-b"],
+    )
 
     merged = OmniDuplexSessionHandler._merge_native_audio_payloads(first, second)
 
     assert merged["is_speech"] is True
+    assert merged["video_frames"] == ["frame-a", "frame-b"]
+    assert merged["video_preencode_ids"] == ["cache-a", "cache-b"]
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_arrival_vision_preencode_microbatches_stage0_rpc():
+    class _PreencodeEngine(FakeEngineClient):
+        def __init__(self):
+            super().__init__()
+            self.preencode_calls = []
+
+        async def collective_rpc(
+            self,
+            *,
+            method,
+            args,
+            stage_ids,
+            timeout,
+        ):
+            self.preencode_calls.append((method, args, stage_ids, timeout))
+            return [{"supported": True, "encoded_frames": len(args[0])}]
+
+    engine = _PreencodeEngine()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+
+    first, second = await asyncio.gather(
+        handler._preencode_minicpmo45_vision(
+            {"session_id": "a", "preencode_ids": ["a"]},
+            timeout_s=2,
+        ),
+        handler._preencode_minicpmo45_vision(
+            {"session_id": "b", "preencode_ids": ["b"]},
+            timeout_s=3,
+        ),
+    )
+
+    assert first is True
+    assert second is True
+    assert len(engine.preencode_calls) == 1
+    method, args, stage_ids, timeout = engine.preencode_calls[0]
+    assert method == "preencode_minicpmo45_vision"
+    assert len(args[0]) == 2
+    assert stage_ids == [0]
+    assert timeout == 3
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_arrival_vision_preencode_serializes_worker_rpcs():
+    class _SerialPreencodeEngine(FakeEngineClient):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+            self.inflight = 0
+            self.max_inflight = 0
+
+        async def collective_rpc(self, *, method, args, stage_ids, timeout):
+            del method, stage_ids, timeout
+            self.calls.append(list(args[0]))
+            self.inflight += 1
+            self.max_inflight = max(self.max_inflight, self.inflight)
+            if len(self.calls) == 1:
+                self.first_started.set()
+                await self.release_first.wait()
+            self.inflight -= 1
+            return [{"supported": True, "encoded_frames": len(args[0])}]
+
+    engine = _SerialPreencodeEngine()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+
+    first = asyncio.create_task(
+        handler._preencode_minicpmo45_vision(
+            {"session_id": "a", "preencode_ids": ["a"]},
+            timeout_s=2,
+        )
+    )
+    await engine.first_started.wait()
+    second = asyncio.create_task(
+        handler._preencode_minicpmo45_vision(
+            {"session_id": "b", "preencode_ids": ["b"]},
+            timeout_s=2,
+        )
+    )
+    third = asyncio.create_task(
+        handler._preencode_minicpmo45_vision(
+            {"session_id": "c", "preencode_ids": ["c"]},
+            timeout_s=2,
+        )
+    )
+    await asyncio.sleep(0.11)
+    assert len(engine.calls) == 1
+
+    engine.release_first.set()
+    assert await asyncio.gather(first, second, third) == [True, True, True]
+    assert engine.max_inflight == 1
+    assert [[job["session_id"] for job in batch] for batch in engine.calls] == [
+        ["a"],
+        ["b", "c"],
+    ]
 
 
 def test_minicpmo_merge_drops_serving_new_user_turn_marker():
@@ -1481,6 +1599,54 @@ async def test_minicpmo_clear_continuation_does_not_cancel_pending_silence_task(
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_vision_preencode_does_not_run_past_two_unconsumed_frames():
+    async def _complete() -> bool:
+        return True
+
+    native = MiniCPMO45ServingSessionState()
+    first = asyncio.create_task(_complete())
+    second = asyncio.create_task(_complete())
+    assert native.track_vision_preencode(["frame-1"], epoch=0, task=first)
+    assert native.track_vision_preencode(["frame-2"], epoch=0, task=second)
+    await asyncio.gather(first, second)
+
+    # Completed RPCs still correspond to live cached embeddings; completion
+    # alone must not reopen speculative capacity.
+    assert not native.can_start_vision_preencode(frame_count=1, epoch=0)
+
+    assert native.pop_vision_preencode_tasks(["frame-1"], epoch=0) == [first]
+    assert native.can_start_vision_preencode(frame_count=1, epoch=0)
+
+    third = asyncio.create_task(_complete())
+    assert native.track_vision_preencode(["frame-3"], epoch=0, task=third)
+    await third
+    native.cancel_vision_preencode_tasks()
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_vision_preencode_lookahead_can_be_configured(monkeypatch):
+    async def _complete() -> bool:
+        return True
+
+    monkeypatch.setenv(
+        "MINICPMO45_MAX_PENDING_VISION_PREENCODES_PER_SESSION",
+        "3",
+    )
+    native = MiniCPMO45ServingSessionState()
+    tasks = [asyncio.create_task(_complete()) for _ in range(3)]
+    for index, task in enumerate(tasks):
+        assert native.track_vision_preencode(
+            [f"frame-{index}"],
+            epoch=0,
+            task=task,
+        )
+    await asyncio.gather(*tasks)
+
+    assert not native.can_start_vision_preencode(frame_count=1, epoch=0)
+    native.cancel_vision_preencode_tasks()
 
 
 def test_auto_response_playback_overlap_keeps_model_owned_listen_speak_decision():

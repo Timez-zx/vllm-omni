@@ -289,15 +289,28 @@ class RealtimeEventCollector:
 class RealtimeDuplexClient:
     """Small async client used by the user demo and reusable smoke probes."""
 
-    def __init__(self, url: str, *, max_size: int = 64 * 1024 * 1024) -> None:
+    def __init__(
+        self,
+        url: str,
+        *,
+        max_size: int = 64 * 1024 * 1024,
+        open_timeout_s: float = 30.0,
+    ) -> None:
+        if open_timeout_s <= 0:
+            raise ValueError("open_timeout_s must be positive")
         self.url = url
         self.max_size = max_size
+        self.open_timeout_s = open_timeout_s
         self.events = RealtimeEventCollector()
         self._ws: Any = None
         self._reader_task: asyncio.Task[None] | None = None
 
     async def __aenter__(self) -> RealtimeDuplexClient:
-        self._ws = await websockets.connect(self.url, max_size=self.max_size)
+        self._ws = await websockets.connect(
+            self.url,
+            max_size=self.max_size,
+            open_timeout=self.open_timeout_s,
+        )
         self._reader_task = asyncio.create_task(self._read_events())
         return self
 

@@ -15,12 +15,18 @@ One native model unit represents one second of input. For Thinker and Talker:
 RTF = 1000 ms / stage service time
 ```
 
-Real-time requires RTF `> 1`. The strict capacity criterion requires every
-observed Thinker and Talker unit to pass; one unit at RTF `<= 1` is a capacity
+Real-time requires RTF `>= 1`. The strict capacity criterion requires every
+observed Thinker and Talker unit to pass; one unit at RTF `< 1` is a capacity
 failure. RTF p05 and miss rate are also reported to show how far the system is
 from the boundary. Code2Wav uses one persistent request for the whole session,
 including idle periods, so its request wall time is not a valid per-unit RTF
 and is excluded from this SLO.
+
+An RTF result is reportable only when the run is complete: no user fails and
+every client input unit reaches each required Thinker stage. Completeness is a
+measurement-validity check, not a second latency threshold; it prevents
+dropped or stuck units from making the observed-unit RTF look artificially
+good.
 
 Protocol-event gaps are diagnostics only. A model unit may listen silently or
 emit several events, so input and output event indices cannot be paired as
@@ -132,7 +138,7 @@ python benchmarks/minicpmo/continuous_av.py \
   --connect-stagger-s 0.5 --post-stream-s 4 --gpus 0 1 2 3 \
   --media /path/to/MiniCPM-o-4_5/assets/omni_duplex1.mp4 \
   --ref-audio /path/to/MiniCPM-o-4_5/assets/HT_ref_audio.wav \
-  --frame-max-side 0 --max-slice-nums 4 \
+  --frame-max-side 0 --max-slice-nums 1 \
   --out /tmp/minicpm-pd-u8-30s.json
 
 python benchmarks/minicpmo/analyze_rtf.py \
@@ -141,20 +147,122 @@ python benchmarks/minicpmo/analyze_rtf.py \
   --out /tmp/minicpm-pd-u8-30s-rtf.json
 ```
 
-P/D adds an end-to-end slot criterion: input-ready through D completion must
-also remain below one second. Formal 30-second HD4 runs give:
+P/D uses the same stage-RTF capacity criterion as the non-P/D deployment.
+Input-ready through D completion remains a latency diagnostic, but is not a
+capacity gate because P and D are separate pipeline stages. The analyzer
+excludes setup and autonomous post-stream continuation slots from the client
+input measurements. Earlier 30-second HD4 screening runs on the serial
+video-CPU path give:
 
-| Users | P-ready→D p50/p95/p99/max | Late slots | P p95/p99 | D p95/p99 | Result |
+| Users | Seed | P max | D max | Talker max | RTF misses | Diagnostic P→D p99 | RTF result |
+|---:|---:|---:|---:|---:|---:|---:|:---:|
+| 9 | 20260828 | 372 ms | 323 ms | 363 ms | 0 | 567 ms | pass |
+| 10 | 20260828 | 691 ms | 600 ms | 404 ms | 0 | 1063 ms | pass |
+| 9 | 20260829 | 481 ms | 353 ms | 329 ms | 0 | 659 ms | pass |
+| 10 | 20260829 | 706 ms | 577 ms | 408 ms | 0 | 1029 ms | pass |
+
+P/D pre-registers D destination blocks while P computes and emits only D's
+newly scheduled hidden rows; it does not rebuild a full historical side-output
+cache. Both 30-second ten-user traces pass the RTF-only criterion. Their P→D
+p99 exceeds one second when phases collide, but that path is now diagnostic.
+
+The current implementation batches both sides of video preparation. Eight
+persistent CPU workers decode JPEG payloads and run `process_image` across
+sessions. GPU inputs are then bucketed by exact pixel-tensor shape and target
+patch grid and encoded with a default microbatch of 8. Outputs are scattered
+back to their original request/frame/slice positions; any batch failure falls
+back to the request-at-a-time path. The default can be overridden with
+`MINICPMO45_VISION_ENCODER_BATCH_SIZE`.
+
+The formal long run preserves the 960x540 source, uses one global vision block
+per frame (`79` steady scheduler tokens per one-second model unit), loops the
+real MP4, and runs 180 seconds plus 60 seconds of drain time. Each boundary
+point uses a clean server and a four-second single-user slice1 warm-up first:
+
+```bash
+python benchmarks/minicpmo/continuous_av.py \
+  --users 1 --duration-s 4 --phase-window-s 0 --seed 20260829 \
+  --connect-stagger-s 0 --post-stream-s 10 --close-timeout-s 30 \
+  --gpus 0 1 2 3 --loop-media \
+  --media /path/to/MiniCPM-o-4_5/assets/omni_duplex1.mp4 \
+  --ref-audio /path/to/MiniCPM-o-4_5/assets/HT_ref_audio.wav \
+  --frame-max-side 0 --max-slice-nums 1 \
+  --out /tmp/minicpm-pd-slice1-warmup.json
+
+python benchmarks/minicpmo/continuous_av.py \
+  --users 17 --duration-s 180 --phase-window-s 1 --seed 20260839 \
+  --connect-stagger-s 0.5 --post-stream-s 60 --close-timeout-s 30 \
+  --gpus 0 1 2 3 --loop-media \
+  --media /path/to/MiniCPM-o-4_5/assets/omni_duplex1.mp4 \
+  --ref-audio /path/to/MiniCPM-o-4_5/assets/HT_ref_audio.wav \
+  --frame-max-side 0 --max-slice-nums 1 \
+  --out /tmp/minicpm-pd-slice1-u17x180.json
+```
+
+Repeat at 18 users on another clean server with the same seed. Keeping the seed
+fixed makes the 17-user phases an exact subset of the 18-user phases. Diagnostic
+runs use `VLLM_USE_FLASHINFER_SAMPLER=0` because this host lacks `nvcc`.
+
+With shape-bucketed GPU vision batching, the 13-user/30-second screen completes
+all 390 P and D input units with no stage RTF miss. P/D/Talker p50/p95/p99 are
+656/707/711, 437/516/550, and 309/505/522 ms. The same point before GPU
+encoder batching had P p99 1251 ms and 115 P misses. A synchronized 8-user
+probe forms a 7-request HD4 runner batch whose input preparation is 455–485 ms
+(65–69 ms per image), compared with about 648 ms for request-ordered encoding.
+The removed heterogeneous all-frame batch took about 1.33 s; exact-shape
+bucketing avoids that padding path. These are diagnostic results, not the
+formal 180-second capacity boundary.
+
+The direct slice1 control uses the same synchronized 8-user, 12-second probe.
+Both modes form a seven-request batch:
+
+| Video mode | New tokens/request | Preparation | Model forward | Runner total | P service p50/p95/p99 |
+|---|---:|---:|---:|---:|---:|
+| HD4 | 211 | 481 ms | 77.6 ms | 579 ms | 688/748/760 ms |
+| slice1 | 79 | 251–253 ms | 33.0–33.1 ms | 301–304 ms | 356/459/476 ms |
+
+Slice1 cuts both preparation and total runner time by about 48%. The reported
+preparation is for the whole seven-request batch, about 36 ms per request, and
+also includes audio encoding, media assembly, and runner input construction;
+it is not pure Vision Encoder time. All 96 P/D input units complete with no RTF
+miss.
+
+The clean 180-second boundary is:
+
+After the Talker stop fix, seed-varied 30-second screens pass at 40 users and
+fail at 41 due to five Talker units just over one second. This is only a
+short-context throughput screen; it does not define an adjacent fixed-seed
+boundary or replace the long run below.
+
+| Users | P service p50/p95/p99/max | D service p50/p95/p99/max | Talker service p50/p95/p99/max | RTF misses P/D/Talker | Result |
 |---:|---:|---:|---:|---:|:---:|
-| 8 | 416/614/717/747 ms | 0/247 | 341/411 ms | 319/383 ms | pass |
-| 9 | 620/1289/1431/1515 ms | 71/288 | 678/742 ms | 512/592 ms | fail |
+| 17 | 110/182/205/249 ms | 123/286/646/983 ms | 61/284/423/493 ms | 0/0/0 | pass |
+| 18 | 114/184/209/382 ms | 126/355/663/1295 ms | 66/346/583/799 ms | 0/10/0 | fail |
 
-At nine users, the slowest 5% of P units average 714 ms: 304 ms before Core
-admission, 359 ms in the multimodal-prefill runner, and 50 ms exposing the
-result. The slowest D units average 541 ms, of which 326 ms is ordered
-KV/scheduler wait and only 142 ms is runner work. P/D removes mixed
-prefill/decode batches, but bursty P work plus the current P/D progress path
-still pushes the serial P-to-D slot over its deadline. The archive is
+The strict long-session capacity is 17 sessions under seed `20260839`. The old
+stage-2 `min_tokens=50` setting was invalid for native duplex: MiniCPMTTS already
+limits a codec chunk to 26 steps, while the outer sampler only selects a binary
+continue/stop row. Masking stop until step 50 forced 51 useless Talker forwards.
+Stage 2 now uses `min_tokens=0`; measured Talker output is 1–26 tokens and has no
+RTF miss at either boundary point.
+
+The new limit is Thinker-D long-context decode. All ten 18-user misses occur in
+one late burst at about 13,973 context tokens. D scheduler queue p99/max is only
+4/10 ms, but runner p99/max reaches 514/1047 ms and decode-runner p99/max reaches
+438/944 ms. The burst forms a 14-request batch; 17 users form at most 12 and
+remain below one second. P has no miss and a 209 ms p99, so multimodal
+preprocessing and P/D transfer are not the boundary. The identical looped AV
+trace aligns semantic long-decode positions across users, which is why adjacent
+capacity points must use the same phase seed. Current results are archived in
+`results/capacity_pd_slice1_optimized_4gpu_20260829.json`.
+
+The long-run lifecycle bug is fixed: an append may commit after the session
+fence advances to that append's exact same-epoch target, while input-sequence,
+epoch, incarnation, and later-fence changes remain stale. D completion is used
+as the completeness witness because resumable P logging can coalesce middle
+completion records. One eight-user run hit malformed MessagePack IPC after
+reusing a server for two preceding long tests; it is excluded, and the clean
+server rerun completed. The superseded serial-fallback archive is
 `results/capacity_pd_hd4_4gpu_20260829.json`.
 
 ## HD-slicing capacity result

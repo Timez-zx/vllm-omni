@@ -475,6 +475,25 @@ def test_async_omni_output_guard_requires_safe_conditions():
     assert GPUARModelRunner._should_use_async_omni_output(runner)
 
 
+def test_prefix_cache_mm_rows_respect_model_opt_out():
+    runner = _make_async_output_runner()
+    payload = {"latent": torch.tensor([[1.0, 2.0]])}
+
+    runner.model.requires_full_prefix_cached_multimodal_outputs = False
+    assert (
+        GPUARModelRunner._multimodal_outputs_for_prefix_cache(runner, payload)
+        is None
+    )
+
+    runner.model.requires_full_prefix_cached_multimodal_outputs = True
+    cached = GPUARModelRunner._multimodal_outputs_for_prefix_cache(
+        runner,
+        payload,
+    )
+    assert cached is not None
+    assert torch.equal(cached["latent"], payload["latent"])
+
+
 def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch):
     runner = _make_async_output_runner(engine_output_type="latent")
     runner.model.omni_pooler_payload_include_hidden = False

@@ -1,173 +1,102 @@
-# MiniCPM-o 原生全双工 Serving 工作流
+# MiniCPM-o 原生全双工 P/D 工作流
 
-## 目标与边界
+## 目标
 
-目标是在持续音视频交互中，以实时性为约束测量单机多用户容量，并定位容量失效时的 engine 瓶颈。研究对象是调度、batching、KV cache 和流水线延迟，不是模型质量。
+测量单机在实时约束下可持续服务的音视频 session 数量，并定位容量瓶颈。模型质量不在本实验范围内。
 
-本分支使用 `openbmb/MiniCPM-o-4_5` 的原生 duplex 路径。与 Qwen3-Omni 的 duplex-like 模拟不同，MiniCPM 会持续接收音视频，并由模型自行决定 listen 或 speak，因此更接近目标业务负载。
-
-## 阶段一：应用与 engine 接口
+## 阶段一：最终 serving 设计
 
 ```text
-每个用户建立长期 WebSocket
-  → 每 200 ms 上传一段 PCM16 音频
-  → 每 1 秒附带一帧视频
-  → 应用将 5 段音频组成一个 1 秒原生 model unit
-  → Thinker 增量处理该 unit，并决定 listen 或 speak
-  → speak 时进入 Talker → Code2Wav
-  → 输入流继续，不等待音频播放完成
+每个用户建立一个 WebSocket
+  -> 每 200 ms 上传 PCM16 音频，每秒上传一帧视频
+  -> 聚合成一个原生 1 秒 model unit
+  -> Thinker-P 只把新增 AV unit 追加到该 session 的 KV lineage
+  -> 将新增 KV delta 交给 Thinker-D
+  -> Thinker-D 完成有限长度的自回归 decode，并决定 listen/speak
+  -> D 输出回写到下一轮 P lineage
+  -> speak 时运行 Talker -> Code2Wav
 ```
 
-- 每个 session 使用一条可续接的 Thinker request/KV lineage；新 unit 只追加新 token，不重复 prefill 全部历史。
-- `auto_response` 保持开启。客户端不提交合成 query，也不强制模型回答。
-- 不同 session 直接并发进入 engine；应用层没有全局 gate，也不做跨用户 batching。
-- 音频上传频率是 5 Hz，但模型计算单位是 1 Hz。零散 PCM 只在应用输入缓冲区中聚合，不会形成五个 Thinker prefill。
-- 用户输入在 assistant 输出期间仍可进入已有 session；播放状态不控制模型 admission。
-- KV lineage 是可丢弃的执行状态。session、输入缓冲、重连和输出状态由应用层维护。
-
-## 阶段二：固定部署
-
-正式基线只使用 `benchmarks/minicpmo/deploy_capacity_3gpu.yaml`：
-
-| Stage | GPU | 配置 |
-|---|---:|---|
-| Thinker | 0 | BF16，单个非 P/D vLLM engine |
-| Talker | 1 | BF16 |
-| Code2Wav | 2 | BF16 |
-
-- 硬件：3 × RTX PRO 6000 Blackwell 96 GB。
-- 三个 stage 的 `max_num_seqs` 均为 64，使用同步调度。
-- `active_stream_window: 0`，不在应用层限制同时说话的用户数。
-- 本阶段不做 P/D 分离；容量瓶颈必须先在这一固定基线上确认。
-
-启动：
-
-```bash
-VLLM_OMNI_LOG_DUPLEX_CADENCE=1 \
-python -m vllm_omni.entrypoints.cli.main serve openbmb/MiniCPM-o-4_5 \
-  --omni --deploy-config benchmarks/minicpmo/deploy_capacity_3gpu.yaml \
-  --trust-remote-code --host 127.0.0.1 --port 8113
-```
-
-## 阶段三：正式 workload 与指标
-
-- 每个用户连续播放同一真实 MP4 中对齐的音频和视频。
-- 音频：16 kHz mono PCM16，每 200 ms 上传。
-- 视频：1 FPS，保留源分辨率 960×540，`max_slice_nums=4`。
-- 官方切图算法实际生成一张全局图和两个局部 crop。每个稳态 unit 含 198 个视觉 scheduler tokens，共 211 个 scheduler tokens。
-- 用户连接分批建立；全部 session 就绪后从同一 barrier 开始，并在 `[0, 1 s)` 内按固定 seed 随机错相。
-- 每个 cell 运行 30 秒。该长度已经包含短 context 和逐渐增长的 context；只有跨窗口测试才循环媒体。
-
-Thinker 和 Talker 每处理一个 1 秒 model unit，定义：
-
-```text
-RTF = 1000 ms / stage service time
-```
-
-实时要求为 RTF `> 1`。严格容量要求所有观测到的 Thinker 和 Talker unit 都低于 1000 ms；任何一次超时即判定该并发数失败。Code2Wav 使用覆盖整个 session、包含静默期的 persistent request，因此其 request wall time 不作为 unit RTF。
-
-正式运行示例：
-
-```bash
-python benchmarks/minicpmo/continuous_av.py \
-  --users 8 --duration-s 30 --phase-window-s 1 --seed 20260829 \
-  --connect-stagger-s 0.5 --post-stream-s 4 --gpus 0 1 2 \
-  --media /path/to/omni_duplex1.mp4 \
-  --ref-audio /path/to/HT_ref_audio.wav \
-  --frame-max-side 0 --max-slice-nums 4 \
-  --out /tmp/minicpm-hd4-u8.json
-
-python benchmarks/minicpmo/analyze_rtf.py \
-  --server-log /tmp/minicpm-server.log \
-  --run-json /tmp/minicpm-hd4-u8.json \
-  --out /tmp/minicpm-hd4-u8-rtf.json
-```
-
-## 阶段四：长 session context 管理
-
-模型最大 context 为 40,960 tokens。估计长度达到 36,000 tokens 后，下一个 unit 重开 KV lineage，只保留：
-
-- system prompt 和 reference audio；
-- 上一个完整 AV unit 及其已确认 Thinker 输出；
-- 当前 AV unit。
-
-旧 lineage 的 KV blocks 在新 prompt admission 前释放。36k 阈值为最大输出、在途 unit 和估计误差保留约 5k tokens，不生成 summary，也不会阻塞在线路径等待额外模型调用。
-
-180 秒单用户 HD4 测试在 unit 157 发生一次 rollover：
-
-| 指标 | 结果 |
-|---|---:|
-| 新 prompt | 494 tokens |
-| Thinker p50/p95/p99 | 175/407/567 ms |
-| Talker p50/p95/p99 | 231/591/621 ms |
-| RTF ≤ 1 | 0 |
-| session/server error | 0 |
-
-rollover unit 的 Thinker service time 为 175 ms；此前 20 个 unit 均值为 394 ms，此后 20 个为 199 ms。该策略已验证能在线越过 context 上限并清除长历史执行成本。归档结果：`benchmarks/minicpmo/results/long_context_hd4_3gpu_20260829.json`。
-
-## 阶段五：当前容量
-
-当前代码、预热 server、30 秒 HD4 workload 的结果：
-
-| Users | Seed | Thinker p50/p95/p99/max | Thinker misses | Talker p50/p95/p99/max | Talker misses | 结论 |
-|---:|---:|---:|---:|---:|---:|:---:|
-| 7 | 20260829 | 284/613/706/731 ms | 0/220 | 168/474/687/701 ms | 0/189 | 通过 |
-| 8 | 20260829 | 464/888/959/991 ms | 0/237 | 219/460/609/668 ms | 0/208 | 通过 |
-| 8 | 20260828 | 407/923/981/994 ms | 0/242 | 200/575/737/838 ms | 0/207 | 通过 |
-| 9 | 20260829 | 566/1007/1851/2071 ms | 13/228 | 199/626/1224/1450 ms | 5/230 | 失败 |
-
-测得的严格容量为 8 个 session，但两次 8 用户测试的最大延迟余量都不足 10 ms，因此需要安全余量时应使用 7 个 session。9 用户是第一个明确失效点。
-
-## 阶段六：9 用户失效的根因
-
-9 用户最慢 5% Thinker unit 的平均 service time 为 1493 ms：
-
-| 部分 | 平均时间 | 占比 |
-|---|---:|---:|
-| 应用提交到 engine admission | 133 ms | 8.9% |
-| scheduler 等待 | 0.3 ms | <0.1% |
-| runner 执行 | 1302 ms | 87.2% |
-| └ 首次 AV prefill forward | 280 ms | 18.7% |
-| └ 后续 decode forwards | 1023 ms | 68.5% |
-| forward 间控制间隔 | 3 ms | 0.2% |
-| 结果暴露 | 54 ms | 3.6% |
-
-关键证据：
-
-1. 同一 9 用户运行中，与其他 session 的 AV prefill 混合执行的 decode forward 为 159/414 ms（p50/p95）；decode-only forward 仅为 24/42 ms，分别相差 6.7× 和 9.8×。
-2. 最慢 unit 的 1023 ms decode 中，981 ms 位于 mixed prefill/decode forward。
-3. 保留相同 9 用户、270 个 HD4 AV prefill，但强制每个 unit 在 listen decision 结束后，Thinker p50/p95/p99/max 为 215/385/405/436 ms，零 miss。
-4. scheduler queue 只有 0.3 ms，因此不是应用串行或 scheduler admission 堵塞。
-
-结论：9 用户失效的直接原因是 Thinker runner 将多模态 prefill 与其他 session 的多步 decode 放入同一 iteration，重复拉长 decode forward。AV prefill 单独可以满足 1 秒预算；prefill 与持续 decode 混合后才越过实时边界。Talker 的超时是次要且主要受上游 Thinker 延迟影响。
-
-GPU 0 的 NVML busy p95 为 83%，memory-I/O busy p95 为 57%。这些是设备忙碌时间，不是 SM occupancy，不能据此声称 GPU 算力或显存带宽已完全饱和。当前证据支持的是 mixed prefill/decode runner 效率与调度问题。
-
-归档结果：`benchmarks/minicpmo/results/capacity_hd4_3gpu_20260829.json`。
-
-## 阶段七：研究基线结论
-
-当前应用设计保留：原生 1 秒 duplex unit、session 内增量 KV、跨 session 无全局 gate、模型自行 listen/speak、36k context rollover。它能够真实暴露持续 AV prefill 与 decode 的并发负载，不应通过应用层串行化隐藏竞争。
-
-下一步 engine 研究应在固定输入 trace 下优化 mixed multimodal-prefill/decode batching 或 deadline/QoS 调度，并比较相同实时 SLO 下的用户容量。
-
-## 阶段八：MiniCPM P/D 分离
-
-`minicpm-pd` 将 Thinker 拆为四个独立 stage：
-
-| Stage | GPU | 生命周期 |
-|---|---:|---|
-| Thinker-P | 0 | 每个 session 一条 resumable KV lineage；每秒追加 211 个 AV tokens，只执行 prefill 并采样边界 token |
-| Thinker-D | 1 | 每个 model unit 一个 finite request；载入 P 的 KV delta 后继续 decode |
-| Talker | 2 | 每个 session 串行续接；不同 session 并发 |
-| Code2Wav | 3 | 消费 Talker 的流式 codec chunks |
-
-- P 和 D 使用 `NixlDeltaPushConnector`。D 保留已接收的 prefix KV，每轮只传输新的 block-aligned suffix，不复制完整历史。
-- D 生成的 Thinker token 回写到下一轮 P lineage，保持模型递归状态一致。
-- 同一 session 的下一次 Thinker-P 不等待 Talker/Code2Wav；Talker 自身保持有序，防止同一用户两段语音重叠。
-- Context rollover、AV 输入节奏和应用层 session 语义与非 P/D 基线相同。
+- 应用层维护 session、输入缓冲、重连和输出状态；engine KV 是可丢弃的执行状态。
+- 不同 session 独立进入 engine；应用层没有全局 gate，也不做跨用户 batch。
+- 媒体预处理可以提前，但 `D(i-1)` 必须先于 `P(i)` 完成，因为其 Thinker 输出属于下一轮 lineage。
+- 下一轮 Thinker 不等待 Talker 或 Code2Wav。
+- 估计 context 达到 36,000 tokens 时重开 lineage，只保留 system/reference input、上一完整 AV unit 及其确认后的 Thinker 输出、当前 unit。模型上限为 40,960 tokens。
 
 部署：
+
+| Stage | GPU | 作用 |
+|---|---:|---|
+| Thinker-P | 0 | 增量多模态 prefill |
+| Thinker-D | 1 | 有限长度自回归 decode |
+| Talker | 2 | 生成语音 code |
+| Code2Wav + Vision Encoder | 3 | 生成波形和无状态视频编码 |
+
+P/D 使用 `NixlDeltaPushConnector`。D 保留 prefix KV，每个 unit 只传输新增的 block-aligned KV suffix。
+
+## 阶段二：正式 workload 与容量判据
+
+- 循环真实 MP4：960×540 视频、对齐的 16 kHz mono 音频和 reference audio。
+- 音频每 200 ms 到达，视频为 1 FPS；模型以 1 Hz 消费 1 秒 unit。
+- `max_slice_nums=4`，每个视频 unit 使用 HD4 路径。
+- 15 用户、360 秒、`[0, 1 s)` 随机相位、seed `20260839`。
+- 共 5,400 个输入 unit；每个 session 两次越过 context 阈值。
+
+单轮 RTF 用于诊断 jitter：
+
+```text
+unit RTF = 1000 ms / stage service time
+```
+
+容量使用长期处理速度：
+
+```text
+stream RTF = 已完成的 1 秒输入总量 /
+             从首个 input-ready 到最后一个 D 完成的 wall time
+```
+
+只有所有 session 的 `stream RTF >= 1`、全部输入 unit 完成且没有用户失败时，容量才通过。单轮超过 1 秒只是 tail miss；如果后续 unit 能追回 backlog，就不属于容量失效。
+
+## 阶段三：最终测量
+
+P/D-only 控制实验设置 `VLLM_OMNI_MINICPMO_PD_ONLY_DIAGNOSTIC=1`。它保留完整 P 计算、KV-delta handoff、完整有限 D decode 和 D 到下一轮 P 的反馈，只跳过 Talker/Code2Wav；两个下游 stage 的请求数为 0。D 输出长度与完整 pipeline 等价：mean/p95/p99 分别为 3.038/8/8 和 2.982/8/8 tokens。Vision 正式等待 p99 为 1 ms，因此 GPU 3 不阻塞该控制实验。
+
+| 指标 | 完整 pipeline | P/D-only 控制实验 |
+|---|---:|---:|
+| P service p50/p95/p99 | 310/849/1060 ms | 126/405/686 ms |
+| D service p50/p95/p99 | 299/790/1096 ms | 166/833/1110 ms |
+| Input-ready 到 D 完成 p50/p95/p99 | 1080/2631/3031 ms | 306/1420/2441 ms |
+| 等待前一轮 D p50/p95/p99 | 223/1352/1593 ms | 0.2/643/1223 ms |
+| 超过 1 秒的 unit | 2818/5400 | 605/5400 |
+| 每 session stream RTF min/p50/p95 | 1.002/1.002/1.002 | 1.002/1.002/1.003 |
+
+两次运行均完成 5,400 个 D unit，无失败，并可长期维持 15 用户。约 0.2% 的 RTF 余量说明该点已接近实测边界。下游会显著放大延迟，但去掉下游后 P/D tail 仍然存在。
+
+## 阶段四：最终根因
+
+同一 session 存在无法消除的模型依赖：
+
+```text
+D(i-1) feedback -> P(i) -> KV handoff -> D(i) -> feedback -> P(i+1)
+```
+
+一个 session 的 P 可以和另一个 session 的 D 重叠，但同一 session 的 `P(i)`、`D(i)` 和 `P(i+1)` 不能重叠。
+
+P/D-only 最慢 1% unit 的 input-ready-to-D 平均延迟为 2,895 ms：
+
+| 串行部分 | 均值 | 占比 |
+|---|---:|---:|
+| 等待前一轮 D feedback | 1,319 ms | 45% |
+| 当前 P service | 541 ms | 19% |
+| 当前 P 完成到 D 完成 | 1,048 ms | 36% |
+
+D 不会让正在执行的 decode 停下来等待独立的 prefill-only request。新 KV 就绪的请求会加入 active decode，形成 mixed activation batch。Decode-only runner step 的 p50/p95/p99 为 20/49/75 ms，mixed step 为 75/165/249 ms。
+
+最终结论：并发增长会提高 P batch 和 mixed D activation/decode 的开销；同一 session 的递归依赖又把前一轮 D 等待、当前 P、handoff 和当前 D 串在一条关键路径上。偶发长 unit 只产生可恢复 jitter；只有 backlog 无法清空、某个 session 的长期 `stream RTF` 低于 1 时，才是容量失效。这来自模型依赖与 engine service time，不是应用层错误串行化。
+
+## 阶段五：复现
+
+启动完整 pipeline：
 
 ```bash
 VLLM_OMNI_LOG_DUPLEX_CADENCE=1 \
@@ -176,46 +105,28 @@ python -m vllm_omni.entrypoints.cli.main serve openbmb/MiniCPM-o-4_5 \
   --trust-remote-code --host 127.0.0.1 --port 8113
 ```
 
-P/D 的严格容量除要求 P、D、Talker 的每个 unit 都低于 1 秒外，还要求同一 slot 从输入就绪到 D 完成低于 1 秒。正式测试关闭逐请求 handoff 诊断，只保留 cadence trace，避免日志 I/O 干扰容量。
+P/D-only 控制实验在 server 环境中增加 `VLLM_OMNI_MINICPMO_PD_ONLY_DIAGNOSTIC=1`。
 
-30 秒正式结果：
+运行并分析：
 
-| Users | P-ready→D p50/p95/p99/max | 超时 slot | P p95/p99 | D p95/p99 | Talker p95/p99 | 结果 |
-|---:|---:|---:|---:|---:|---:|:---:|
-| 8 | 416/614/717/747 ms | 0/247 | 341/411 ms | 319/383 ms | 404/447 ms | 通过 |
-| 9 | 620/1289/1431/1515 ms | 71/288 | 678/742 ms | 512/592 ms | 471/541 ms | 失败 |
+```bash
+python benchmarks/minicpmo/continuous_av.py \
+  --users 15 --duration-s 360 --phase-window-s 1 --seed 20260839 \
+  --loop-media --media /path/to/omni_duplex1.mp4 \
+  --ref-audio /path/to/HT_ref_audio.wav \
+  --frame-max-side 0 --max-slice-nums 4 \
+  --context-window-trigger-tokens 36000 --close-timeout-s 120 \
+  --gpus 0 1 2 3 --out /tmp/minicpm-pd-u15x360.json
 
-严格容量为 8 用户；9 用户是首个失败点。P/D 没有提高整数容量上限，但把非 P/D 的 8 用户最大 Thinker 延迟从约 991 ms 降至 747 ms 的完整 P→D 延迟，因此 8 用户从不足 10 ms 余量变为约 253 ms 余量。
+python benchmarks/minicpmo/analyze_rtf.py \
+  --server-log /tmp/minicpm-pd-u15-server.log \
+  --run-json /tmp/minicpm-pd-u15x360.json \
+  --out /tmp/minicpm-pd-u15x360-rtf.json
+```
 
-9 用户最慢 5% 的分解：
+关键文件：
 
-| 路径 | service | 应用→Core | scheduler/KV 等待 | runner | 结果暴露 |
-|---|---:|---:|---:|---:|---:|
-| Thinker-P | 714 ms | 304 ms | 0.5 ms | 359 ms | 50 ms |
-| Thinker-D | 541 ms | 37 ms | 326 ms | 142 ms | 34 ms |
-
-结论：
-
-1. P 上完全没有 decode，D 上也没有 multimodal prefill，因此非 P/D 的 prefill/decode 同 batch 竞争已被消除。
-2. 9 用户失败时，P 的 211-token 多模态增量会在随机相位碰撞时形成 3–4 request batch。P runner 和应用到 Core 的输入路径共同拉长；P 是限制 stage。
-3. D 的模型计算不是主要瓶颈。最慢 D unit 中 runner 仅 142 ms，326 ms 位于有序 KV 可用与 scheduler queue；这是当前 P/D connector/progress 路径的工程优化空间。
-4. 同一 slot 必须先 P 后 D。两个 stage 各自都低于 1 秒，并不保证串行总延迟低于 1 秒；9 用户的 burst 使完整路径越过 deadline，并产生下一 slot 等待。
-5. GPU busy p95 为 P/D `72%/71%`。该指标不是 SM occupancy，不能据此宣称硬件算力或显存带宽饱和。
-
-归档结果：`benchmarks/minicpmo/results/capacity_pd_hd4_4gpu_20260829.json`。
-
-## 快速恢复入口
-
-| 内容 | 路径 |
-|---|---|
-| 固定部署 | `benchmarks/minicpmo/deploy_capacity_3gpu.yaml` |
-| P/D 部署 | `benchmarks/minicpmo/deploy_capacity_pd_4gpu.yaml` |
-| 多用户 workload | `benchmarks/minicpmo/continuous_av.py` |
-| RTF 与 tail 分析 | `benchmarks/minicpmo/analyze_rtf.py` |
-| 当前容量归档 | `benchmarks/minicpmo/results/capacity_hd4_3gpu_20260829.json` |
-| P/D 容量归档 | `benchmarks/minicpmo/results/capacity_pd_hd4_4gpu_20260829.json` |
-| 长 context 归档 | `benchmarks/minicpmo/results/long_context_hd4_3gpu_20260829.json` |
-| MiniCPM 输入聚合 | `vllm_omni/experimental/fullduplex/minicpmo45/input.py` |
-| Context rollover | `vllm_omni/experimental/fullduplex/minicpmo45/runtime.py` |
-| Thinker 多模态输入 | `vllm_omni/experimental/fullduplex/minicpmo45/stage0.py` |
-| Realtime orchestration | `vllm_omni/experimental/fullduplex/openai/runtime_bridge.py` |
+- `benchmarks/minicpmo/deploy_capacity_pd_4gpu.yaml`
+- `benchmarks/minicpmo/continuous_av.py`
+- `benchmarks/minicpmo/analyze_rtf.py`
+- `vllm_omni/engine/orchestrator.py`

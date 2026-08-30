@@ -210,7 +210,7 @@ class UserSession:
         send_drift_ms: list[float] = []
         admitted = False
         errors: list[str] = []
-        client = RealtimeDuplexClient(url)
+        client = RealtimeDuplexClient(url, open_timeout_s=self.args.timeout_s)
         started_at = time.monotonic()
         ready_reported = False
         try:
@@ -269,7 +269,7 @@ class UserSession:
                 # create speech-continuation units on its own.
                 await asyncio.sleep(self.args.post_stream_s)
                 try:
-                    await client.close_session(timeout_s=self.args.timeout_s)
+                    await client.close_session(timeout_s=self.args.close_timeout_s)
                 except TimeoutError as exc:
                     errors.append(str(exc))
         except Exception as exc:  # keep all user failures in the audit artifact
@@ -408,6 +408,7 @@ async def _main(args: argparse.Namespace) -> dict[str, Any]:
             "max_slice_nums": args.max_slice_nums,
             "context_window_trigger_tokens": args.context_window_trigger_tokens or 36_000,
             "force_listen_count": args.force_listen_count,
+            "close_timeout_s": args.close_timeout_s,
             "progress_stall_threshold_ms": 1200,
             "audio_startup_buffer_ms": 200,
         },
@@ -440,6 +441,12 @@ def main() -> None:
     parser.add_argument("--phase-window-s", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=20260828)
     parser.add_argument("--timeout-s", type=float, default=30.0)
+    parser.add_argument(
+        "--close-timeout-s",
+        type=float,
+        default=30.0,
+        help="bound teardown independently from the runtime request timeout",
+    )
     parser.add_argument("--post-stream-s", type=float, default=3.0)
     parser.add_argument("--connect-stagger-s", type=float, default=0.5)
     parser.add_argument("--admission-timeout-s", type=float, default=90.0)
@@ -463,6 +470,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.users <= 0 or args.duration_s <= 0:
         parser.error("--users and --duration-s must be positive")
+    if args.close_timeout_s <= 0:
+        parser.error("--close-timeout-s must be positive")
     if args.frame_max_side < 0:
         parser.error("--frame-max-side must be non-negative (0 keeps source resolution)")
     if not 1 <= args.max_slice_nums <= 9:

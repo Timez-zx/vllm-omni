@@ -30,6 +30,11 @@ stages:
       video: 1
     env:
       VLLM_NIXL_SIDE_CHANNEL_PORT: "5600"
+      # Preserve TP=1 on physical GPU 0, but also expose physical GPU 3 as
+      # logical cuda:1 for the stateless SigLIP + resampler. Their compact
+      # embeddings return to GPU 0 before Thinker-P consumes them.
+      VLLM_OMNI_AUX_VISIBLE_DEVICES: "3"
+      MINICPMO45_VISION_ENCODER_DEVICE: "cuda:1"
     engine_extras:
       # P/D handoff uses the KV connector, not Omni async-chunk payloads.
       async_chunk: false
@@ -102,7 +107,11 @@ stages:
       temperature: 0.0
       top_p: 1.0
       top_k: -1
-      min_tokens: 50
+      # Native-duplex codec length/EOS is enforced inside MiniCPMTTS.  This
+      # outer sampler only selects its binary continue/stop row; a positive
+      # minimum masks the stop row and schedules useless model forwards after
+      # the 26-step codec chunk is already complete.
+      min_tokens: 0
       max_tokens: 2048
       stop_token_ids: [1]
       seed: 42

@@ -255,13 +255,29 @@ class DuplexSessionRuntimeState:
         )
 
     def commit_append(self, reservation: DuplexAppendReservation) -> DuplexInputAppend:
-        if (
-            self.fence != reservation.base_fence
-            or self.input_seq != reservation.base_input_seq
-            or self.input_turn_seq != reservation.base_input_turn_seq
-            or self._append_turn_key != reservation.base_append_turn_key
-        ):
-            raise RuntimeError("duplex append reservation is stale")
+        changed: list[str] = []
+        # A non-input control event may publish the exact fence carried by
+        # this append while its stage submission is in flight.  That does not
+        # consume an input sequence and is safe to commit.  Epoch/incarnation
+        # changes and advances beyond this append remain stale.
+        fence_advanced_to_target = (
+            self.fence == reservation.fence
+            and reservation.fence.epoch == reservation.base_fence.epoch
+            and reservation.fence.incarnation == reservation.base_fence.incarnation
+        )
+        if self.fence != reservation.base_fence and not fence_advanced_to_target:
+            changed.append("fence")
+        if self.input_seq != reservation.base_input_seq:
+            changed.append("input_seq")
+        if self.input_turn_seq != reservation.base_input_turn_seq:
+            changed.append("input_turn_seq")
+        if self._append_turn_key != reservation.base_append_turn_key:
+            changed.append("append_turn_key")
+        if changed:
+            raise RuntimeError(
+                "duplex append reservation is stale; changed="
+                + ",".join(changed)
+            )
         self.accept_fence(reservation.fence)
         self.input_seq = reservation.update.seq
         self.input_turn_seq = reservation.update.turn_seq
