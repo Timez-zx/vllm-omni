@@ -42,7 +42,7 @@ class MiniCPMO45PcmAppendReservation:
         is_speech: bool,
         spans: list[_PcmSpan] | None = None,
         turn_had_speech: bool = False,
-        video_entries: list[tuple[str, int]] | None = None,
+        video_entries: list[tuple[str, int, str | None]] | None = None,
     ) -> None:
         self._owner = owner
         self.operation_id = operation_id
@@ -115,7 +115,7 @@ class MiniCPMO45PcmAppendBuffer:
         self._reservations: list[MiniCPMO45PcmAppendReservation] = []
         # Omni duplex: queued camera frames and their HD-slice policies,
         # consumed FIFO at one frame per emitted model unit.
-        self._frame_queue: list[tuple[str, int]] = []
+        self._frame_queue: list[tuple[str, int, str | None]] = []
 
     def clear(self) -> None:
         for reservation in self._reservations:
@@ -203,7 +203,12 @@ class MiniCPMO45PcmAppendBuffer:
             payload = {
                 key: value
                 for key, value in payload.items()
-                if key not in {"video_frames", "max_slice_nums"}
+                if key
+                not in {
+                    "video_frames",
+                    "max_slice_nums",
+                    "video_preencode_ids",
+                }
             }
         reservation = MiniCPMO45PcmAppendReservation(
             owner=self,
@@ -263,7 +268,16 @@ class MiniCPMO45PcmAppendBuffer:
                 ]
             else:
                 max_slices = [1] * len(frames)
-            self._frame_queue.extend(zip(frames, max_slices, strict=True))
+            raw_preencode_ids = payload.get("video_preencode_ids")
+            if (
+                isinstance(raw_preencode_ids, list)
+                and len(raw_preencode_ids) == len(frames)
+                and all(isinstance(preencode_id, str) and preencode_id for preencode_id in raw_preencode_ids)
+            ):
+                preencode_ids: list[str | None] = list(raw_preencode_ids)
+            else:
+                preencode_ids = [None] * len(frames)
+            self._frame_queue.extend(zip(frames, max_slices, preencode_ids, strict=True))
         self._turn_had_speech = self._turn_had_speech or bool(payload.get("is_speech", False))
         if not allow_emit:
             return None
@@ -295,6 +309,7 @@ class MiniCPMO45PcmAppendBuffer:
         out.pop("force_speak", None)
         out.pop("video_frames", None)
         out.pop("max_slice_nums", None)
+        out.pop("video_preencode_ids", None)
         out["audio"] = base64.b64encode(emit_raw).decode("ascii")
         out["sample_rate_hz"] = sample_rate_hz
         # Omni duplex: attach at most one queued camera frame per emitted
@@ -304,11 +319,13 @@ class MiniCPMO45PcmAppendBuffer:
         # append consumes extra samples (1035 ms first window), so per-unit
         # attachment could outrun the units Stage0 actually builds. Attach at
         # most ONE frame per emitted payload; the rest stay queued.
-        attached_entries: list[tuple[str, int]] = []
+        attached_entries: list[tuple[str, int, str | None]] = []
         if emit_samples + pad_samples >= min_samples and self._frame_queue:
             attached_entries = [self._frame_queue.pop(0)]
             out["video_frames"] = [entry[0] for entry in attached_entries]
             out["max_slice_nums"] = [entry[1] for entry in attached_entries]
+            if all(entry[2] is not None for entry in attached_entries):
+                out["video_preencode_ids"] = [str(entry[2]) for entry in attached_entries]
         out["force_listen"] = any(span.force_listen for span in reserved_spans)
         out["is_speech"] = any(span.is_speech for span in reserved_spans)
         reservation = MiniCPMO45PcmAppendReservation(

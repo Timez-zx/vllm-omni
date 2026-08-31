@@ -259,14 +259,29 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         """
         if LOG_DUPLEX_CADENCE:
             self._duplex_admit_generation[request.request_id] += 1
+            duplex_input_seq: int | str = "-"
+            duplex_input_origin = "-"
+            model_buffer = getattr(request, "model_intermediate_buffer", None)
+            duplex = model_buffer.get("duplex") if isinstance(model_buffer, dict) else None
+            if isinstance(duplex, dict):
+                raw_seq = duplex.get("seq")
+                if isinstance(raw_seq, int) and not isinstance(raw_seq, bool):
+                    duplex_input_seq = raw_seq
+                payload = duplex.get("payload")
+                if isinstance(payload, dict):
+                    raw_origin = payload.get("_duplex_input_origin")
+                    if raw_origin in {"client", "continuation"}:
+                        duplex_input_origin = raw_origin
             logger.info(
                 "[duplex_cadence] stage=%s ADMIT req=%s generation=%s "
-                "admit_epoch=%.6f prompt_tokens=%s",
+                "admit_epoch=%.6f prompt_tokens=%s input_seq=%s input_origin=%s",
                 self.vllm_config.model_config.stage_id,
                 request.request_id,
                 self._duplex_admit_generation[request.request_id],
                 time(),
                 getattr(request, "num_prompt_tokens", "?"),
+                duplex_input_seq,
+                duplex_input_origin,
             )
         super().add_request(request)
 

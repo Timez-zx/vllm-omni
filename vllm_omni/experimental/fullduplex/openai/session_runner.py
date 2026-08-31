@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import time
 import uuid
 from contextlib import suppress
 from copy import deepcopy
@@ -43,6 +45,12 @@ from vllm_omni.experimental.fullduplex.openai.websocket import (
 logger = init_logger(__name__)
 
 _MAX_EVENT_BYTES = 15 * 1024 * 1024
+_MINICPMO45_LOG_PREP_DIAG = os.environ.get("MINICPMO45_LOG_PREP_DIAG", "0") not in (
+    "0",
+    "",
+    "false",
+    "False",
+)
 
 
 class DuplexSessionRunnerMixin:
@@ -309,6 +317,80 @@ class DuplexSessionRunnerMixin:
                 or actor.has_queued_input_events()
             )
 
+        def start_native_vision_preencode(payload: dict[str, object]) -> None:
+            """Start camera encoding before the matching 1 s audio unit exists."""
+            if session is None or not self._uses_native_input_append(session):
+                return
+            frames = payload.get("video_frames")
+            if not isinstance(frames, list) or not frames:
+                return
+            if not callable(getattr(self._chat_service.engine_client, "collective_rpc", None)):
+                return
+            can_start = getattr(native, "can_start_vision_preencode", None)
+            if callable(can_start) and not can_start(
+                frame_count=len(frames),
+                epoch=session.epoch,
+            ):
+                # Speculation must not outrun the formal per-session append
+                # chain. This frame remains in the ordinary payload and is
+                # encoded exactly once when its P request is admitted.
+                return
+            preencode_ids = [uuid.uuid4().hex for _ in frames]
+            payload["video_preencode_ids"] = preencode_ids
+            job: dict[str, object] = {
+                "session_id": session.session_id,
+                "incarnation": session.incarnation,
+                "epoch": session.epoch,
+                "preencode_ids": preencode_ids,
+                "video_frames": list(frames),
+                "max_slice_nums": payload.get("max_slice_nums", 1),
+            }
+            task = asyncio.create_task(
+                self._preencode_minicpmo45_vision(
+                    job,
+                    timeout_s=self._runtime_control_timeout_s(session),
+                ),
+                name=f"minicpmo45-vision-{session.session_id}-{preencode_ids[0][:8]}",
+            )
+            track = getattr(native, "track_vision_preencode", None)
+            if callable(track) and not track(preencode_ids, epoch=session.epoch, task=task):
+                task.cancel()
+                payload.pop("video_preencode_ids", None)
+
+        async def wait_native_vision_preencode(payload: object, *, epoch: int) -> None:
+            if not isinstance(payload, dict):
+                return
+            raw_ids = payload.get("video_preencode_ids")
+            if not isinstance(raw_ids, list):
+                return
+            preencode_ids = [preencode_id for preencode_id in raw_ids if isinstance(preencode_id, str) and preencode_id]
+            pop_tasks = getattr(native, "pop_vision_preencode_tasks", None)
+            if not preencode_ids or not callable(pop_tasks):
+                return
+            tasks = pop_tasks(preencode_ids, epoch=epoch)
+            if tasks:
+                # Readiness is represented by the worker-local embedding
+                # cache, not by the control-plane RPC acknowledgement. Submit
+                # the formal append immediately: preprocessing atomically
+                # consumes a ready cache entry or retires the speculative key
+                # and performs one correctness fallback. Drain acknowledgments
+                # separately so output-queue latency cannot serialize the
+                # Encoder -> Thinker pipeline.
+                async def drain() -> None:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+                asyncio.create_task(
+                    drain(),
+                    name=f"minicpmo45-vision-ack-{session.session_id}",
+                )
+                if _MINICPMO45_LOG_PREP_DIAG:
+                    logger.info(
+                        "[MINICPM-PREP-FORMAL-WAIT] tasks=%d wait_ms=0.000 "
+                        "detached_ack=true done_epoch=%.6f",
+                        len(tasks),
+                        time.time(),
+                    )
+
         async def start_native_append(
             payload: object,
             *,
@@ -347,9 +429,21 @@ class DuplexSessionRunnerMixin:
             async def _run() -> bool:
                 nonlocal runtime_closed
                 try:
+                    runtime_payload = payload
+                    if isinstance(payload, dict):
+                        # Preserve the distinction in the engine trace between
+                        # periodic client AV units and model-owned silence
+                        # continuations.  Both advance the native session seq,
+                        # but only client units belong in capacity RTF.
+                        runtime_payload = {
+                            **payload,
+                            "_duplex_input_origin": (
+                                "continuation" if silence_continuation else "client"
+                            ),
+                        }
                     append_ok, emitted_response = await self._append_runtime_input(
                         session,
-                        payload,
+                        runtime_payload,
                         operation_id=(pcm_reservation.operation_id if pcm_reservation is not None else operation_id),
                         final=final,
                         send_json=emit_event,
@@ -449,6 +543,7 @@ class DuplexSessionRunnerMixin:
                     return True
                 if pcm_reservation is not None and not pcm_reservation.active:
                     return False
+                await wait_native_vision_preencode(payload, epoch=append_epoch)
                 return await _run()
 
             predecessor = actor.native_append_tail
@@ -1400,6 +1495,7 @@ class DuplexSessionRunnerMixin:
                                     }
                                 )
                                 continue
+                            start_native_vision_preencode(payload)
                             allow_emit = not defer_native_append and (
                                 realtime_protocol is None
                                 or event_type != "input_audio_buffer.append"
@@ -1920,6 +2016,9 @@ class DuplexSessionRunnerMixin:
                 else:
                     begin_close(actor.close_reason or "disconnect")
                     await actor.cancel_append_tasks()
+                    cancel_preencode = getattr(native, "cancel_vision_preencode_tasks", None)
+                    if callable(cancel_preencode):
+                        cancel_preencode()
                     await self._cancel_native_data_plane_stream(session)
                     await self._cancel_active_response(
                         session,

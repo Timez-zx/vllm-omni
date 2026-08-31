@@ -1,166 +1,153 @@
-# MiniCPM-o Native-Duplex Serving Workflow
+# MiniCPM-o Non-P/D Native-Duplex Workflow
 
-## Goal and scope
+## 1. Goal
 
-The goal is to measure single-node multi-user capacity under a real-time constraint for continuous audio-video interaction, then locate the engine bottleneck when capacity fails. The research target is scheduling, batching, KV cache behavior, and pipeline latency rather than model quality.
+Measure how many continuous audio-video sessions one four-GPU non-P/D deployment can sustain in real time, then compare it with the MiniCPM P/D deployment under the same workload. Model quality is out of scope.
 
-This branch uses the native duplex path of `openbmb/MiniCPM-o-4_5`. Unlike the duplex-like Qwen3-Omni approximation, MiniCPM continuously consumes AV input and decides whether to listen or speak, so it more closely represents the target serving workload.
+MiniCPM-o 4.5 is used through its native duplex path: the model consumes one-second AV units continuously and decides whether to listen or speak. No synthetic query or forced response is inserted.
 
-## Phase 1: application and engine interface
+## 2. Application design
 
 ```text
-one long-lived WebSocket per user
-  → upload one PCM16 audio chunk every 200 ms
-  → attach one video frame every second
-  → combine five audio chunks into one native 1 s model unit
-  → Thinker incrementally processes the unit and decides listen or speak
-  → on speak, run Talker → Code2Wav
-  → keep accepting input without waiting for audio playback to finish
+one WebSocket per user
+  -> upload 200 ms PCM16 audio chunks and one video frame per second
+  -> combine five audio chunks and one frame into a native one-second unit
+  -> append the unit to the session's resident Thinker request/KV lineage
+  -> Thinker decides listen or speak
+  -> on speak: Talker -> Code2Wav
 ```
 
-- Each session owns one resumable Thinker request/KV lineage. A new unit appends only new tokens instead of prefilling the complete history again.
-- Native `auto_response` remains enabled. The client submits neither synthetic queries nor forced responses.
-- Sessions enter the engine concurrently. There is no application-wide gate or cross-user batching.
-- Network audio arrives at 5 Hz, but model execution operates at 1 Hz. Partial PCM is combined in the application input buffer and does not create five Thinker prefills.
-- User input can enter the existing session while assistant output is active; playback state does not control model admission.
-- KV lineage is disposable execution state. The application owns the session, input buffer, reconnect, and output state.
+- Sessions enter the engine independently; there is no application-wide admission gate or cross-user batch.
+- New input does not wait for Talker, Code2Wav, or audio playback.
+- The resident request appends only new input. Generic prefix caching is disabled because the active lineage already owns its incremental KV.
+- A newer cumulative session snapshot may supersede an older queued snapshot. The newer snapshot includes the older input; the analyzer credits it only after that cumulative generation actually runs.
+- At 36,000 estimated tokens, the next unit starts a fresh lineage containing the fixed system/reference context, the latest complete AV unit and confirmed Thinker output, and the current unit. The model limit is 40,960 tokens.
 
-## Phase 2: fixed deployment
+## 3. Four-GPU non-P/D deployment
 
-Formal baseline experiments use only `benchmarks/minicpmo/deploy_capacity_3gpu.yaml`:
+| GPU | Role |
+|---:|---|
+| 0 | Thinker LLM |
+| 1 | Talker |
+| 2 | Code2Wav |
+| 3 | Vision encoder and resampler |
 
-| Stage | GPU | Configuration |
-|---|---:|---|
-| Thinker | 0 | BF16, one non-disaggregated vLLM engine |
-| Talker | 1 | BF16 |
-| Code2Wav | 2 | BF16 |
+Configuration: `benchmarks/minicpmo/deploy_capacity_4gpu.yaml`.
 
-- Hardware: 3 × RTX PRO 6000 Blackwell 96 GB.
-- All three stages use `max_num_seqs: 64` and synchronous scheduling.
-- `active_stream_window: 0` avoids an application-side cap on concurrent speaking sessions.
-- This phase does not use P/D disaggregation. The bottleneck must first be established on this fixed baseline.
+- Thinker uses `max_model_len=40960`, `max_num_batched_tokens=32768`, `max_num_seqs=64`, and synchronous scheduling.
+- The auxiliary GPU is exposed only to the vision tower; it does not change Thinker TP or world size.
+- Arrival-side vision work is prepared on CPU, grouped by exact tensor shape across sessions, and encoded in microbatches of at most eight.
+- A formal Thinker append consumes the speculative embedding when ready. On a miss it retires that cache key and performs a correctness fallback on GPU 3; late speculative writes cannot overwrite the session state.
+- Encoder RPCs bypass the busy Thinker Core loop and are acknowledged when admitted to the sidecar queue. The API does not wait for the shared result queue, and the sidecar remains single-threaded to preserve model safety.
+- Session/reference context, CPU audio preparation, stage-output consumption, SDPA vision attention, and the resampler use the same applicable engineering optimizations as the P/D branch. NIXL, KV handoff, and P/D feedback code are intentionally not present.
 
-Start the server with:
+## 4. Capacity workload and metric
+
+- Source: the real 960x540 `omni_duplex1.mp4` with aligned 16 kHz mono audio and `HT_ref_audio.wav`.
+- Arrival rate: audio every 200 ms and video at 1 FPS; the model consumes one one-second unit per user per second.
+- `frame_max_side=0`, `max_slice_nums=4`. The reference frame produces one global image and two local crops: 198 vision scheduler rows and 211 steady-state rows per unit.
+- Users start at deterministic random phases in `[0, 1 s)`, seed `20260839`.
+- Each formal run lasts 360 seconds and loops the media. Every session crosses the 36k context threshold twice.
+
+Capacity uses sustained input progress, not isolated unit latency:
+
+```text
+stream RTF = 360 seconds of input budget /
+             wall time from the first client AV admission
+             through the final unit's Thinker runner completion
+```
+
+A concurrency level passes only if every session has `stream RTF >= 1`, all expected input units complete, and no user fails. Per-unit Thinker/Talker latency remains a jitter diagnostic. Talker may be silent for a model-owned listen decision, and Code2Wav spans session idle time, so neither request count nor Code2Wav wall time is the capacity clock.
+
+## 5. Final non-P/D result
+
+Every row below is a 360-second long-session cell. Each session receives 360 one-second AV units and crosses the 36k context rollover threshold twice.
+
+| Users | Completed units | Stream RTF min/p50/max | Terminal backlog p99 | Result |
+|---:|---:|---:|---:|:---:|
+| 4 | 1440/1440 | 1.001/1.001/1.002 | -296 ms | pass |
+| 5 | 1800/1800 | 0.999/0.999/1.000 | 522 ms | fail |
+| 7 | 2520/2520 | 0.985/0.986/0.987 | 5666 ms | fail |
+| 8 | 2880/2880 | 0.947/0.948/0.949 | 19981 ms | fail |
+
+The measured strict long-session capacity is four users. Five is the first failure under the agreed `RTF >= 1` rule; it misses by only about 0.1%, but must not be rounded up.
+
+At four users, seven older input snapshots were coalesced into later cumulative snapshots. All 1440 inputs completed, so this is legal request replacement rather than data loss. The trace contains eight 490-row rollover admissions, two per session.
+
+The old 30-second capacity table is not comparable and is superseded by this result: a short cell can finish before persistent queue drift or repeated context cycles become visible.
+
+## 6. Bottleneck
+
+The dedicated encoder is not the boundary:
+
+- vision encoder p50/p95/p99: `27/44/55 ms`;
+- GPU 3 utilization mean/p95/p99: `6.7%/32%/41%`;
+- 1417 of 1440 frames reached the speculative embedding cache; the other 23 used the formal correctness fallback, so no frame was dropped;
+- the formal path always consumes either the speculative result or a correctness fallback.
+
+At the four-user point, NVML device-busy mean/p95/p99 is `25.3%/72%/79%` on Thinker, `2.5%/18%/27%` on Talker, and `10.1%/58%/64%` on Code2Wav. These are GPU busy-time samples, not SM occupancy; the bottleneck conclusion comes from the runner traces below, not from treating NVML utilization as raw compute saturation.
+
+A mixed step is one Thinker forward containing both existing decode tokens and newly arrived AV prefill rows. The same-run GPU 0 trace gives the direct comparison:
+
+| Users | Mixed decode steps | Decode-only p50 | Mixed p50 | Slowdown | Stream RTF | Terminal backlog p99 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 7.4% | 18.8 ms | 86.2 ms | 4.6x | 1.001 | -296 ms |
+| 5 | 13.0% | 19.4 ms | 81.3 ms | 4.2x | 0.999 | 522 ms |
+| 8 | 27.8% | 21.3 ms | 102.2 ms | 4.8x | 0.947 | 19981 ms |
+
+The trace directly proves that AV prefill stretches decode iterations by roughly 4-5x on the shared Thinker GPU. As concurrency raises the mixed-step share, sustained Thinker progress falls below the input rate and backlog accumulates. The reverse direction, decode slowing prefill, is expected from shared execution resources but was not independently isolated by this experiment.
+
+Therefore the current non-P/D capacity limit is concurrent multimodal prefill and multi-step decode sharing GPU 0, not vision preprocessing, Talker, Code2Wav, or an application-wide gate.
+
+## 7. P/D comparison
+
+The comparison uses the same model, byte-identical MP4, HD4 input, one-second cadence, seed, 360-second duration, and 36k rollover policy.
+
+| Deployment | Four-GPU allocation | Verified real-time point |
+|---|---|---:|
+| Non-P/D | Thinker / Talker / Code2Wav / Encoder | 4 users |
+| P/D | Thinker-P / Thinker-D / Talker / Code2Wav+Encoder | 15 users |
+
+The P/D run completed 5400/5400 units with per-session stream RTF `1.002`. Its P and D service p50/p95/p99 were `310/849/1060 ms` and `299/790/1096 ms`.
+
+This is a deployment-level comparison, not an equal-Thinker-GPU efficiency claim: P/D assigns two GPUs to Thinker while non-P/D assigns one and dedicates the fourth GPU to vision. It nevertheless answers the requested four-GPU setup question and shows that separating prefill and decode substantially increases sustainable sessions for this workload.
+
+## 8. Reproduction
+
+Start the non-P/D server:
 
 ```bash
-VLLM_OMNI_LOG_DUPLEX_CADENCE=1 \
+VLLM_OMNI_LOG_DUPLEX_CADENCE=1 MINICPMO45_LOG_PREP_DIAG=1 \
 python -m vllm_omni.entrypoints.cli.main serve openbmb/MiniCPM-o-4_5 \
-  --omni --deploy-config benchmarks/minicpmo/deploy_capacity_3gpu.yaml \
+  --omni --deploy-config benchmarks/minicpmo/deploy_capacity_4gpu.yaml \
   --trust-remote-code --host 127.0.0.1 --port 8113
 ```
 
-## Phase 3: formal workload and metric
-
-- Every user continuously streams aligned audio and video from the same real MP4.
-- Audio: 16 kHz mono PCM16, uploaded every 200 ms.
-- Video: 1 FPS at the source 960×540 resolution, with `max_slice_nums=4`.
-- The official slicing algorithm produces one global image and two local crops. Each steady-state unit contains 198 vision scheduler tokens and 211 scheduler tokens in total.
-- Connections are staggered during setup. Once all sessions are ready, they start behind one barrier at seeded random phases in `[0, 1 s)`.
-- Each cell runs for 30 seconds, covering both short and growing context. Media looping is used only for the context-boundary stress test.
-
-For each one-second Thinker and Talker model unit:
-
-```text
-RTF = 1000 ms / stage service time
-```
-
-Real time requires RTF `> 1`. Strict capacity requires every observed Thinker and Talker unit to stay below 1000 ms; one miss fails that concurrency level. Code2Wav uses one persistent request spanning the entire session, including silent periods, so its request wall time is not a valid unit RTF.
-
-Example formal run:
+Run one capacity cell and analyze it:
 
 ```bash
 python benchmarks/minicpmo/continuous_av.py \
-  --users 8 --duration-s 30 --phase-window-s 1 --seed 20260829 \
-  --connect-stagger-s 0.5 --post-stream-s 4 --gpus 0 1 2 \
-  --media /path/to/omni_duplex1.mp4 \
+  --users 4 --duration-s 360 --phase-window-s 1 --seed 20260839 \
+  --connect-stagger-s 0.5 --post-stream-s 30 --close-timeout-s 480 \
+  --loop-media --media /path/to/omni_duplex1.mp4 \
   --ref-audio /path/to/HT_ref_audio.wav \
   --frame-max-side 0 --max-slice-nums 4 \
-  --out /tmp/minicpm-hd4-u8.json
+  --context-window-trigger-tokens 36000 --gpus 0 1 2 3 \
+  --out /tmp/minicpm-nonpd-u4x360.json
 
 python benchmarks/minicpmo/analyze_rtf.py \
-  --server-log /tmp/minicpm-server.log \
-  --run-json /tmp/minicpm-hd4-u8.json \
-  --out /tmp/minicpm-hd4-u8-rtf.json
+  --server-log /tmp/minicpm-nonpd-server.log \
+  --run-json /tmp/minicpm-nonpd-u4x360.json \
+  --out /tmp/minicpm-nonpd-u4x360-analysis.json
 ```
 
-## Phase 4: long-session context management
+Key files:
 
-The model limit is 40,960 tokens. Once the estimate reaches 36,000 tokens, the next unit opens a new KV lineage containing only:
-
-- the system prompt and reference audio;
-- the previous complete AV unit and its confirmed Thinker output;
-- the current AV unit.
-
-The scheduler releases the old lineage's KV blocks before admitting the replacement prompt. The 36k trigger reserves roughly 5k tokens for maximum output, an in-flight unit, and estimation error. It creates no summary and adds no separate model call to the online path.
-
-A 180-second single-user HD4 run rolled over once at unit 157:
-
-| Metric | Result |
-|---|---:|
-| Replacement prompt | 494 tokens |
-| Thinker p50/p95/p99 | 175/407/567 ms |
-| Talker p50/p95/p99 | 231/591/621 ms |
-| RTF ≤ 1 | 0 |
-| Session/server errors | 0 |
-
-The rollover unit took 175 ms. Mean Thinker service time was 394 ms over the preceding 20 units and 199 ms over the following 20. The policy therefore crossed the context limit online and removed the old long-context execution cost. Archived result: `benchmarks/minicpmo/results/long_context_hd4_3gpu_20260829.json`.
-
-## Phase 5: current capacity
-
-Current code on a warmed server with the 30-second HD4 workload:
-
-| Users | Seed | Thinker p50/p95/p99/max | Thinker misses | Talker p50/p95/p99/max | Talker misses | Result |
-|---:|---:|---:|---:|---:|---:|:---:|
-| 7 | 20260829 | 284/613/706/731 ms | 0/220 | 168/474/687/701 ms | 0/189 | pass |
-| 8 | 20260829 | 464/888/959/991 ms | 0/237 | 219/460/609/668 ms | 0/208 | pass |
-| 8 | 20260828 | 407/923/981/994 ms | 0/242 | 200/575/737/838 ms | 0/207 | pass |
-| 9 | 20260829 | 566/1007/1851/2071 ms | 13/228 | 199/626/1224/1450 ms | 5/230 | fail |
-
-The measured strict capacity is eight sessions, but both eight-user runs have less than 10 ms of maximum-latency headroom. Seven sessions is the practical operating point when a safety margin is required. Nine users is the first clear failure.
-
-## Phase 6: root cause of the nine-user failure
-
-The slowest 5% of nine-user Thinker units average 1493 ms:
-
-| Component | Mean | Share |
-|---|---:|---:|
-| Application submission to engine admission | 133 ms | 8.9% |
-| Scheduler wait | 0.3 ms | <0.1% |
-| Runner execution | 1302 ms | 87.2% |
-| └ first AV prefill forward | 280 ms | 18.7% |
-| └ subsequent decode forwards | 1023 ms | 68.5% |
-| Inter-forward control gaps | 3 ms | 0.2% |
-| Result exposure | 54 ms | 3.6% |
-
-Key evidence:
-
-1. Within the same nine-user run, decode forwards mixed with another session's AV prefill take 159/414 ms at p50/p95. Decode-only forwards take 24/42 ms, a 6.7×/9.8× difference.
-2. Of the slowest units' 1023 ms decode time, 981 ms is inside mixed prefill/decode forwards.
-3. A control keeps the same nine users and all 270 HD4 AV prefills but forces every unit to terminate at the listen decision. Thinker p50/p95/p99/max becomes 215/385/405/436 ms with zero misses.
-4. Scheduler queue time is only 0.3 ms, excluding application serialization and scheduler admission as the dominant cause.
-
-Conclusion: nine users fail because the Thinker runner places multimodal prefill and other sessions' multi-step decode in the same iterations, repeatedly stretching decode forwards. AV prefill alone meets the one-second budget; the real-time boundary is crossed only when it is mixed with sustained decode. Talker misses are secondary and largely inherit upstream Thinker delay.
-
-GPU 0 NVML busy is 83% at p95 and memory-I/O busy is 57% at p95. These are device busy-time counters, not SM occupancy, so they do not prove complete compute or memory-bandwidth saturation. The supported conclusion is specifically a mixed prefill/decode runner-efficiency and scheduling problem.
-
-Archived result: `benchmarks/minicpmo/results/capacity_hd4_3gpu_20260829.json`.
-
-## Phase 7: research baseline conclusion
-
-Keep the current application design: native one-second duplex units, incremental per-session KV, no cross-session global gate, model-owned listen/speak decisions, and 36k context rollover. It exposes the concurrent continuous-AV prefill/decode load instead of hiding contention through application serialization.
-
-The next engine study should optimize mixed multimodal-prefill/decode batching or deadline/QoS scheduling under a fixed input trace, then compare user capacity under the same real-time SLO.
-
-## Recovery map
-
-| Purpose | Path |
-|---|---|
-| Fixed deployment | `benchmarks/minicpmo/deploy_capacity_3gpu.yaml` |
-| Multi-user workload | `benchmarks/minicpmo/continuous_av.py` |
-| RTF and tail analysis | `benchmarks/minicpmo/analyze_rtf.py` |
-| Current capacity archive | `benchmarks/minicpmo/results/capacity_hd4_3gpu_20260829.json` |
-| Long-context archive | `benchmarks/minicpmo/results/long_context_hd4_3gpu_20260829.json` |
-| MiniCPM input aggregation | `vllm_omni/experimental/fullduplex/minicpmo45/input.py` |
-| Context rollover | `vllm_omni/experimental/fullduplex/minicpmo45/runtime.py` |
-| Thinker multimodal input | `vllm_omni/experimental/fullduplex/minicpmo45/stage0.py` |
-| Realtime orchestration | `vllm_omni/experimental/fullduplex/openai/runtime_bridge.py` |
+- `benchmarks/minicpmo/deploy_capacity_4gpu.yaml`
+- `vllm_omni/deploy/minicpmo_4_5_4gpu.yaml`
+- `benchmarks/minicpmo/continuous_av.py`
+- `benchmarks/minicpmo/analyze_rtf.py`
+- `benchmarks/minicpmo/results/nonpd_4gpu_hd4_u4_360s_20260831.*.json`
+- `benchmarks/minicpmo/results/nonpd_4gpu_hd4_u5_360s_20260831.*.json`
+- `benchmarks/minicpmo/results/nonpd_4gpu_hd4_u8_360s_20260831.*.json`
+- `benchmarks/minicpmo/results/pd_4gpu_hd4_u15_360s_20260830.*.json`

@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import contextlib
 import os
+import queue
 import signal
-from typing import Any
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from typing import Any, Callable
 
 import vllm.v1.engine.core as _vllm_engine_core_module
 from vllm.logger import init_logger
@@ -21,7 +23,12 @@ from vllm.utils.system_utils import (
     decorate_logs,
     set_process_title,
 )
-from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.engine import (
+    EngineCoreOutputs,
+    EngineCoreRequestType,
+    UtilityOutput,
+    UtilityResult,
+)
 from vllm.v1.engine.core import EngineCoreProc, EngineShutdownState
 from vllm.v1.engine.utils import (
     EngineZmqAddresses,
@@ -41,6 +48,48 @@ logger = init_logger(__name__)
 _SIGNAL_EXIT_BASE = 128
 
 
+class _StageInputQueue(queue.Queue[tuple[EngineCoreRequestType, Any]]):
+    """FIFO for data requests with a direct auxiliary-sidecar dispatch."""
+
+    def __init__(
+        self,
+        auxiliary_dispatch: Callable[[tuple[EngineCoreRequestType, Any]], None]
+        | None = None,
+    ) -> None:
+        super().__init__()
+        self._auxiliary_dispatch = auxiliary_dispatch
+
+    @staticmethod
+    def _is_auxiliary_vision_rpc(item: tuple[EngineCoreRequestType, Any]) -> bool:
+        request_type, request = item
+        if request_type != EngineCoreRequestType.UTILITY:
+            return False
+        try:
+            _client_idx, _call_id, method_name, args = request
+            return (
+                method_name == "collective_rpc"
+                and bool(args)
+                and args[0] == "preencode_minicpmo45_vision"
+            )
+        except (TypeError, ValueError, IndexError):
+            return False
+
+    def put(
+        self,
+        item: tuple[EngineCoreRequestType, Any],
+        block: bool = True,
+        timeout: float | None = None,
+    ) -> None:
+        dispatch = self._auxiliary_dispatch
+        if dispatch is not None and self._is_auxiliary_vision_rpc(item):
+            # The RPC itself immediately returns a Future backed by the
+            # dedicated sidecar executor. Dispatching it from the ZMQ IO
+            # thread avoids waiting for Core's current Thinker batch to end.
+            dispatch(item)
+            return
+        super().put(item, block=block, timeout=timeout)
+
+
 def _signal_exit_code(signum: int) -> int:
     """Return the conventional process exit code for signal-driven exits."""
     return _SIGNAL_EXIT_BASE + signum
@@ -54,12 +103,158 @@ class StageEngineCoreProc(EngineCoreProc):
     ``EngineCoreProc.run_engine_core()``.
     """
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # Base init starts the ZMQ input thread but the Core busy loop does not
+        # start until this constructor returns. The IO thread dereferences
+        # ``self.input_queue`` on every put, so replacing the still-unconsumed
+        # queue here safely gives the auxiliary encoder RPC priority over an
+        # accumulated ADD backlog. It never interrupts an executing batch.
+        old_queue = self.input_queue
+        priority_queue = _StageInputQueue(
+            lambda item: self._handle_client_request(*item),
+        )
+        # Publish the replacement before draining the old queue.  The input
+        # thread resolves ``self.input_queue`` for every message, so this order
+        # prevents a request from landing in the old queue after the drain.
+        self.input_queue = priority_queue
+        while True:
+            try:
+                priority_queue.put_nowait(old_queue.get_nowait())
+            except queue.Empty:
+                break
+
     def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
         """Preserve omni payloads when vLLM builds its scheduler request."""
         scheduler_request, current_wave = super().preprocess_add_request(request)
         scheduler_request.additional_information = request.additional_information
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
         return scheduler_request, current_wave
+
+    def _put_priority_output(self, output: tuple[int, EngineCoreOutputs]) -> None:
+        """Expose latency-critical sidecar readiness ahead of data outputs.
+
+        The auxiliary vision encoder runs on its own GPU/thread.  Its admission
+        reply is detached from the formal append, but exposing the reply ahead
+        of data outputs still bounds control-future lifetime and keeps the
+        arrival diagnostic meaningful.  Keep the shared output socket and put
+        this tiny reply at the head of its thread-safe queue.
+        """
+        output_queue = self.output_queue
+        with output_queue.not_empty:
+            output_queue.queue.appendleft(output)
+            output_queue.unfinished_tasks += 1
+            output_queue.not_empty.notify()
+
+    def _handle_client_request(
+        self,
+        request_type: EngineCoreRequestType,
+        request: Any,
+    ) -> None:
+        """Acknowledge auxiliary vision work when it enters the sidecar queue.
+
+        The formal Thinker request depends on the worker-local embedding cache,
+        not on this control-plane reply. Waiting to acknowledge until GPU work
+        completed made the shared Core output path throttle an otherwise
+        independent encoder GPU. The sidecar remains single-threaded and the
+        cache/tombstone protocol preserves data readiness and correctness.
+        """
+        if request_type != EngineCoreRequestType.UTILITY:
+            return super()._handle_client_request(request_type, request)
+
+        client_idx, call_id, method_name, args = request
+        rpc_method = args[0] if method_name == "collective_rpc" and args else None
+        if rpc_method != "preencode_minicpmo45_vision":
+            return super()._handle_client_request(request_type, request)
+        if self._reject_utility_in_shutdown(client_idx, call_id, method_name):
+            return
+
+        output = UtilityOutput(call_id)
+        enqueue_output = lambda out: self._put_priority_output(
+            (client_idx, EngineCoreOutputs(utility_output=out))
+        )
+        try:
+            method = getattr(self, method_name)
+            converted_args = self._convert_msgspec_args(method, args)
+            result = method(*converted_args)
+            if isinstance(result, Future):
+                result.add_done_callback(self._consume_auxiliary_vision_result)
+                encoded_frames = self._auxiliary_vision_frame_count(args)
+                output.result = UtilityResult(
+                    [
+                        {
+                            "supported": True,
+                            "accepted": True,
+                            # Retain the existing response field so older API
+                            # processes interpret queue admission as success.
+                            "encoded_frames": encoded_frames,
+                        }
+                    ]
+                )
+            else:
+                output.result = UtilityResult(result)
+        except Exception as exc:
+            logger.exception("Invocation of %s method failed", method_name)
+            output.failure_message = f"Call to {method_name} method failed: {str(exc)}"
+        enqueue_output(output)
+
+    @staticmethod
+    def _auxiliary_vision_frame_count(args: Any) -> int:
+        try:
+            jobs = args[2][0]
+            return sum(
+                len(job.get("video_frames", ()))
+                for job in jobs
+                if isinstance(job, dict)
+            )
+        except (TypeError, ValueError, IndexError):
+            return 0
+
+    @staticmethod
+    def _consume_auxiliary_vision_result(future: Future[Any]) -> None:
+        """Observe background failures without delaying the admission ACK."""
+        try:
+            future.result()
+        except CancelledError:
+            return
+        except Exception:
+            logger.exception("MiniCPM-o auxiliary vision preencode failed")
+
+    def collective_rpc(
+        self,
+        method: Any,
+        timeout: float | None = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        """Run only the auxiliary-GPU vision sidecar outside Core's loop."""
+        if (
+            method == "preencode_minicpmo45_vision"
+            and os.environ.get("MINICPMO45_VISION_ENCODER_DEVICE", "").strip()
+        ):
+            executor = getattr(self, "_vision_preencode_executor", None)
+            if executor is None:
+                executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="minicpmo-vision-sidecar",
+                )
+                self._vision_preencode_executor = executor
+            collective_rpc = super().collective_rpc
+            return executor.submit(
+                collective_rpc,
+                method,
+                timeout,
+                args,
+                kwargs,
+            )
+        return super().collective_rpc(method, timeout, args, kwargs)
+
+    def shutdown(self) -> None:
+        executor = getattr(self, "_vision_preencode_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+            self._vision_preencode_executor = None
+        super().shutdown()
 
     @staticmethod
     def run_stage_core(

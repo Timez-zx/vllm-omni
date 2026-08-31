@@ -1,0 +1,1226 @@
+{
+  "run_json": "/tmp/minicpm-nonpd4gpu-final5-u4x360-drain30.json",
+  "definition": "RTF = 1 second model unit / stage service time; RTF >= 1 is real-time",
+  "capacity_slo": "the complete long-session input set finishes without errors and every session's stream RTF is >= 1 from first client AV admission through the final unit's Thinker runner completion; per-unit Thinker/Talker RTF remains a tail diagnostic; Code2Wav persistent-session wall time is excluded",
+  "rtf_capacity_pass": false,
+  "strict_unit_rtf_capacity_pass": false,
+  "long_horizon_rtf_capacity_pass": true,
+  "capacity_pass": true,
+  "p95_capacity_pass": false,
+  "measurement_complete": true,
+  "expected_input_units": 1440,
+  "completed_input_units": {
+    "0": 1440
+  },
+  "completion_witness_stage": 0,
+  "failed_users": 0,
+  "limiting_periodic_stage": "1",
+  "stages": {
+    "0": {
+      "requests": 894,
+      "service_ms": {
+        "count": 894,
+        "mean": 445.434,
+        "p50": 141.397,
+        "p95": 918.801,
+        "p99": 1383.955,
+        "max": 29313.51
+      },
+      "accumulated_unit_rtf": 2.245,
+      "unit_rtf": {
+        "count": 894,
+        "mean": 7.289,
+        "min": 0.034,
+        "p01": 0.723,
+        "p05": 1.088,
+        "p50": 7.056,
+        "p95": 16.945,
+        "max": 73.153
+      },
+      "unit_rtf_lt_1": 28,
+      "unit_rtf_lt_1_rate": 0.0313,
+      "ttft_ms": {
+        "count": 894,
+        "mean": 24495.735,
+        "p50": 363.187,
+        "p95": 103763.085,
+        "p99": 118449.642,
+        "max": 138416.248
+      },
+      "dispatch_to_core_ms": {
+        "count": 894,
+        "mean": 16.755,
+        "p50": 2.325,
+        "p95": 79.032,
+        "p99": 93.222,
+        "max": 129.485
+      },
+      "core_admit_to_done_ms": {
+        "count": 894,
+        "mean": 428.678,
+        "p50": 131.479,
+        "p95": 878.843,
+        "p99": 1302.468,
+        "max": 29274.741
+      },
+      "scheduler_queue_ms": {
+        "count": 890,
+        "mean": 0.377,
+        "p50": 0.34,
+        "p95": 0.672,
+        "p99": 1.119,
+        "max": 2.133
+      },
+      "scheduled_to_done_ms": {
+        "count": 890,
+        "mean": 426.998,
+        "p50": 130.865,
+        "p95": 875.309,
+        "p99": 1302.035,
+        "max": 29274.375
+      },
+      "runner_ms_sum": {
+        "count": 890,
+        "mean": 133.458,
+        "p50": 106.18,
+        "p95": 354.877,
+        "p99": 727.482,
+        "max": 1099.078
+      },
+      "first_runner_ms": {
+        "count": 807,
+        "mean": 69.662,
+        "p50": 62.308,
+        "p95": 138.069,
+        "p99": 171.886,
+        "max": 194.153
+      },
+      "decode_runner_ms_sum": {
+        "count": 807,
+        "mean": 77.523,
+        "p50": 45.332,
+        "p95": 279.255,
+        "p99": 647.597,
+        "max": 1062.181
+      },
+      "runner_ms_per_step": {
+        "count": 807,
+        "mean": 42.565,
+        "p50": 37.627,
+        "p95": 84.931,
+        "p99": 128.399,
+        "max": 151.013
+      },
+      "mixed_decode_step_rate": {
+        "count": 729,
+        "mean": 0.081,
+        "min": 0.0,
+        "p01": 0.0,
+        "p05": 0.0,
+        "p50": 0.0,
+        "p95": 0.5,
+        "max": 1.0
+      },
+      "mixed_decode_runner_ms_sum": {
+        "count": 729,
+        "mean": 22.335,
+        "p50": 0,
+        "p95": 119.0,
+        "p99": 269.579,
+        "max": 570.567
+      },
+      "decode_only_runner_ms_sum": {
+        "count": 729,
+        "mean": 63.482,
+        "p50": 40.835,
+        "p95": 213.178,
+        "p99": 430.34,
+        "max": 512.038
+      },
+      "mixed_decode_runner_ms_per_step": {
+        "count": 143,
+        "mean": 89.063,
+        "p50": 82.587,
+        "p95": 139.038,
+        "p99": 147.97,
+        "max": 152.118
+      },
+      "decode_only_runner_ms_per_step": {
+        "count": 701,
+        "mean": 20.445,
+        "p50": 18.841,
+        "p95": 30.751,
+        "p99": 36.749,
+        "max": 42.049
+      },
+      "mixed_decode_step_runner_ms": {
+        "count": 174,
+        "mean": 93.576,
+        "p50": 86.213,
+        "p95": 139.976,
+        "p99": 157.705,
+        "max": 166.865
+      },
+      "decode_only_step_runner_ms": {
+        "count": 2174,
+        "mean": 21.287,
+        "p50": 18.823,
+        "p95": 34.05,
+        "p99": 37.76,
+        "max": 45.55
+      },
+      "inter_step_ms_sum": {
+        "count": 890,
+        "mean": 0.707,
+        "p50": 0.48,
+        "p95": 2.479,
+        "p99": 5.131,
+        "max": 7.258
+      },
+      "result_exposure_ms": {
+        "count": 807,
+        "mean": 318.058,
+        "p50": 19.841,
+        "p95": 707.586,
+        "p99": 1160.449,
+        "max": 29131.344
+      },
+      "scheduler_steps": {
+        "count": 890,
+        "mean": 3.731,
+        "p50": 3.0,
+        "p95": 10.0,
+        "p99": 20.0,
+        "max": 22.0
+      },
+      "first_schedule_batch_reqs": {
+        "count": 890,
+        "mean": 1.615,
+        "p50": 1.0,
+        "p95": 4.0,
+        "p99": 4.0,
+        "max": 4.0
+      },
+      "first_schedule_batch_tokens": {
+        "count": 890,
+        "mean": 254.722,
+        "p50": 211.0,
+        "p95": 424.0,
+        "p99": 634.0,
+        "max": 1472.0
+      },
+      "tokens_in": {
+        "count": 894,
+        "mean": 24646.54,
+        "p50": 23700.0,
+        "p95": 48244.0,
+        "p99": 50565.0,
+        "max": 53519.0
+      },
+      "tokens_out": {
+        "count": 894,
+        "mean": 4.662,
+        "p50": 3.0,
+        "p95": 17.0,
+        "p99": 20.0,
+        "max": 20.0
+      },
+      "slowest_5pct": {
+        "count": 45,
+        "service_threshold_ms": 918.801,
+        "service_ms": {
+          "count": 45,
+          "mean": 3591.127,
+          "p50": 1054.521,
+          "p95": 29094.228,
+          "p99": 29313.51,
+          "max": 29313.51
+        },
+        "dispatch_ms": {
+          "count": 45,
+          "mean": 41.893,
+          "p50": 41.022,
+          "p95": 82.021,
+          "p99": 97.607,
+          "max": 97.607
+        },
+        "scheduler_queue_ms": {
+          "count": 43,
+          "mean": 0.36,
+          "p50": 0.327,
+          "p95": 0.563,
+          "p99": 1.555,
+          "max": 1.555
+        },
+        "runner_ms_sum": {
+          "count": 43,
+          "mean": 301.406,
+          "p50": 182.039,
+          "p95": 865.488,
+          "p99": 1099.078,
+          "max": 1099.078
+        },
+        "first_runner_ms": {
+          "count": 43,
+          "mean": 85.371,
+          "p50": 79.583,
+          "p95": 157.705,
+          "p99": 175.327,
+          "max": 175.327
+        },
+        "decode_runner_ms_sum": {
+          "count": 43,
+          "mean": 216.036,
+          "p50": 82.099,
+          "p95": 828.684,
+          "p99": 1062.181,
+          "max": 1062.181
+        },
+        "mixed_decode_runner_ms_sum": {
+          "count": 43,
+          "mean": 65.236,
+          "p50": 0.0,
+          "p95": 355.472,
+          "p99": 570.567,
+          "max": 570.567
+        },
+        "decode_only_runner_ms_sum": {
+          "count": 43,
+          "mean": 150.799,
+          "p50": 68.885,
+          "p95": 479.42,
+          "p99": 512.038,
+          "max": 512.038
+        },
+        "mixed_decode_step_rate": {
+          "count": 43,
+          "mean": 0.051,
+          "p50": 0.0,
+          "p95": 0.214,
+          "p99": 0.5,
+          "max": 0.5
+        },
+        "inter_step_ms_sum": {
+          "count": 43,
+          "mean": 2.006,
+          "p50": 0.975,
+          "p95": 6.541,
+          "p99": 7.258,
+          "max": 7.258
+        },
+        "result_exposure_ms": {
+          "count": 43,
+          "mean": 3359.497,
+          "p50": 846.26,
+          "p95": 29000.737,
+          "p99": 29131.344,
+          "max": 29131.344
+        },
+        "scheduler_steps": {
+          "count": 43,
+          "mean": 7.674,
+          "p50": 4.0,
+          "p95": 20.0,
+          "p99": 20.0,
+          "max": 20.0
+        },
+        "batch_reqs": {
+          "count": 43,
+          "mean": 2.488,
+          "p50": 2.0,
+          "p95": 4.0,
+          "p99": 4.0,
+          "max": 4.0
+        },
+        "batch_tokens": {
+          "count": 43,
+          "mean": 271.093,
+          "p50": 212.0,
+          "p95": 424.0,
+          "p99": 634.0,
+          "max": 634.0
+        },
+        "runner_service_share": {
+          "count": 43,
+          "mean": 0.274,
+          "min": 0.003,
+          "p01": 0.003,
+          "p05": 0.005,
+          "p50": 0.148,
+          "p95": 0.909,
+          "max": 0.961
+        }
+      }
+    },
+    "1": {
+      "requests": 502,
+      "service_ms": {
+        "count": 502,
+        "mean": 555.99,
+        "p50": 298.984,
+        "p95": 1683.51,
+        "p99": 3193.177,
+        "max": 5706.357
+      },
+      "accumulated_unit_rtf": 1.7986,
+      "unit_rtf": {
+        "count": 502,
+        "mean": 5.385,
+        "min": 0.175,
+        "p01": 0.313,
+        "p05": 0.594,
+        "p50": 3.25,
+        "p95": 16.503,
+        "max": 49.036
+      },
+      "unit_rtf_lt_1": 88,
+      "unit_rtf_lt_1_rate": 0.1753,
+      "ttft_ms": {
+        "count": 502,
+        "mean": 17560.664,
+        "p50": 167.954,
+        "p95": 120918.01,
+        "p99": 167783.994,
+        "max": 185279.431
+      },
+      "dispatch_to_core_ms": {
+        "count": 502,
+        "mean": 161.008,
+        "p50": 27.584,
+        "p95": 728.85,
+        "p99": 1317.501,
+        "max": 2525.616
+      },
+      "core_admit_to_done_ms": {
+        "count": 502,
+        "mean": 394.981,
+        "p50": 223.135,
+        "p95": 1218.903,
+        "p99": 2750.842,
+        "max": 5178.832
+      },
+      "scheduler_queue_ms": {
+        "count": 493,
+        "mean": 2.214,
+        "p50": 1.229,
+        "p95": 7.061,
+        "p99": 8.838,
+        "max": 10.347
+      },
+      "scheduled_to_done_ms": {
+        "count": 493,
+        "mean": 384.058,
+        "p50": 216.832,
+        "p95": 1192.444,
+        "p99": 2797.301,
+        "max": 5178.686
+      },
+      "runner_ms_sum": {
+        "count": 493,
+        "mean": 270.845,
+        "p50": 140.131,
+        "p95": 972.345,
+        "p99": 2215.859,
+        "max": 3630.39
+      },
+      "first_runner_ms": {
+        "count": 473,
+        "mean": 64.104,
+        "p50": 33.029,
+        "p95": 162.976,
+        "p99": 669.619,
+        "max": 1066.567
+      },
+      "decode_runner_ms_sum": {
+        "count": 473,
+        "mean": 218.193,
+        "p50": 89.074,
+        "p95": 818.14,
+        "p99": 2010.871,
+        "max": 3624.869
+      },
+      "runner_ms_per_step": {
+        "count": 473,
+        "mean": 25.979,
+        "p50": 7.738,
+        "p95": 115.862,
+        "p99": 228.964,
+        "max": 366.446
+      },
+      "mixed_decode_step_rate": {
+        "count": 457,
+        "mean": 0.047,
+        "min": 0.0,
+        "p01": 0.0,
+        "p05": 0.0,
+        "p50": 0.0,
+        "p95": 0.2,
+        "max": 1.0
+      },
+      "mixed_decode_runner_ms_sum": {
+        "count": 457,
+        "mean": 135.194,
+        "p50": 0,
+        "p95": 729.984,
+        "p99": 1585.745,
+        "max": 2468.335
+      },
+      "decode_only_runner_ms_sum": {
+        "count": 457,
+        "mean": 90.638,
+        "p50": 75.751,
+        "p95": 206.843,
+        "p99": 709.727,
+        "max": 1163.288
+      },
+      "mixed_decode_runner_ms_per_step": {
+        "count": 162,
+        "mean": 259.227,
+        "p50": 141.142,
+        "p95": 795.082,
+        "p99": 1092.404,
+        "max": 1171.743
+      },
+      "decode_only_runner_ms_per_step": {
+        "count": 454,
+        "mean": 7.476,
+        "p50": 4.79,
+        "p95": 13.945,
+        "p99": 65.599,
+        "max": 546.313
+      },
+      "mixed_decode_step_runner_ms": {
+        "count": 247,
+        "mean": 250.137,
+        "p50": 144.393,
+        "p95": 721.567,
+        "p99": 1074.816,
+        "max": 1171.743
+      },
+      "decode_only_step_runner_ms": {
+        "count": 7108,
+        "mean": 5.827,
+        "p50": 3.775,
+        "p95": 6.885,
+        "p99": 29.603,
+        "max": 1073.136
+      },
+      "inter_step_ms_sum": {
+        "count": 493,
+        "mean": 8.997,
+        "p50": 4.498,
+        "p95": 29.257,
+        "p99": 79.331,
+        "max": 264.768
+      },
+      "result_exposure_ms": {
+        "count": 473,
+        "mean": 91.366,
+        "p50": 5.86,
+        "p95": 469.152,
+        "p99": 782.47,
+        "max": 2590.98
+      },
+      "scheduler_steps": {
+        "count": 493,
+        "mean": 16.199,
+        "p50": 17.0,
+        "p95": 26.0,
+        "p99": 33.0,
+        "max": 90.0
+      },
+      "first_schedule_batch_reqs": {
+        "count": 493,
+        "mean": 2.3,
+        "p50": 2.0,
+        "p95": 4.0,
+        "p99": 4.0,
+        "max": 4.0
+      },
+      "first_schedule_batch_tokens": {
+        "count": 493,
+        "mean": 4.243,
+        "p50": 4.0,
+        "p95": 8.0,
+        "p99": 21.0,
+        "max": 22.0
+      },
+      "tokens_in": {
+        "count": 502,
+        "mean": 0.0,
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0
+      },
+      "tokens_out": {
+        "count": 502,
+        "mean": 21.237,
+        "p50": 26.0,
+        "p95": 26.0,
+        "p99": 26.0,
+        "max": 26.0
+      },
+      "slowest_5pct": {
+        "count": 26,
+        "service_threshold_ms": 1683.51,
+        "service_ms": {
+          "count": 26,
+          "mean": 2604.421,
+          "p50": 2269.845,
+          "p95": 4545.265,
+          "p99": 5706.357,
+          "max": 5706.357
+        },
+        "dispatch_ms": {
+          "count": 26,
+          "mean": 667.584,
+          "p50": 413.161,
+          "p95": 1968.642,
+          "p99": 2525.616,
+          "max": 2525.616
+        },
+        "scheduler_queue_ms": {
+          "count": 23,
+          "mean": 0.176,
+          "p50": 0.148,
+          "p95": 0.355,
+          "p99": 0.557,
+          "max": 0.557
+        },
+        "runner_ms_sum": {
+          "count": 23,
+          "mean": 1389.862,
+          "p50": 1271.447,
+          "p95": 3625.643,
+          "p99": 3630.39,
+          "max": 3630.39
+        },
+        "first_runner_ms": {
+          "count": 21,
+          "mean": 113.217,
+          "p50": 5.931,
+          "p95": 669.619,
+          "p99": 1066.567,
+          "max": 1066.567
+        },
+        "decode_runner_ms_sum": {
+          "count": 21,
+          "mean": 1409.014,
+          "p50": 1264.603,
+          "p95": 3619.712,
+          "p99": 3624.869,
+          "max": 3624.869
+        },
+        "mixed_decode_runner_ms_sum": {
+          "count": 21,
+          "mean": 1062.634,
+          "p50": 1080.98,
+          "p95": 2461.581,
+          "p99": 2468.335,
+          "max": 2468.335
+        },
+        "decode_only_runner_ms_sum": {
+          "count": 21,
+          "mean": 346.38,
+          "p50": 147.937,
+          "p95": 1151.377,
+          "p99": 1163.288,
+          "max": 1163.288
+        },
+        "mixed_decode_step_rate": {
+          "count": 21,
+          "mean": 0.119,
+          "p50": 0.125,
+          "p95": 0.333,
+          "p99": 0.333,
+          "max": 0.333
+        },
+        "inter_step_ms_sum": {
+          "count": 23,
+          "mean": 50.336,
+          "p50": 30.511,
+          "p95": 199.261,
+          "p99": 264.768,
+          "max": 264.768
+        },
+        "result_exposure_ms": {
+          "count": 21,
+          "mean": 521.244,
+          "p50": 296.681,
+          "p95": 1330.673,
+          "p99": 2590.98,
+          "max": 2590.98
+        },
+        "scheduler_steps": {
+          "count": 23,
+          "mean": 16.783,
+          "p50": 18.0,
+          "p95": 33.0,
+          "p99": 45.0,
+          "max": 45.0
+        },
+        "batch_reqs": {
+          "count": 23,
+          "mean": 4.0,
+          "p50": 4.0,
+          "p95": 4.0,
+          "p99": 4.0,
+          "max": 4.0
+        },
+        "batch_tokens": {
+          "count": 23,
+          "mean": 4.478,
+          "p50": 4.0,
+          "p95": 7.0,
+          "p99": 8.0,
+          "max": 8.0
+        },
+        "runner_service_share": {
+          "count": 23,
+          "mean": 0.499,
+          "min": 0.0,
+          "p01": 0.0,
+          "p05": 0.0,
+          "p50": 0.623,
+          "p95": 0.799,
+          "max": 0.82
+        }
+      }
+    },
+    "2": {
+      "requests": 4,
+      "service_ms": {
+        "count": 4,
+        "mean": 99244.394,
+        "p50": 99224.183,
+        "p95": 100778.956,
+        "p99": 100778.956,
+        "max": 100778.956
+      },
+      "accumulated_unit_rtf": null,
+      "unit_rtf": {
+        "count": 0,
+        "mean": null,
+        "min": null,
+        "p01": null,
+        "p05": null,
+        "p50": null,
+        "p95": null,
+        "max": null
+      },
+      "unit_rtf_lt_1": 0,
+      "unit_rtf_lt_1_rate": null,
+      "ttft_ms": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "dispatch_to_core_ms": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "core_admit_to_done_ms": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "scheduler_queue_ms": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "scheduled_to_done_ms": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "runner_ms_sum": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "first_runner_ms": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "decode_runner_ms_sum": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "runner_ms_per_step": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "mixed_decode_step_rate": {
+        "count": 0,
+        "mean": null,
+        "min": null,
+        "p01": null,
+        "p05": null,
+        "p50": null,
+        "p95": null,
+        "max": null
+      },
+      "mixed_decode_runner_ms_sum": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "decode_only_runner_ms_sum": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "mixed_decode_runner_ms_per_step": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "decode_only_runner_ms_per_step": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "mixed_decode_step_runner_ms": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "decode_only_step_runner_ms": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "inter_step_ms_sum": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "result_exposure_ms": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "scheduler_steps": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "first_schedule_batch_reqs": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "first_schedule_batch_tokens": {
+        "count": 0,
+        "mean": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "tokens_in": {
+        "count": 4,
+        "mean": 0.0,
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0
+      },
+      "tokens_out": {
+        "count": 4,
+        "mean": 0.0,
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0
+      },
+      "persistent_audio_wall_ratio": {
+        "count": 4,
+        "mean": 0.586,
+        "min": 0.529,
+        "p01": 0.529,
+        "p05": 0.529,
+        "p50": 0.595,
+        "p95": 0.617,
+        "max": 0.617
+      },
+      "audio_duration_s": {
+        "count": 4,
+        "mean": 58.22,
+        "p50": 59.08,
+        "p95": 62.12,
+        "p99": 62.12,
+        "max": 62.12
+      },
+      "persistent_stage_note": "This request spans session idle time; do not use its wall ratio as per-unit RTF.",
+      "slowest_5pct": {
+        "count": 1,
+        "service_threshold_ms": 100778.956,
+        "service_ms": {
+          "count": 1,
+          "mean": 100778.956,
+          "p50": 100778.956,
+          "p95": 100778.956,
+          "p99": 100778.956,
+          "max": 100778.956
+        },
+        "dispatch_ms": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "scheduler_queue_ms": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "runner_ms_sum": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "first_runner_ms": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "decode_runner_ms_sum": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "mixed_decode_runner_ms_sum": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "decode_only_runner_ms_sum": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "mixed_decode_step_rate": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "inter_step_ms_sum": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "result_exposure_ms": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "scheduler_steps": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "batch_reqs": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "batch_tokens": {
+          "count": 0,
+          "mean": null,
+          "p50": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "runner_service_share": {
+          "count": 0,
+          "mean": null,
+          "min": null,
+          "p01": null,
+          "p05": null,
+          "p50": null,
+          "p95": null,
+          "max": null
+        }
+      }
+    }
+  },
+  "vision_arrival": {
+    "batches": 1388,
+    "jobs": 1440,
+    "encoded_frames": 1417,
+    "cpu_prepare_ms": {
+      "count": 1388,
+      "mean": 33.726,
+      "p50": 32.869,
+      "p95": 43.759,
+      "p99": 52.77,
+      "max": 63.449
+    },
+    "vision_encoder_ms": {
+      "count": 1388,
+      "mean": 29.727,
+      "p50": 27.196,
+      "p95": 44.373,
+      "p99": 55.103,
+      "max": 81.847
+    },
+    "cache_ms": {
+      "count": 1388,
+      "mean": 0.015,
+      "p50": 0.014,
+      "p95": 0.025,
+      "p99": 0.035,
+      "max": 0.049
+    },
+    "batch_total_ms": {
+      "count": 1388,
+      "mean": 63.631,
+      "p50": 62.119,
+      "p95": 82.433,
+      "p99": 91.286,
+      "max": 124.017
+    },
+    "by_batch_size": {
+      "1": {
+        "batches": 1336,
+        "vision_encoder_ms": {
+          "count": 1336,
+          "mean": 29.189,
+          "p50": 26.801,
+          "p95": 43.3,
+          "p99": 51.028,
+          "max": 81.847
+        },
+        "total_ms": {
+          "count": 1336,
+          "mean": 62.905,
+          "p50": 61.593,
+          "p95": 80.656,
+          "p99": 88.303,
+          "max": 109.31
+        }
+      },
+      "2": {
+        "batches": 52,
+        "vision_encoder_ms": {
+          "count": 52,
+          "mean": 43.55,
+          "p50": 40.664,
+          "p95": 58.722,
+          "p99": 77.086,
+          "max": 77.086
+        },
+        "total_ms": {
+          "count": 52,
+          "mean": 82.278,
+          "p50": 80.183,
+          "p95": 102.673,
+          "p99": 124.017,
+          "max": 124.017
+        }
+      }
+    },
+    "arrival_to_ready_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+    },
+    "arrival_ready_successes": 0,
+    "arrival_to_control_ack_ms": {
+      "count": 1440,
+      "mean": 63.708,
+      "p50": 54.0,
+      "p95": 120.0,
+      "p99": 181.0,
+      "max": 305.0
+    },
+    "arrival_control_ack_successes": 1440,
+    "formal_wait_calls": 0,
+    "formal_wait_tasks": 0,
+    "formal_wait_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+    }
+  },
+  "native_long_horizon": {
+    "definition": "stream_rtf = client one-second AV-unit budget / wall time from the first Stage0 admission through the final unit's last Thinker runner completion; values >= 1 sustain real time",
+    "sessions": 4,
+    "complete_sessions": 4,
+    "expected_units_per_session": 360,
+    "completed_input_units": 1440,
+    "coalesced_input_units": 7,
+    "admitted_units_per_session": {
+      "count": 4,
+      "mean": 360.0,
+      "p50": 360.0,
+      "p95": 360.0,
+      "p99": 360.0,
+      "max": 360.0
+    },
+    "completed_units_per_session": {
+      "count": 4,
+      "mean": 360.0,
+      "p50": 360.0,
+      "p95": 360.0,
+      "p99": 360.0,
+      "max": 360.0
+    },
+    "per_session_stream_rtf": {
+      "count": 4,
+      "mean": 1.001,
+      "min": 1.001,
+      "p01": 1.001,
+      "p05": 1.001,
+      "p50": 1.001,
+      "p95": 1.002,
+      "max": 1.002
+    },
+    "completion_cadence_rtf": {
+      "count": 4,
+      "mean": 0.999,
+      "min": 0.998,
+      "p01": 0.998,
+      "p05": 0.998,
+      "p50": 0.998,
+      "p95": 0.999,
+      "max": 0.999
+    },
+    "terminal_stream_backlog_ms": {
+      "count": 4,
+      "mean": -434.212,
+      "p50": -415.473,
+      "p95": -295.527,
+      "p99": -295.527,
+      "max": -295.527
+    },
+    "terminal_input_latency_ms": {
+      "count": 4,
+      "mean": 147.582,
+      "p50": 143.397,
+      "p95": 205.323,
+      "p99": 205.323,
+      "max": 205.323
+    },
+    "input_admit_to_runner_done_ms": {
+      "count": 1440,
+      "mean": 209.13,
+      "p50": 141.642,
+      "p95": 670.482,
+      "p99": 1082.399,
+      "max": 1828.806
+    }
+  },
+  "measurement_scope": {
+    "input_units_per_session": 360,
+    "client_stage0_admits": 1440,
+    "model_owned_continuations_excluded": true,
+    "done_snapshots_are_diagnostic_only": true
+  }
+}

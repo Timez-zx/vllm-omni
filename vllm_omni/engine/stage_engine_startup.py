@@ -902,6 +902,19 @@ def scoped_spawn_device_env(
         yield
         return
 
+    auxiliary_devices = os.environ.get("VLLM_OMNI_AUX_VISIBLE_DEVICES", "")
+    if auxiliary_devices.strip():
+        visible = [
+            item.strip()
+            for item in stage_visible_devices.split(",")
+            if item.strip()
+        ]
+        for item in auxiliary_devices.split(","):
+            item = item.strip()
+            if item and item not in visible:
+                visible.append(item)
+        stage_visible_devices = ",".join(visible)
+
     device_control_env = current_omni_platform.device_control_env_var
     with spawn_device_lock:
         previous_visible_devices = os.environ.get(device_control_env)

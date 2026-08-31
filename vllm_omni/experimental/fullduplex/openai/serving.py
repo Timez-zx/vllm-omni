@@ -5,6 +5,8 @@ import base64
 import binascii
 import inspect
 import json
+import os
+import time
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
@@ -72,6 +74,13 @@ __all__ = ["OmniDuplexSessionHandler", "should_enable_duplex_endpoint"]
 
 _DEFAULT_CONFIG_TIMEOUT_S = 10.0
 _DEFAULT_IDLE_TIMEOUT_S = 300.0
+_MINICPMO45_VISION_PREENCODE_BATCH_WINDOW_S = 0.05
+_MINICPMO45_LOG_PREP_DIAG = os.environ.get("MINICPMO45_LOG_PREP_DIAG", "0") not in (
+    "0",
+    "",
+    "false",
+    "False",
+)
 
 
 @dataclass(frozen=True)
@@ -145,6 +154,121 @@ class OmniDuplexSessionHandler(
             replay_max_bytes_per_session=self._duplex_session_config.resume_replay_max_bytes_per_session,
             disconnect_grace_s=self._duplex_session_config.disconnect_grace_s,
         )
+        self._minicpmo45_vision_preencode_pending: list[tuple[dict[str, object], float, asyncio.Future[bool]]] = []
+        self._minicpmo45_vision_preencode_flush_task: asyncio.Task[None] | None = None
+        self._minicpmo45_vision_preencode_rpc_tasks: set[asyncio.Task[object]] = set()
+
+    async def _preencode_minicpmo45_vision(
+        self,
+        job: dict[str, object],
+        *,
+        timeout_s: float,
+    ) -> bool:
+        """Microbatch arrival-side camera encoding on the Thinker worker."""
+        collective_rpc = getattr(self._chat_service.engine_client, "collective_rpc", None)
+        if not callable(collective_rpc):
+            return False
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        future: asyncio.Future[bool] = loop.create_future()
+        self._minicpmo45_vision_preencode_pending.append((job, max(0.1, float(timeout_s)), future))
+        flush_task = self._minicpmo45_vision_preencode_flush_task
+        if flush_task is None or flush_task.done():
+            self._minicpmo45_vision_preencode_flush_task = asyncio.create_task(
+                self._flush_minicpmo45_vision_preencode(),
+                name="minicpmo45-vision-preencode",
+            )
+        success = await future
+        if _MINICPMO45_LOG_PREP_DIAG:
+            logger.info(
+                "[MINICPM-PREP-ARRIVAL-ACCEPTED] success=%s "
+                "arrival_to_accepted_ms=%.3f "
+                "done_epoch=%.6f",
+                success,
+                (loop.time() - started) * 1000.0,
+                time.time(),
+            )
+        return success
+
+    async def _flush_minicpmo45_vision_preencode(self) -> None:
+        cancelled = False
+        try:
+            while True:
+                await asyncio.sleep(_MINICPMO45_VISION_PREENCODE_BATCH_WINDOW_S)
+                pending = self._minicpmo45_vision_preencode_pending
+                self._minicpmo45_vision_preencode_pending = []
+                if not pending:
+                    return
+                task = asyncio.create_task(
+                    self._run_minicpmo45_vision_preencode_batch(pending),
+                    name="minicpmo45-vision-preencode-rpc",
+                )
+                self._minicpmo45_vision_preencode_rpc_tasks.add(task)
+                task.add_done_callback(
+                    self._minicpmo45_vision_preencode_rpc_tasks.discard
+                )
+        except asyncio.CancelledError:
+            cancelled = True
+            queued = self._minicpmo45_vision_preencode_pending
+            self._minicpmo45_vision_preencode_pending = []
+            for _, _, future in queued:
+                if not future.done():
+                    future.set_result(False)
+            raise
+        finally:
+            self._minicpmo45_vision_preencode_flush_task = None
+            # Cancellation or an arrival in the final event-loop turn must not
+            # strand a waiter. A fresh drain owns any remaining work.
+            if not cancelled and self._minicpmo45_vision_preencode_pending:
+                self._minicpmo45_vision_preencode_flush_task = asyncio.create_task(
+                    self._flush_minicpmo45_vision_preencode(),
+                    name="minicpmo45-vision-preencode",
+                )
+
+    async def _run_minicpmo45_vision_preencode_batch(
+        self,
+        pending: list[tuple[dict[str, object], float, asyncio.Future[bool]]],
+    ) -> None:
+        jobs = [job for job, _, _ in pending]
+        timeout_s = max(timeout for _, timeout, _ in pending)
+        accepted = False
+        try:
+            # The response travels through the shared stage-output channel and
+            # is not a data-readiness signal. Submit it as fire-and-forget so a
+            # delayed utility reply cannot throttle the independent Encoder
+            # GPU. Formal preprocessing atomically consumes the worker-local
+            # cache or performs the correctness fallback.
+            rpc_task = asyncio.create_task(
+                self._chat_service.engine_client.collective_rpc(
+                    method="preencode_minicpmo45_vision",
+                    args=(jobs,),
+                    stage_ids=[0],
+                    timeout=timeout_s,
+                ),
+                name="minicpmo45-vision-preencode-control-ack",
+            )
+            self._minicpmo45_vision_preencode_rpc_tasks.add(rpc_task)
+
+            def observe_result(task: asyncio.Task[object]) -> None:
+                self._minicpmo45_vision_preencode_rpc_tasks.discard(task)
+                if task.cancelled():
+                    return
+                exc = task.exception()
+                if exc is not None:
+                    logger.warning("MiniCPM-o arrival vision preencode failed: %s", exc)
+
+            rpc_task.add_done_callback(observe_result)
+            accepted = True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Preencoding is speculative. The ordinary request-local encoder
+            # remains the correctness fallback.
+            logger.warning("MiniCPM-o arrival vision preencode failed: %s", exc)
+        finally:
+            for _, _, future in pending:
+                if not future.done():
+                    future.set_result(accepted)
 
     async def handle_realtime_session(self, websocket: WebSocket) -> None:
         await self.handle_session(
@@ -719,6 +843,8 @@ class OmniDuplexSessionHandler(
         if merged_frames:
             merged["video_frames"] = merged_frames
             merged_slice_limits: list[int] = []
+            merged_preencode_ids: list[str] = []
+            preencode_ids_complete = True
             for source in (first, second):
                 source_frames = source.get("video_frames")
                 if not isinstance(source_frames, list):
@@ -734,10 +860,24 @@ class OmniDuplexSessionHandler(
                     )
                 else:
                     merged_slice_limits.extend([1] * len(valid_frames))
+                raw_preencode_ids = source.get("video_preencode_ids")
+                if (
+                    isinstance(raw_preencode_ids, list)
+                    and len(raw_preencode_ids) == len(valid_frames)
+                    and all(isinstance(preencode_id, str) and preencode_id for preencode_id in raw_preencode_ids)
+                ):
+                    merged_preencode_ids.extend(raw_preencode_ids)
+                else:
+                    preencode_ids_complete = False
             merged["max_slice_nums"] = merged_slice_limits
+            if preencode_ids_complete:
+                merged["video_preencode_ids"] = merged_preencode_ids
+            else:
+                merged.pop("video_preencode_ids", None)
         else:
             merged.pop("video_frames", None)
             merged.pop("max_slice_nums", None)
+            merged.pop("video_preencode_ids", None)
         merged["force_listen"] = bool(first.get("force_listen", False)) or bool(second.get("force_listen", False))
         merged.pop("force_speak", None)
         merged["is_speech"] = bool(first.get("is_speech", False)) or bool(second.get("is_speech", False))

@@ -418,6 +418,7 @@ class Orchestrator:
         self._stages_shutdown = False
         self._fatal_error: str | None = None
         self._fatal_error_stage_id: int | None = None
+        self._background_collective_rpc_tasks: set[asyncio.Task[None]] = set()
 
         # Distributed membership (optional, injected by DistStageRuntime)
         self._membership = membership_controller
@@ -596,7 +597,10 @@ class Orchestrator:
             elif msg_type == "interaction":
                 await self._handle_interaction(msg)
             elif msg_type == "collective_rpc":
-                await self._handle_collective_rpc(msg)
+                if msg.method == "preencode_minicpmo45_vision":
+                    self._schedule_background_collective_rpc(msg)
+                else:
+                    await self._handle_collective_rpc(msg)
             elif isinstance(msg, RegisterRemoteReplicaMessage):
                 if self._membership is not None:
                     await self._membership.handle_register(msg.stage_id, msg.replica_id)
@@ -870,6 +874,31 @@ class Orchestrator:
                 results=results,
             )
         )
+
+    def _schedule_background_collective_rpc(
+        self,
+        msg: CollectiveRPCRequestMessage,
+    ) -> None:
+        """Keep speculative vision preprocessing from blocking ingress."""
+        task = asyncio.create_task(
+            self._handle_collective_rpc(msg),
+            name=f"orchestrator-rpc-{msg.method}-{msg.rpc_id}",
+        )
+        self._background_collective_rpc_tasks.add(task)
+
+        def discard(done: asyncio.Task[None]) -> None:
+            self._background_collective_rpc_tasks.discard(done)
+            if done.cancelled():
+                return
+            error = done.exception()
+            if error is not None:
+                logger.error(
+                    "[Orchestrator] background collective_rpc(%s) failed: %s",
+                    msg.method,
+                    error,
+                )
+
+        task.add_done_callback(discard)
 
     # ---- Orchestration loop ----
 

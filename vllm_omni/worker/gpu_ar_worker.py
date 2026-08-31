@@ -142,3 +142,15 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         if isinstance(task, dict):
             task = OmniWakeTask(**task)
         return super().handle_wake_task(task)
+
+    @torch.inference_mode()
+    def preencode_minicpmo45_vision(
+        self,
+        jobs: list[dict[str, object]],
+    ) -> dict[str, object]:
+        """Run MiniCPM arrival-side vision encoding without an LLM request."""
+        model = getattr(self.model_runner, "model", None)
+        preencode = getattr(model, "preencode_duplex_vision", None)
+        if not callable(preencode):
+            return {"supported": False, "encoded_frames": 0}
+        return preencode(jobs)

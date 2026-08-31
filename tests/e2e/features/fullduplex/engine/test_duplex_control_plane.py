@@ -1268,3 +1268,62 @@ async def test_control_dispatch_is_ordered_per_session_without_blocking_other_se
         for submission in stage_port.submit_calls
         if submission.context.session_id == blocked.session_id
     ] == [blocked.session_id]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_handle_calls_are_serialized_per_session() -> None:
+    class _FirstSubmitBlockingStagePort(_TypedStagePort):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+
+        async def submit(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult:
+            if not self.submit_calls:
+                self.first_started.set()
+                await self.release_first.wait()
+            return await super().submit(submission)
+
+    stage_port = _FirstSubmitBlockingStagePort()
+    result_sink: asyncio.Queue = asyncio.Queue()
+    plane = DuplexControlPlane(extension=_Extension(), stage_port=stage_port, result_sink=result_sink)
+    fence = DuplexFence("sid-concurrent-handle")
+    plane.sessions.open_session(
+        fence,
+        capabilities=DuplexRuntimeCapabilities(input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK}),
+    )
+
+    first = asyncio.create_task(
+        plane.handle(
+            AppendDuplexInputMessage(
+                control_id="append-1",
+                fence=fence,
+                session_id=fence.session_id,
+                mode=DuplexInputMode.APPEND_AUDIO_CHUNK.value,
+                payload={"audio": b"first"},
+            )
+        )
+    )
+    await asyncio.wait_for(stage_port.first_started.wait(), timeout=1)
+    second = asyncio.create_task(
+        plane.handle(
+            AppendDuplexInputMessage(
+                control_id="append-2",
+                fence=fence,
+                session_id=fence.session_id,
+                mode=DuplexInputMode.APPEND_AUDIO_CHUNK.value,
+                payload={"audio": b"second"},
+            )
+        )
+    )
+    await asyncio.sleep(0)
+    assert stage_port.submit_calls == []
+
+    stage_port.release_first.set()
+    await asyncio.gather(first, second)
+
+    results = [result_sink.get_nowait(), result_sink.get_nowait()]
+    assert [result.ok for result in results] == [True, True]
+    assert [result.stage_results[0]["result"]["seq"] for result in results] == [1, 2]
+    assert [call.already_submitted for call in stage_port.submit_calls] == [False, True]
+    assert plane.sessions.require(fence.session_id).input_seq == 2

@@ -147,6 +147,12 @@ class FakeStageClient:
         except queue.Empty:
             return SimpleNamespace(outputs=[])
 
+    def get_output_nowait(self):
+        try:
+            return self._engine_core_outputs.get_nowait()
+        except queue.Empty:
+            return SimpleNamespace(outputs=[])
+
     def get_diffusion_output_nowait(self):
         try:
             return self._diffusion_outputs.get_nowait()
@@ -2078,6 +2084,68 @@ async def test_collective_rpc_ignores_invalid_stage_ids(orchestrator_factory, ca
         assert len(stage1.collective_rpc_calls) == 1
         assert "collective_rpc: ignoring invalid stage_id 99" in caplog.text
     finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_vision_preencode_rpc_does_not_block_request_ingress(
+    orchestrator_factory,
+) -> None:
+    class _BlockingPreencodeStage(FakeCollectiveRpcStageClient):
+        def __init__(self):
+            super().__init__(stage_type="llm", final_output=True)
+            self.preencode_started = threading.Event()
+            self.preencode_release = threading.Event()
+
+        async def collective_rpc_async(self, **kwargs):
+            self.collective_rpc_calls.append(
+                (
+                    kwargs["method"],
+                    kwargs.get("timeout"),
+                    kwargs.get("args", ()),
+                    dict(kwargs.get("kwargs") or {}),
+                )
+            )
+            self.preencode_started.set()
+            while not self.preencode_release.is_set():
+                await asyncio.sleep(0.005)
+            return {"supported": True, "encoded_frames": 1}
+
+    stage0 = _BlockingPreencodeStage()
+    orchestrator_fixture = orchestrator_factory([stage0])
+    try:
+        orchestrator_fixture.request_sync_q.put_nowait(
+            CollectiveRPCRequestMessage(
+                rpc_id="vision-preencode",
+                method="preencode_minicpmo45_vision",
+                timeout=2,
+                args=([{"preencode_ids": ["frame-a"]}],),
+                kwargs={},
+                stage_ids=[0],
+            )
+        )
+        assert await asyncio.to_thread(stage0.preencode_started.wait, 1)
+
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="request-during-preencode",
+            prompt=SimpleNamespace(
+                request_id="request-during-preencode",
+                prompt_token_ids=[1],
+            ),
+            original_prompt={"prompt": "hello"},
+            sampling_params_list=[_sampling_params()],
+            final_stage_id=0,
+        )
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+        assert not stage0.preencode_release.is_set()
+
+        stage0.preencode_release.set()
+        rpc_result = await _get_rpc_message(orchestrator_fixture)
+        assert rpc_result.rpc_id == "vision-preencode"
+        assert rpc_result.results == [{"supported": True, "encoded_frames": 1}]
+    finally:
+        stage0.preencode_release.set()
         await _shutdown_orchestrator(orchestrator_fixture)
 
 

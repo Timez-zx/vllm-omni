@@ -1,0 +1,80 @@
+# MiniCPM-o 4.5 native-duplex deployment with a dedicated Vision Encoder GPU.
+# GPU 0: Thinker; GPU 1: Talker; GPU 2: Code2Wav; GPU 3: Vision Encoder.
+pipeline: minicpmo_4_5
+async_chunk: true
+trust_remote_code: true
+enable_prefix_caching: false
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 3
+
+stages:
+  - stage_id: 0
+    max_model_len: 40960
+    max_num_batched_tokens: 32768
+    max_num_seqs: 64
+    async_scheduling: false
+    gpu_memory_utilization: 0.9
+    devices: "0"
+    limit_mm_per_prompt:
+      video: 1
+    env:
+      # TP/world-size remains one. Physical GPU 3 is exposed as logical
+      # cuda:1 only for the stateless SigLIP tower and resampler.
+      VLLM_OMNI_AUX_VISIBLE_DEVICES: "3"
+      MINICPMO45_VISION_ENCODER_DEVICE: "cuda:1"
+      MINICPMO45_VISION_ENCODER_BATCH_SIZE: "8"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.1
+
+  - stage_id: 1
+    max_model_len: 4096
+    max_num_batched_tokens: 8192
+    max_num_seqs: 64
+    async_scheduling: false
+    gpu_memory_utilization: 0.9
+    devices: "1"
+    output_connectors:
+      to_stage_2: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      min_tokens: 0
+      max_tokens: 2048
+      stop_token_ids: [1]
+      seed: 42
+      detokenize: false
+
+  - stage_id: 2
+    max_model_len: 65536
+    max_num_batched_tokens: 65536
+    max_num_seqs: 64
+    async_scheduling: false
+    gpu_memory_utilization: 0.9
+    enforce_eager: true
+    enable_chunked_prefill: false
+    devices: "2"
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      detokenize: true
+
+platforms: {}
