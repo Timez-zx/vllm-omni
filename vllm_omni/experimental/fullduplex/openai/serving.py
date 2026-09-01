@@ -180,7 +180,8 @@ class OmniDuplexSessionHandler(
         success = await future
         if _MINICPMO45_LOG_PREP_DIAG:
             logger.info(
-                "[MINICPM-PREP-ARRIVAL-READY] success=%s arrival_to_ready_ms=%.3f "
+                "[MINICPM-PREP-ARRIVAL-READY] success=%s "
+                "arrival_to_ready_ms=%.3f "
                 "done_epoch=%.6f",
                 success,
                 (loop.time() - started) * 1000.0,
@@ -192,44 +193,16 @@ class OmniDuplexSessionHandler(
         cancelled = False
         try:
             while True:
-                # Only one worker RPC may be in flight. Arrivals received while
-                # it runs accumulate here and become the next, larger batch
-                # instead of queuing more control RPCs ahead of formal P work.
                 await asyncio.sleep(_MINICPMO45_VISION_PREENCODE_BATCH_WINDOW_S)
                 pending = self._minicpmo45_vision_preencode_pending
                 self._minicpmo45_vision_preencode_pending = []
                 if not pending:
                     return
-                jobs = [job for job, _, _ in pending]
-                timeout_s = max(timeout for _, timeout, _ in pending)
-                success = False
-                try:
-                    results = await self._chat_service.engine_client.collective_rpc(
-                        method="preencode_minicpmo45_vision",
-                        args=(jobs,),
-                        stage_ids=[0],
-                        timeout=timeout_s,
-                    )
-
-                    def encoded_count(value: object) -> int:
-                        if isinstance(value, dict):
-                            count = value.get("encoded_frames")
-                            return int(count) if isinstance(count, int) else 0
-                        if isinstance(value, list | tuple):
-                            return sum(encoded_count(item) for item in value)
-                        return 0
-
-                    success = encoded_count(results) > 0
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    # Preencoding is speculative. The ordinary request-local
-                    # encoder remains the correctness fallback.
-                    logger.warning("MiniCPM-o arrival vision preencode failed: %s", exc)
-                finally:
-                    for _, _, future in pending:
-                        if not future.done():
-                            future.set_result(success)
+                # Keep one encoder RPC in flight. Frames that arrive while it
+                # runs remain in the unbounded pending list and are coalesced
+                # into the next GPU batch. This preserves every frame without
+                # fragmenting the sidecar into many queued singleton RPCs.
+                await self._run_minicpmo45_vision_preencode_batch(pending)
         except asyncio.CancelledError:
             cancelled = True
             queued = self._minicpmo45_vision_preencode_pending
@@ -247,6 +220,47 @@ class OmniDuplexSessionHandler(
                     self._flush_minicpmo45_vision_preencode(),
                     name="minicpmo45-vision-preencode",
                 )
+
+    async def _run_minicpmo45_vision_preencode_batch(
+        self,
+        pending: list[tuple[dict[str, object], float, asyncio.Future[bool]]],
+    ) -> None:
+        jobs = [job for job, _, _ in pending]
+        timeout_s = max(timeout for _, timeout, _ in pending)
+        success = False
+        try:
+            # Completion of this RPC is the readiness fence for the
+            # worker-local embedding cache. The matching formal append waits
+            # for this future before entering Thinker-P, so request-local
+            # preprocessing does not repeat vision encoding on P's critical
+            # path.
+            results = await self._chat_service.engine_client.collective_rpc(
+                method="preencode_minicpmo45_vision",
+                args=(jobs,),
+                stage_ids=[0],
+                timeout=timeout_s,
+            )
+
+            def encoded_count(value: object) -> int:
+                if isinstance(value, dict):
+                    count = value.get("encoded_frames")
+                    return int(count) if isinstance(count, int) else 0
+                if isinstance(value, list | tuple):
+                    return sum(encoded_count(item) for item in value)
+                return 0
+
+            success = encoded_count(results) > 0
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Preserve correctness on an actual encoder failure. The formal
+            # request may use its request-local fallback, but ordinary capacity
+            # runs should never take that path.
+            logger.warning("MiniCPM-o arrival vision preencode failed: %s", exc)
+        finally:
+            for _, _, future in pending:
+                if not future.done():
+                    future.set_result(success)
 
     async def handle_realtime_session(self, websocket: WebSocket) -> None:
         await self.handle_session(

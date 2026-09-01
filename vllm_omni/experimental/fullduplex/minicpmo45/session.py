@@ -9,17 +9,23 @@ from vllm_omni.experimental.fullduplex.minicpmo45.input import (
     MiniCPMO45PcmAppendBuffer,
 )
 
-_DEFAULT_MAX_PENDING_VISION_PREENCODES_PER_SESSION = 2
+_DEFAULT_MAX_PENDING_VISION_PREENCODES_PER_SESSION = 0
 
 
-def _max_pending_vision_preencodes_per_session() -> int:
-    """Return the bounded arrival-vision lookahead used by this process."""
+def _max_pending_vision_preencodes_per_session() -> int | None:
+    """Return the arrival-vision lookahead, or ``None`` when unbounded.
+
+    Native-duplex capacity experiments must submit every arriving camera frame
+    to the independent encoder.  A positive environment override retains the
+    bounded speculative policy for deployments that prefer memory protection.
+    """
     raw = os.environ.get(
         "MINICPMO45_MAX_PENDING_VISION_PREENCODES_PER_SESSION",
         str(_DEFAULT_MAX_PENDING_VISION_PREENCODES_PER_SESSION),
     )
     try:
-        return max(1, int(raw))
+        value = int(raw)
+        return value if value > 0 else None
     except ValueError:
         return _DEFAULT_MAX_PENDING_VISION_PREENCODES_PER_SESSION
 
@@ -89,10 +95,10 @@ class MiniCPMO45ServingSessionState:
         for task in stale_tasks:
             if not task.done():
                 task.cancel()
-        return (
-            frame_count > 0
-            and len(self.vision_preencode_tasks) + frame_count
-            <= _max_pending_vision_preencodes_per_session()
+        limit = _max_pending_vision_preencodes_per_session()
+        return frame_count > 0 and (
+            limit is None
+            or len(self.vision_preencode_tasks) + frame_count <= limit
         )
 
     def track_vision_preencode(

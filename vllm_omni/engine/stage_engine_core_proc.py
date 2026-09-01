@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import contextlib
 import os
+import queue
 import signal
 import threading
 import time
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from collections.abc import Callable
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from contextlib import ExitStack
 from typing import Any
 
@@ -28,7 +30,13 @@ from vllm.transformers_utils.config import (
 )
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
-from vllm.v1.engine import EngineCoreReadyResponse, EngineCoreRequestType
+from vllm.v1.engine import (
+    EngineCoreOutputs,
+    EngineCoreReadyResponse,
+    EngineCoreRequestType,
+    UtilityOutput,
+    UtilityResult,
+)
 from vllm.v1.engine.core import EngineCoreProc, EngineShutdownState
 from vllm.v1.engine.tensor_ipc import TensorIpcSender
 from vllm.v1.engine.utils import EngineZmqAddresses, SignalCallback
@@ -62,6 +70,48 @@ _DIAG_STAGES = (
     else frozenset(stage.strip() for stage in _DIAG_STAGE_RAW.split(",") if stage.strip())
 )
 _OUTPUT_IPC_FALLBACK_MIN_BYTES = 1 << 20
+
+
+class _StageInputQueue(queue.Queue[tuple[EngineCoreRequestType, Any]]):
+    """FIFO for data requests with direct auxiliary-sidecar dispatch."""
+
+    def __init__(
+        self,
+        auxiliary_dispatch: Callable[[tuple[EngineCoreRequestType, Any]], None]
+        | None = None,
+    ) -> None:
+        super().__init__()
+        self._auxiliary_dispatch = auxiliary_dispatch
+
+    @staticmethod
+    def _is_auxiliary_vision_rpc(item: tuple[EngineCoreRequestType, Any]) -> bool:
+        request_type, request = item
+        if request_type != EngineCoreRequestType.UTILITY:
+            return False
+        try:
+            _client_idx, _call_id, method_name, args = request
+            return (
+                method_name == "collective_rpc"
+                and bool(args)
+                and args[0] == "preencode_minicpmo45_vision"
+            )
+        except (TypeError, ValueError, IndexError):
+            return False
+
+    def put(
+        self,
+        item: tuple[EngineCoreRequestType, Any],
+        block: bool = True,
+        timeout: float | None = None,
+    ) -> None:
+        dispatch = self._auxiliary_dispatch
+        if dispatch is not None and self._is_auxiliary_vision_rpc(item):
+            # Dispatch from the ZMQ IO thread. The RPC only queues work on the
+            # dedicated single-threaded Encoder sidecar and never interrupts
+            # an executing Thinker-P batch.
+            dispatch(item)
+            return
+        super().put(item, block=block, timeout=timeout)
 
 
 def _signal_exit_code(signum: int) -> int:
@@ -201,7 +251,22 @@ class StageEngineCoreProc(EngineCoreProc):
             if output_tensor_queue is not None
             else None
         )
+        self._vision_preencode_executor: ThreadPoolExecutor | None = None
         super().__init__(*args, **kwargs)
+        # The input thread resolves ``self.input_queue`` for each message. Swap
+        # the still-unconsumed startup queue so auxiliary vision RPCs can be
+        # admitted directly instead of waiting behind the Thinker-P ADD
+        # backlog. Ordinary data ordering is unchanged.
+        old_queue = self.input_queue
+        sidecar_queue = _StageInputQueue(
+            lambda item: self._handle_client_request(*item),
+        )
+        self.input_queue = sidecar_queue
+        while True:
+            try:
+                sidecar_queue.put_nowait(old_queue.get_nowait())
+            except queue.Empty:
+                break
         self._install_materialized_mm_receiver_cache()
         if _LOG_CORE_STEP_DIAG:
             self._install_core_step_diagnostics()
@@ -214,7 +279,91 @@ class StageEngineCoreProc(EngineCoreProc):
         # orchestrator wait for a utility result on D's busy output socket.
         self._pd_pending_decode_adds: dict[str, tuple[Any, int]] = {}
         self._pd_cache_sync_last_poll = 0.0
-        self._vision_preencode_executor: ThreadPoolExecutor | None = None
+
+    def _put_priority_output(self, output: tuple[int, EngineCoreOutputs]) -> None:
+        """Expose the tiny Encoder admission reply ahead of data outputs."""
+        output_queue = self.output_queue
+        with output_queue.not_empty:
+            output_queue.queue.appendleft(output)
+            output_queue.unfinished_tasks += 1
+            output_queue.not_empty.notify()
+
+    def _handle_client_request(
+        self,
+        request_type: EngineCoreRequestType,
+        request: Any,
+    ) -> None:
+        """Complete vision RPCs only after embeddings enter the side cache."""
+        if request_type != EngineCoreRequestType.UTILITY:
+            return super()._handle_client_request(request_type, request)
+
+        client_idx, call_id, method_name, args = request
+        rpc_method = args[0] if method_name == "collective_rpc" and args else None
+        if rpc_method != "preencode_minicpmo45_vision":
+            return super()._handle_client_request(request_type, request)
+        if self._reject_utility_in_shutdown(client_idx, call_id, method_name):
+            return
+
+        output = UtilityOutput(call_id)
+        try:
+            method = getattr(self, method_name)
+            converted_args = self._convert_msgspec_args(method, args)
+            result = method(*converted_args)
+            if isinstance(result, Future):
+                # The API uses this utility result as a readiness fence before
+                # submitting the matching formal P request. Keep the encoder
+                # off the Core busy loop, but do not turn queue admission into
+                # a false cache-ready acknowledgement.
+                result.add_done_callback(
+                    lambda done: self._complete_auxiliary_vision_result(
+                        done,
+                        client_idx=client_idx,
+                        output=output,
+                        method_name=method_name,
+                    )
+                )
+                return
+            else:
+                output.result = UtilityResult(result)
+        except Exception as exc:
+            logger.exception("Invocation of %s method failed", method_name)
+            output.failure_message = f"Call to {method_name} method failed: {str(exc)}"
+        self._put_priority_output(
+            (client_idx, EngineCoreOutputs(utility_output=output))
+        )
+
+    def _complete_auxiliary_vision_result(
+        self,
+        future: Future[Any],
+        *,
+        client_idx: int,
+        output: UtilityOutput,
+        method_name: str,
+    ) -> None:
+        """Publish the sidecar result after its cache write is visible."""
+        try:
+            output.result = UtilityResult(future.result())
+        except CancelledError:
+            output.failure_message = f"Call to {method_name} was cancelled"
+        except Exception as exc:
+            logger.exception("Invocation of %s method failed", method_name)
+            output.failure_message = f"Call to {method_name} method failed: {str(exc)}"
+        self._put_priority_output(
+            (client_idx, EngineCoreOutputs(utility_output=output))
+        )
+
+    @staticmethod
+    def _auxiliary_vision_frame_count(args: Any) -> int:
+        """Retained for compatibility with older instrumentation callers."""
+        try:
+            jobs = args[2][0]
+            return sum(
+                len(job.get("video_frames", ()))
+                for job in jobs
+                if isinstance(job, dict)
+            )
+        except (TypeError, ValueError, IndexError):
+            return 0
 
     def collective_rpc(
         self,
@@ -226,9 +375,9 @@ class StageEngineCoreProc(EngineCoreProc):
         """Keep an auxiliary-GPU vision RPC out of the P scheduling loop.
 
         vLLM utility calls normally execute synchronously on the EngineCore
-        thread.  That is correct when the vision tower shares the P GPU, but
-        defeats auxiliary placement: a slower Encoder call on the Code2Wav GPU
-        would still stop P from admitting and scheduling LLM work.  EngineCore
+        thread. That is correct when the vision tower shares the P GPU, but
+        defeats auxiliary placement: a slower call on the dedicated Encoder
+        GPU would still stop P from admitting and scheduling LLM work. EngineCore
         already understands ``Future`` utility results, so run only this
         stateless, single-flight sidecar RPC on a dedicated host thread.
         """

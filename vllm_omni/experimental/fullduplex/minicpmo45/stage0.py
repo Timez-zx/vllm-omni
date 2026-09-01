@@ -8,7 +8,7 @@ import time
 from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass, field
-from threading import Lock
+from threading import Lock, RLock
 from typing import Any
 
 import numpy as np
@@ -19,7 +19,21 @@ _MINICPMO45_SPECIAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS
 _MINICPMO45_OPTIONAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.OPTIONAL_TOKEN_FIELDS
 _MINICPMO45_PROCESSOR_LOAD_LOCK = Lock()
 _MINICPMO45_LOG_PREP_DIAG = os.environ.get("MINICPMO45_LOG_PREP_DIAG", "0") not in ("0", "", "false", "False")
-_MINICPMO45_MAX_ARRIVAL_VISION_CACHE_ENTRIES = 256
+_DEFAULT_MAX_ARRIVAL_VISION_CACHE_ENTRIES = 0
+_MINICPMO45_MAX_RETIRED_VISION_KEYS = 256
+
+
+def _max_arrival_vision_cache_entries() -> int | None:
+    """Return the embedding-cache limit, or ``None`` for capacity runs."""
+    raw = os.environ.get(
+        "MINICPMO45_MAX_ARRIVAL_VISION_CACHE_ENTRIES",
+        str(_DEFAULT_MAX_ARRIVAL_VISION_CACHE_ENTRIES),
+    )
+    try:
+        value = int(raw)
+        return value if value > 0 else None
+    except ValueError:
+        return None
 
 
 @dataclass
@@ -97,7 +111,9 @@ class MiniCPMO45Stage0DuplexRuntime:
             tuple[tuple[Any, ...], tuple[int, ...]],
         ] = OrderedDict()
         self._arrival_vision_cache: OrderedDict[tuple[str, int, int, str], list[Any]] = OrderedDict()
+        self._arrival_vision_retired: OrderedDict[tuple[str, int, int, str], None] = OrderedDict()
         self._arrival_vision_cache_lock = Lock()
+        self._vision_execution_lock = RLock()
         self.thinker = getattr(stage_model, "thinker", None) or getattr(stage_model, "model", None) or stage_model
         self.processor = (
             getattr(stage_model, "processor", None)
@@ -279,7 +295,14 @@ class MiniCPMO45Stage0DuplexRuntime:
         preencode_ids: list[str],
         frame_blocks: list[list[Any]],
     ) -> int:
-        """Cache frame embeddings without advancing the session's LLM state."""
+        """Cache frame embeddings without advancing the session's LLM state.
+
+        The encoder returns blocks on the Thinker device. Arrival work can run
+        ahead of formal P consumption, so retaining those blocks on GPU would
+        turn an unbounded input queue into unbounded GPU memory. Store the
+        compact blocks on CPU and move only the consumed frame back to the
+        Thinker device on the formal request path.
+        """
         if len(preencode_ids) != len(frame_blocks):
             return 0
         cache = getattr(self, "_arrival_vision_cache", None)
@@ -300,12 +323,68 @@ class MiniCPMO45Stage0DuplexRuntime:
                 if not isinstance(preencode_id, str) or not preencode_id:
                     continue
                 key = (*session_prefix, int(epoch), preencode_id)
-                cache[key] = list(blocks)
+                retired = getattr(self, "_arrival_vision_retired", None)
+                if isinstance(retired, OrderedDict) and key in retired:
+                    retired.pop(key, None)
+                    continue
+                cpu_blocks: list[Any] = []
+                for block in blocks:
+                    detach = getattr(block, "detach", None)
+                    cached = detach() if callable(detach) else block
+                    to = getattr(cached, "to", None)
+                    if callable(to):
+                        cached = to(device="cpu")
+                    cpu_blocks.append(cached)
+                cache[key] = cpu_blocks
                 cache.move_to_end(key)
                 encoded += 1
-            while len(cache) > _MINICPMO45_MAX_ARRIVAL_VISION_CACHE_ENTRIES:
-                cache.popitem(last=False)
+            limit = _max_arrival_vision_cache_entries()
+            if limit is not None:
+                while len(cache) > limit:
+                    cache.popitem(last=False)
         return encoded
+
+    def arrival_vision_cache_size(self) -> int:
+        cache = getattr(self, "_arrival_vision_cache", None)
+        lock = getattr(self, "_arrival_vision_cache_lock", None)
+        if not isinstance(cache, OrderedDict) or lock is None:
+            return 0
+        with lock:
+            return len(cache)
+
+    def retire_arrival_vision_embeddings(
+        self,
+        *,
+        session_id: str,
+        incarnation: int,
+        epoch: int | None,
+        preencode_ids: list[str],
+    ) -> None:
+        """Fence a formal fallback from a late speculative cache write."""
+        if epoch is None or not preencode_ids:
+            return
+        lock = getattr(self, "_arrival_vision_cache_lock", None)
+        if lock is None:
+            lock = Lock()
+            self._arrival_vision_cache_lock = lock
+        retired = getattr(self, "_arrival_vision_retired", None)
+        if not isinstance(retired, OrderedDict):
+            retired = OrderedDict()
+            self._arrival_vision_retired = retired
+        cache = getattr(self, "_arrival_vision_cache", None)
+        keys = [
+            (str(session_id), int(incarnation), int(epoch), preencode_id)
+            for preencode_id in preencode_ids
+            if isinstance(preencode_id, str) and preencode_id
+        ]
+        with lock:
+            for key in keys:
+                if isinstance(cache, OrderedDict):
+                    cache.pop(key, None)
+                retired[key] = None
+                retired.move_to_end(key)
+            while len(retired) > _MINICPMO45_MAX_RETIRED_VISION_KEYS:
+                retired.popitem(last=False)
 
     def take_arrival_vision_embeddings(
         self,
@@ -335,12 +414,16 @@ class MiniCPMO45Stage0DuplexRuntime:
     ) -> None:
         cache = getattr(self, "_arrival_vision_cache", None)
         lock = getattr(self, "_arrival_vision_cache_lock", None)
+        retired = getattr(self, "_arrival_vision_retired", None)
         if not isinstance(cache, OrderedDict) or lock is None:
             return
         prefix = (str(session_id), int(incarnation))
         with lock:
             for key in [key for key in cache if key[:2] == prefix]:
                 cache.pop(key, None)
+            if isinstance(retired, OrderedDict):
+                for key in [key for key in retired if key[:2] == prefix]:
+                    retired.pop(key, None)
 
     def _stage_prefill_embeddings_only(
         self,
@@ -409,7 +492,18 @@ class MiniCPMO45Stage0DuplexRuntime:
                 # The unit-building loop consumes this list. Keep the batched
                 # cache immutable so retries cannot observe a partially popped
                 # result.
-                frame_blocks = [list(blocks) for blocks in preencoded_vision]
+                model_device = self._model_device()
+                frame_blocks = []
+                for blocks in preencoded_vision:
+                    materialized: list[Any] = []
+                    for block in blocks:
+                        to = getattr(block, "to", None)
+                        materialized.append(
+                            to(device=model_device, non_blocking=True)
+                            if callable(to)
+                            else block
+                        )
+                    frame_blocks.append(materialized)
             else:
                 frame_blocks = self._stage_vision_embeddings(
                     video_frames,
@@ -1388,6 +1482,24 @@ class MiniCPMO45Stage0DuplexRuntime:
         max_slice_nums: int | list[int] = 1,
         preprocessed: Any | None = None,
     ) -> list[list[Any]] | None:
+        lock = getattr(self, "_vision_execution_lock", None)
+        if lock is None:
+            lock = RLock()
+            self._vision_execution_lock = lock
+        with lock:
+            return self._stage_vision_embeddings_unlocked(
+                frames,
+                max_slice_nums=max_slice_nums,
+                preprocessed=preprocessed,
+            )
+
+    def _stage_vision_embeddings_unlocked(
+        self,
+        frames: list[Any],
+        *,
+        max_slice_nums: int | list[int] = 1,
+        preprocessed: Any | None = None,
+    ) -> list[list[Any]] | None:
         """Encode camera frames for omni duplex via the loaded vision tower.
 
         Semantics mirror ``MiniCPMODuplex.streaming_prefill``: every frame has
@@ -1469,6 +1581,22 @@ class MiniCPMO45Stage0DuplexRuntime:
         return None
 
     def _stage_vision_embeddings_batch(
+        self,
+        processed_batch: list[Any],
+        *,
+        microbatch_size: int = 8,
+    ) -> list[list[list[Any]]] | None:
+        lock = getattr(self, "_vision_execution_lock", None)
+        if lock is None:
+            lock = RLock()
+            self._vision_execution_lock = lock
+        with lock:
+            return self._stage_vision_embeddings_batch_unlocked(
+                processed_batch,
+                microbatch_size=microbatch_size,
+            )
+
+    def _stage_vision_embeddings_batch_unlocked(
         self,
         processed_batch: list[Any],
         *,

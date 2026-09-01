@@ -5,10 +5,16 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from vllm.v1.engine.core import EngineCoreProc
+import pytest
+
+from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.engine.core import EngineCoreProc, EngineShutdownState
 
 from vllm_omni.engine import OmniEngineCoreOutputs
-from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
+from vllm_omni.engine.stage_engine_core_proc import (
+    StageEngineCoreProc,
+    _StageInputQueue,
+)
 
 
 def test_auxiliary_vision_rpc_does_not_block_core_thread():
@@ -62,6 +68,72 @@ def test_ordinary_collective_rpc_stays_on_core_thread():
 
     assert result == [core_thread]
     assert engine._vision_preencode_executor is None
+
+
+def test_auxiliary_vision_reply_waits_for_cache_ready_and_bypasses_data_outputs():
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    engine.output_queue = queue.Queue()
+    engine.shutdown_state = EngineShutdownState.RUNNING
+    engine.output_queue.put_nowait("ordinary-data-output")
+    result = Future()
+
+    def fake_collective_rpc(self, method, timeout=None, args=(), kwargs=None):
+        del self, method, timeout, args, kwargs
+        return result
+
+    with patch.object(
+        StageEngineCoreProc,
+        "collective_rpc",
+        new=fake_collective_rpc,
+    ):
+        engine._handle_client_request(
+            EngineCoreRequestType.UTILITY,
+            (
+                0,
+                7,
+                "collective_rpc",
+                (
+                    "preencode_minicpmo45_vision",
+                    5.0,
+                    ([{"video_frames": ["a", "b"]}],),
+                    None,
+                ),
+            ),
+        )
+
+    assert engine.output_queue.get_nowait() == "ordinary-data-output"
+    with pytest.raises(queue.Empty):
+        engine.output_queue.get_nowait()
+
+    result.set_result([{"supported": True, "encoded_frames": 2}])
+    client_idx, outputs = engine.output_queue.get_nowait()
+    assert client_idx == 0
+    assert outputs.utility_output.call_id == 7
+    assert outputs.utility_output.result.result == [
+        {"supported": True, "encoded_frames": 2}
+    ]
+
+
+def test_auxiliary_vision_rpc_bypasses_core_busy_loop():
+    dispatched = []
+    input_queue = _StageInputQueue(dispatched.append)
+    ordinary_add = (EngineCoreRequestType.ADD, "ordinary-add")
+    vision_rpc = (
+        EngineCoreRequestType.UTILITY,
+        (
+            0,
+            7,
+            "collective_rpc",
+            ("preencode_minicpmo45_vision", 5.0, ([],), None),
+        ),
+    )
+
+    input_queue.put_nowait(ordinary_add)
+    input_queue.put_nowait(vision_rpc)
+
+    assert dispatched == [vision_rpc]
+    assert input_queue.get_nowait() == ordinary_add
+    assert input_queue.empty()
 
 
 def test_preprocess_add_request_preserves_omni_fields():

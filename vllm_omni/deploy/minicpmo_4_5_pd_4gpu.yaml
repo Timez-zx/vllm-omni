@@ -1,5 +1,6 @@
 # MiniCPM-o 4.5 native-duplex P/D deployment.
-# GPU 0: Thinker-P; GPU 1: Thinker-D; GPU 2: Talker; GPU 3: Code2Wav.
+# GPU 0: Thinker-P; GPU 1: Thinker-D; GPU 2: Vision Encoder;
+# GPU 3: Talker + Code2Wav.
 pipeline: minicpmo_4_5_pd
 session_mode: duplex
 async_chunk: true
@@ -30,14 +31,26 @@ stages:
       video: 1
     env:
       VLLM_NIXL_SIDE_CHANNEL_PORT: "5600"
-      # Preserve TP=1 on physical GPU 0, but also expose physical GPU 3 as
+      # Preserve TP=1 on physical GPU 0, but also expose physical GPU 2 as
       # logical cuda:1 for the stateless SigLIP + resampler. Their compact
       # embeddings return to GPU 0 before Thinker-P consumes them.
-      VLLM_OMNI_AUX_VISIBLE_DEVICES: "3"
+      VLLM_OMNI_AUX_VISIBLE_DEVICES: "2"
       MINICPMO45_VISION_ENCODER_DEVICE: "cuda:1"
+      MINICPMO45_VISION_ENCODER_BATCH_SIZE: "8"
+      # Capacity diagnosis: every arriving frame is encoded and retained until
+      # its formal P append consumes the embedding. A production deployment
+      # may set positive limits and apply explicit backpressure/drop policy.
+      MINICPMO45_MAX_ARRIVAL_VISION_CACHE_ENTRIES: "0"
     engine_extras:
       # P/D handoff uses the KV connector, not Omni async-chunk payloads.
       async_chunk: false
+      # The long-session working set, rather than model weights, limits the
+      # number of live Thinker lineages.  Keep P and D on the same FP8 KV
+      # representation so NIXL can transfer cache blocks without conversion.
+      kv_cache_dtype: fp8
+      # MiniCPM ships no KV scales.  Keep the same deterministic scale on P/D;
+      # independent runtime calibration would make imported FP8 bytes invalid.
+      calculate_kv_scales: false
       kv_transfer_config:
         kv_connector: NixlDeltaPushConnector
         kv_connector_module_path: vllm_omni.engine.nixl_delta_push_connector
@@ -75,6 +88,8 @@ stages:
       # D is a complete finite request.  Only Talker -> Code2Wav uses the
       # async-chunk data plane in this topology.
       async_chunk: false
+      kv_cache_dtype: fp8
+      calculate_kv_scales: false
       kv_transfer_config:
         kv_connector: NixlDeltaPushConnector
         kv_connector_module_path: vllm_omni.engine.nixl_delta_push_connector
@@ -99,8 +114,10 @@ stages:
     max_num_batched_tokens: 8192
     max_num_seqs: 64
     async_scheduling: false
-    gpu_memory_utilization: 0.9
-    devices: "2"
+    # Share GPU 3 with Code2Wav. This split is the proven MiniCPM two-stage
+    # colocation budget and keeps the two Thinker GPUs isolated.
+    gpu_memory_utilization: 0.55
+    devices: "3"
     output_connectors:
       to_stage_3: connector_of_shared_memory
     default_sampling_params:
@@ -122,7 +139,7 @@ stages:
     max_num_batched_tokens: 65536
     max_num_seqs: 64
     async_scheduling: false
-    gpu_memory_utilization: 0.9
+    gpu_memory_utilization: 0.35
     enforce_eager: true
     enable_chunked_prefill: false
     devices: "3"

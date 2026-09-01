@@ -472,6 +472,16 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                     float(diag.get("assembly_ms", 0.0)),
                     float(diag.get("stage_total_ms", 0.0)),
                 )
+            if video_frames:
+                logger.info(
+                    "[MINICPM-FRAME-CONSUMED] req=%s seq=%s frames=%d "
+                    "source=%s done_epoch=%.6f",
+                    kwargs.get("request_id", "?"),
+                    seq,
+                    len(video_frames),
+                    "arrival" if preencoded_vision is not None else "formal_fallback",
+                    time.time(),
+                )
 
         target_dtype = (
             input_embeds.dtype if input_embeds is not None else self.get_input_embeddings(input_ids[:1]).dtype
@@ -667,10 +677,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             )
         if _MINICPMO45_LOG_PREP_DIAG:
             cache_ms = (time.perf_counter() - cache_start) * 1000.0
+            cache_size = getattr(helper, "arrival_vision_cache_size", None)
+            cache_entries = int(cache_size()) if callable(cache_size) else -1
             logger.info(
                 "[MINICPM-PREP-ARRIVAL] jobs=%d encoded_frames=%d "
                 "cpu_prepare_ms=%.3f vision_encoder_ms=%.3f cache_ms=%.3f "
-                "total_ms=%.3f done_epoch=%.6f",
+                "total_ms=%.3f done_epoch=%.6f cache_entries=%d",
                 len(prepared),
                 encoded_frames,
                 cpu_prepare_ms,
@@ -678,6 +690,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 cache_ms,
                 (time.perf_counter() - total_start) * 1000.0,
                 time.time(),
+                cache_entries,
             )
         return {
             "supported": True,
@@ -813,6 +826,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                     }
                     arrival_hits.append((info, identity, payload, uniform_limit, state))
                     continue
+                retire_preencoded = getattr(
+                    helper,
+                    "retire_arrival_vision_embeddings",
+                    None,
+                )
+                if callable(retire_preencoded):
+                    retire_preencoded(
+                        session_id=session_id,
+                        incarnation=incarnation,
+                        epoch=epoch,
+                        preencode_ids=list(raw_preencode_ids),
+                    )
             pending.append(
                 (
                     info,

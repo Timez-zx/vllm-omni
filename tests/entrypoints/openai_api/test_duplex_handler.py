@@ -1488,6 +1488,7 @@ async def test_minicpmo_arrival_vision_preencode_microbatches_stage0_rpc():
             timeout_s=3,
         ),
     )
+    await asyncio.sleep(0)
 
     assert first is True
     assert second is True
@@ -1500,7 +1501,7 @@ async def test_minicpmo_arrival_vision_preencode_microbatches_stage0_rpc():
 
 
 @pytest.mark.asyncio
-async def test_minicpmo_arrival_vision_preencode_serializes_worker_rpcs():
+async def test_minicpmo_arrival_vision_preencode_waits_for_ready_result():
     class _SerialPreencodeEngine(FakeEngineClient):
         def __init__(self):
             super().__init__()
@@ -1549,6 +1550,10 @@ async def test_minicpmo_arrival_vision_preencode_serializes_worker_rpcs():
     )
     await asyncio.sleep(0.11)
     assert len(engine.calls) == 1
+    assert engine.max_inflight == 1
+    assert not first.done()
+    assert not second.done()
+    assert not third.done()
 
     engine.release_first.set()
     assert await asyncio.gather(first, second, third) == [True, True, True]
@@ -1602,10 +1607,16 @@ async def test_minicpmo_clear_continuation_does_not_cancel_pending_silence_task(
 
 
 @pytest.mark.asyncio
-async def test_minicpmo_vision_preencode_does_not_run_past_two_unconsumed_frames():
+async def test_minicpmo_vision_preencode_respects_configured_bounded_lookahead(
+    monkeypatch,
+):
     async def _complete() -> bool:
         return True
 
+    monkeypatch.setenv(
+        "MINICPMO45_MAX_PENDING_VISION_PREENCODES_PER_SESSION",
+        "2",
+    )
     native = MiniCPMO45ServingSessionState()
     first = asyncio.create_task(_complete())
     second = asyncio.create_task(_complete())
@@ -1623,6 +1634,29 @@ async def test_minicpmo_vision_preencode_does_not_run_past_two_unconsumed_frames
     third = asyncio.create_task(_complete())
     assert native.track_vision_preencode(["frame-3"], epoch=0, task=third)
     await third
+    native.cancel_vision_preencode_tasks()
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_vision_preencode_is_unbounded_by_default(monkeypatch):
+    async def _complete() -> bool:
+        return True
+
+    monkeypatch.delenv(
+        "MINICPMO45_MAX_PENDING_VISION_PREENCODES_PER_SESSION",
+        raising=False,
+    )
+    native = MiniCPMO45ServingSessionState()
+    tasks = [asyncio.create_task(_complete()) for _ in range(8)]
+    for index, task in enumerate(tasks):
+        assert native.track_vision_preencode(
+            [f"frame-{index}"],
+            epoch=0,
+            task=task,
+        )
+    await asyncio.gather(*tasks)
+
+    assert native.can_start_vision_preencode(frame_count=1, epoch=0)
     native.cancel_vision_preencode_tasks()
 
 

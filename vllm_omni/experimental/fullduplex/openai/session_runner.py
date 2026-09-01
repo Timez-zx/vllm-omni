@@ -369,15 +369,17 @@ class DuplexSessionRunnerMixin:
                 return
             tasks = pop_tasks(preencode_ids, epoch=epoch)
             if tasks:
-                # A failed or cancelled speculative task is harmless: the P
-                # request falls back to its ordinary request-local encoder.
+                # These tasks finish only after the Encoder has installed the
+                # matching embeddings in the worker-local cache. Keep Encoder
+                # and Thinker-P pipelined across slots, but never let a formal
+                # P request re-encode its own frame on the runner path.
                 loop = asyncio.get_running_loop()
                 wait_started = loop.time()
                 await asyncio.gather(*tasks, return_exceptions=True)
                 if _MINICPMO45_LOG_PREP_DIAG:
                     logger.info(
                         "[MINICPM-PREP-FORMAL-WAIT] tasks=%d wait_ms=%.3f "
-                        "done_epoch=%.6f",
+                        "ready_fence=true done_epoch=%.6f",
                         len(tasks),
                         (loop.time() - wait_started) * 1000.0,
                         time.time(),

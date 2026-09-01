@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import math
 import re
@@ -43,15 +44,21 @@ VISION_ARRIVAL_BATCH = re.compile(
     r"cache_ms=([0-9]+(?:\.[0-9]+)?) total_ms=([0-9]+(?:\.[0-9]+)?) "
     r"done_epoch=([0-9]+(?:\.[0-9]+)?)"
 )
-VISION_ARRIVAL_READY = re.compile(
-    r"\[MINICPM-PREP-ARRIVAL-READY\] success=(True|False) "
-    r"arrival_to_ready_ms=([0-9]+(?:\.[0-9]+)?) "
+VISION_ARRIVAL_DISPATCH = re.compile(
+    r"\[MINICPM-PREP-ARRIVAL-(?:READY|ACCEPTED|SUBMITTED)\] "
+    r"success=(True|False) "
+    r"arrival_to_(?:ready|accepted|submitted)_ms=([0-9]+(?:\.[0-9]+)?) "
     r"done_epoch=([0-9]+(?:\.[0-9]+)?)"
 )
 VISION_FORMAL_WAIT = re.compile(
     r"\[MINICPM-PREP-FORMAL-WAIT\] tasks=(\d+) "
     r"wait_ms=([0-9]+(?:\.[0-9]+)?) "
+    r"(?:\S+\s+)*"
     r"done_epoch=([0-9]+(?:\.[0-9]+)?)"
+)
+FRAME_CONSUMED = re.compile(
+    r"\[MINICPM-FRAME-CONSUMED\] req=(\S+) seq=(\d+) "
+    r"frames=(\d+) source=(\S+) done_epoch=([0-9]+(?:\.[0-9]+)?)"
 )
 MODEL_UNIT_MS = 1000.0
 PD_DECODE_REQUEST = re.compile(r"^(?P<logical>.+)-(?P<slot>[0-9a-f]{8})$")
@@ -101,9 +108,54 @@ def _rtf_miss_count(values: list[float]) -> int:
     return sum(value < 1.0 for value in values)
 
 
+def _request_session_id(request_id: str) -> str | None:
+    """Decode the session id embedded in a current duplex resource id."""
+    parts = request_id.split(".")
+    if len(parts) != 8 or parts[0] != "duplex-s":
+        return None
+    encoded = parts[1]
+    try:
+        padded = encoded + "=" * (-len(encoded) % 4)
+        return base64.urlsafe_b64decode(padded).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def _measurement_sequence_ranges(run: dict[str, Any]) -> dict[str, tuple[int, int]]:
+    ranges: dict[str, tuple[int, int]] = {}
+    for user in run.get("users", []):
+        if not isinstance(user, dict):
+            continue
+        session_id = user.get("session_id")
+        start = user.get("formal_seq_start")
+        end = user.get("formal_seq_end")
+        if (
+            isinstance(session_id, str)
+            and session_id
+            and isinstance(start, int)
+            and isinstance(end, int)
+            and 1 <= start <= end
+        ):
+            ranges[session_id] = (start, end)
+    return ranges
+
+
+def _sequence_in_measurement(
+    request_id: str,
+    sequence: int,
+    ranges: dict[str, tuple[int, int]],
+) -> bool:
+    if not ranges:
+        return False
+    session_id = _request_session_id(request_id)
+    bounds = ranges.get(session_id) if session_id is not None else None
+    return bounds is not None and bounds[0] <= sequence <= bounds[1]
+
+
 def _pd_long_horizon_summary(
     pd_slots: list[dict[str, Any]],
     input_units_per_session: int | None,
+    measurement_ranges: dict[str, tuple[int, int]] | None = None,
 ) -> dict[str, Any]:
     """Summarize sustained per-session P-to-D progress.
 
@@ -168,12 +220,22 @@ def _pd_long_horizon_summary(
             if completion_span_ms > 0:
                 cadence_rtfs.append(sequence_span * MODEL_UNIT_MS / completion_span_ms)
             lag_growth_per_unit_ms.append(growth / sequence_span)
-        if (
-            input_units_per_session is not None
-            and len(rows) == input_units_per_session
-            and first_sequence == 1
-            and last_sequence == input_units_per_session
-        ):
+        session_id = _request_session_id(str(first["request_id"]))
+        bounds = (measurement_ranges or {}).get(session_id) if session_id is not None else None
+        complete = (
+            bounds is not None
+            and len(rows) == bounds[1] - bounds[0] + 1
+            and first_sequence == bounds[0]
+            and last_sequence == bounds[1]
+        )
+        if bounds is None:
+            complete = (
+                input_units_per_session is not None
+                and len(rows) == input_units_per_session
+                and first_sequence == 1
+                and last_sequence == input_units_per_session
+            )
+        if complete:
             complete_sessions += 1
 
     latency_budget_rtf = (
@@ -345,10 +407,10 @@ def _parse_vision_timing(
                 }
             )
             continue
-        ready = VISION_ARRIVAL_READY.search(line)
-        if ready is not None and started <= float(ready.group(3)) <= ended:
-            ready_successes += ready.group(1) == "True"
-            ready_ms.append(float(ready.group(2)))
+        dispatch = VISION_ARRIVAL_DISPATCH.search(line)
+        if dispatch is not None and started <= float(dispatch.group(3)) <= ended:
+            ready_successes += dispatch.group(1) == "True"
+            ready_ms.append(float(dispatch.group(2)))
             continue
         formal_wait = VISION_FORMAL_WAIT.search(line)
         if formal_wait is not None and started <= float(formal_wait.group(3)) <= ended:
@@ -384,6 +446,9 @@ def _parse_vision_timing(
             [float(batch["total_ms"]) for batch in batches]
         ),
         "by_batch_size": by_batch_size,
+        "arrival_to_dispatch_ms": _latency_summary(ready_ms),
+        "arrival_dispatch_successes": ready_successes,
+        # Backward-compatible aliases for archived READY traces.
         "arrival_to_ready_ms": _latency_summary(ready_ms),
         "arrival_ready_successes": ready_successes,
         "formal_wait_calls": len(formal_wait_ms),
@@ -650,6 +715,7 @@ def _periodic_pd_records(
     completions: list[dict[str, Any]],
     pd_slots: list[dict[str, Any]],
     input_units_per_session: int | None,
+    measurement_ranges: dict[str, tuple[int, int]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Exclude setup and post-stream continuation work from input-unit SLOs.
 
@@ -660,7 +726,7 @@ def _periodic_pd_records(
     runs depend on how many continuation slots happen to finish before the
     benchmark's wall-clock cutoff.
     """
-    if input_units_per_session is None:
+    if input_units_per_session is None and not measurement_ranges:
         return completions, pd_slots
 
     periodic_completions: list[dict[str, Any]] = []
@@ -669,7 +735,19 @@ def _periodic_pd_records(
             periodic_completions.append(completion)
             continue
         generation = completion.get("generation")
-        if isinstance(generation, int) and 1 <= generation <= input_units_per_session:
+        in_range = (
+            isinstance(generation, int)
+            and measurement_ranges
+            and _sequence_in_measurement(
+                str(completion.get("request_id", "")),
+                generation,
+                measurement_ranges,
+            )
+        )
+        if isinstance(generation, int) and (
+            in_range
+            or (not measurement_ranges and 1 <= generation <= input_units_per_session)
+        ):
             periodic_completions.append(completion)
 
     periodic_slots: list[dict[str, Any]] = []
@@ -678,9 +756,50 @@ def _periodic_pd_records(
             sequence = int(slot["seq"])
         except (TypeError, ValueError):
             continue
-        if 1 <= sequence <= input_units_per_session:
+        in_range = bool(
+            measurement_ranges
+            and _sequence_in_measurement(
+                str(slot.get("request_id", "")),
+                sequence,
+                measurement_ranges,
+            )
+        )
+        if in_range or (not measurement_ranges and 1 <= sequence <= input_units_per_session):
             periodic_slots.append(slot)
     return periodic_completions, periodic_slots
+
+
+def _parse_frame_audit(
+    log_path: Path,
+    started: float,
+    ended: float,
+    measurement_ranges: dict[str, tuple[int, int]],
+) -> dict[str, Any]:
+    latest: dict[tuple[str, int], tuple[int, str]] = {}
+    for line in log_path.read_text(errors="replace").splitlines():
+        match = FRAME_CONSUMED.search(line)
+        if match is None:
+            continue
+        done_epoch = float(match.group(5))
+        if not started <= done_epoch <= ended:
+            continue
+        request_id = match.group(1)
+        sequence = int(match.group(2))
+        if measurement_ranges and not _sequence_in_measurement(
+            request_id,
+            sequence,
+            measurement_ranges,
+        ):
+            continue
+        latest[(request_id, sequence)] = (int(match.group(3)), match.group(4))
+    by_source: dict[str, int] = defaultdict(int)
+    for frames, source in latest.values():
+        by_source[source] += frames
+    return {
+        "units": len(latest),
+        "frames_consumed": sum(frames for frames, _ in latest.values()),
+        "by_source": dict(sorted(by_source.items())),
+    }
 
 
 def _stage_summary(
@@ -853,10 +972,12 @@ def main() -> None:
     all_completions = completions
     all_pd_slots = pd_slots
     input_units_per_session = _input_units_per_session(run)
+    measurement_ranges = _measurement_sequence_ranges(run)
     completions, pd_slots = _periodic_pd_records(
         completions,
         pd_slots,
         input_units_per_session,
+        measurement_ranges,
     )
     stage_ids = sorted({item["stage"] for item in completions})
     is_pd = bool(pd_slots) or 3 in stage_ids
@@ -905,8 +1026,28 @@ def main() -> None:
         completed_input_units,
         is_pd=is_pd,
     )
+    frame_audit = _parse_frame_audit(
+        server_log,
+        started,
+        ended,
+        measurement_ranges,
+    )
+    expected_frames = run.get("frames_sent")
+    frame_audit_required = run.get("config", {}).get("frame_audit_required") is True
+    frame_audit_complete = bool(
+        isinstance(expected_frames, int)
+        and expected_frames >= 0
+        and frame_audit["frames_consumed"] == expected_frames
+        and frame_audit["units"] == expected_input_units
+    )
+    if frame_audit_required:
+        measurement_complete = measurement_complete and frame_audit_complete
     pd_long_horizon = (
-        _pd_long_horizon_summary(pd_slots, input_units_per_session)
+        _pd_long_horizon_summary(
+            pd_slots,
+            input_units_per_session,
+            measurement_ranges,
+        )
         if is_pd
         else None
     )
@@ -951,6 +1092,12 @@ def main() -> None:
         "completed_input_units": completed_input_units,
         "completion_witness_stage": 1 if is_pd else 0,
         "failed_users": int(run.get("failed_users", 0)),
+        "frame_audit": {
+            **frame_audit,
+            "expected_frames": expected_frames,
+            "required": frame_audit_required,
+            "complete": frame_audit_complete,
+        },
         "limiting_periodic_stage": min(periodic_stage_p05, key=periodic_stage_p05.get)
         if periodic_stage_p05
         else None,
@@ -964,6 +1111,10 @@ def main() -> None:
         result["vision_arrival"] = vision_timing
         result["measurement_scope"] = {
             "input_units_per_session": input_units_per_session,
+            "per_session_sequence_ranges": {
+                session_id: {"start": bounds[0], "end": bounds[1]}
+                for session_id, bounds in sorted(measurement_ranges.items())
+            },
             "periodic_stage_requests": {
                 str(stage): sum(item["stage"] == stage for item in completions)
                 for stage in (0, 1)

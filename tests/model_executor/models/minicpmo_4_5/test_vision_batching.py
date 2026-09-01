@@ -253,6 +253,7 @@ def test_arrival_vision_cache_is_epoch_fenced_and_atomically_consumed() -> None:
         )
         is None
     )
+
     cached = runtime.take_arrival_vision_embeddings(
         session_id="session-a",
         incarnation=3,
@@ -285,6 +286,38 @@ def test_arrival_vision_cache_is_epoch_fenced_and_atomically_consumed() -> None:
             incarnation=3,
             epoch=4,
             preencode_ids=["new-frame"],
+        )
+        is None
+    )
+
+
+def test_retired_arrival_vision_key_rejects_late_sidecar_write() -> None:
+    runtime = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
+    blocks = [[torch.full((2, 2), 1.0)]]
+
+    runtime.retire_arrival_vision_embeddings(
+        session_id="session-a",
+        incarnation=3,
+        epoch=4,
+        preencode_ids=["late-frame"],
+    )
+
+    assert (
+        runtime.cache_arrival_vision_embeddings(
+            session_id="session-a",
+            incarnation=3,
+            epoch=4,
+            preencode_ids=["late-frame"],
+            frame_blocks=blocks,
+        )
+        == 0
+    )
+    assert (
+        runtime.take_arrival_vision_embeddings(
+            session_id="session-a",
+            incarnation=3,
+            epoch=4,
+            preencode_ids=["late-frame"],
         )
         is None
     )
