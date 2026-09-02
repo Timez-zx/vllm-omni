@@ -75,6 +75,12 @@ __all__ = ["OmniDuplexSessionHandler", "should_enable_duplex_endpoint"]
 _DEFAULT_CONFIG_TIMEOUT_S = 10.0
 _DEFAULT_IDLE_TIMEOUT_S = 300.0
 _MINICPMO45_VISION_PREENCODE_BATCH_WINDOW_S = 0.05
+# Match the encoder's default microbatch width.  One serving job may own
+# several frames and therefore remains atomic, but an unbounded number of
+# sessions must not become one head-of-line-blocking collective RPC.
+_MINICPMO45_VISION_PREENCODE_MAX_JOBS_PER_RPC = 8
+_MINICPMO45_AUDIO_PREENCODE_BATCH_WINDOW_S = 0.05
+_MINICPMO45_AUDIO_PREENCODE_MAX_JOBS_PER_RPC = 8
 _MINICPMO45_LOG_PREP_DIAG = os.environ.get("MINICPMO45_LOG_PREP_DIAG", "0") not in (
     "0",
     "",
@@ -156,6 +162,10 @@ class OmniDuplexSessionHandler(
         )
         self._minicpmo45_vision_preencode_pending: list[tuple[dict[str, object], float, asyncio.Future[bool]]] = []
         self._minicpmo45_vision_preencode_flush_task: asyncio.Task[None] | None = None
+        self._minicpmo45_audio_preencode_pending: list[
+            tuple[dict[str, object], float, asyncio.Future[bool]]
+        ] = []
+        self._minicpmo45_audio_preencode_flush_task: asyncio.Task[None] | None = None
 
     async def _preencode_minicpmo45_vision(
         self,
@@ -192,16 +202,20 @@ class OmniDuplexSessionHandler(
     async def _flush_minicpmo45_vision_preencode(self) -> None:
         cancelled = False
         try:
-            while True:
-                await asyncio.sleep(_MINICPMO45_VISION_PREENCODE_BATCH_WINDOW_S)
-                pending = self._minicpmo45_vision_preencode_pending
-                self._minicpmo45_vision_preencode_pending = []
-                if not pending:
-                    return
-                # Keep one encoder RPC in flight. Frames that arrive while it
-                # runs remain in the unbounded pending list and are coalesced
-                # into the next GPU batch. This preserves every frame without
-                # fragmenting the sidecar into many queued singleton RPCs.
+            # Debounce only the empty -> non-empty transition.  This preserves
+            # cross-session batching for an idle encoder without inserting an
+            # avoidable idle window between batches while work is backlogged.
+            await asyncio.sleep(_MINICPMO45_VISION_PREENCODE_BATCH_WINDOW_S)
+            while self._minicpmo45_vision_preencode_pending:
+                batch_size = max(
+                    1,
+                    int(_MINICPMO45_VISION_PREENCODE_MAX_JOBS_PER_RPC),
+                )
+                pending = self._minicpmo45_vision_preencode_pending[:batch_size]
+                del self._minicpmo45_vision_preencode_pending[:batch_size]
+                # Keep one encoder RPC in flight. Arrivals during this RPC stay
+                # queued and are dispatched immediately in the next capped
+                # batch. No job is discarded or overwritten.
                 await self._run_minicpmo45_vision_preencode_batch(pending)
         except asyncio.CancelledError:
             cancelled = True
@@ -261,6 +275,164 @@ class OmniDuplexSessionHandler(
             for _, _, future in pending:
                 if not future.done():
                     future.set_result(success)
+
+    async def _preencode_minicpmo45_audio(
+        self,
+        job: dict[str, object],
+        *,
+        timeout_s: float,
+    ) -> bool:
+        """Queue one complete PCM unit for cross-session sidecar batching."""
+        collective_rpc = getattr(self._chat_service.engine_client, "collective_rpc", None)
+        if not callable(collective_rpc):
+            return False
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        success = False
+        # A false result can mean the worker committed the plan but its RPC
+        # acknowledgement was lost. Retry the exact stable identity once,
+        # strictly after the first attempt completes. The worker-side cache is
+        # the durable idempotency fence, so this neither re-encodes nor advances
+        # the lineage twice when the first attempt actually committed.
+        for attempt in range(2):
+            future: asyncio.Future[bool] = loop.create_future()
+            self._minicpmo45_audio_preencode_pending.append(
+                (job, max(0.1, float(timeout_s)), future)
+            )
+            flush_task = self._minicpmo45_audio_preencode_flush_task
+            if flush_task is None or flush_task.done():
+                self._minicpmo45_audio_preencode_flush_task = asyncio.create_task(
+                    self._flush_minicpmo45_audio_preencode(),
+                    name="minicpmo45-audio-preencode",
+                )
+            try:
+                success = await future
+            except asyncio.CancelledError:
+                # A disconnected session no longer needs its queued unit. The
+                # shared drain skips cancelled futures before issuing its next
+                # RPC.
+                future.cancel()
+                raise
+            if success:
+                break
+            if attempt == 0:
+                logger.warning(
+                    "MiniCPM-o arrival audio preencode returned false; "
+                    "retrying exact identity once: session=%s epoch=%s seq=%s id=%s",
+                    job.get("session_id"),
+                    job.get("epoch"),
+                    job.get("audio_preencode_seq"),
+                    job.get("audio_preencode_id"),
+                )
+        if _MINICPMO45_LOG_PREP_DIAG:
+            logger.info(
+                "[MINICPM-AUDIO-ARRIVAL-READY] success=%s "
+                "arrival_to_ready_ms=%.3f done_epoch=%.6f",
+                success,
+                (loop.time() - started) * 1000.0,
+                time.time(),
+            )
+        return success
+
+    async def _flush_minicpmo45_audio_preencode(self) -> None:
+        cancelled = False
+        try:
+            # Debounce only an idle -> active transition.  While backlogged,
+            # dispatch capped batches without another artificial 50 ms gap.
+            await asyncio.sleep(_MINICPMO45_AUDIO_PREENCODE_BATCH_WINDOW_S)
+            while self._minicpmo45_audio_preencode_pending:
+                batch_size = max(
+                    1,
+                    int(_MINICPMO45_AUDIO_PREENCODE_MAX_JOBS_PER_RPC),
+                )
+                pending = self._minicpmo45_audio_preencode_pending[:batch_size]
+                del self._minicpmo45_audio_preencode_pending[:batch_size]
+                pending = [item for item in pending if not item[2].done()]
+                if pending:
+                    await self._run_minicpmo45_audio_preencode_batch(pending)
+        except asyncio.CancelledError:
+            cancelled = True
+            queued = self._minicpmo45_audio_preencode_pending
+            self._minicpmo45_audio_preencode_pending = []
+            for _, _, future in queued:
+                if not future.done():
+                    future.set_result(False)
+            raise
+        finally:
+            self._minicpmo45_audio_preencode_flush_task = None
+            if not cancelled and self._minicpmo45_audio_preencode_pending:
+                self._minicpmo45_audio_preencode_flush_task = asyncio.create_task(
+                    self._flush_minicpmo45_audio_preencode(),
+                    name="minicpmo45-audio-preencode",
+                )
+
+    async def _run_minicpmo45_audio_preencode_batch(
+        self,
+        pending: list[tuple[dict[str, object], float, asyncio.Future[bool]]],
+    ) -> None:
+        jobs = [job for job, _, _ in pending]
+        timeout_s = max(timeout for _, timeout, _ in pending)
+        succeeded_ids: set[str] = set()
+        job_results: dict[str, bool] = {}
+        encoded_jobs = 0
+        try:
+            # The RPC response is the cache-readiness fence.  Prefer explicit
+            # IDs so a partial worker result cannot mark an unrelated session
+            # ready; accept an aggregate only when the whole batch succeeded.
+            results = await self._chat_service.engine_client.collective_rpc(
+                method="preencode_minicpmo45_audio",
+                args=(jobs,),
+                stage_ids=[0],
+                timeout=timeout_s,
+            )
+
+            def collect_status(value: object) -> None:
+                nonlocal encoded_jobs
+                if isinstance(value, dict):
+                    if value.get("supported") is False:
+                        return
+                    raw_job_results = value.get("job_results")
+                    if isinstance(raw_job_results, Mapping):
+                        for raw_id, raw_success in raw_job_results.items():
+                            if isinstance(raw_id, str) and raw_id:
+                                job_results[raw_id] = raw_success is True
+                    for key in (
+                        "encoded_audio_preencode_ids",
+                        "audio_preencode_ids",
+                        "encoded_audio_ids",
+                    ):
+                        raw_ids = value.get(key)
+                        if isinstance(raw_ids, list | tuple):
+                            succeeded_ids.update(
+                                item for item in raw_ids if isinstance(item, str) and item
+                            )
+                    for key in ("encoded_audio_units", "encoded_audio", "encoded_jobs"):
+                        count = value.get(key)
+                        if isinstance(count, int) and not isinstance(count, bool):
+                            encoded_jobs = max(encoded_jobs, count)
+                    return
+                if isinstance(value, list | tuple):
+                    for item in value:
+                        collect_status(item)
+
+            collect_status(results)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("MiniCPM-o arrival audio preencode failed: %s", exc)
+        finally:
+            all_succeeded = not succeeded_ids and encoded_jobs >= len(jobs)
+            for job, _, future in pending:
+                if future.done():
+                    continue
+                preencode_id = job.get("audio_preencode_id")
+                if isinstance(preencode_id, str) and preencode_id in job_results:
+                    future.set_result(job_results[preencode_id])
+                else:
+                    future.set_result(
+                        all_succeeded
+                        or (isinstance(preencode_id, str) and preencode_id in succeeded_ids)
+                    )
 
     async def handle_realtime_session(self, websocket: WebSocket) -> None:
         await self.handle_session(
@@ -334,6 +506,9 @@ class OmniDuplexSessionHandler(
                 with suppress(asyncio.CancelledError):
                     await active_response_task
         native = self._serving_runtime_adapter.session_states.get(session.session_id)
+        cancel_preencode = getattr(native, "cancel_preencode_tasks", None)
+        if callable(cancel_preencode):
+            cancel_preencode()
         if native is not None and native.data_plane_task is not None:
             data_plane_task = native.data_plane_task
             native.data_plane_task = None

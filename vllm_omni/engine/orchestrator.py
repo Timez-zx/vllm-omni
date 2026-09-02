@@ -59,6 +59,7 @@ from vllm_omni.engine.messages import (
     ErrorMessage,
     InteractionMessage,
     OutputMessage,
+    PhysicalDCompletionWitnessMessage,
     RegisterRemoteReplicaMessage,
     ShutdownRequestMessage,
     StageMetricsMessage,
@@ -68,6 +69,12 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.experimental.fullduplex.engine.intermediate import (
+    NATIVE_LAST_PROMPT_TOKEN_KEY,
+    NATIVE_PROMPT_LEN_KEY,
+    NATIVE_PROMPT_TOKEN_IDS_KEY,
+    NATIVE_SEGMENT_TOKEN_IDS_KEY,
+)
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
@@ -103,6 +110,43 @@ def _pd_snapshot_max_chunks() -> int:
     except ValueError:
         logger.warning("Invalid VLLM_OMNI_PD_SNAPSHOT_MAX_CHUNKS=%r; using 16", raw)
         return 16
+
+
+def _extend_native_pd_feedback_budget(prompt: dict[str, Any], feedback_token_ids: list[int]) -> None:
+    """Reserve the prompt rows Stage0 uses to replay D feedback on P.
+
+    The final D token is the unit terminator and replaces the native boundary;
+    only the preceding feedback rows add scheduler-visible prompt work.
+    """
+    model_buffer = prompt.get("model_intermediate_buffer")
+    duplex = model_buffer.get("duplex") if isinstance(model_buffer, dict) else None
+    if not isinstance(duplex, dict):
+        return
+    feedback = [int(token_id) for token_id in feedback_token_ids]
+    duplex["pd_feedback_token_ids"] = feedback
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+        duplex_feedback_scheduler_rows,
+    )
+
+    extra_rows = duplex_feedback_scheduler_rows(feedback)
+    if extra_rows == 0:
+        return
+    prompt_ids = prompt.get("prompt_token_ids")
+    if not isinstance(prompt_ids, (list, tuple)):
+        return
+    existing_ids = [int(token_id) for token_id in prompt_ids]
+    raw_scheduler_token = duplex.get("scheduler_token_id")
+    try:
+        scheduler_token = int(raw_scheduler_token)
+    except (TypeError, ValueError):
+        scheduler_token = existing_ids[-1] if existing_ids else 0
+    prompt["prompt_token_ids"] = [*existing_ids, *([scheduler_token] * extra_rows)]
+    raw_budget = duplex.get("scheduler_token_budget")
+    try:
+        scheduler_budget = int(raw_budget)
+    except (TypeError, ValueError):
+        scheduler_budget = len(existing_ids)
+    duplex["scheduler_token_budget"] = scheduler_budget + extra_rows
 
 
 if TYPE_CHECKING:
@@ -433,22 +477,22 @@ class _OrchestratorDuplexStagePort:
         slot_ready_epoch = _time.time()
         slot_wait_started = _time.monotonic()
         is_pd_prefill = self._pd_pair is not None and context.stage_id == self._pd_pair[0]
+        pd_predicted_prompt_token_ids: list[int] | None = None
         if is_pd_prefill:
             bridge = request_state.streaming.bridge_states
             if submission.already_submitted:
                 decode_ready = bridge.get("pd_duplex_decode_ready")
                 if isinstance(decode_ready, asyncio.Event):
                     await decode_ready.wait()
+                route_error = bridge.get("pd_duplex_prefill_raw_error")
+                if route_error is not None:
+                    raise RuntimeError(f"previous native P/D route failed for {context.request_id}: {route_error}")
+                if self._request_states.get(context.request_id) is not request_state:
+                    raise RuntimeError(f"duplex request was closed while waiting for D: {context.request_id}")
                 feedback = bridge.pop("pd_duplex_feedback_token_ids", [])
                 if feedback:
-                    import copy
-
                     prompt = copy.deepcopy(original_prompt)
-                    model_buffer = prompt.get("model_intermediate_buffer")
-                    if isinstance(model_buffer, dict):
-                        duplex = model_buffer.get("duplex")
-                        if isinstance(duplex, dict):
-                            duplex["pd_feedback_token_ids"] = list(feedback)
+                    _extend_native_pd_feedback_budget(prompt, list(feedback))
             # One request per session may be in P→D flight.  This is the
             # model's recurrence dependency, not a global admission gate:
             # unrelated sessions continue independently.
@@ -456,8 +500,39 @@ class _OrchestratorDuplexStagePort:
             model_buffer = original_prompt.get("model_intermediate_buffer")
             duplex = model_buffer.get("duplex") if isinstance(model_buffer, dict) else None
             seq = duplex.get("seq") if isinstance(duplex, dict) else None
+            payload = duplex.get("payload") if isinstance(duplex, dict) else None
+            input_source = (
+                "auto_continuation"
+                if isinstance(payload, dict) and payload.get("duplex_input_source") == "auto_continuation"
+                else "real_input"
+            )
+            raw_input_unit_index = payload.get("input_unit_index") if isinstance(payload, dict) else None
+            try:
+                input_unit_index = (
+                    int(raw_input_unit_index)
+                    if raw_input_unit_index is not None and not isinstance(raw_input_unit_index, bool)
+                    else None
+                )
+            except (TypeError, ValueError):
+                input_unit_index = None
+            video_frames = payload.get("video_frames") if isinstance(payload, dict) else None
+            input_video_frames = len(video_frames) if isinstance(video_frames, list) else 0
             bridge["pd_duplex_active_slot"] = {
                 "seq": seq,
+                "input_unit_index": input_unit_index,
+                "source": input_source,
+                "input_video_frames": input_video_frames,
+                "arrival_video_frames": 0,
+                "vision_fallback_frames": 0,
+                "arrival_audio_units": 0,
+                "audio_fallback_units": 0,
+                "local_cached_tokens": -1,
+                "external_cached_tokens": -1,
+                "computed_tokens": -1,
+                "kv_transfer_selected_blocks": -1,
+                "kv_transfer_selected_tokens": -1,
+                "kv_transfer_selected_bytes": -1,
+                "kv_transfer_write_submit_to_d_ready_ms": -1.0,
                 "ready_epoch": slot_ready_epoch,
                 "wait_previous_d_ms": (_time.monotonic() - slot_wait_started) * 1000.0,
             }
@@ -466,13 +541,15 @@ class _OrchestratorDuplexStagePort:
             # that boundary, so the raw-output path owns exactly one P->D
             # dispatch for this slot.
             bridge["pd_duplex_prefill_raw_routed"] = False
+            bridge.pop("pd_duplex_prefill_raw_scheduled_id", None)
+            bridge.pop("pd_duplex_prefill_raw_routed_id", None)
             if seq is None:
                 seq = int(bridge.get("pd_duplex_decode_sequence", 0)) + 1
             decode_engine_req_id = f"{context.request_id}-{int(seq) & 0xFFFFFFFF:08x}"
             bridge["pd_duplex_decode_sequence"] = int(seq)
             bridge["pd_decode_engine_request_id"] = decode_engine_req_id
             bridge["pd_decode_transfer_id"] = f"xfer-{decode_engine_req_id}"
-            bridge["pd_duplex_predicted_prompt_token_ids"] = self._native_pd_prefix_prediction(
+            pd_predicted_prompt_token_ids = self._native_pd_prefix_prediction(
                 prompt,
                 bridge,
                 already_submitted=submission.already_submitted,
@@ -526,11 +603,12 @@ class _OrchestratorDuplexStagePort:
                 )
         if is_pd_prefill and self._schedule_pd_early_cache_sync is not None:
             bridge = request_state.streaming.bridge_states
+            assert pd_predicted_prompt_token_ids is not None
             self._schedule_pd_early_cache_sync(
                 context.request_id,
                 request_state,
                 engine_request_id=bridge["pd_decode_engine_request_id"],
-                prompt_token_ids=bridge["pd_duplex_predicted_prompt_token_ids"],
+                prompt_token_ids=pd_predicted_prompt_token_ids,
             )
         request_state.duplex_stage_fences[context.stage_id] = context.fence
         request_state.stage_submit_ts[context.stage_id] = _time.time()
@@ -615,6 +693,11 @@ class Orchestrator:
         # session continues to send complete canonical prompts.
         self._pd_cache_sync_tasks: dict[str, asyncio.Task[Any]] = {}
         self._background_collective_rpc_tasks: set[asyncio.Task[None]] = set()
+        # Raw resumable-P boundaries must not await D admission from the one
+        # global stage-output poller.  Ownership remains request-scoped: the
+        # model recurrence permits at most one P->D route per logical session,
+        # while unrelated sessions may submit D independently.
+        self._pd_raw_route_tasks: dict[str, asyncio.Task[None]] = {}
         # P output routing is kept FIFO but runs independently from the global
         # stage poller. Snapshot compaction can then yield to D/Talker output
         # consumption instead of blocking every stage on the orchestrator
@@ -821,6 +904,10 @@ class Orchestrator:
                 await asyncio.gather(*tasks, return_exceptions=True)
             except Exception:
                 pass
+
+            await self._cancel_pd_raw_route_tasks(
+                reason="orchestrator shutdown",
+            )
 
             cache_sync_tasks = list(self._pd_cache_sync_tasks.values())
             for task in cache_sync_tasks:
@@ -1107,6 +1194,30 @@ class Orchestrator:
         """Forward abort requests to all stage pools."""
         if not request_ids:
             return
+        pd_pair = getattr(self, "_pd_pair", None)
+        aliases = getattr(self, "_pd_decode_request_aliases", {})
+        request_states = getattr(self, "request_states", {})
+        if pd_pair is not None:
+            _, d_stage_id = pd_pair
+            d_pool = self.stage_pools[d_stage_id]
+            abort_physical = getattr(
+                d_pool,
+                "abort_engine_requests_for_binding",
+                None,
+            )
+            if callable(abort_physical):
+                for request_id in request_ids:
+                    physical_ids = [
+                        engine_request_id
+                        for engine_request_id, logical_request_id in aliases.items()
+                        if logical_request_id == request_id
+                    ]
+                    req_state = request_states.get(request_id)
+                    if req_state is not None:
+                        active_id = req_state.streaming.bridge_states.get("pd_decode_engine_request_id")
+                        if isinstance(active_id, str) and active_id:
+                            physical_ids.append(active_id)
+                    await abort_physical(request_id, physical_ids)
         for pool in self.stage_pools:
             await pool.abort_requests(request_ids)
             pool.release_bindings(request_ids)
@@ -1327,6 +1438,54 @@ class Orchestrator:
                                     and self._is_duplex_session_request(req_state)
                                 ):
                                     bridge = req_state.streaming.bridge_states
+                                    active_slot = bridge.get("pd_duplex_active_slot")
+                                    prefill_stats = getattr(eco, "prefill_stats", None)
+                                    if isinstance(active_slot, dict) and prefill_stats is not None:
+                                        prompt_tokens = self._coerce_int(
+                                            getattr(prefill_stats, "num_prompt_tokens", None)
+                                        )
+                                        local_cached_tokens = self._coerce_int(
+                                            getattr(prefill_stats, "num_local_cached_tokens", None)
+                                        )
+                                        external_cached_tokens = self._coerce_int(
+                                            getattr(prefill_stats, "num_external_cached_tokens", None)
+                                        )
+                                        computed_tokens = self._coerce_int(
+                                            getattr(prefill_stats, "num_computed_tokens", None)
+                                        )
+                                        cached_tokens = self._coerce_int(
+                                            getattr(prefill_stats, "num_cached_tokens", None)
+                                        )
+                                        counts = (
+                                            prompt_tokens,
+                                            local_cached_tokens,
+                                            external_cached_tokens,
+                                            computed_tokens,
+                                            cached_tokens,
+                                        )
+                                        if (
+                                            all(value is not None and value >= 0 for value in counts)
+                                            and prompt_tokens is not None
+                                            and local_cached_tokens is not None
+                                            and external_cached_tokens is not None
+                                            and computed_tokens is not None
+                                            and cached_tokens is not None
+                                            and local_cached_tokens + external_cached_tokens == cached_tokens
+                                            and computed_tokens + cached_tokens == prompt_tokens
+                                        ):
+                                            active_slot.update(
+                                                {
+                                                    "prompt_tokens": prompt_tokens,
+                                                    "local_cached_tokens": local_cached_tokens,
+                                                    "external_cached_tokens": external_cached_tokens,
+                                                    "computed_tokens": computed_tokens,
+                                                }
+                                            )
+                                    if isinstance(active_slot, dict):
+                                        self._update_native_pd_transfer_evidence(
+                                            active_slot,
+                                            getattr(eco, "kv_transfer_params", None),
+                                        )
                                     segment_tokens = bridge.setdefault(
                                         "pd_duplex_decode_segment_token_ids",
                                         [],
@@ -1378,28 +1537,37 @@ class Orchestrator:
                                         )
                                         if isinstance(active_slot, dict):
                                             done_epoch = _time.time()
+                                            await self._emit_native_duplex_d_completion_witness(
+                                                stage_id=stage_id,
+                                                replica_id=replica_id,
+                                                engine_request_id=str(engine_req_id),
+                                                req_state=req_state,
+                                                active_slot=active_slot,
+                                                completed_epoch_s=done_epoch,
+                                            )
                                             ready_epoch = float(
                                                 active_slot.get(
                                                     "ready_epoch",
                                                     done_epoch,
                                                 )
                                             )
-                                            logger.info(
-                                                "[minicpm_pd_slot] req=%s seq=%s "
-                                                "ready_epoch=%.6f done_epoch=%.6f "
-                                                "e2e_ms=%.3f wait_previous_d_ms=%.3f",
-                                                req_state.request_id,
-                                                active_slot.get("seq"),
-                                                ready_epoch,
-                                                done_epoch,
-                                                (done_epoch - ready_epoch) * 1000.0,
-                                                float(
-                                                    active_slot.get(
-                                                        "wait_previous_d_ms",
-                                                        0.0,
-                                                    )
-                                                ),
-                                            )
+                                            if _LOG_HANDOFF_DIAG:
+                                                logger.info(
+                                                    "[minicpm_pd_slot] req=%s seq=%s "
+                                                    "ready_epoch=%.6f done_epoch=%.6f "
+                                                    "e2e_ms=%.3f wait_previous_d_ms=%.3f",
+                                                    req_state.request_id,
+                                                    active_slot.get("seq"),
+                                                    ready_epoch,
+                                                    done_epoch,
+                                                    (done_epoch - ready_epoch) * 1000.0,
+                                                    float(
+                                                        active_slot.get(
+                                                            "wait_previous_d_ms",
+                                                            0.0,
+                                                        )
+                                                    ),
+                                                )
                                         decode_ready = bridge.get("pd_duplex_decode_ready")
                                         if isinstance(decode_ready, asyncio.Event):
                                             decode_ready.set()
@@ -1422,7 +1590,7 @@ class Orchestrator:
                                     and stage_id == self._pd_pair[0]
                                     and self._is_duplex_session_request(req_state)
                                 ):
-                                    await self._route_native_duplex_pd_prefill_raw(
+                                    self._schedule_native_duplex_pd_prefill_raw(
                                         stage_id,
                                         replica_id,
                                         eco,
@@ -1586,6 +1754,155 @@ class Orchestrator:
 
             await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
 
+    @classmethod
+    def _update_native_pd_transfer_evidence(
+        cls,
+        active_slot: dict[str, Any],
+        kv_transfer_params: Any,
+    ) -> None:
+        """Copy only connector-proven request scalars into the active slot."""
+        if not isinstance(kv_transfer_params, dict):
+            return
+        for name in (
+            "kv_transfer_selected_blocks",
+            "kv_transfer_selected_tokens",
+            "kv_transfer_selected_bytes",
+        ):
+            value = cls._coerce_int(kv_transfer_params.get(name))
+            if value is not None and value >= 0:
+                active_slot[name] = value
+
+        raw_ms = kv_transfer_params.get("kv_transfer_write_submit_to_d_ready_ms")
+        if isinstance(raw_ms, int | float) and not isinstance(raw_ms, bool):
+            value_ms = float(raw_ms)
+            if value_ms >= 0.0:
+                active_slot["kv_transfer_write_submit_to_d_ready_ms"] = value_ms
+
+    async def _emit_native_duplex_d_completion_witness(
+        self,
+        *,
+        stage_id: int,
+        replica_id: int,
+        engine_request_id: str,
+        req_state: OrchestratorRequestState,
+        active_slot: dict[str, Any],
+        completed_epoch_s: float,
+    ) -> None:
+        """Emit exactly one observer record at a finite native-D boundary."""
+        sequence = self._coerce_int(active_slot.get("seq"))
+        if sequence is None:
+            _, separator, raw_sequence = engine_request_id.rpartition("-")
+            try:
+                sequence = int(raw_sequence, 16) if separator and len(raw_sequence) == 8 else None
+            except ValueError:
+                sequence = None
+        if sequence is None:
+            logger.warning(
+                "[Orchestrator][PD] cannot identify physical D completion req=%s",
+                engine_request_id,
+            )
+            return
+
+        bridge = req_state.streaming.bridge_states
+        last_sequence = self._coerce_int(bridge.get("pd_duplex_last_completion_witness_sequence"))
+        if last_sequence is not None and sequence <= last_sequence:
+            return
+
+        submit_epoch_s = float(req_state.stage_submit_ts.get(stage_id, completed_epoch_s))
+        raw_input_unit_index = self._coerce_int(active_slot.get("input_unit_index"))
+        source = active_slot.get("source")
+        if source not in ("real_input", "auto_continuation"):
+            source = "real_input"
+        prompt_tokens = self._coerce_int(active_slot.get("prompt_tokens"))
+        local_cached_tokens = self._coerce_int(active_slot.get("local_cached_tokens"))
+        external_cached_tokens = self._coerce_int(active_slot.get("external_cached_tokens"))
+        computed_tokens = self._coerce_int(active_slot.get("computed_tokens"))
+        kv_transfer_selected_blocks = self._coerce_int(active_slot.get("kv_transfer_selected_blocks"))
+        kv_transfer_selected_tokens = self._coerce_int(active_slot.get("kv_transfer_selected_tokens"))
+        kv_transfer_selected_bytes = self._coerce_int(active_slot.get("kv_transfer_selected_bytes"))
+        raw_write_to_ready_ms = active_slot.get("kv_transfer_write_submit_to_d_ready_ms")
+        prompt_tokens = prompt_tokens if prompt_tokens is not None and prompt_tokens >= 0 else -1
+        local_cached_tokens = (
+            local_cached_tokens if local_cached_tokens is not None and local_cached_tokens >= 0 else -1
+        )
+        external_cached_tokens = (
+            external_cached_tokens if external_cached_tokens is not None and external_cached_tokens >= 0 else -1
+        )
+        computed_tokens = computed_tokens if computed_tokens is not None and computed_tokens >= 0 else -1
+        kv_transfer_selected_blocks = (
+            kv_transfer_selected_blocks
+            if kv_transfer_selected_blocks is not None and kv_transfer_selected_blocks >= 0
+            else -1
+        )
+        kv_transfer_selected_tokens = (
+            kv_transfer_selected_tokens
+            if kv_transfer_selected_tokens is not None and kv_transfer_selected_tokens >= 0
+            else -1
+        )
+        kv_transfer_selected_bytes = (
+            kv_transfer_selected_bytes
+            if kv_transfer_selected_bytes is not None and kv_transfer_selected_bytes >= 0
+            else -1
+        )
+        kv_transfer_write_submit_to_d_ready_ms = (
+            float(raw_write_to_ready_ms)
+            if isinstance(raw_write_to_ready_ms, int | float)
+            and not isinstance(raw_write_to_ready_ms, bool)
+            and float(raw_write_to_ready_ms) >= 0.0
+            else -1.0
+        )
+        cached_tokens = (
+            local_cached_tokens + external_cached_tokens
+            if local_cached_tokens >= 0 and external_cached_tokens >= 0
+            else -1
+        )
+        await self.output_async_queue.put(
+            PhysicalDCompletionWitnessMessage(
+                request_id=req_state.request_id,
+                stage_id=stage_id,
+                replica_id=replica_id,
+                engine_request_id=engine_request_id,
+                physical_sequence=sequence,
+                input_unit_index=(raw_input_unit_index if raw_input_unit_index is not None else sequence),
+                source=source,
+                prompt_tokens=prompt_tokens,
+                cached_tokens=cached_tokens,
+                local_cached_tokens=local_cached_tokens,
+                external_cached_tokens=external_cached_tokens,
+                computed_tokens=computed_tokens,
+                # Core batch identity is not exposed at this raw boundary.
+                batch_id=0,
+                submit_epoch_s=submit_epoch_s,
+                completed_epoch_s=completed_epoch_s,
+                service_ms=max(0.0, (completed_epoch_s - submit_epoch_s) * 1000.0),
+                input_video_frames=max(
+                    0,
+                    self._coerce_int(active_slot.get("input_video_frames")) or 0,
+                ),
+                arrival_video_frames=max(
+                    0,
+                    self._coerce_int(active_slot.get("arrival_video_frames")) or 0,
+                ),
+                vision_fallback_frames=max(
+                    0,
+                    self._coerce_int(active_slot.get("vision_fallback_frames")) or 0,
+                ),
+                arrival_audio_units=max(
+                    0,
+                    self._coerce_int(active_slot.get("arrival_audio_units")) or 0,
+                ),
+                audio_fallback_units=max(
+                    0,
+                    self._coerce_int(active_slot.get("audio_fallback_units")) or 0,
+                ),
+                kv_transfer_selected_blocks=kv_transfer_selected_blocks,
+                kv_transfer_selected_tokens=kv_transfer_selected_tokens,
+                kv_transfer_selected_bytes=kv_transfer_selected_bytes,
+                kv_transfer_write_submit_to_d_ready_ms=(kv_transfer_write_submit_to_d_ready_ms),
+            )
+        )
+        bridge["pd_duplex_last_completion_witness_sequence"] = sequence
+
     async def _handle_stage_error(self, stage_id: int, output: Any) -> None:
         """Emit a frontend-visible error and clean up request state."""
         if self._cfg_tracker.is_companion(output.request_id):
@@ -1667,6 +1984,25 @@ class Orchestrator:
                 )
                 cleanup_ids.extend(stale_request_ids)
             cleanup_ids = list(dict.fromkeys(cleanup_ids))
+
+        cleanup_reason = (
+            "duplex request aborted"
+            if abort
+            else "duplex request closed"
+            if close_duplex_sessions
+            else "duplex request cleaned up"
+        )
+        for request_id in cleanup_ids:
+            req_state = self.request_states.get(request_id)
+            if req_state is not None and self._is_duplex_session_request(req_state):
+                self._signal_native_duplex_pd_route_error(
+                    req_state,
+                    cleanup_reason,
+                )
+        await self._cancel_pd_raw_route_tasks(
+            cleanup_ids,
+            reason=cleanup_reason,
+        )
 
         try:
             if abort:
@@ -2018,14 +2354,25 @@ class Orchestrator:
             )
 
         pd_prefill_boundary = finished or (req_state.streaming.enabled and req_state.streaming.segment_finished)
+        bridge = req_state.streaming.bridge_states
+        current_d_request_id = bridge.get("pd_decode_engine_request_id")
+        native_raw_route_owned = bool(
+            bridge.get("pd_duplex_prefill_raw_routed", False)
+            or (
+                isinstance(current_d_request_id, str)
+                and current_d_request_id
+                and current_d_request_id
+                in (
+                    bridge.get("pd_duplex_prefill_raw_scheduled_id"),
+                    bridge.get("pd_duplex_prefill_raw_routed_id"),
+                )
+            )
+        )
         if (
             self._pd_pair is not None
             and stage_id == self._pd_pair[0]
             and self._is_duplex_session_request(req_state)
-            and req_state.streaming.bridge_states.get(
-                "pd_duplex_prefill_raw_routed",
-                False,
-            )
+            and native_raw_route_owned
         ):
             # Native duplex P segments are dispatched from their raw boundary.
             # A backend that also materializes a processed FINAL_ONLY object
@@ -2052,10 +2399,6 @@ class Orchestrator:
                             ):
                                 if key in source_prompt:
                                     decode_prompt[key] = copy.deepcopy(source_prompt[key])
-                        model_buffer = decode_prompt.get("model_intermediate_buffer")
-                        duplex = model_buffer.get("duplex") if isinstance(model_buffer, dict) else None
-                        if isinstance(duplex, dict):
-                            duplex["duplex_prompt_token_ids"] = list(decode_prompt["prompt_token_ids"])
                         bridge = req_state.streaming.bridge_states
                         bridge["pd_decode_prompt"] = decode_prompt
                         bridge["pd_duplex_prefill_sample_token_ids"] = p_sampled_ids
@@ -3091,7 +3434,11 @@ class Orchestrator:
             raise RuntimeError(f"[Orchestrator][PD] native P boundary lacks remote prompt tokens for req={req_id}")
 
         self._pd_kv_params[req_id] = dict(kv_params)
-        actual_prefix_ids = [int(token_id) for token_id in remote_prompt_token_ids]
+        actual_prefix_ids = (
+            remote_prompt_token_ids
+            if isinstance(remote_prompt_token_ids, list)
+            else [int(token_id) for token_id in remote_prompt_token_ids]
+        )
         p_sampled_ids = list(req_state.streaming.segment_token_ids)
         decode_prompt: dict[str, Any] = {
             "prompt_token_ids": [
@@ -3101,17 +3448,24 @@ class Orchestrator:
         }
         source_prompt = req_state.prompt
         if isinstance(source_prompt, dict):
-            for key in (
-                "additional_information",
-                "model_intermediate_buffer",
-                "cache_salt",
-            ):
+            for key in ("additional_information", "cache_salt"):
                 if key in source_prompt:
                     decode_prompt[key] = copy.deepcopy(source_prompt[key])
-        model_buffer = decode_prompt.get("model_intermediate_buffer")
-        duplex = model_buffer.get("duplex") if isinstance(model_buffer, dict) else None
-        if isinstance(duplex, dict):
-            duplex["duplex_prompt_token_ids"] = list(decode_prompt["prompt_token_ids"])
+            source_model_buffer = source_prompt.get("model_intermediate_buffer")
+            if isinstance(source_model_buffer, dict):
+                # The native D runner imports P's cumulative AV KV and
+                # deliberately ignores ``duplex.payload``.  Avoid copying and
+                # serializing the raw audio/video a second time on every slot;
+                # retain only the compact control metadata D and Talker use.
+                decode_model_buffer = {
+                    key: copy.deepcopy(value) for key, value in source_model_buffer.items() if key != "duplex"
+                }
+                source_duplex = source_model_buffer.get("duplex")
+                if isinstance(source_duplex, dict):
+                    decode_model_buffer["duplex"] = {
+                        key: copy.deepcopy(value) for key, value in source_duplex.items() if key != "payload"
+                    }
+                decode_prompt["model_intermediate_buffer"] = decode_model_buffer
         bridge = req_state.streaming.bridge_states
         bridge["pd_duplex_remote_prompt_token_ids"] = actual_prefix_ids
         active_slot = bridge.get("pd_duplex_active_slot")
@@ -3129,12 +3483,40 @@ class Orchestrator:
         if decode_engine_req_id != expected_engine_req_id:
             decode_engine_req_id = expected_engine_req_id
         bridge["pd_decode_prompt"] = decode_prompt
+        bridge["pd_decode_prompt_len"] = len(decode_prompt["prompt_token_ids"])
+        bridge["pd_decode_last_prompt_token_id"] = (
+            int(decode_prompt["prompt_token_ids"][-1]) if decode_prompt["prompt_token_ids"] else None
+        )
+        decode_model_buffer = decode_prompt.get("model_intermediate_buffer")
+        decode_duplex = decode_model_buffer.get("duplex") if isinstance(decode_model_buffer, dict) else None
+        decode_special_ids = decode_duplex.get("special_token_ids") if isinstance(decode_duplex, dict) else None
+        if isinstance(decode_special_ids, dict):
+            bridge["pd_duplex_special_token_ids"] = dict(decode_special_ids)
         bridge["pd_decode_engine_request_id"] = decode_engine_req_id
         bridge["pd_decode_transfer_id"] = f"xfer-{decode_engine_req_id}"
         bridge["pd_duplex_prefill_sample_token_ids"] = p_sampled_ids
+        if isinstance(active_slot, dict):
+            active_slot["prompt_tokens"] = len(decode_prompt["prompt_token_ids"])
         p_mm_output = self._completion_multimodal_output(output, None)
         if p_mm_output:
             p_mm_output = unflatten_payload(dict(p_mm_output))
+            if isinstance(active_slot, dict):
+                audit_sources = [p_mm_output]
+                nested_audit = p_mm_output.get("duplex")
+                if isinstance(nested_audit, dict):
+                    audit_sources.append(nested_audit)
+                for wire_name, slot_name in (
+                    ("duplex_input_video_frames", "input_video_frames"),
+                    ("duplex_arrival_video_frames", "arrival_video_frames"),
+                    ("duplex_vision_fallback_frames", "vision_fallback_frames"),
+                    ("duplex_arrival_audio_units", "arrival_audio_units"),
+                    ("duplex_audio_fallback_units", "audio_fallback_units"),
+                ):
+                    for audit_source in audit_sources:
+                        audit_value = self._coerce_int(audit_source.get(wire_name))
+                        if audit_value is not None:
+                            active_slot[slot_name] = max(0, audit_value)
+                            break
             p_meta = p_mm_output.get("meta")
             p_special = p_mm_output.get("special_token_ids")
             special_ids: dict[str, int] = {}
@@ -3160,13 +3542,12 @@ class Orchestrator:
         output: Any,
         req_state: OrchestratorRequestState,
     ) -> None:
-        """Restore the native handoff metadata on a finite D output.
+        """Attach compact native handoff metadata to a finite D output.
 
         D receives a token-only prompt and imports the media prefix KV.  Its
         accumulated latent is authoritative, while the prompt-boundary and
-        tokenizer IDs remain application metadata.  Keep those fields beside
-        the latent so the unchanged MiniCPM llm2tts bridge can select exactly
-        this slot's generated rows.
+        tokenizer IDs remain application metadata.  The Talker needs only the
+        boundary and current D segment, never another full cached-prompt copy.
         """
         completions = getattr(output, "outputs", None)
         completion = completions[0] if isinstance(completions, list) and completions else None
@@ -3176,21 +3557,31 @@ class Orchestrator:
             return
 
         bridge = req_state.streaming.bridge_states
-        decode_prompt = bridge.get("pd_decode_prompt")
-        if not isinstance(decode_prompt, dict):
+        prompt_len = bridge.get("pd_decode_prompt_len")
+        last_prompt_token = bridge.get("pd_decode_last_prompt_token_id")
+        if not isinstance(prompt_len, int):
+            # Compatibility for request states created before compact prompt
+            # metadata was introduced.
+            decode_prompt = bridge.get("pd_decode_prompt")
+            prompt_ids = decode_prompt.get("prompt_token_ids") if isinstance(decode_prompt, dict) else None
+            if not isinstance(prompt_ids, (list, tuple)):
+                return
+            prompt_len = len(prompt_ids)
+            last_prompt_token = int(prompt_ids[-1]) if prompt_ids else None
+        if prompt_len < 0:
             return
-        prompt_ids = decode_prompt.get("prompt_token_ids")
-        if isinstance(prompt_ids, (list, tuple)):
-            metadata.setdefault(
-                "duplex_prompt_token_ids",
-                [int(token_id) for token_id in prompt_ids],
-            )
+        metadata.pop(NATIVE_PROMPT_TOKEN_IDS_KEY, None)
+        metadata.setdefault(NATIVE_PROMPT_LEN_KEY, prompt_len)
+        metadata.setdefault(
+            NATIVE_LAST_PROMPT_TOKEN_KEY,
+            last_prompt_token,
+        )
+        if metadata.get(NATIVE_SEGMENT_TOKEN_IDS_KEY) is None:
+            segment_ids = getattr(completion, "token_ids", None)
+            if isinstance(segment_ids, (list, tuple)):
+                metadata[NATIVE_SEGMENT_TOKEN_IDS_KEY] = [int(token_id) for token_id in segment_ids]
 
-        model_buffer = decode_prompt.get("model_intermediate_buffer")
-        duplex = model_buffer.get("duplex") if isinstance(model_buffer, dict) else None
-        special_ids = duplex.get("special_token_ids") if isinstance(duplex, dict) else None
-        if not isinstance(special_ids, dict):
-            special_ids = bridge.get("pd_duplex_special_token_ids")
+        special_ids = bridge.get("pd_duplex_special_token_ids")
         if isinstance(special_ids, dict):
             existing = metadata.get("special_token_ids")
             merged = dict(existing) if isinstance(existing, dict) else {}
@@ -3203,12 +3594,247 @@ class Orchestrator:
             )
             metadata["special_token_ids"] = merged
 
+    @staticmethod
+    def _signal_native_duplex_pd_route_error(
+        req_state: OrchestratorRequestState,
+        error: str,
+    ) -> None:
+        """Wake a same-session append that is waiting for the previous D."""
+        bridge = req_state.streaming.bridge_states
+        bridge.setdefault("pd_duplex_prefill_raw_error", error)
+        decode_ready = bridge.get("pd_duplex_decode_ready")
+        if isinstance(decode_ready, asyncio.Event):
+            decode_ready.set()
+
+    async def _cancel_pd_raw_route_tasks(
+        self,
+        request_ids: list[str] | None = None,
+        *,
+        reason: str,
+    ) -> None:
+        """Cancel and join owned raw P->D route tasks before state teardown."""
+        tasks = getattr(self, "_pd_raw_route_tasks", None)
+        if not tasks:
+            return
+        selected_ids = list(tasks) if request_ids is None else list(dict.fromkeys(request_ids))
+        current = asyncio.current_task()
+        to_join: list[asyncio.Task[None]] = []
+        for request_id in selected_ids:
+            task = tasks.get(request_id)
+            if task is None:
+                continue
+            req_state = getattr(self, "request_states", {}).get(request_id)
+            if req_state is not None:
+                self._signal_native_duplex_pd_route_error(req_state, reason)
+            if task is current:
+                continue
+            if not task.done():
+                task.cancel()
+            to_join.append(task)
+        if to_join:
+            await asyncio.gather(*to_join, return_exceptions=True)
+        for request_id in selected_ids:
+            task = tasks.get(request_id)
+            if task is not None and task is not current and task.done():
+                tasks.pop(request_id, None)
+
+    def _schedule_native_duplex_pd_prefill_raw(
+        self,
+        stage_id: int,
+        replica_id: int,
+        output: Any,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        """Own one raw P->D route task without blocking global output polling."""
+        req_id = req_state.request_id
+        if self.request_states.get(req_id) is not req_state:
+            return
+        bridge = req_state.streaming.bridge_states
+        physical_id = bridge.get("pd_decode_engine_request_id")
+        if not isinstance(physical_id, str) or not physical_id:
+            raise RuntimeError(f"[Orchestrator][PD] native P boundary has no physical D id for req={req_id}")
+        if (
+            bridge.get("pd_duplex_prefill_raw_scheduled_id") == physical_id
+            or bridge.get("pd_duplex_prefill_raw_routed_id") == physical_id
+            or bridge.get("pd_duplex_prefill_raw_routed", False)
+        ):
+            return
+
+        tasks = getattr(self, "_pd_raw_route_tasks", None)
+        if tasks is None:
+            tasks = self._pd_raw_route_tasks = {}
+        previous = tasks.get(req_id)
+        if previous is not None and not previous.done():
+            raise RuntimeError(f"duplicate in-flight native P/D route for req={req_id} physical={physical_id}")
+        if previous is not None:
+            if not previous.cancelled():
+                previous.exception()
+            tasks.pop(req_id, None)
+
+        bridge["pd_duplex_prefill_raw_scheduled_id"] = physical_id
+        task = asyncio.create_task(
+            self._run_native_duplex_pd_prefill_raw(
+                stage_id,
+                replica_id,
+                output,
+                req_state,
+                physical_id=physical_id,
+            ),
+            name=f"orchestrator-native-pd-route-{physical_id}",
+        )
+        tasks[req_id] = task
+
+        def _discard(done: asyncio.Task[None]) -> None:
+            if tasks.get(req_id) is done:
+                tasks.pop(req_id, None)
+            if done.cancelled():
+                return
+            error = done.exception()
+            if error is not None:
+                logger.error(
+                    "[Orchestrator][PD] raw route task failed during error cleanup req=%s physical=%s: %s",
+                    req_id,
+                    physical_id,
+                    error,
+                )
+
+        task.add_done_callback(_discard)
+
+    async def _run_native_duplex_pd_prefill_raw(
+        self,
+        stage_id: int,
+        replica_id: int,
+        output: Any,
+        req_state: OrchestratorRequestState,
+        *,
+        physical_id: str,
+    ) -> None:
+        req_id = req_state.request_id
+        try:
+            if self.request_states.get(req_id) is not req_state:
+                return
+            if req_state.streaming.bridge_states.get("pd_decode_engine_request_id") != physical_id:
+                raise RuntimeError(f"stale native P/D route identity for req={req_id} physical={physical_id}")
+            await self._route_native_duplex_pd_prefill_raw(
+                stage_id,
+                replica_id,
+                output,
+                req_state,
+                physical_id=physical_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except EngineDeadError as exc:
+            await self._handle_native_duplex_pd_route_engine_dead(
+                stage_id,
+                exc,
+                req_state,
+            )
+        except Exception as exc:
+            if self.request_states.get(req_id) is not req_state:
+                return
+            error_text = f"{type(exc).__name__}: {exc}"
+            self._signal_native_duplex_pd_route_error(req_state, error_text)
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    request_id=req_id,
+                    stage_id=self._pd_pair[1] if self._pd_pair is not None else stage_id + 1,
+                    error=str(exc),
+                    error_type="PDRawRouteError",
+                )
+            )
+            try:
+                await self._cleanup_request_ids(
+                    [req_id],
+                    abort=True,
+                    close_duplex_sessions=True,
+                )
+            except Exception:
+                logger.exception(
+                    "[Orchestrator][PD] cleanup after raw route failure failed req=%s physical=%s",
+                    req_id,
+                    physical_id,
+                )
+        finally:
+            bridge = req_state.streaming.bridge_states
+            if bridge.get("pd_duplex_prefill_raw_scheduled_id") == physical_id:
+                bridge.pop("pd_duplex_prefill_raw_scheduled_id", None)
+
+    async def _handle_native_duplex_pd_route_engine_dead(
+        self,
+        prefill_stage_id: int,
+        exc: EngineDeadError,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        """Quarantine a D replica that dies during detached admission."""
+        req_id = req_state.request_id
+        d_stage_id = self._pd_pair[1] if self._pd_pair is not None else prefill_stage_id + 1
+        d_pool = self.stage_pools[d_stage_id]
+        available_before = d_pool.available_replica_ids()
+        failed_replica_id = getattr(exc, "vllm_omni_replica_id", None)
+        failed_stage_id = getattr(exc, "vllm_omni_stage_id", d_stage_id)
+        if failed_stage_id != d_stage_id:
+            failed_replica_id = None
+        if failed_replica_id is None:
+            failed_replica_id = d_pool.get_bound_replica_id(req_id)
+        if failed_replica_id is None and len(available_before) == 1:
+            # Native Duplex P/D currently deploys one D replica.  If an
+            # unannotated admission error reaches us, the sole live replica is
+            # necessarily the failed target.
+            failed_replica_id = available_before[0]
+
+        affected_request_ids: list[str] = []
+        if isinstance(failed_replica_id, int):
+            affected_request_ids.extend(d_pool.mark_replica_unavailable(failed_replica_id))
+        if self.request_states.get(req_id) is req_state:
+            affected_request_ids.insert(0, req_id)
+            self._signal_native_duplex_pd_route_error(
+                req_state,
+                f"{type(exc).__name__}: {exc}",
+            )
+        affected_request_ids = list(dict.fromkeys(affected_request_ids))
+
+        fatal = not d_pool.available_replica_ids()
+        if fatal:
+            self._fatal_error = str(exc) or "Decode stage engine died during admission"
+            self._fatal_error_stage_id = d_stage_id
+
+        message_request_ids: list[str | None] = affected_request_ids or ([None] if fatal else [])
+        for affected_request_id in message_request_ids:
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    request_id=affected_request_id,
+                    stage_id=d_stage_id,
+                    error=str(exc),
+                    error_type="EngineDeadError",
+                    fatal=fatal,
+                )
+            )
+
+        try:
+            await self._cleanup_request_ids(
+                affected_request_ids,
+                close_duplex_sessions=True,
+            )
+        except Exception:
+            logger.exception(
+                "[Orchestrator][PD] cleanup after D admission death failed req=%s stage=%s replica=%s",
+                req_id,
+                d_stage_id,
+                failed_replica_id,
+            )
+        finally:
+            if fatal:
+                self._shutdown_event.set()
+
     async def _route_native_duplex_pd_prefill_raw(
         self,
         stage_id: int,
         replica_id: int,
         output: Any,
         req_state: OrchestratorRequestState,
+        *,
+        physical_id: str | None = None,
     ) -> None:
         """Dispatch D at the raw resumable P boundary.
 
@@ -3217,10 +3843,25 @@ class Orchestrator:
         is therefore the authoritative point at which P's KV is publishable.
         """
         bridge = req_state.streaming.bridge_states
-        if bridge.get("pd_duplex_prefill_raw_routed", False):
+        physical_id = physical_id or bridge.get("pd_decode_engine_request_id")
+        if not isinstance(physical_id, str) or not physical_id:
+            raise RuntimeError(
+                f"[Orchestrator][PD] native P boundary has no physical D id for req={req_state.request_id}"
+            )
+        if bridge.get("pd_duplex_prefill_raw_routed_id") == physical_id:
             return
+        if self.request_states.get(req_state.request_id) is not req_state:
+            return
+        if bridge.get("pd_decode_engine_request_id") != physical_id:
+            raise RuntimeError(f"stale native P/D route identity for req={req_state.request_id} physical={physical_id}")
         self._prepare_native_duplex_pd_decode(output, req_state)
-        bridge["pd_duplex_prefill_raw_routed"] = True
+        if self.request_states.get(req_state.request_id) is not req_state:
+            return
+        if bridge.get("pd_decode_engine_request_id") != physical_id:
+            raise RuntimeError(
+                f"native P/D route identity changed during preparation "
+                f"req={req_state.request_id} physical={physical_id}"
+            )
         try:
             await self._forward_to_next_stage(
                 req_state.request_id,
@@ -3233,7 +3874,11 @@ class Orchestrator:
             )
         except Exception:
             bridge["pd_duplex_prefill_raw_routed"] = False
+            if bridge.get("pd_duplex_prefill_raw_routed_id") == physical_id:
+                bridge.pop("pd_duplex_prefill_raw_routed_id", None)
             raise
+        bridge["pd_duplex_prefill_raw_routed"] = True
+        bridge["pd_duplex_prefill_raw_routed_id"] = physical_id
 
     def _build_pd_local_decode_params(self, req_id: str, sp: Any) -> Any:
         """Build D params after an early cache-only import completed.
@@ -3320,7 +3965,7 @@ class Orchestrator:
         if params is None:
             return None
         decode_inputs = (
-            [{"prompt_token_ids": list(prompt_token_ids)}]
+            [{"prompt_token_ids": prompt_token_ids}]
             if prompt_token_ids is not None
             else self._pd_decode_inputs(req_state)
         )
@@ -3770,6 +4415,13 @@ class Orchestrator:
                     replica_id,
                     req_state,
                 )
+
+            if native_duplex_pd:
+                # D owns an independent serialized EngineCoreRequest after the
+                # successful submit. Keep only the two scalars Talker needs;
+                # retaining another full prompt in the session bridge would
+                # add O(context) memory to every live session.
+                req_state.streaming.bridge_states.pop("pd_decode_prompt", None)
 
             req_state.stage_submit_ts[next_logical] = _time.time()
             _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0

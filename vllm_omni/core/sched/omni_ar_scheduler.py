@@ -28,12 +28,19 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
     uses_full_payload_input_coordinator,
 )
+from vllm_omni.core.sched.output import OmniCachedRequestData
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.experimental.fullduplex.engine.intermediate import (
+    NATIVE_LAST_PROMPT_TOKEN_KEY,
+    NATIVE_PROMPT_LEN_KEY,
+    NATIVE_PROMPT_TOKEN_IDS_KEY,
+    NATIVE_SEGMENT_TOKEN_IDS_KEY,
+)
 from vllm_omni.outputs import OmniConnectorOutput
 
 logger = init_logger(__name__)
@@ -51,6 +58,13 @@ _DIAG_STAGES = (
     None
     if _DIAG_STAGE_RAW is None
     else frozenset(stage.strip() for stage in _DIAG_STAGE_RAW.split(",") if stage.strip())
+)
+
+_KV_TRANSFER_EVIDENCE_FIELDS = (
+    "kv_transfer_selected_blocks",
+    "kv_transfer_selected_tokens",
+    "kv_transfer_selected_bytes",
+    "kv_transfer_write_submit_to_d_ready_ms",
 )
 
 
@@ -87,6 +101,49 @@ def _diagnostic_tensor_bytes(value: Any) -> int:
     if isinstance(value, (list, tuple)):
         return sum(_diagnostic_tensor_bytes(item) for item in value)
     return 0
+
+
+def _compact_native_duplex_prompt_metadata(
+    multimodal_output: Any,
+    *,
+    current_segment_token_ids: Iterable[int] | None = None,
+) -> Any:
+    """Replace MiniCPM's O(context) prompt snapshot with boundary metadata.
+
+    The scheduler still owns the complete request prompt and KV identity.  The
+    model-provided copy exists only to help the downstream Talker locate the
+    current segment, so prompt length plus the final prompt token is sufficient.
+    Unknown/legacy payload shapes are returned unchanged.
+    """
+    if not isinstance(multimodal_output, dict):
+        return multimodal_output
+    raw_prompt_ids = multimodal_output.get(NATIVE_PROMPT_TOKEN_IDS_KEY)
+    if raw_prompt_ids is None:
+        return multimodal_output
+    if hasattr(raw_prompt_ids, "detach"):
+        raw_prompt_ids = raw_prompt_ids.detach().cpu().tolist()
+    if isinstance(raw_prompt_ids, tuple):
+        raw_prompt_ids = list(raw_prompt_ids)
+    if (
+        isinstance(raw_prompt_ids, list)
+        and len(raw_prompt_ids) == 1
+        and isinstance(raw_prompt_ids[0], (list, tuple))
+    ):
+        raw_prompt_ids = list(raw_prompt_ids[0])
+    if not isinstance(raw_prompt_ids, list):
+        return multimodal_output
+    try:
+        prompt_ids = [int(token_id) for token_id in raw_prompt_ids]
+    except (TypeError, ValueError):
+        return multimodal_output
+
+    compact = dict(multimodal_output)
+    compact.pop(NATIVE_PROMPT_TOKEN_IDS_KEY, None)
+    compact[NATIVE_PROMPT_LEN_KEY] = len(prompt_ids)
+    compact[NATIVE_LAST_PROMPT_TOKEN_KEY] = prompt_ids[-1] if prompt_ids else None
+    if current_segment_token_ids is not None:
+        compact[NATIVE_SEGMENT_TOKEN_IDS_KEY] = [int(token_id) for token_id in current_segment_token_ids]
+    return compact
 
 
 LOG_DUPLEX_CADENCE = os.environ.get("VLLM_OMNI_LOG_DUPLEX_CADENCE", "0") == "1"
@@ -330,6 +387,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # NixlDeltaPushConnector emits an empty registration here so P can
             # release its request-scoped lease even though D needs no bytes.
             connector.update_state_after_alloc(request, computed_blocks, 0)
+            self._snapshot_pd_transfer_evidence(request)
             metadata = connector.build_connector_meta(SchedulerOutput.make_empty())
             hash_block_size = int(getattr(self.kv_cache_manager.block_pool, "hash_block_size", 0))
             lineage_id = getattr(request, "kv_lineage_id", None)
@@ -374,6 +432,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         metadata = connector.build_connector_meta(SchedulerOutput.make_empty())
         return "loading", metadata
 
+    @staticmethod
+    def _snapshot_pd_transfer_evidence(request: Request) -> None:
+        """Retain connector-proven scalars past cache-sync finalization."""
+        params = getattr(request, "kv_transfer_params", None)
+        if not isinstance(params, dict) or not any(
+            name in params for name in _KV_TRANSFER_EVIDENCE_FIELDS
+        ):
+            return
+        request.pd_transfer_evidence = {
+            name: params.get(name, -1)
+            for name in _KV_TRANSFER_EVIDENCE_FIELDS
+        }
+
     def complete_direct_pd_cache_sync(self, request: Request) -> None:
         """Commit a completed cache-only import to D's prefix cache."""
         connector = self.connector
@@ -402,6 +473,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             )
 
         request.status = RequestStatus.FINISHED_STOPPED
+        # request_finished() owns connector cleanup and may clear or replace
+        # its control dictionary.  The paired formal D request still needs
+        # the exact allocation/WRITE evidence for its completion witness.
+        self._snapshot_pd_transfer_evidence(request)
         self._connector_finished(request)
         if not bool(getattr(request, "pd_cache_sync_retain", False)):
             self.kv_cache_manager.free(request)
@@ -636,6 +711,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     )
         after_base_schedule = monotonic() if _LOG_CORE_STEP_DIAG else 0.0
 
+        # A normal vLLM recompute preemption discards the request's KV and
+        # resets its computed-token cursor.  MiniCPM P deliberately owns only
+        # the newest suffix on the steady path, so switch the preempted live
+        # request to its exact compact recovery lineage before it is resumed.
+        for req_id in scheduler_output.preempted_req_ids:
+            request = self.requests.get(req_id)
+            if request is not None:
+                self._rebase_preempted_minicpmo_duplex_request(request)
+
         if getattr(self, "_prefill_microbatch_window_s", 0.0) > 0:
             for scheduled in scheduler_output.scheduled_new_reqs:
                 self._prefill_scheduler_admit_mono.pop(scheduled.req_id, None)
@@ -705,6 +789,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     batch_reqs,
                     batch_tokens,
                 )
+        cached = scheduler_output.scheduled_cached_reqs
+        rebased_resumed_req_ids = {
+            req_id
+            for req_id in cached.resumed_req_ids
+            if req_id in self.requests
+            and bool(
+                getattr(
+                    self.requests[req_id],
+                    "_minicpmo_duplex_preemption_rebased",
+                    False,
+                )
+            )
+        }
         try:
             # Late import to avoid circulars in some launch modes
             from .output import OmniNewRequestData
@@ -737,14 +834,46 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 )
                 new_list.append(omni_nr)
 
+            # Base CachedRequestData does not carry a changed prompt on
+            # preemption resume; the worker would otherwise retain the old
+            # cumulative prompt length while the scheduler owns the compact
+            # rebase.  OmniCachedRequestData synchronizes that identity for all
+            # resumed requests (ordinary cached-running requests stay empty).
+            resumed_prompt_token_ids = {
+                req_id: list(self.requests[req_id].prompt_token_ids or ())
+                for req_id in rebased_resumed_req_ids
+            }
+            omni_cached = OmniCachedRequestData(
+                req_ids=cached.req_ids,
+                resumed_req_ids=cached.resumed_req_ids,
+                new_token_ids=cached.new_token_ids,
+                all_token_ids=cached.all_token_ids,
+                new_block_ids=cached.new_block_ids,
+                num_computed_tokens=cached.num_computed_tokens,
+                num_output_tokens=cached.num_output_tokens,
+                prompt_token_ids=resumed_prompt_token_ids,
+                additional_information={},
+            )
+            # Construct both wrappers before publishing either one.  This
+            # avoids a half-wrapped SchedulerOutput if dataclass construction
+            # or a future serialization field check raises.
             scheduler_output.scheduled_new_reqs = new_list  # type: ignore[assignment]
+            scheduler_output.scheduled_cached_reqs = omni_cached
             if self.chunk_transfer_adapter:
                 self.chunk_transfer_adapter.postprocess_scheduler_output(scheduler_output, self.requests)
             # Add information about requests needing KV cache transfer
             finished_reqs = self.get_finished_requests_needing_kv_transfer()
-        except Exception:
-            # If anything goes wrong, leave the original output unchanged
-            init_logger(__name__).exception("Failed to wrap scheduled_new_reqs with OmniNewRequestData")
+        except Exception as exc:
+            if rebased_resumed_req_ids:
+                # The scheduler request now owns a compact recompute lineage.
+                # Continuing without delivering its replacement prompt to the
+                # worker would silently split their token/KV identities.
+                raise RuntimeError(
+                    "Failed to publish a compact MiniCPM-o preemption rebase "
+                    "to the worker for requests "
+                    f"{sorted(rebased_resumed_req_ids)}"
+                ) from exc
+            logger.exception("Failed to wrap scheduled_new_reqs with OmniNewRequestData")
             finished_reqs = {}
 
         # Wrap in omni scheduler output to carry transfer metadata.
@@ -989,6 +1118,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     request.resumable = False
                     stopped = True
 
+            # Capture the complete finite/resumable segment before the stop
+            # handler clears a live session's output-token list.
+            current_segment_token_ids = (
+                list(getattr(request, "output_token_ids", ()))
+                if stopped
+                else None
+            )
+
             if stopped:
                 if model_runner_output.routed_experts is not None:
                     routed_experts = omni_routed_experts_for_request(model_runner_output.routed_experts, request)
@@ -1006,7 +1143,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # lease before its paired D segment completes.
                 segment_kv_params = getattr(request, "kv_transfer_params", None)
                 publish_pd_segment = bool(
-                    request.resumable
+                    getattr(request, "resumable", False)
                     and isinstance(segment_kv_params, dict)
                     and segment_kv_params.get("do_remote_decode")
                     and self.connector is not None
@@ -1024,6 +1161,32 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     kv_transfer_params["remote_prompt_token_ids"] = list(
                         (request.prompt_token_ids or ())[: request.num_computed_tokens]
                     )
+                else:
+                    # Native duplex D normally uses one finite request per
+                    # slot, while compatibility paths may retain a streaming
+                    # request.  In both cases the physical transfer belonged
+                    # to the preceding cache-sync request, so surface only its
+                    # immutable evidence here without disturbing connector
+                    # state or re-running request_finished().
+                    request_kv_params = getattr(
+                        request,
+                        "pd_transfer_evidence",
+                        None,
+                    )
+                    if not isinstance(request_kv_params, dict):
+                        request_kv_params = getattr(
+                            request,
+                            "kv_transfer_params",
+                            None,
+                        )
+                    if isinstance(request_kv_params, dict) and any(
+                        name in request_kv_params
+                        for name in _KV_TRANSFER_EVIDENCE_FIELDS
+                    ):
+                        kv_transfer_params = {
+                            name: request_kv_params.get(name, -1)
+                            for name in _KV_TRANSFER_EVIDENCE_FIELDS
+                        }
                 finished = self._handle_stopped_request(request)
                 is_segment_finished = not finished
                 if finished:
@@ -1045,7 +1208,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     request.spec_token_ids = []
                     request._output_token_ids.clear()
                 if finished:
-                    kv_transfer_params, _ = self._free_request(request)
+                    final_kv_transfer_params, _ = self._free_request(request)
+                    if final_kv_transfer_params is not None:
+                        kv_transfer_params = final_kv_transfer_params
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
                 elif status_before_stop == RequestStatus.WAITING_FOR_CHUNK:
@@ -1058,6 +1223,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
+
+            mm_output = _compact_native_duplex_prompt_metadata(
+                mm_output,
+                current_segment_token_ids=current_segment_token_ids,
+            )
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)

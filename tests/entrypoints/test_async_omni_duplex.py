@@ -1,8 +1,12 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 
-from vllm_omni.engine.messages import OutputMessage
+from vllm_omni.engine.messages import (
+    OutputMessage,
+    PhysicalDCompletionWitnessMessage,
+)
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
@@ -334,6 +338,118 @@ async def test_duplex_request_client_retains_output_route_at_segment_terminal():
 
     assert outputs == [output]
     assert request_states[request_id] is request_state
+
+
+@pytest.mark.asyncio
+async def test_duplex_request_client_consumes_witness_without_metrics_and_cleans_on_close():
+    fence = DuplexFence("sid")
+    request_id = duplex_resource_request_id(fence, "stage0")
+    request_state = ClientRequestState(request_id)
+    request_states = {request_id: request_state}
+    request_state.metrics = OrchestratorAggregator(2, False, 100.0, 1)
+    witness = PhysicalDCompletionWitnessMessage(
+        request_id=request_id,
+        stage_id=1,
+        replica_id=0,
+        engine_request_id=f"{request_id}-00000001",
+        physical_sequence=1,
+        input_unit_index=1,
+        source="real_input",
+        prompt_tokens=1000,
+        cached_tokens=900,
+        local_cached_tokens=128,
+        external_cached_tokens=772,
+        computed_tokens=100,
+        batch_id=0,
+        submit_epoch_s=100.0,
+        completed_epoch_s=100.1,
+        service_ms=100.0,
+        input_video_frames=1,
+        arrival_video_frames=1,
+        vision_fallback_frames=0,
+        arrival_audio_units=1,
+        audio_fallback_units=0,
+    )
+    await request_state.queue.put(witness)
+    close_calls = []
+
+    async def close_duplex_session_async(session_id, **kwargs):
+        close_calls.append((session_id, kwargs))
+        return {"ok": True}
+
+    client = DuplexRequestClient(
+        SimpleNamespace(close_duplex_session_async=close_duplex_session_async),
+        SimpleNamespace(
+            request_states=request_states,
+            num_stages=2,
+            log_stats=False,
+        ),
+    )
+
+    outputs = await client.collect_outputs(
+        request_id,
+        request_state,
+        response_stage_id=1,
+        timeout=1.0,
+    )
+
+    assert outputs == [witness]
+    assert request_state.metrics.stage_events == {}
+    assert request_state.queue.empty()
+
+    await client.close("sid", reason="test", fence=fence, timeout=1.0)
+    assert close_calls
+    assert request_id not in request_states
+
+
+@pytest.mark.asyncio
+async def test_async_omni_routes_completion_witness_to_matching_request_queue():
+    request_id = "duplex-session-stage0"
+    request_state = ClientRequestState(request_id)
+    witness = PhysicalDCompletionWitnessMessage(
+        request_id=request_id,
+        stage_id=1,
+        replica_id=0,
+        engine_request_id=f"{request_id}-00000001",
+        physical_sequence=1,
+        input_unit_index=1,
+        source="real_input",
+        prompt_tokens=1000,
+        cached_tokens=900,
+        local_cached_tokens=128,
+        external_cached_tokens=772,
+        computed_tokens=100,
+        batch_id=0,
+        submit_epoch_s=100.0,
+        completed_epoch_s=100.1,
+        service_ms=100.0,
+        input_video_frames=1,
+        arrival_video_frames=1,
+        vision_fallback_frames=0,
+        arrival_audio_units=1,
+        audio_fallback_units=0,
+    )
+    engine_messages: asyncio.Queue[object] = asyncio.Queue()
+    await engine_messages.put(witness)
+
+    async def try_get_output_async():
+        return await engine_messages.get()
+
+    app = object.__new__(AsyncOmni)
+    app.engine = SimpleNamespace(try_get_output_async=try_get_output_async)
+    app.request_states = {request_id: request_state}
+    app.final_output_task = None
+    app.duplex_lifecycle_events = asyncio.Queue()
+    app.event_resolver = SimpleNamespace(resolve=lambda _message: None)
+
+    app._final_output_handler()
+    try:
+        routed = await asyncio.wait_for(request_state.queue.get(), timeout=1.0)
+    finally:
+        app.final_output_task.cancel()
+        await asyncio.gather(app.final_output_task, return_exceptions=True)
+
+    assert routed is witness
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,7 @@ from collections.abc import Mapping
 import numpy as np
 from vllm.logger import init_logger
 
+from vllm_omni.engine.messages import PhysicalDCompletionWitnessMessage
 from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlRequestError
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import duplex_data_plane_request_info
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
@@ -325,6 +326,7 @@ class NativeRuntimeBridgeMixin:
             "audio": self._NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO,
             "format": "pcm_f32le",
             "sample_rate_hz": 16000,
+            "duplex_input_source": "auto_continuation",
         }
 
     def _native_response_continuations_remaining(self, session: DuplexSession, response_id: str) -> bool:
@@ -641,8 +643,32 @@ class NativeRuntimeBridgeMixin:
             return None, False
         if request_id is not None and session.active_request_id is None:
             session.bind_request(request_id)
+        # A model-unit completion is an engine fact, not a speech/listen
+        # protocol fact.  Some valid D outputs intentionally project to no
+        # Realtime payload (for example a non-terminal auto-listen while a
+        # response remains open).  Emit the requested fixed-size witness from
+        # the raw stage-1 output before projection so formal measurement never
+        # mistakes a suppressed UI event for an unfinished engine request.
+        if session.config.extra_body.get("return_completion_witness") is True:
+            active_request_matches = request_id is None or session.active_request_id == request_id
+            if active_request_matches:
+                for witness in self._physical_d_completion_witnesses(result):
+                    await send_json(
+                        {
+                            "type": "response.model_unit.done",
+                            "session_id": session.session_id,
+                            "epoch": session.epoch,
+                            "vllm_omni": {"completion_witness": witness},
+                        }
+                    )
+        projection_result = self._without_physical_d_completion_witnesses(result)
+        if projection_result is None:
+            return close_reason, emitted_response
         context = self._runtime_data_plane_context(session)
-        for native_result in self._serving_runtime_adapter.data_plane.project(result, context=context):
+        for native_result in self._serving_runtime_adapter.data_plane.project(
+            projection_result,
+            context=context,
+        ):
             close_reason_for_result, did_emit = await self._send_one_native_duplex_event(
                 send_json,
                 native_result,
@@ -654,6 +680,72 @@ class NativeRuntimeBridgeMixin:
             if expected_epoch is not None and session.epoch != expected_epoch:
                 return None, emitted_response
         return close_reason, emitted_response
+
+    @staticmethod
+    def _physical_d_completion_witnesses(result: object) -> list[dict[str, object]]:
+        """Extract dedicated physical-D observers without metric aggregation."""
+        if not isinstance(result, dict):
+            return []
+        outputs = result.get("data_plane_outputs")
+        if not isinstance(outputs, list):
+            return []
+        witnesses: list[dict[str, object]] = []
+        for output in outputs:
+            if not isinstance(output, PhysicalDCompletionWitnessMessage):
+                continue
+            witnesses.append(
+                {
+                    "stage_id": output.stage_id,
+                    "engine_request_id": output.engine_request_id,
+                    "physical_sequence": output.physical_sequence,
+                    "input_unit_index": output.input_unit_index,
+                    "source": output.source,
+                    "prompt_tokens": output.prompt_tokens,
+                    "cached_tokens": output.cached_tokens,
+                    "local_cached_tokens": output.local_cached_tokens,
+                    "external_cached_tokens": output.external_cached_tokens,
+                    "computed_tokens": output.computed_tokens,
+                    "batch_id": output.batch_id,
+                    "submit_epoch_s": output.submit_epoch_s,
+                    "completed_epoch_s": output.completed_epoch_s,
+                    "service_ms": output.service_ms,
+                    "input_video_frames": output.input_video_frames,
+                    "arrival_video_frames": output.arrival_video_frames,
+                    "vision_fallback_frames": output.vision_fallback_frames,
+                    "arrival_audio_units": output.arrival_audio_units,
+                    "audio_fallback_units": output.audio_fallback_units,
+                    "kv_transfer_selected_blocks": (
+                        output.kv_transfer_selected_blocks
+                    ),
+                    "kv_transfer_selected_tokens": (
+                        output.kv_transfer_selected_tokens
+                    ),
+                    "kv_transfer_selected_bytes": output.kv_transfer_selected_bytes,
+                    "kv_transfer_write_submit_to_d_ready_ms": (
+                        output.kv_transfer_write_submit_to_d_ready_ms
+                    ),
+                }
+            )
+        return witnesses
+
+    @staticmethod
+    def _without_physical_d_completion_witnesses(result: object) -> object | None:
+        """Remove observer-only messages before invoking the model projector."""
+        if not isinstance(result, dict):
+            return result
+        outputs = result.get("data_plane_outputs")
+        if not isinstance(outputs, list):
+            return result
+        projected_outputs = [
+            output
+            for output in outputs
+            if not isinstance(output, PhysicalDCompletionWitnessMessage)
+        ]
+        if not projected_outputs:
+            return None
+        if len(projected_outputs) == len(outputs):
+            return result
+        return {**result, "data_plane_outputs": projected_outputs}
 
     async def _drain_native_data_plane_stream(
         self,
@@ -741,7 +833,14 @@ class NativeRuntimeBridgeMixin:
         outputs = result.get("data_plane_outputs")
         if not isinstance(outputs, list) or not outputs:
             return False
-        return bool(getattr(outputs[-1], "finished", False))
+        visible_outputs = [
+            output
+            for output in outputs
+            if not isinstance(output, PhysicalDCompletionWitnessMessage)
+        ]
+        if not visible_outputs:
+            return False
+        return bool(getattr(visible_outputs[-1], "finished", False))
 
     @staticmethod
     def _data_plane_request_info(result: object) -> tuple[str | None, int | None]:
@@ -772,6 +871,20 @@ class NativeRuntimeBridgeMixin:
     ) -> tuple[str | None, bool]:
         close_reason: str | None = None
         emitted_response = False
+        include_stage_metrics = session.config.extra_body.get("return_stage_metrics") is not False
+
+        def attach_runtime_metadata(
+            payload: dict[str, object],
+            *,
+            stage_metrics: Mapping[str, object] | None = None,
+        ) -> None:
+            self._attach_native_runtime_metadata(
+                payload,
+                native_result,
+                stage_metrics=stage_metrics,
+                include_stage_metrics=include_stage_metrics,
+            )
+
         if expected_epoch is not None and session.epoch != expected_epoch:
             return close_reason, emitted_response
         data_plane_request_id = native_result.get("data_plane_request_id")
@@ -833,7 +946,7 @@ class NativeRuntimeBridgeMixin:
                 "model_listen": False,
                 "buffering": True,
             }
-            self._attach_native_runtime_metadata(payload, native_result)
+            attach_runtime_metadata(payload)
             await send_json(payload)
             return close_reason, emitted_response
         if is_listen is True:
@@ -878,7 +991,7 @@ class NativeRuntimeBridgeMixin:
                 "reason": native_result.get("reason") or "model_listen",
                 "model_listen": model_listen,
             }
-            self._attach_native_runtime_metadata(payload, native_result)
+            attach_runtime_metadata(payload)
             await send_json(payload)
             if native_result.get("abort_data_plane_request") is True and isinstance(data_plane_request_id, str):
                 await self._abort_request_background(
@@ -952,7 +1065,7 @@ class NativeRuntimeBridgeMixin:
                     "reason": "model_turn_completed_without_output",
                     "model_listen": True,
                 }
-                self._attach_native_runtime_metadata(payload, native_result)
+                attach_runtime_metadata(payload)
                 await send_json(payload)
             return close_reason, emitted_response
         if session.active_response_id is None and model_turn_id is not None and model_turn_id < session.turn_id:
@@ -985,8 +1098,20 @@ class NativeRuntimeBridgeMixin:
                     epoch=session.epoch,
                 )
             )
-        response_stage_metrics = session.accumulate_response_stage_metrics(
-            native_result.get("stage_metrics") if isinstance(native_result.get("stage_metrics"), Mapping) else None
+        native_stage_metrics = (
+            native_result.get("stage_metrics")
+            if isinstance(native_result.get("stage_metrics"), Mapping)
+            else None
+        )
+        # Full response-level metrics append every ITL sample seen so far and
+        # are intentionally cumulative.  That is useful for diagnostics, but
+        # serializing the growing arrays on every realtime audio event is
+        # O(session_length^2).  Formal capacity runs request only the compact
+        # physical-D witness below and therefore skip this accumulator.
+        response_stage_metrics = (
+            session.accumulate_response_stage_metrics(native_stage_metrics)
+            if include_stage_metrics
+            else native_stage_metrics
         )
         if response_created:
             speak_payload = {
@@ -998,9 +1123,8 @@ class NativeRuntimeBridgeMixin:
                 "end_of_turn": end_of_turn,
                 "model_speak": True,
             }
-            self._attach_native_runtime_metadata(
+            attach_runtime_metadata(
                 speak_payload,
-                native_result,
                 stage_metrics=response_stage_metrics,
             )
             await send_json(speak_payload)
@@ -1066,9 +1190,8 @@ class NativeRuntimeBridgeMixin:
         sample_rate_hz = native_result.get("sample_rate_hz") or native_result.get("audio_sample_rate_hz")
         if isinstance(sample_rate_hz, int | float) and int(sample_rate_hz) > 0:
             payload["sample_rate_hz"] = int(sample_rate_hz)
-        self._attach_native_runtime_metadata(
+        attach_runtime_metadata(
             payload,
-            native_result,
             stage_metrics=response_stage_metrics,
         )
         await send_json(payload)
@@ -1222,6 +1345,7 @@ class NativeRuntimeBridgeMixin:
         native_result: dict[str, object],
         *,
         stage_metrics: Mapping[str, object] | None = None,
+        include_stage_metrics: bool = True,
     ) -> None:
         metadata: dict[str, object] = {}
         runtime_impl = native_result.get("runtime_impl")
@@ -1242,11 +1366,12 @@ class NativeRuntimeBridgeMixin:
                 metadata[name] = value
         effective_stage_metrics = stage_metrics if stage_metrics is not None else native_result.get("stage_metrics")
         if isinstance(effective_stage_metrics, Mapping):
-            metadata["stage_metrics"] = {
-                str(stage_id): dict(values)
-                for stage_id, values in effective_stage_metrics.items()
-                if isinstance(values, Mapping)
-            }
+            if include_stage_metrics:
+                metadata["stage_metrics"] = {
+                    str(stage_id): dict(values)
+                    for stage_id, values in effective_stage_metrics.items()
+                    if isinstance(values, Mapping)
+                }
         if metadata:
             payload["vllm_omni"] = metadata
 

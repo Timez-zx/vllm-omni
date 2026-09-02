@@ -49,6 +49,19 @@ logger = init_logger(__name__)
 
 _DIRECT_COMPLETION_WAKE_TIMEOUT_S = 0.001
 
+_KV_TRANSFER_SELECTED_BLOCKS = "kv_transfer_selected_blocks"
+_KV_TRANSFER_SELECTED_TOKENS = "kv_transfer_selected_tokens"
+_KV_TRANSFER_SELECTED_BYTES = "kv_transfer_selected_bytes"
+_KV_TRANSFER_WRITE_SUBMIT_TO_D_READY_MS = (
+    "kv_transfer_write_submit_to_d_ready_ms"
+)
+_KV_TRANSFER_EVIDENCE_FIELDS = (
+    _KV_TRANSFER_SELECTED_BLOCKS,
+    _KV_TRANSFER_SELECTED_TOKENS,
+    _KV_TRANSFER_SELECTED_BYTES,
+    _KV_TRANSFER_WRITE_SUBMIT_TO_D_READY_MS,
+)
+
 _LOG_CONNECTOR_DIAG = os.environ.get("VLLM_OMNI_LOG_HANDOFF_DIAG", "").strip().lower() in {
     "1",
     "true",
@@ -130,6 +143,64 @@ def _select_delta_source_blocks(
     return tuple(selected)
 
 
+def _delta_transfer_evidence(
+    destination_block_ids: BlockIds | None,
+    *,
+    external_tokens: int,
+    bytes_per_block_by_group: tuple[int, ...] | None,
+) -> dict[str, int | float]:
+    """Describe one D registration without inspecting tensors.
+
+    ``external_tokens`` is the semantic KV suffix requested by D. The block
+    count and byte count describe the whole block-granular WRITE, so they may
+    include padding after the last external token. Byte counts are exact only
+    when the scheduler can map every registered cache group to its static KV
+    page size; otherwise they fail closed to ``-1``.
+    """
+    if destination_block_ids is None:
+        group_counts: tuple[int, ...] | None = None
+    elif destination_block_ids and isinstance(
+        destination_block_ids[0], (int, bool)
+    ):
+        # Some upstream single-group paths collapse BlockIds to a flat list.
+        group_counts = (len(destination_block_ids),)
+    else:
+        try:
+            group_counts = tuple(len(group) for group in destination_block_ids)
+        except TypeError:
+            group_counts = None
+
+    selected_blocks = sum(group_counts) if group_counts is not None else -1
+    selected_bytes = -1
+    if selected_blocks == 0 and external_tokens == 0:
+        selected_bytes = 0
+    elif (
+        group_counts is not None
+        and bytes_per_block_by_group is not None
+        and len(group_counts) == len(bytes_per_block_by_group)
+        and all(value >= 0 for value in bytes_per_block_by_group)
+    ):
+        selected_bytes = sum(
+            count * bytes_per_block
+            for count, bytes_per_block in zip(
+                group_counts,
+                bytes_per_block_by_group,
+            )
+        )
+
+    return {
+        _KV_TRANSFER_SELECTED_BLOCKS: selected_blocks,
+        _KV_TRANSFER_SELECTED_TOKENS: (
+            int(external_tokens) if int(external_tokens) >= 0 else -1
+        ),
+        _KV_TRANSFER_SELECTED_BYTES: selected_bytes,
+        # P's WRITE submission timestamp lives in another process and is not
+        # carried by the existing completion notification. Do not substitute
+        # registration or D-service time for this interval.
+        _KV_TRANSFER_WRITE_SUBMIT_TO_D_READY_MS: -1.0,
+    }
+
+
 class NixlDeltaPushConnectorScheduler(NixlPushConnectorScheduler):
     """Attach D's exact local-prefix offset to each push registration."""
 
@@ -142,6 +213,98 @@ class NixlDeltaPushConnectorScheduler(NixlPushConnectorScheduler):
         super().__init__(vllm_config, engine_id, kv_cache_config)
         if self._is_hma_required:
             raise NotImplementedError("NixlDeltaPushConnector currently supports full-attention cache groups only.")
+
+    def _bytes_per_block_by_group(self) -> tuple[int, ...] | None:
+        """Return request-level bytes per logical block for each cache group.
+
+        KV specs are per tensor-parallel rank. Multiplying by D TP size gives
+        the aggregate bytes written for one physical request. This connector
+        rejects hybrid cache groups, so the static full-attention page sizes
+        are the exact NIXL WRITE sizes and require no device inspection.
+        """
+        kv_cache_config = getattr(self, "kv_cache_config", None)
+        vllm_config = getattr(self, "vllm_config", None)
+        groups = getattr(kv_cache_config, "kv_cache_groups", None)
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        tp_size = getattr(parallel_config, "tensor_parallel_size", None)
+        if not isinstance(groups, list | tuple) or not isinstance(tp_size, int):
+            return None
+        if tp_size <= 0:
+            return None
+
+        result: list[int] = []
+        for group in groups:
+            layer_names = getattr(group, "layer_names", None)
+            spec = getattr(group, "kv_cache_spec", None)
+            page_size_bytes = getattr(spec, "page_size_bytes", None)
+            if (
+                not isinstance(layer_names, list | tuple)
+                or not layer_names
+                or not isinstance(page_size_bytes, int)
+                or page_size_bytes < 0
+            ):
+                return None
+            result.append(page_size_bytes * len(layer_names) * tp_size)
+        return tuple(result)
+
+    def take_immediate_push_metadata(
+        self,
+    ) -> NixlConnectorMetadata | None:
+        """Detach newly finished P blocks from the next model batch.
+
+        Upstream NIXL normally carries this state in the following
+        ``SchedulerOutput``.  For a streaming P/D stage that means a completed
+        segment cannot start its WRITE until an unrelated next P batch has
+        finished input preparation.  Return a self-contained worker message so
+        EngineCore can wake the push writer immediately after processing the
+        segment output.
+
+        ``_finished_request_blocks`` deliberately remains scheduler-owned: it
+        is the block lease and is released only after the worker reports
+        ``finished_sending`` (or the lease expires).
+        """
+        if not self._newly_finished_push_blocks:
+            return None
+
+        blocks = dict(self._newly_finished_push_blocks)
+        missing_leases = set(blocks).difference(self._reqs_need_send)
+        if missing_leases:
+            raise RuntimeError(
+                "Finished P/D blocks are missing worker lease metadata: "
+                f"{sorted(missing_leases)}"
+            )
+        self._newly_finished_push_blocks.clear()
+
+        metadata = NixlConnectorMetadata()
+        metadata.push_finished_blocks = blocks
+        # A normal model step has already told the worker these requests are in
+        # process. Repeating the id is idempotent and also makes this control
+        # path safe if a connector implementation changes that ordering.
+        metadata.reqs_in_batch = set(blocks)
+        for request_id in blocks:
+            metadata.reqs_to_send[request_id] = self._reqs_need_send.pop(
+                request_id
+            )
+        return metadata
+
+    def _attach_transfer_evidence(
+        self,
+        request: Request,
+        registration: dict[str, Any],
+        *,
+        external_tokens: int,
+    ) -> None:
+        """Attach immutable request-scoped evidence to D and its PUSH_REG."""
+        params = request.kv_transfer_params
+        if params is None:
+            return
+        evidence = _delta_transfer_evidence(
+            registration.get("local_block_ids"),
+            external_tokens=external_tokens,
+            bytes_per_block_by_group=self._bytes_per_block_by_group(),
+        )
+        registration.update(evidence)
+        params.update(evidence)
 
     def update_state_after_alloc(
         self,
@@ -166,6 +329,33 @@ class NixlDeltaPushConnectorScheduler(NixlPushConnectorScheduler):
                 block_size=self.block_size,
             )
 
+        if is_decode_registration:
+            # Ordinary vLLM admission records this split before calling the
+            # connector.  Direct P/D cache-sync admission calls the connector
+            # itself, so preserve the same PrefillStats contract here as well.
+            # The matched prefix is local on D; the remaining remote prefix is
+            # supplied by the P -> D transfer.
+            prompt_tokens = len(request.prompt_token_ids or ())
+            remote_prompt_tokens = int(
+                params.get(
+                    "remote_prompt_tokens",
+                    self._get_remote_prefill_token_count(prompt_tokens),
+                )
+            )
+            prefill_stats = getattr(request, "prefill_stats", None)
+            if (
+                prefill_stats is not None
+                and int(getattr(prefill_stats, "num_prompt_tokens", 0) or 0)
+                == 0
+            ):
+                prefill_stats.set(
+                    num_prompt_tokens=int(request.num_prompt_tokens),
+                    num_local_cached_tokens=(
+                        remote_prompt_tokens - num_external_tokens
+                    ),
+                    num_external_cached_tokens=num_external_tokens,
+                )
+
         if _LOG_CONNECTOR_DIAG and is_decode_registration:
             logger.info(
                 "[NIXL-D-TRACE] event=after-alloc request=%s "
@@ -184,6 +374,11 @@ class NixlDeltaPushConnectorScheduler(NixlPushConnectorScheduler):
             if registration is None:
                 raise RuntimeError(f"NIXL delta push registration was not staged for {request.request_id}")
             registration.update(fields)
+            self._attach_transfer_evidence(
+                request,
+                registration,
+                external_tokens=num_external_tokens,
+            )
         elif is_decode_registration:
             # A full D prefix hit needs no WRITE, but P may already be running
             # because push mode dispatches both legs concurrently. Send an
@@ -213,6 +408,11 @@ class NixlDeltaPushConnectorScheduler(NixlPushConnectorScheduler):
                 "decode_block_size": self.block_size,
                 "remote_prompt_tokens": remote_prompt_tokens,
             }
+            self._attach_transfer_evidence(
+                request,
+                self._push_pending_registrations[request.request_id],
+                external_tokens=0,
+            )
             params["do_remote_prefill"] = False
 
     def get_num_new_matched_tokens(
@@ -251,7 +451,10 @@ class NixlDeltaPushConnectorScheduler(NixlPushConnectorScheduler):
         request: Request,
         block_ids: BlockIds,
     ) -> tuple[bool, dict[str, Any] | None]:
-        result = super().request_finished(request, block_ids)
+        delay_free_blocks, output_params = super().request_finished(
+            request,
+            block_ids,
+        )
         if (
             _LOG_CONNECTOR_DIAG
             and _is_formal_handoff_diagnostic(request.request_id)
@@ -262,7 +465,14 @@ class NixlDeltaPushConnectorScheduler(NixlPushConnectorScheduler):
                 request.request_id,
                 monotonic(),
             )
-        return result
+        params = request.kv_transfer_params
+        if isinstance(params, dict) and any(
+            name in params for name in _KV_TRANSFER_EVIDENCE_FIELDS
+        ):
+            output_params = dict(output_params or {})
+            for name in _KV_TRANSFER_EVIDENCE_FIELDS:
+                output_params[name] = params.get(name, -1)
+        return delay_free_blocks, output_params
 
 class _TimestampedNotifQueue(queue.Queue[bytes]):
     """Record when the NIXL writer first exposes a completion notification."""
@@ -310,16 +520,22 @@ class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
         )
 
     def _record_completion_notification(self, notification: bytes) -> None:
+        if notification.startswith(b"HB:"):
+            return
+        # The event is part of the transfer protocol: publish it even when
+        # diagnostics are disabled.  Decoding request identity and retaining
+        # timestamps, however, are observability-only work and must not tax
+        # every cache handoff in a formal capacity run.
+        self._completion_notif_available.set()
+        if not _LOG_CONNECTOR_DIAG:
+            return
         try:
             message = notification.decode("utf-8")
-            if message.startswith("HB:"):
-                return
             request_id, _ = message.rsplit(":", 1)
         except Exception:
             return
         now = monotonic()
-        self._completion_notif_available.set()
-        if _LOG_CONNECTOR_DIAG and _is_formal_handoff_diagnostic(request_id):
+        if _is_formal_handoff_diagnostic(request_id):
             with self._completion_notif_lock:
                 self._completion_notif_seen.setdefault(request_id, now)
             logger.info(
@@ -340,17 +556,16 @@ class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
         """Timestamp D registration through completed KV installation."""
         if not hasattr(self, "_delta_registration_enqueued"):
             self._delta_registration_enqueued = {}
-        now = monotonic()
-        for req_id in metadata.reqs_to_recv:
-            self._delta_load_started.setdefault(req_id, now)
-            self._delta_registration_enqueued.setdefault(req_id, now)
-            if _LOG_CONNECTOR_DIAG:
+        if _LOG_CONNECTOR_DIAG:
+            now = monotonic()
+            for req_id in metadata.reqs_to_recv:
+                self._delta_load_started.setdefault(req_id, now)
+                self._delta_registration_enqueued.setdefault(req_id, now)
                 logger.info(
                     "[NIXL-D-TRACE] event=registration-enqueued request=%s mono=%.6f",
                     req_id,
                     now,
                 )
-        if _LOG_CONNECTOR_DIAG:
             for req_id in metadata.push_finished_blocks:
                 if not _is_formal_handoff_diagnostic(req_id):
                     continue
@@ -381,32 +596,33 @@ class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
         reg_data: dict[str, Any],
     ) -> None:
         super()._do_send_reg_notif(req_id, reg_data)
+        if not _LOG_CONNECTOR_DIAG:
+            return
         now = monotonic()
         started = self._delta_registration_enqueued.get(req_id, now)
-        if _LOG_CONNECTOR_DIAG:
-            logger.info(
-                "[NIXL-D-TRACE] event=registration-sent request=%s mono=%.6f queue_ms=%.3f",
-                req_id,
-                now,
-                (now - started) * 1000.0,
-            )
+        logger.info(
+            "[NIXL-D-TRACE] event=registration-sent request=%s mono=%.6f queue_ms=%.3f",
+            req_id,
+            now,
+            (now - started) * 1000.0,
+        )
 
     def _handle_push_reg_notif(self, notif: bytes) -> None:
         # This method executes on P's writer thread.  Decode only enough of
         # the inherited framing to identify the request in diagnostics; the
         # parent remains authoritative for validation and matching.
-        now = monotonic()
-        try:
-            from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
-                PUSH_REG_NOTIF_PREFIX,
-            )
-            import msgspec
-
-            registration = msgspec.msgpack.decode(notif[len(PUSH_REG_NOTIF_PREFIX) :])
-            req_id = registration.get("request_id", "?") if isinstance(registration, dict) else "?"
-        except Exception:
-            req_id = "?"
         if _LOG_CONNECTOR_DIAG:
+            now = monotonic()
+            try:
+                import msgspec
+                from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+                    PUSH_REG_NOTIF_PREFIX,
+                )
+
+                registration = msgspec.msgpack.decode(notif[len(PUSH_REG_NOTIF_PREFIX) :])
+                req_id = registration.get("request_id", "?") if isinstance(registration, dict) else "?"
+            except Exception:
+                req_id = "?"
             logger.info(
                 "[NIXL-P-TRACE] event=registration-received request=%s mono=%.6f",
                 req_id,
@@ -424,33 +640,33 @@ class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
             self._deferred_regular_finished_recving = set()
         self._ensure_direct_progress_state()
         done_sending, done_recving = super().get_finished()
-        now = monotonic()
-        for req_id in done_recving:
-            with self._completion_notif_lock:
-                forwarded = self._completion_notif_seen.pop(req_id, None)
-            started = self._delta_load_started.pop(req_id, None)
-            if started is not None:
-                self._delta_registration_enqueued.pop(req_id, None)
-                logger.info(
-                    "[nixl-delta-load] request=%s transfer_load_ms=%.3f",
-                    req_id,
-                    (now - started) * 1000.0,
-                )
-                if _LOG_CONNECTOR_DIAG:
+        if _LOG_CONNECTOR_DIAG:
+            now = monotonic()
+            for req_id in done_recving:
+                with self._completion_notif_lock:
+                    forwarded = self._completion_notif_seen.pop(req_id, None)
+                started = self._delta_load_started.pop(req_id, None)
+                if started is not None:
+                    self._delta_registration_enqueued.pop(req_id, None)
+                    logger.info(
+                        "[nixl-delta-load] request=%s transfer_load_ms=%.3f",
+                        req_id,
+                        (now - started) * 1000.0,
+                    )
                     logger.info(
                         "[NIXL-D-TRACE] event=completion-observed request=%s mono=%.6f total_ms=%.3f",
                         req_id,
                         now,
                         (now - started) * 1000.0,
                     )
-            if _LOG_CONNECTOR_DIAG and forwarded is not None:
-                logger.info(
-                    "[NIXL-D-TRACE] event=completion-core-observed "
-                    "request=%s mono=%.6f notify_to_core_ms=%.3f",
-                    req_id,
-                    now,
-                    (now - forwarded) * 1000.0,
-                )
+                if forwarded is not None:
+                    logger.info(
+                        "[NIXL-D-TRACE] event=completion-core-observed "
+                        "request=%s mono=%.6f notify_to_core_ms=%.3f",
+                        req_id,
+                        now,
+                        (now - forwarded) * 1000.0,
+                    )
         direct_done = done_recving & self._direct_cache_sync_req_ids
         if direct_done:
             self._direct_cache_sync_req_ids.difference_update(direct_done)
@@ -515,16 +731,26 @@ class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
         source_groups = self._as_grouped_block_ids(local_block_ids)
         destination_groups = self._as_grouped_block_ids(registration_data["local_block_ids"])
         if not any(destination_groups):
+            evidence_blocks = registration_data.get(
+                _KV_TRANSFER_SELECTED_BLOCKS,
+                -1,
+            )
+            if int(evidence_blocks) not in (-1, 0):
+                raise ValueError(
+                    "NIXL delta evidence disagrees with an empty WRITE: "
+                    f"request={request_id} selected_blocks={evidence_blocks}"
+                )
             # No data is needed on a full D prefix hit. Materialize an empty
             # P-side transfer entry; the normal completion poll will report it
             # as done and release P's request-scoped block lease.
             with self._sending_transfers_lock:
                 self._sending_transfers[request_id] = []
-            logger.info(
-                "[nixl-delta-push] request=%s prefix_tokens=%d full_hit=true",
-                request_id,
-                int(registration_data["matched_prefix_tokens"]),
-            )
+            if _LOG_CONNECTOR_DIAG:
+                logger.info(
+                    "[nixl-delta-push] request=%s prefix_tokens=%d full_hit=true",
+                    request_id,
+                    int(registration_data["matched_prefix_tokens"]),
+                )
             return
         selected_source = _select_delta_source_blocks(
             source_groups,
@@ -533,16 +759,27 @@ class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
             source_block_size=self.block_size,
             decode_block_size=int(registration_data["decode_block_size"]),
         )
-        diag_selected = monotonic() if _LOG_CONNECTOR_DIAG else 0.0
-        total_source_blocks = sum(len(group) for group in source_groups)
-        delta_source_blocks = sum(len(group) for group in selected_source)
-        logger.info(
-            "[nixl-delta-push] request=%s prefix_tokens=%d source_blocks=%d delta_blocks=%d",
-            request_id,
-            int(registration_data["matched_prefix_tokens"]),
-            total_source_blocks,
-            delta_source_blocks,
+        selected_block_count = sum(len(group) for group in selected_source)
+        evidence_blocks = int(
+            registration_data.get(_KV_TRANSFER_SELECTED_BLOCKS, -1)
         )
+        if evidence_blocks >= 0 and evidence_blocks != selected_block_count:
+            raise ValueError(
+                "NIXL delta evidence disagrees with P's selected source "
+                f"blocks: request={request_id} evidence={evidence_blocks} "
+                f"selected={selected_block_count}"
+            )
+        diag_selected = monotonic() if _LOG_CONNECTOR_DIAG else 0.0
+        if _LOG_CONNECTOR_DIAG:
+            total_source_blocks = sum(len(group) for group in source_groups)
+            delta_source_blocks = selected_block_count
+            logger.info(
+                "[nixl-delta-push] request=%s prefix_tokens=%d source_blocks=%d delta_blocks=%d",
+                request_id,
+                int(registration_data["matched_prefix_tokens"]),
+                total_source_blocks,
+                delta_source_blocks,
+            )
         super()._do_start_push_kv(
             request_id,
             selected_source,
@@ -593,6 +830,14 @@ class NixlDeltaPushConnector(NixlPushConnector):
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, NixlConnectorMetadata)
         self.connector_worker.start_load_kv(self._connector_metadata)
+
+    def take_immediate_push_metadata(
+        self,
+    ) -> NixlConnectorMetadata | None:
+        """Return P completions that should bypass the next model batch."""
+        scheduler = self.connector_scheduler
+        assert isinstance(scheduler, NixlDeltaPushConnectorScheduler)
+        return scheduler.take_immediate_push_metadata()
 
 
 __all__ = [

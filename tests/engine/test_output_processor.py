@@ -12,6 +12,7 @@ from vllm.outputs import PoolingRequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine import FinishReason
 from vllm.v1.engine.output_processor import OutputProcessor as VLLMOutputProcessor
+from vllm.v1.metrics.stats import PrefillStats
 
 from vllm_omni.outputs import output_processor
 from vllm_omni.outputs.output_modality import OutputModality, OutputModalityNames
@@ -88,6 +89,80 @@ def test_streaming_update_resets_native_text_metrics_for_next_segment():
     assert state.native_text_stats.num_generation_tokens == 0
     assert state.native_text_stats.first_token_ts == 0.0
     assert state.native_text_stats.last_token_ts == 0.0
+
+
+def test_request_output_preserves_physical_engine_identity_and_prefill_stats():
+    state = OmniRequestState(
+        **{
+            **_DEFAULT_STATE_KWARGS,
+            "request_id": "logical-session-0000002a",
+            "external_req_id": "logical-session",
+            "prompt_token_ids": [1, 2, 3, 4],
+        },
+        output_kind=RequestOutputKind.CUMULATIVE,
+    )
+    state.num_cached_tokens = 3
+    state.record_engine_prefill_stats(
+        PrefillStats(
+            num_prompt_tokens=4,
+            num_computed_tokens=1,
+            num_cached_tokens=3,
+            num_cache_creation_tokens=1,
+        )
+    )
+
+    result = state.make_request_output([9], None, FinishReason.STOP, None)
+
+    assert result is not None
+    assert result.request_id == "logical-session"
+    assert result.engine_request_id == "logical-session-0000002a"
+    assert result.engine_prompt_tokens == 4
+    assert result.engine_num_cached_tokens == 3
+    assert result.engine_prefill_stats == {
+        "num_prompt_tokens": 4,
+        "num_computed_tokens": 1,
+        "num_cached_tokens": 3,
+        "num_local_cached_tokens": 0,
+        "num_external_cached_tokens": 0,
+        "num_cache_creation_tokens": 1,
+    }
+
+
+def test_request_output_preserves_fixed_size_physical_input_audit():
+    state = _make_state(RequestOutputKind.CUMULATIVE)
+    state.add_multimodal_tensor(
+        {
+            "duplex": {
+                # The AR runner's tensor-only wire contract produces scalar
+                # CPU tensors; NumPy integers exercise the local fallback.
+                "duplex_input_video_frames": torch.tensor(1),
+                "duplex_arrival_video_frames": np.int64(1),
+                "duplex_vision_fallback_frames": torch.tensor(0),
+                "duplex_arrival_audio_units": torch.tensor(1),
+                "duplex_audio_fallback_units": np.int64(0),
+            }
+        },
+        mm_type=LATENT,
+    )
+
+    # Observer-only counters must not enter multimodal accumulation or be
+    # forwarded to later model stages.
+    assert state.mm_accumulated.is_empty
+
+    result = state.make_request_output([9], None, FinishReason.STOP, None)
+
+    assert result is not None
+    assert result.engine_input_audit == {
+        "duplex_input_video_frames": 1,
+        "duplex_arrival_video_frames": 1,
+        "duplex_vision_fallback_frames": 0,
+        "duplex_arrival_audio_units": 1,
+        "duplex_audio_fallback_units": 0,
+    }
+
+    assert state._coerce_nonnegative_scalar_count(torch.tensor([1, 2])) is None
+    assert state._coerce_nonnegative_scalar_count(torch.tensor(True)) is None
+    assert state._coerce_nonnegative_scalar_count(-1) is None
 
 
 def test_native_text_tpot_snapshot_matches_vllm_finished_metric_definition():

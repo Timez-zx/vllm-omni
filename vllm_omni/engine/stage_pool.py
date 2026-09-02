@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.distributed.omni_coordinator import (
@@ -609,6 +610,7 @@ class StagePool:
         stage_gen_time_ms = (now - submit_ts) * 1000.0
 
         request_id = str(getattr(request_outputs[0], "request_id", "")) if request_outputs else ""
+        engine_request_id = request_id
         output_timestamps = self._output_timestamps_by_request.pop(request_id, []) if request_id else []
         non_empty_first_output_ts = (
             self._non_empty_first_output_timestamps_by_request.pop(request_id, None) if request_id else None
@@ -677,10 +679,66 @@ class StagePool:
         #
         # Purely additive: it fills a field that was already emitted, as zero.
         num_tokens_in = 0
+        num_cached_tokens = 0
+        engine_prompt_tokens = 0
+        input_video_frames = 0
+        arrival_video_frames = 0
+        vision_fallback_frames = 0
+        arrival_audio_units = 0
+        audio_fallback_units = 0
         for ro in request_outputs:
             ptids = getattr(ro, "prompt_token_ids", None)
             if ptids is not None:
                 num_tokens_in += len(ptids)
+            physical_request_id = getattr(ro, "engine_request_id", None)
+            if isinstance(physical_request_id, str) and physical_request_id:
+                engine_request_id = physical_request_id
+            physical_prompt_tokens = getattr(ro, "engine_prompt_tokens", None)
+            if isinstance(physical_prompt_tokens, int) and not isinstance(
+                physical_prompt_tokens, bool
+            ):
+                # This is the full prompt length of one physical engine
+                # request, not an additive logical-session token counter.
+                engine_prompt_tokens = max(
+                    engine_prompt_tokens,
+                    physical_prompt_tokens,
+                )
+            cached = getattr(
+                ro,
+                "engine_num_cached_tokens",
+                getattr(ro, "num_cached_tokens", None),
+            )
+            if isinstance(cached, int) and not isinstance(cached, bool):
+                # A streaming RequestOutput repeats the request-level cache
+                # count on every delta; it is not additive across deltas.
+                num_cached_tokens = max(num_cached_tokens, cached)
+            input_audit = getattr(ro, "engine_input_audit", None)
+            if isinstance(input_audit, dict):
+                input_video_frames = max(
+                    input_video_frames,
+                    int(input_audit.get("duplex_input_video_frames", 0) or 0),
+                )
+                arrival_video_frames = max(
+                    arrival_video_frames,
+                    int(input_audit.get("duplex_arrival_video_frames", 0) or 0),
+                )
+                vision_fallback_frames = max(
+                    vision_fallback_frames,
+                    int(input_audit.get("duplex_vision_fallback_frames", 0) or 0),
+                )
+                arrival_audio_units = max(
+                    arrival_audio_units,
+                    int(input_audit.get("duplex_arrival_audio_units", 0) or 0),
+                )
+                audio_fallback_units = max(
+                    audio_fallback_units,
+                    int(input_audit.get("duplex_audio_fallback_units", 0) or 0),
+                )
+        if engine_prompt_tokens <= 0:
+            # Compatibility for non-Omni/legacy output producers.  Unlike
+            # the snapshot's additive num_tokens_in, this fallback is applied
+            # before a single StageRequestStats event is emitted.
+            engine_prompt_tokens = num_tokens_in
 
         metrics = self._replica_metrics[replica_id]
         metrics.batch_seq += 1
@@ -691,6 +749,16 @@ class StagePool:
         result = StageRequestMetrics(
             num_tokens_in=num_tokens_in,
             num_tokens_out=num_tokens_out,
+            num_cached_tokens=num_cached_tokens,
+            engine_request_id=engine_request_id,
+            engine_prompt_tokens=engine_prompt_tokens,
+            input_video_frames=input_video_frames,
+            arrival_video_frames=arrival_video_frames,
+            vision_fallback_frames=vision_fallback_frames,
+            arrival_audio_units=arrival_audio_units,
+            audio_fallback_units=audio_fallback_units,
+            submit_epoch_s=submit_ts,
+            completed_epoch_s=now,
             stage_gen_time_ms=stage_gen_time_ms,
             batch_id=batch_id,
             # This event summarizes one completed request. Execution batching
@@ -1037,7 +1105,13 @@ class StagePool:
 
         try:
             await self._llm_client(replica_id).add_request_async(request, **submit_kwargs)
-        except Exception:
+        except Exception as exc:
+            # Admission failures happen outside the stage-output poller, so
+            # preserve the selected replica on EngineDeadError for the
+            # orchestrator's detached admission task to quarantine it.
+            if isinstance(exc, EngineDeadError):
+                exc.vllm_omni_stage_id = self.stage_id
+                exc.vllm_omni_replica_id = replica_id
             self.release_binding(request_id)
             rollback = getattr(self.output_processor, "remove_request", None)
             if callable(rollback):
@@ -1302,6 +1376,35 @@ class StagePool:
         all_aborted = [rid for ids in request_ids_by_replica.values() for rid in ids]
         if all_aborted and self._output_processor is not None:
             self._output_processor.abort_requests(all_aborted, internal=True)
+
+    async def abort_engine_requests_for_binding(
+        self,
+        binding_request_id: str,
+        engine_request_ids: list[str],
+    ) -> None:
+        """Abort physical engine ids through a logical request's replica.
+
+        Native duplex P/D uses one logical session binding while D executes a
+        fresh finite engine request for every model unit.  Those physical ids
+        are intentionally different from ``binding_request_id``; forwarding a
+        normal logical abort would therefore miss the active D request.
+        """
+        physical_ids = list(dict.fromkeys(engine_request_ids))
+        if not physical_ids:
+            return
+        replica_id = self.get_bound_replica_id(binding_request_id)
+        if replica_id is None or self.clients[replica_id] is None:
+            logger.debug(
+                "[StagePool] physical abort: no live binding for req=%s in stage-%s",
+                binding_request_id,
+                self.stage_id,
+            )
+            return
+        client = self.clients[replica_id]
+        assert client is not None
+        await client.abort_requests_async(physical_ids)
+        if self._output_processor is not None:
+            self._output_processor.abort_requests(physical_ids, internal=True)
 
     async def collective_rpc(
         self,

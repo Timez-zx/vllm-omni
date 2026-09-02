@@ -91,6 +91,73 @@ def test_build_and_log_summary_e2e_only() -> None:
     assert stage_entry["stages"] == []
 
 
+def test_stage_metrics_snapshot_exposes_exact_identity_and_cache_count() -> None:
+    event = StageRequestStats(
+        batch_id=17,
+        batch_size=1,
+        num_tokens_in=12_345,
+        num_tokens_out=1,
+        stage_gen_time_ms=42.0,
+        rx_transfer_bytes=0,
+        rx_decode_time_ms=0.0,
+        rx_in_flight_time_ms=0.0,
+        stage_stats=StageStats(),
+        stage_id=1,
+        request_id="duplex-request-0000002a",
+        engine_request_id="duplex-request-0000002a",
+        engine_prompt_tokens=12_345,
+        num_cached_tokens=12_343,
+        input_video_frames=1,
+        arrival_video_frames=1,
+        vision_fallback_frames=0,
+        arrival_audio_units=1,
+        audio_fallback_units=0,
+        submit_epoch_s=100.0,
+        completed_epoch_s=100.042,
+    )
+
+    snapshot = OrchestratorAggregator._merge_stage_metric_event(None, event)
+
+    assert snapshot["request_id"] == "duplex-request-0000002a"
+    assert snapshot["engine_request_id"] == "duplex-request-0000002a"
+    assert snapshot["batch_id"] == 17
+    assert snapshot["num_tokens_in"] == 12_345
+    assert snapshot["engine_prompt_tokens"] == 12_345
+    assert snapshot["num_cached_tokens"] == 12_343
+    assert snapshot["input_video_frames"] == 1
+    assert snapshot["arrival_video_frames"] == 1
+    assert snapshot["vision_fallback_frames"] == 0
+    assert snapshot["arrival_audio_units"] == 1
+    assert snapshot["audio_fallback_units"] == 0
+    assert snapshot["submit_epoch_s"] == 100.0
+    assert snapshot["completed_epoch_s"] == 100.042
+
+    later_event = StageRequestStats(
+        batch_id=18,
+        batch_size=1,
+        num_tokens_in=12_556,
+        num_tokens_out=1,
+        stage_gen_time_ms=43.0,
+        rx_transfer_bytes=0,
+        rx_decode_time_ms=0.0,
+        rx_in_flight_time_ms=0.0,
+        stage_stats=StageStats(),
+        stage_id=1,
+        request_id="duplex-request",
+        engine_request_id="duplex-request-0000002b",
+        engine_prompt_tokens=12_556,
+        num_cached_tokens=12_554,
+    )
+    merged = OrchestratorAggregator._merge_stage_metric_event(snapshot, later_event)
+
+    # Legacy totals remain additive, while physical witness fields describe
+    # exactly the latest finite engine request.
+    assert merged["num_tokens_in"] == 24_901
+    assert merged["engine_request_id"] == "duplex-request-0000002b"
+    assert merged["engine_prompt_tokens"] == 12_556
+    assert merged["num_cached_tokens"] == 12_554
+
+
 def test_build_and_log_summary_multiple_requests() -> None:
     agg = OrchestratorAggregator(
         num_stages=2, log_stats=True, wall_start_ts=0.0, final_stage_id_for_e2e={"r1": 1, "r2": 0}

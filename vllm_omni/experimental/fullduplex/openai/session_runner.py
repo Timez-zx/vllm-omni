@@ -385,6 +385,148 @@ class DuplexSessionRunnerMixin:
                         time.time(),
                     )
 
+        def start_native_audio_preencode(
+            payload: object,
+            *,
+            epoch: int,
+        ) -> None:
+            """Start sidecar encoding for one or more complete PCM units."""
+            if (
+                session is None
+                or not self._uses_native_input_append(session)
+                or not isinstance(payload, dict)
+                or payload.get("format") != "pcm_f32le"
+            ):
+                return
+            if not callable(getattr(self._chat_service.engine_client, "collective_rpc", None)):
+                return
+            sample_rate_hz = payload.get("sample_rate_hz")
+            if (
+                not isinstance(sample_rate_hz, int)
+                or isinstance(sample_rate_hz, bool)
+                or sample_rate_hz <= 0
+            ):
+                return
+            chunk_period_ms = session.capabilities.chunk_period_ms or 1000
+            expected_samples = max(
+                1,
+                int(sample_rate_hz * max(1, int(chunk_period_ms)) / 1000),
+            )
+            expected_bytes = expected_samples * 4
+            payload_bytes = self._native_audio_payload_size_bytes(payload)
+            if payload_bytes <= 0 or payload_bytes % expected_bytes != 0:
+                return
+            allocate = getattr(native, "allocate_audio_preencode", None)
+            track = getattr(native, "track_audio_preencode", None)
+            if not callable(allocate) or not callable(track):
+                return
+            seq, preencode_id = allocate(epoch=epoch)
+            payload["audio_preencode_seq"] = seq
+            payload["audio_preencode_id"] = preencode_id
+            job: dict[str, object] = {
+                "session_id": session.session_id,
+                "incarnation": session.incarnation,
+                "epoch": epoch,
+                "audio_preencode_seq": seq,
+                "audio_preencode_id": preencode_id,
+                "audio": payload.get("audio"),
+                "format": payload.get("format"),
+                "sample_rate_hz": sample_rate_hz,
+                "audio_preencode_unit_count": payload_bytes // expected_bytes,
+                "payload": dict(payload),
+                "session_config": session.config.as_dict(),
+                "runtime_config": dict(session.runtime_config),
+            }
+            task = asyncio.create_task(
+                self._preencode_minicpmo45_audio(
+                    job,
+                    timeout_s=self._runtime_control_timeout_s(session),
+                ),
+                name=(
+                    f"minicpmo45-audio-{session.session_id}-"
+                    f"{seq}-{preencode_id[:8]}"
+                ),
+            )
+            track(
+                preencode_id,
+                seq=seq,
+                epoch=epoch,
+                task=task,
+            )
+
+        def clear_native_audio_preencode_metadata(payload: object) -> None:
+            if not isinstance(payload, dict):
+                return
+            payload.pop("audio_preencode_id", None)
+            payload.pop("audio_preencode_seq", None)
+
+        def discard_native_audio_preencode(payload: object, *, epoch: int) -> None:
+            if not isinstance(payload, dict):
+                return
+            preencode_id = payload.get("audio_preencode_id")
+            seq = payload.get("audio_preencode_seq")
+            pop_task = getattr(native, "pop_audio_preencode_task", None)
+            task = None
+            if (
+                isinstance(preencode_id, str)
+                and preencode_id
+                and isinstance(seq, int)
+                and not isinstance(seq, bool)
+                and callable(pop_task)
+            ):
+                task = pop_task(preencode_id, seq=seq, epoch=epoch)
+            if task is not None and not task.done():
+                task.cancel()
+            clear_native_audio_preencode_metadata(payload)
+
+        async def wait_native_audio_preencode(payload: object, *, epoch: int) -> None:
+            if not isinstance(payload, dict):
+                return
+            preencode_id = payload.get("audio_preencode_id")
+            seq = payload.get("audio_preencode_seq")
+            pop_task = getattr(native, "pop_audio_preencode_task", None)
+            if (
+                not isinstance(preencode_id, str)
+                or not preencode_id
+                or not isinstance(seq, int)
+                or isinstance(seq, bool)
+                or not callable(pop_task)
+            ):
+                clear_native_audio_preencode_metadata(payload)
+                return
+            task = pop_task(preencode_id, seq=seq, epoch=epoch)
+            if task is None:
+                clear_native_audio_preencode_metadata(payload)
+                return
+            loop = asyncio.get_running_loop()
+            wait_started = loop.time()
+            success = False
+            try:
+                success = bool(await task)
+            except asyncio.CancelledError:
+                clear_native_audio_preencode_metadata(payload)
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+            except Exception:
+                success = False
+            if not success:
+                # No cache entry is promised.  Omit the speculative identity so
+                # Stage0 takes its exact request-local audio fallback. Stage0
+                # reports that path as ``duplex_audio_fallback_units``; the
+                # formal capacity audit rejects any non-zero fallback count
+                # instead of misclassifying it as a sidecar hit.
+                clear_native_audio_preencode_metadata(payload)
+            if _MINICPMO45_LOG_PREP_DIAG:
+                logger.info(
+                    "[MINICPM-AUDIO-FORMAL-WAIT] seq=%d success=%s "
+                    "wait_ms=%.3f ready_fence=true done_epoch=%.6f",
+                    seq,
+                    success,
+                    (loop.time() - wait_started) * 1000.0,
+                    time.time(),
+                )
+
         async def start_native_append(
             payload: object,
             *,
@@ -419,6 +561,18 @@ class DuplexSessionRunnerMixin:
                     )
                 )
             precreated_response_id = session.active_response_id if precreate_response else None
+
+            # A complete real PCM unit is immutable once it reaches this
+            # method.  Start its ordered audio sidecar immediately, while the
+            # preceding formal append is still in P/D.  Waiting for
+            # ``native_append_tail`` first serialized Encoder work behind the
+            # LLM recurrence and put hundreds of milliseconds of otherwise
+            # overlap-safe audio preparation on the next slot's critical
+            # path.  Speculative silence remains below the staleness fence: a
+            # rejected silence must not consume a sidecar sequence number.
+            eager_audio_preencode = not silence_continuation and before_append is None
+            if eager_audio_preencode:
+                start_native_audio_preencode(payload, epoch=append_epoch)
 
             async def _run() -> bool:
                 nonlocal runtime_closed
@@ -512,20 +666,30 @@ class DuplexSessionRunnerMixin:
                     except Exception:
                         predecessor_ok = False
                     if not predecessor_ok:
+                        discard_native_audio_preencode(payload, epoch=append_epoch)
                         if pcm_reservation is not None:
                             pcm_reservation.rollback()
                         return False
                 if actor.closing or runtime_closed or session.state != DuplexSessionState.OPEN:
+                    discard_native_audio_preencode(payload, epoch=append_epoch)
                     if pcm_reservation is not None:
                         pcm_reservation.rollback()
                     return False
                 if before_append is not None and not before_append():
+                    discard_native_audio_preencode(payload, epoch=append_epoch)
                     if pcm_reservation is not None:
                         pcm_reservation.rollback()
                     return True
                 if pcm_reservation is not None and not pcm_reservation.active:
+                    discard_native_audio_preencode(payload, epoch=append_epoch)
                     return False
+                # Speculative silence cannot start early because its
+                # ``before_append`` fence may still reject it. Real input has
+                # already started above and can overlap the predecessor.
+                if not eager_audio_preencode:
+                    start_native_audio_preencode(payload, epoch=append_epoch)
                 await wait_native_vision_preencode(payload, epoch=append_epoch)
+                await wait_native_audio_preencode(payload, epoch=append_epoch)
                 return await _run()
 
             predecessor = actor.native_append_tail
@@ -1315,6 +1479,14 @@ class DuplexSessionRunnerMixin:
                         "sample_rate_hz": sample_rate_hz,
                         "force_listen": force_listen,
                     }
+                    # Keep the logical client input identity separate from the
+                    # physical engine sequence.  Auto-continuations consume
+                    # physical sequence numbers but are not workload units.
+                    input_unit_index = event.get("input_unit_index")
+                    if isinstance(input_unit_index, int) and not isinstance(
+                        input_unit_index, bool
+                    ):
+                        payload["input_unit_index"] = input_unit_index
                     video_frames = event.get("video_frames")
                     if isinstance(video_frames, list):
                         frames = [frame for frame in video_frames if isinstance(frame, str) and frame]
@@ -1998,7 +2170,7 @@ class DuplexSessionRunnerMixin:
                 else:
                     begin_close(actor.close_reason or "disconnect")
                     await actor.cancel_append_tasks()
-                    cancel_preencode = getattr(native, "cancel_vision_preencode_tasks", None)
+                    cancel_preencode = getattr(native, "cancel_preencode_tasks", None)
                     if callable(cancel_preencode):
                         cancel_preencode()
                     await self._cancel_native_data_plane_stream(session)

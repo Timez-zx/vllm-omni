@@ -85,6 +85,12 @@ if TYPE_CHECKING:
 
 _STARTUP_POLL_INTERVAL_S = 1.0
 _REQUEST_QUEUE_MAXSIZE = 256
+_LOG_ORCH_LAG = os.environ.get("VLLM_OMNI_LOG_ORCH_LAG", "0") not in (
+    "0",
+    "",
+    "false",
+    "False",
+)
 # ============================================================================
 # Parent-EngineArgs field-routing contracts (consumed by
 # AsyncOmniEngine._strip_parent_engine_args when ``stage_configs_path`` is set).
@@ -506,7 +512,8 @@ class AsyncOmniEngine:
                         logger.info("[orch-lag] p50=%.1fms p99=%.1fms max=%.1fms", lags[50], lags[99], lags[-1])
                         lags = []
 
-            asyncio.get_running_loop().create_task(_orch_lag_probe())
+            if _LOG_ORCH_LAG:
+                asyncio.get_running_loop().create_task(_orch_lag_probe())
             await orchestrator.run()
 
         try:

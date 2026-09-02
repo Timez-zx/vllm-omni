@@ -160,7 +160,10 @@ def test_first_chunk_forwards_reference_voice_and_duplex_identity() -> None:
     request = _request("req")
     request.additional_information = {
         "codes": {"ref": [0.1, -0.1]},
-        "meta": {"ref_audio_sr": 16000},
+        "meta": {
+            "ref_audio_sr": 16000,
+            "ref_audio_handle": "minicpmo45-ref:session:1",
+        },
     }
 
     payload = tts2code2wav_async_chunk(
@@ -173,6 +176,7 @@ def test_first_chunk_forwards_reference_voice_and_duplex_identity() -> None:
     assert payload is not None
     assert payload.codes.ref.tolist() == pytest.approx([0.1, -0.1])
     assert payload.meta.ref_audio_sr == 16000
+    assert payload.meta.ref_audio_handle == "minicpmo45-ref:session:1"
     torch.testing.assert_close(
         payload.meta.llm_output_text_utf8,
         torch.tensor(list(b"hello"), dtype=torch.uint8),
@@ -190,6 +194,7 @@ def test_full_payload_forwards_all_codes_and_request_metadata() -> None:
         "codes": {"ref": [0.1, -0.1]},
         "meta": {
             "ref_audio_sr": 16000,
+            "ref_audio_handle": "minicpmo45-ref:session:1",
             "native_duplex_segment_text": "hello",
             "segment_end": True,
             "turn_end": True,
@@ -217,6 +222,7 @@ def test_full_payload_forwards_all_codes_and_request_metadata() -> None:
     assert payload.meta.last_chunk is True
     assert payload.meta.finished.item() is True
     assert payload.meta.ref_audio_sr == 16000
+    assert payload.meta.ref_audio_handle == "minicpmo45-ref:session:1"
     assert payload.meta.native_duplex_segment_text == "hello"
     assert payload.meta.duplex_epoch == 3
     assert payload.meta.duplex_turn_id == 7

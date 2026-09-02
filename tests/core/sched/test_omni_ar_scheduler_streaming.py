@@ -18,7 +18,10 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
-from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+from vllm_omni.core.sched.omni_ar_scheduler import (
+    OmniARScheduler,
+    _compact_native_duplex_prompt_metadata,
+)
 
 # isort: on
 
@@ -55,6 +58,95 @@ def _make_update(prompt_token_ids: list[int] | None = None) -> StreamingUpdate:
         arrival_time=200.0,
         sampling_params=SamplingParams(max_tokens=16),
     )
+
+
+def test_native_duplex_output_compacts_prompt_snapshot() -> None:
+    latent = object()
+    original = {
+        "latent": latent,
+        "duplex_prompt_token_ids": [[10, 20, 30]],
+        "meta": {"tts_bos_token_id": 99},
+    }
+
+    compact = _compact_native_duplex_prompt_metadata(
+        original,
+        current_segment_token_ids=[40, 41],
+    )
+
+    assert compact == {
+        "latent": latent,
+        "duplex_prompt_len": 3,
+        "duplex_last_prompt_token_id": 30,
+        "duplex_segment_token_ids": [40, 41],
+        "meta": {"tts_bos_token_id": 99},
+    }
+    assert original["duplex_prompt_token_ids"] == [[10, 20, 30]]
+
+
+def test_preempted_minicpmo_duplex_request_rebases_to_exact_compact_prompt() -> None:
+    sched = _make_scheduler(stage_id=0)
+    session = _make_request()
+    session.prompt_token_ids = [0] * 200
+    session.num_prompt_tokens = 200
+    session._all_token_ids.clear()
+    session._all_token_ids.extend(session.prompt_token_ids)
+    session.append_output_token_ids([91, 92])
+    session.num_computed_tokens = 0
+    session.num_preemptions = 1
+    session.status = RequestStatus.PREEMPTED
+    session.model_intermediate_buffer = {
+        "duplex": {
+            "data_plane": True,
+            "session_id": "sid-rebase",
+            "incarnation": 2,
+            "epoch": 3,
+            "seq": 4,
+            "scheduler_token_id": 7,
+            "scheduler_token_budget": 13,
+            "compact_rebase_prefix_tokens": 59,
+        }
+    }
+
+    assert sched._rebase_preempted_minicpmo_duplex_request(session) is True
+
+    assert session.prompt_token_ids == [7] * 72
+    assert session.num_prompt_tokens == 72
+    assert session.num_computed_tokens == 0
+    assert list(session.output_token_ids) == [91, 92]
+    assert list(session.all_token_ids) == [*([7] * 72), 91, 92]
+    assert session.cache_salt == "minicpmo45:sid-rebase:2:preempt-rebase-3-4-1"
+    assert session._minicpmo_duplex_preemption_rebased is True
+
+
+def test_preempted_minicpmo_duplex_rebase_rejects_async_inflight_tokens() -> None:
+    sched = _make_scheduler(stage_id=0)
+    session = _make_request()
+    session.num_in_flight_tokens = 1
+    session.model_intermediate_buffer = {
+        "duplex": {
+            "data_plane": True,
+            "scheduler_token_budget": 13,
+            "compact_rebase_prefix_tokens": 59,
+        }
+    }
+
+    with pytest.raises(RuntimeError, match="tokens still in flight"):
+        sched._rebase_preempted_minicpmo_duplex_request(session)
+
+
+def test_preempted_minicpmo_duplex_rebase_is_stage0_only() -> None:
+    sched = _make_scheduler(stage_id=1)
+    session = _make_request()
+    session.model_intermediate_buffer = {
+        "duplex": {
+            "data_plane": True,
+            "scheduler_token_budget": 13,
+            "compact_rebase_prefix_tokens": 59,
+        }
+    }
+
+    assert sched._rebase_preempted_minicpmo_duplex_request(session) is False
+    assert session.prompt_token_ids == [1, 2, 3]
 
 
 def _run_resumable_segment_stop(
@@ -131,6 +223,52 @@ def test_resumable_pd_segment_publishes_cumulative_prompt_identity() -> None:
     assert output.is_segment_finished is True
     assert output.kv_transfer_params["remote_request_id"] == session.request_id
     assert output.kv_transfer_params["remote_prompt_token_ids"] == [1, 2, 3]
+
+
+def test_finite_pd_decode_segment_exposes_allocated_transfer_evidence() -> None:
+    session = _make_request()
+    session.status = RequestStatus.RUNNING
+    session.resumable = False
+    session.num_computed_tokens = session.num_prompt_tokens
+    session.pd_transfer_evidence = {
+        "kv_transfer_selected_blocks": 3,
+        "kv_transfer_selected_tokens": 41,
+        "kv_transfer_selected_bytes": 98_304,
+        "kv_transfer_write_submit_to_d_ready_ms": -1.0,
+    }
+
+    outputs = _run_resumable_segment_stop(session)
+
+    output = outputs[session.client_index].outputs[0]
+    assert output.is_segment_finished is True
+    assert output.kv_transfer_params == {
+        "kv_transfer_selected_blocks": 3,
+        "kv_transfer_selected_tokens": 41,
+        "kv_transfer_selected_bytes": 98_304,
+        "kv_transfer_write_submit_to_d_ready_ms": -1.0,
+    }
+
+
+def test_direct_pd_cache_sync_snapshots_connector_evidence() -> None:
+    request = SimpleNamespace(
+        kv_transfer_params={
+            "do_remote_prefill": False,
+            "remote_host": "control-only",
+            "kv_transfer_selected_blocks": 2,
+            "kv_transfer_selected_tokens": 17,
+            "kv_transfer_selected_bytes": 24_576,
+            "kv_transfer_write_submit_to_d_ready_ms": -1.0,
+        }
+    )
+
+    OmniARScheduler._snapshot_pd_transfer_evidence(request)
+
+    assert request.pd_transfer_evidence == {
+        "kv_transfer_selected_blocks": 2,
+        "kv_transfer_selected_tokens": 17,
+        "kv_transfer_selected_bytes": 24_576,
+        "kv_transfer_write_submit_to_d_ready_ms": -1.0,
+    }
 
 
 def test_pd_send_completion_retains_live_resumable_request_blocks() -> None:

@@ -944,6 +944,7 @@ class RealtimeInputTranslator:
             "overlap",
             "force_barge_in",
             "force_listen",
+            "input_unit_index",
             "text",
             "transcript",
         ):

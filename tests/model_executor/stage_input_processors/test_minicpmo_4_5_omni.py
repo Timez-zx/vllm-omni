@@ -137,6 +137,112 @@ def test_native_duplex_speak_segment_reaches_split_talker() -> None:
     assert info["duplex"]["turn_id"] == 7
 
 
+def test_native_duplex_compact_handoff_does_not_copy_full_prompt() -> None:
+    prompt_ids = [101] * 1023 + [9304]
+    segment_ids = [21, 22, 9308]
+    latent = torch.arange((len(prompt_ids) + len(segment_ids)) * 2, dtype=torch.float32).reshape(-1, 2)
+    source = _output(
+        prompt_ids=prompt_ids,
+        output_ids=[999],
+        latent=latent,
+        multimodal_output={
+            "duplex_prompt_len": len(prompt_ids),
+            "duplex_last_prompt_token_id": 9304,
+            "duplex_segment_token_ids": segment_ids,
+            "meta": {
+                "tts_bos_token_id": 9301,
+                "tts_eos_token_id": 9302,
+                "listen_token_id": 9303,
+                "speak_token_id": 9304,
+                "chunk_eos_token_id": 9308,
+                "chunk_tts_eos_token_id": 9309,
+                "turn_eos_token_id": 9310,
+            },
+        },
+    )
+    context = SimpleNamespace(
+        bridge_states={
+            "duplex": {
+                "session_id": "session-1",
+                "incarnation": 2,
+                "epoch": 3,
+                "model_turn_id": 7,
+            }
+        }
+    )
+
+    converted = llm2tts([source], prompt=[{}], _streaming_context=context)[0]
+
+    info = converted["model_intermediate_buffer"]
+    assert "prompt_token_ids" not in info
+    assert "llm_output_token_ids" not in info
+    assert "prompt" not in info["ids"]
+    assert "output" not in info["ids"]
+    assert info["ids"]["tts"] == [21, 22]
+    assert info["meta"]["prompt_len"] == len(prompt_ids)
+    assert info["meta"]["last_prompt_token"] == 9304
+    assert info["meta"]["current_segment_token_ids"] == segment_ids
+    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[-3:-1])
+
+
+def test_native_duplex_ref_audio_is_published_once_per_session() -> None:
+    token_ids = {
+        "tts_bos_token_id": 9301,
+        "tts_eos_token_id": 9302,
+        "listen_token_id": 9303,
+        "speak_token_id": 9304,
+        "chunk_eos_token_id": 9308,
+        "chunk_tts_eos_token_id": 9309,
+        "turn_eos_token_id": 9310,
+    }
+    segment_ids = [9304, 21, 9308]
+    source = _output(
+        prompt_ids=[101, 102],
+        output_ids=segment_ids,
+        latent=torch.zeros((5, 2)),
+        multimodal_output={
+            "duplex_prompt_len": 2,
+            "duplex_last_prompt_token_id": 102,
+            "duplex_segment_token_ids": segment_ids,
+            "meta": token_ids,
+        },
+    )
+    context = SimpleNamespace(
+        bridge_states={
+            "duplex": {
+                "session_id": "session-ref",
+                "incarnation": 4,
+                "epoch": 1,
+                "model_turn_id": 2,
+                "runtime_config": {
+                    "ref_audio_data": "zczMPc3MTD6amZk+",
+                    "ref_audio_format": "pcm_f32le",
+                    "ref_audio_sample_rate_hz": 16000,
+                    "keep": "value",
+                },
+                "session_config": {
+                    "extra_body": {
+                        "ref_audio_data": "duplicate-inline-payload",
+                        "keep_nested": True,
+                    }
+                },
+            }
+        }
+    )
+    prompt = [{}]
+
+    first = llm2tts([source], prompt=prompt, _streaming_context=context)[0]["model_intermediate_buffer"]
+    second = llm2tts([source], prompt=prompt, _streaming_context=context)[0]["model_intermediate_buffer"]
+
+    assert first["codes"]["ref"] == pytest.approx([0.1, 0.2, 0.3])
+    assert first["meta"]["ref_audio_sr"] == 16000
+    assert first["meta"]["ref_audio_handle"] == "minicpmo45-ref:session-ref:4"
+    assert "codes" not in second
+    assert second["meta"]["ref_audio_handle"] == first["meta"]["ref_audio_handle"]
+    assert first["duplex"]["runtime_config"] == {"keep": "value"}
+    assert first["duplex"]["session_config"]["extra_body"] == {"keep_nested": True}
+
+
 def test_native_duplex_continuation_appends_only_new_talker_condition() -> None:
     prompt_ids = [101, 102]
     token_ids = {

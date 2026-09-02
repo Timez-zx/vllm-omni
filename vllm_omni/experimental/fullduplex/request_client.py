@@ -8,7 +8,11 @@ import time
 from collections.abc import Callable, MutableMapping
 from typing import Protocol
 
-from vllm_omni.engine.messages import ErrorMessage, OutputMessage
+from vllm_omni.engine.messages import (
+    ErrorMessage,
+    OutputMessage,
+    PhysicalDCompletionWitnessMessage,
+)
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.experimental.fullduplex.engine.contracts import (
     duplex_data_plane_request_info,
@@ -180,7 +184,7 @@ class DuplexRequestClient:
         *,
         response_stage_id: int | None,
         timeout: float | None,
-    ) -> list[OmniRequestOutput]:
+    ) -> list[OmniRequestOutput | PhysicalDCompletionWitnessMessage]:
         self.output_port.start_output_handler()
         request_state = self.output_port.request_states.get(request_id)
         if request_state is None:
@@ -269,7 +273,7 @@ class DuplexRequestClient:
         *,
         response_stage_id: int | None,
         timeout: float | None,
-    ) -> list[OmniRequestOutput]:
+    ) -> list[OmniRequestOutput | PhysicalDCompletionWitnessMessage]:
         deadline = None if timeout is None else time.monotonic() + timeout
         wall_start_ts = request_state.request_arrival_ts or time.time()
         final_stage_id = response_stage_id if response_stage_id is not None else max(0, self.output_port.num_stages - 1)
@@ -282,7 +286,7 @@ class DuplexRequestClient:
         )
         stage_event_cursor = metrics.stage_event_cursor(request_id)
         request_start_ts = {request_id: wall_start_ts}
-        outputs: list[OmniRequestOutput] = []
+        outputs: list[OmniRequestOutput | PhysicalDCompletionWitnessMessage] = []
         while True:
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
             if remaining == 0.0:
@@ -293,6 +297,12 @@ class DuplexRequestClient:
                 break
             if isinstance(message, ErrorMessage):
                 raise RuntimeError(message.error)
+            if isinstance(message, PhysicalDCompletionWitnessMessage):
+                # Observer messages are returned immediately and separately;
+                # they never participate in stage-metric aggregation or model
+                # output processing.
+                outputs.append(message)
+                break
             if not isinstance(message, OutputMessage):
                 continue
             engine_outputs = message.engine_outputs

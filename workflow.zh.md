@@ -1,177 +1,170 @@
 # MiniCPM-o 原生全双工 P/D 工作流
 
-## 目标
+英文版本：[workflow.md](workflow.md)。
 
-测量单机四 GPU 在持续音视频输入下可长期维持的 session 容量。模型质量不在本实验范围内。
+## 阶段一：目标
 
-## 阶段一：serving 设计
+测量单机四 GPU 在持续音视频输入下可长期维持的 session 容量。只研究 serving 延迟和容量，不评价模型质量。在讨论 engine research 前，先排除应用层和 connector 的工程混杂。
+
+## 阶段二：当前 serving 设计
 
 ```text
-每个用户建立一个 WebSocket
-  -> 每 200 ms 上传 PCM16 音频，每秒上传一帧视频
-  -> 聚合成一个原生 1 秒 model unit
-  -> Thinker-P 将新增 AV unit 追加到 session KV lineage
-  -> 只把新增的 block-aligned KV suffix 传给 Thinker-D
-  -> Thinker-D 完成有限 decode，并决定 listen/speak
-  -> D 输出回写到下一轮 P lineage
-  -> speak 时运行 Talker -> Code2Wav
+每 200 ms 音频 + 1 FPS 视频
+  -> 一个原生 1 秒 model unit
+  -> Vision Encoder sidecar
+  -> Thinker-P 增量 prefill
+  -> 传输 block-aligned KV delta
+  -> Thinker-D 有限 decode
+  -> D 输出进入下一轮 P lineage
+  -> 可选 Talker + Code2Wav
 ```
-
-- 应用层维护 session 和媒体 buffer；engine KV 是可丢弃的执行状态。
-- 不同 session 独立进入 engine；应用层没有全局 gate，也不做跨用户 batch。
-- `D(i-1)` 必须先于 `P(i)` 完成，因为 D 输出属于下一轮 Thinker lineage。下一轮 Thinker 不等待 Talker 或 Code2Wav。
-- 估计 context 达到 36,000 tokens 时重开 lineage，只保留 system/reference input、上一完整 AV unit 及其确认后的 Thinker 输出、当前 unit。模型上限为 40,960 tokens。
-
-部署：
 
 | Stage | GPU | 作用 |
 |---|---:|---|
-| Thinker-P | 0 | 增量多模态 prefill |
+| Thinker-P | 0 | 多模态增量 prefill |
 | Thinker-D | 1 | 有限自回归 decode |
 | Vision Encoder | 2 | 无状态 HD4 视频编码 |
 | Talker + Code2Wav | 3 | 生成语音 code 和波形 |
 
-每个到达的视频帧都会提交给 GPU 2。Encoder 同时只执行一个 RPC；执行期间的新帧进入下一 microbatch，不丢帧，也不限制每个 session 的 lookahead。完成的 embedding 保存在 CPU，正式 P 请求消费时才搬回 GPU 0，避免 backlog 占满 Thinker 显存。正式 P 等待对应 embedding ready；只有编码失败时才使用 request-local fallback。
+- 应用层维护 session 历史和媒体 buffer；engine KV 是可丢弃的执行状态。
+- 各 session 独立进入 engine；应用层没有全局 admission gate，也不做跨用户 batch。
+- MiniCPM-o 会把 Thinker 输出反馈给下一 unit，因此真实依赖为 `D(i-1) -> P(i) -> D(i)`。下一 Thinker unit 不等待 Talker 或 Code2Wav。
+- 估计 context 达到 36,000 tokens 时重开 lineage，只保留 system/reference input、上一完整 AV unit 及其确认后的 Thinker 输出、当前 unit。模型上限为 40,960 tokens。
+- P/D 使用 FP8 E4M3 KV 和 `NixlDeltaPushConnector`。D 保留 prefix KV，只导入新增的 block-aligned suffix。
 
-这是容量诊断配置。生产部署仍需根据内存预算增加显式 backpressure 或丢帧策略，但不能用静默 fallback 重编码掩盖真实下游吞吐。
+每个到达的视频帧都在 GPU 2 预编码。完成的 embedding 保存在 CPU，直到对应 P 请求消费。不静默丢帧；编码失败会显式报告，不用正式路径重编码掩盖失败。
 
-P/D 使用 `NixlDeltaPushConnector`。D 保留 prefix KV，每个 unit 只接收新增 KV suffix。
-P/D 都使用 FP8 E4M3 存储 KV。MiniCPM-o 4.5 没有提供 KV scale，因此 P/D 使用相同的确定性默认 scale，不独立校准出两种不兼容的表示。实测 P/D cache 容量从 `497,504/490,416` 提高到 `995,024/980,848` tokens。
+## 阶段三：workload 与有效性
 
-## 阶段二：workload 与容量判据
+容量候选测试为 24 用户、180 秒：
 
-- 循环真实 MP4：960×540 视频、对齐的 16 kHz mono 音频和 reference audio。
-- 音频每 200 ms 到达，视频为 1 FPS；模型以 1 Hz 消费一个 1 秒 unit。
-- `max_slice_nums=4`，每个视频 unit 使用 HD4 路径。
-- 运行 360 秒，session 相位在 `[0, 1 s)` 随机分布，seed `20260839`。
-- 每个容量点都冷启动服务，再做一次单用户 JIT warm-up。不能在多个容量点间复用同一服务，因为残留的 session close 状态会污染下一次测量。
-- 19 用户包含 6,840 个 unit，每个 session 发生两次 context rollover；20 用户应完成 7,200 个 unit。
-- 最新根因实验使用 24 用户、360 秒、seed `20260904`，应完成 8,640 个正式 unit；另用随机历史预热覆盖长 context 与 rollover。
-- 使用 NVIDIA DCGM profiler 以 1 Hz 采集从输入开始到最后一个 D 完成的硬件计数器。`SM active`、`SM occupancy`、`Tensor active` 和 `DRAM active` 表示实际硬件活动；NVML GPU busy 只用于对照，不作为饱和判据。
+- 循环真实 960x540 MP4、对齐的 16 kHz mono 音频和 reference audio；
+- 音频每 200 ms 到达，视频为 1 FPS，模型每秒处理一个 unit；
+- 使用官方 HD slicing，`max_slice_nums=4`；
+- 每个 session 的相位在 `[0, 1 s)` 随机分布，并加入 +/-50 ms arrival jitter；
+- seed 为 `20260915`；
+- context age 在 0 到 154 个 unit 间随机预热，覆盖长 context 和 rollover；
+- 正式测量 4,320 个 unit，另有 1,848 个不计入结果的预热 unit。
 
-单轮 RTF 只用于诊断 jitter：
-
-```text
-unit RTF = 1000 ms / stage service time
-```
-
-容量使用长期处理速度：
+主要容量指标为：
 
 ```text
 stream RTF = 已完成的 1 秒输入总量 /
-             从首个 input-ready 到最后一个 D 完成的 wall time
+             从首个媒体到达到最后一个 physical-D 完成的 wall time
 ```
 
-只有全部 session 的 `stream RTF >= 1`、所有 D unit 完成且没有用户失败时，容量才通过。单轮超时后如果能追回 backlog，只属于 jitter。
+容量通过要求：每个 session 的 `stream RTF >= 1`、全部预期 physical-D 请求完成、没有用户失败、全部视频帧被消费。单轮延迟和 stage RTF 只用于定位 jitter，不单独定义容量。
 
-## 阶段三：最终测量
+正式结果还要求：代码树干净；记录 server/client provenance；关闭诊断开关；没有 truncation、fallback、preemption；D prefix 和物理 KV 传输证据完整。dirty-tree 测量只能作为开发证据。
 
-### 容量边界参考
+## 阶段四：已排除的工程混杂
 
-以下 19/20 用户边界来自前一版有界 arrival cache。最新无界预编码路径尚未重新扫描 19–23 用户，因此它是参考边界，不是当前代码的重新认证结果。
+| 混杂因素 | 当前处理 |
+|---|---|
+| 原始 AV 被复制到 D | D 只接收 prompt metadata 和导入的 KV |
+| 每轮传输完整历史 KV | P 只发送 block-aligned delta |
+| D 重算历史 | D 复用 prefix，只计算 1-2 个 suffix token |
+| Vision fallback 重编码 | 每个正式帧都消费 arrival-preencoded embedding |
+| Encoder 队列丢帧 | 端到端审计 frame identity，不允许静默丢帧 |
+| GPU2 -> GPU0 -> CPU 绕路 | Sidecar 输出直接从 GPU2 搬到 CPU |
+| 持有全局 cache lock 做设备拷贝 | 拷贝在锁外执行，并使用 pending reservation |
+| 迟到 encoder 结果污染已结束 session | session tombstone 拒绝迟到写入 |
+| 重复解析图片/音频 metadata | 每次 planning transaction 只解析一次 |
+| 重复复制完整 prompt list | 删除多余副本，D submit 后释放 bridge payload |
+| 逐 row 读取 sampling metadata 并重复 clone logits | 每 batch 只搬一次 sampling 参数；每 row 只保留一份可写副本，RNG 顺序不变 |
+| FlashInfer cache miss 启动依赖已激活的 shell | clean launcher 自动发现当前 Python 环境的 CUDA toolkit 和 `ninja`，并记录两者路径 |
+| D 完成与 KV 复用证据不明确 | 每个 physical-D 完成都携带 request、prefix、suffix、block、token 和 byte 证据 |
 
-| 用户数 | 结果 | 完成的 D unit | 失败用户 | Stream RTF min/p50/p95 | Cycle RTF min/p50/p95 |
-|---:|---|---:|---:|---|---|
-| 19 | 通过 | 6,840/6,840 | 0 | `1.002/1.002/1.003` | `0.995/1.003/1.018` |
-| 20 | 失败 | 6,162/7,200 | 17 | `0.777/0.790/0.810` | `0.772/0.772/0.781` |
+没有新增 prepared-request 协议：复制并序列化 17k-token list 约为 0.1 ms、73 KiB，不足以解释 0.5-1 秒 tail。也没有引入无上限 pinned-memory cache，避免用新的内存风险处理非主要开销。
 
-20 用户时，每个 session 平均只完成 308.1 个 unit，最终积压平均为 80.6 秒。D 的有效完成速度约为 15.75 个 1 秒 unit/s，低于所需的 20 unit/s。
+## 阶段五：最新测量
 
-| 测试 | P service p50/p95/p99 | D service p50/p95/p99 | P/D 端到端 p50/p95/p99 | 等待上一轮 D p50/p95/p99 |
-|---|---|---|---|---|
-| 19 用户 | `192/736/1,029 ms` | `237/848/1,175 ms` | `473/2,190/2,770 ms` | `0.177/1,117/1,471 ms` |
-| 20 用户 | `656/1,341/1,482 ms` | `440/946/1,269 ms` | `2,302/3,693/4,123 ms` | `1,152/1,903/2,132 ms` |
+两组均使用相同的 24x180 workload 和 seed。当前测试完成 4,320/4,320 个 physical-D 请求，消费 4,320/4,320 帧，fallback 和用户失败均为 0。
 
-### 20 用户失败点的 P/D 真实硬件活动
-
-统计覆盖从输入开始到最后一个 D 完成的 392 个一秒采样点。百分比是 profiler 活动比例，不是显存占用或进程驻留时间。
-
-| 计数器 | Thinker-P mean/p95/max | Thinker-D mean/p95/max |
+| 指标 | 清理前 | 当前 |
 |---|---:|---:|
-| SM active | `27.0/38.1/43.2%` | `15.5/36.1/46.9%` |
-| SM occupancy | `3.9/5.5/6.4%` | `1.9/4.5/6.0%` |
-| Tensor active | `18.7/27.7/32.1%` | `1.3/2.4/2.8%` |
-| DRAM active | `8.8/15.7/17.2%` | `13.9/32.6/43.5%` |
-| PCIe TX | `44.3/98.7/230.4 MiB/s` | `3.1/5.9/6.9 MiB/s` |
-| PCIe RX | `69.3/89.2/101.9 MiB/s` | `51.7/108.1/241.4 MiB/s` |
-| 功耗 | `238/295/326 W` | `138/200/231 W` |
-| NVML GPU busy | `36.8/100/100%` | `19.2/51.5/73%` |
+| Ready -> D p50/p95/p99 | `2069/5075/6034 ms` | `533/970/1244 ms` |
+| 继承上一轮 D 等待 p50/p95/p99 | `1061/4081/5051 ms` | `0/0/236 ms` |
+| 当前轮 fresh pre-D p50/p95/p99 | `574/772/856 ms` | `273/413/481 ms` |
+| 当前轮 D service p50/p95/p99 | `388/701/914 ms` | `251/629/819 ms` |
+| Fresh serial cycle p50/p95/p99 | `983/1300/1555 ms` | `532/929/1158 ms` |
+| 最终 backlog p50/p95/p99 | `2476/3257/3286 ms` | `136/558/620 ms` |
+| Stream RTF mean/min | `0.988/0.982` | `0.999/0.997` |
 
-P 的 NVML busy p95 可以达到 100%，但同期 SM active p95 只有 38.1%，occupancy p95 只有 5.5%。因此 NVML busy 会造成“GPU 已饱和”的假象。P/D 的 SM、Tensor Core、DRAM、PCIe 和 600 W 功耗上限都没有饱和。
+当前每个 unit 传输的 KV 中位数为 9 tokens、1 个 1.125 MiB block；p99 为 16 tokens、1 个 block。4,320 条传输记录全部有效。
 
-失败测试中没有 OOM、preemption 或 recomputation，D 仍命中几乎完整的 prefix。因此失败原因不是 KV 容量，也不是链路带宽，而是流水线效率：循环依赖 `D(i-1) -> P(i) -> D(i)`、有限 request/control 固定开销以及不规则的小 P/D batch，使两个 GPU 在 burst 之间存在空闲。20 用户时，等待上一轮 D 从可恢复 jitter 变成持续等待，backlog 开始增长，但 GPU 原始算力仍未被充分利用。
+旧的 5-6 秒 tail 主要是工程开销逐轮递推造成的。清理后，继承等待均值从 1,467 ms 降至 7 ms，且没有一次超过 1 秒。当前最慢 1% 中，继承等待占 15.6%，当前轮 pre-D 占 26.1%，D service 占 58.3%。
 
-### 最新 24 用户根因实验
+当前开发测试以极小差距未满足严格的有限窗口 RTF 判据（`min=0.997`），并且代码树为 dirty，因此不能认证正式容量。它能确定的是：多秒 backlog 已被消除。
 
-先消除 Encoder 混杂：所有到达帧都预编码，ready embedding 存 CPU，正式请求不再因为 cache 淘汰而回到 P runner 重编码。短测完成 720/720 帧，全部命中 arrival cache；长测无 OOM、无 formal fallback，Encoder ready p99 为 `608 ms`，正式 P 等待 embedding p99 仅 `1 ms`。
+### 28 用户下 Thinker-P 的实际 GPU 利用率
 
-24 用户长测发送 8,640 个正式 unit，D 完成 7,300 个；所有 session 的长期 RTF 都低于 1。
+一次 28x180 长测在正式窗口内采集了 1,004 组 GPU0 硬件计数。这里不使用显存占用判断负载；`GPU kernel active` 也只表示有 kernel 驻留，不等于 GPU 算力已被充分利用。
 
-| 指标 | 结果 |
-|---|---:|
-| Stream RTF min/p50/p95 | `0.776/0.784/0.794` |
-| 最终 backlog p50/p95 | `83.6/86.6 s` |
-| P/D 端到端 p50/p95/p99 | `2,479/3,219/3,604 ms` |
-| 等待上一轮 D p50/p95/p99 | `1,252/1,694/1,921 ms` |
-| P service p50/p95/p99 | `778/1,197/1,368 ms` |
-| P 完成到 D 完成 p50/p95/p99 | `442/794/1,029 ms` |
-| D service p50/p95/p99 | `479/828/1,064 ms` |
+| 指标 | 平均 | p50 | p95 | p99 |
+|---|---:|---:|---:|---:|
+| GPU kernel active | `59.6%` | `60.4%` | `96.1%` | `99.9%` |
+| SM active | `39.6%` | `39.0%` | `73.5%` | `79.7%` |
+| SM occupancy | `5.4%` | `5.3%` | `10.2%` | `11.2%` |
+| Tensor Core active | `29.2%` | `27.8%` | `60.9%` | `66.1%` |
+| DRAM bandwidth active | `9.0%` | `9.2%` | `14.7%` | `15.7%` |
+| Power（上限约 600 W） | `311 W` | `322 W` | `349 W` | `361 W` |
 
-P 的吞吐证据是决定性的：正式窗口为 `390.7 s`，P runner 在其中执行了 `383.3 s`，duty 为 `98.1%`。P 共形成 980 个 batch，平均每批 `7.52` 个请求、`1,599` tokens、运行 `391 ms`，实际只能调度约 `18.8 unit/s`，低于输入的 `24 unit/s`。D runner duty 只有 `56.1%`，因此 D 和 handoff 会增加单轮延迟，但不是 24 用户的容量上限。
+GPU0 并未持续达到算力、带宽或功耗上限：平均 SM active 约 40%，Tensor Core active 约 29%，DRAM active 仅 9%。p95 的短时升高说明 prefill burst 到来时 GPU 会变忙，但这种压力不连续。SM occupancy 不能直接解释为“只用了 5.4% 峰值算力”，但它和 runner 的 batch p50 为 1 个请求、约 219 tokens 一致，说明多数 prefill batch 提供的并行度很低。
 
-| DCGM 计数器 | Thinker-P mean/p95/max | Thinker-D mean/p95/max |
-|---|---:|---:|
-| SM active | `30.7/38.4/41.6%` | `15.8/24.9/30.4%` |
-| SM occupancy | `4.3/5.3/5.8%` | `1.9/3.1/4.1%` |
-| Tensor active | `21.9/28.2/30.2%` | `1.3/1.9/2.3%` |
-| DRAM active | `7.8/9.5/10.8%` | `14.5/22.7/28.5%` |
-| 功耗 | `256/302/313 W` | `143/173/194 W` |
+因此 28 用户下的 P 侧问题不是 GPU 物理能力已经耗尽，而是零碎的增量 prefill 不能持续形成高效 batch：平时硬件利用不足，短时 burst 又会形成排队并放大 tail。硬件计数证明“没有持续饱和”；结合 batch 形状和 runner 时间，才将低效率归因于碎片化 prefill。
 
-`P runner duty=98.1%` 与 `SM active mean=30.7%` 不矛盾：前者表示 engine 几乎一直有 P batch 在执行，后者表示这些小增量 batch 只利用了约三成 SM 时间。当前 P 执行路径已无空闲容量，但每个 batch 的硬件效率仍低。
+完成 sampler 最终清理后，又用最终代码跑了非诊断 24x30 回归：720/720 个 physical-D 完成，720/720 帧被消费，fallback 和用户失败均为 0。Ready-to-D p50/p95/p99 为 `256/457/557 ms`，当前轮 pre-D 为 `121/215/267 ms`，D service 为 `126/278/354 ms`，继承等待 p99 为 0。结果与清理后的短测基线一致；由于只有 30 秒且代码树为 dirty，不能作为正式容量结果。
 
-## 阶段四：结论
+另用相同 production workload 和短测 seed 跑了独立的 24x30 诊断。诊断日志会扰动绝对延迟，因此下表只用于归因：
 
-Tail 来自模型依赖：
+| 剩余路径 | p99 | 含义 |
+|---|---:|---|
+| 应用 ready -> 提交 P | `2.5 ms` | 应用 admission 不是 tail 来源 |
+| P scheduler queue | `1.7 ms` | Core 接纳后很快被选中 |
+| P runner 全部工作 | `222 ms` | 增量准备、forward 和 sampling/snapshot |
+| P 结果暴露 | `33 ms` | 次要控制路径开销 |
+| D 消息完成 IPC 解码后的 ingress | `134 ms` | Core 要等当前同步 runner step 结束后才读取输入队列 |
+| D scheduler queue | `3.6 ms` | 接纳后调度很快 |
+| D runner 全部 decode steps | `315 ms` | 顺序自回归计算；输出 token p99 为 8 |
+| D 结果暴露 | `18 ms` | 次要控制路径开销 |
 
-```text
-D(i-1) feedback -> P(i) -> KV handoff -> D(i) -> feedback -> P(i+1)
-```
+原始 StagePool send、Core receive、消息解码和 preprocessing 通常都低于 2 ms。P 到 D 的 `write()` 调用 p99 为 `3.0 ms`；write 到 D 完成 p99 为 `79 ms`，且与计算流水线重叠。因此 serialization、IPC、KV 带宽、scheduler queue 和应用 gate 都不足以解释剩余 tail。
 
-Context 变长会增加 P/D service time。P 低于输入速率后，`D(i-1)` 反馈变晚，下一 unit 的等待从 jitter 变成持续 backlog。这个等待是 P 容量不足的结果，不是第三个独立执行阶段。
+剩余主要成本已经明确：P 的真实增量准备/forward、D 的顺序 decode，以及同步 Core 只能在 runner step 之间接纳新请求。前两项是模型计算。第三项是 engine 调度抽象：请求已经到达 Core 并完成解码，但不能加入正在执行的 batch。要消除它，需要 event-driven/thread-safe admission 或新的增量 batching scheduler，而不是再加应用层 gate。随机采样为保持各 session 的 RNG 顺序仍需逐 row 做 host 判断；该次要开销不能解释当前 tail。
 
-最新实现已经排除 Encoder cache 淘汰、P 侧视觉重编码、GPU embedding 泄漏和 KV/OOM。24 用户的首要瓶颈是 Thinker-P runner 吞吐：它在时间上已饱和，但小增量 batch 的 SM、Tensor Core 和显存带宽利用率都偏低。研究重点应是提高长 context、小增量 P batch 的执行效率；优化 D/handoff 只能降低单轮延迟，不能单独补足 `18.8 -> 24 unit/s` 的吞吐缺口。
+## 阶段六：复现
 
-前一版实测边界为 19 用户通过、20 用户失败；当前代码确认 24 用户失败，但精确边界仍需重新扫描 19–23。FP8 KV 只解决驻留容量，不减少模型计算。默认 scale 的 FP8 KV 用于生产前仍需独立评估质量。
-
-## 阶段五：复现
+启动新的非诊断服务：
 
 ```bash
-VLLM_OMNI_LOG_DUPLEX_CADENCE=1 \
-MINICPMO45_LOG_PREP_DIAG=1 \
 VLLM_USE_FLASHINFER_SAMPLER=0 \
-python -m vllm_omni.entrypoints.cli.main serve openbmb/MiniCPM-o-4_5 \
+python benchmarks/minicpmo/clean_server.py \
+  --provenance-out /tmp/minicpm-pd-server-provenance.json -- \
+  python -m vllm_omni.entrypoints.cli.main serve openbmb/MiniCPM-o-4_5 \
   --omni --deploy-config benchmarks/minicpmo/deploy_capacity_pd_4gpu.yaml \
-  --trust-remote-code --host 127.0.0.1 --port 8113
+  --trust-remote-code --host 127.0.0.1 --port 8113 \
+  2>&1 | tee /tmp/minicpm-pd-server.log
+```
 
+运行 24x180 production profile 并分析：
+
+```bash
 python benchmarks/minicpmo/continuous_av.py \
-  --users 24 --duration-s 360 --phase-window-s 1 --seed 20260904 \
-  --connect-stagger-s 0.5 --post-stream-s 30 --close-timeout-s 180 \
-  --loop-media --media /path/to/omni_duplex1.mp4 \
+  --url ws://127.0.0.1:8113/v1/realtime \
+  --users 24 --duration-s 180 --workload-profile production --seed 20260915 \
+  --connect-stagger-s 0 --admission-timeout-s 90 \
+  --post-stream-s 120 --close-timeout-s 60 --gpus 0 1 2 3 \
+  --media /path/to/omni_duplex1.mp4 --loop-media \
   --ref-audio /path/to/HT_ref_audio.wav \
   --frame-max-side 0 --max-slice-nums 4 \
-  --context-window-trigger-tokens 36000 --gpus 0 1 2 3 \
-  --out /tmp/minicpm-pd-cpu-cache-u24x360.json
+  --context-window-trigger-tokens 36000 --out /tmp/minicpm-pd-24x180.json
 
 python benchmarks/minicpmo/analyze_rtf.py \
-  --server-log /tmp/minicpm-pd-cpu-cache-u24-server.log \
-  --run-json /tmp/minicpm-pd-cpu-cache-u24x360.json \
-  --out /tmp/minicpm-pd-cpu-cache-u24x360-analysis.json
+  --server-log /tmp/minicpm-pd-server.log \
+  --server-provenance-json /tmp/minicpm-pd-server-provenance.json \
+  --run-json /tmp/minicpm-pd-24x180.json \
+  --out /tmp/minicpm-pd-24x180-analysis.json
 ```
 
-重新扫描容量时依次使用 19–23 用户，并在切换用户数前重启服务。客户端运行期间，用下面的命令采集 profiler 计数器：
-
-```bash
-sudo dcgmi dmon \
-  -e 1001,1002,1003,1004,1005,1009,1010,155,203,204 \
-  -i 0,1,2,3 -d 1000
-```
+每个容量点都必须重启服务。诊断开关只能用于通过 `clean_server.py --allow-diagnostics` 启动的独立测试。

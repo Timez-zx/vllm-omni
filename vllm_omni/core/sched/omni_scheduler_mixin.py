@@ -45,6 +45,132 @@ class OmniSchedulerMixin:
     #  Shared scheduler/output helpers (lift the AR / generation duplicates)
     # ------------------------------------------------------------------ #
 
+    def _rebase_preempted_minicpmo_duplex_request(
+        self,
+        request: Request,
+    ) -> bool:
+        """Install Stage0's exact compact prompt after KV preemption.
+
+        MiniCPM's steady P path materializes only the newest append because
+        the cumulative prefix lives in scheduler-owned KV.  vLLM recompute
+        preemption releases that KV and resets ``num_computed_tokens``.  For a
+        native-duplex data-plane request, explicitly replace the cumulative
+        scheduler prompt with the bounded recovery prompt declared when the
+        append was built.  The worker retains matching immutable embedding
+        components and materializes them only if recomputation starts before
+        the append suffix.
+
+        Returns ``False`` for unrelated requests.  Malformed native-duplex
+        recovery metadata fails hard rather than padding or replaying an
+        inexact prompt.
+        """
+        stage_id = getattr(
+            getattr(getattr(self, "vllm_config", None), "model_config", None),
+            "stage_id",
+            None,
+        )
+        if str(stage_id) != "0":
+            # Only Thinker-P owns Stage0's suffix-only embeddings.  D and the
+            # audio stages must retain their ordinary full-prompt recompute
+            # semantics even if they carry copied duplex metadata.
+            return False
+        model_buffer = getattr(request, "model_intermediate_buffer", None)
+        duplex = model_buffer.get("duplex") if isinstance(model_buffer, dict) else None
+        if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
+            return False
+
+        raw_prefix_tokens = duplex.get("compact_rebase_prefix_tokens")
+        if raw_prefix_tokens in (None, 0):
+            # First appends and planned context-window rollovers already own
+            # their complete prompt and need no scheduler-side replacement.
+            return False
+        raw_suffix_tokens = duplex.get("scheduler_token_budget")
+        if (
+            isinstance(raw_prefix_tokens, bool)
+            or not isinstance(raw_prefix_tokens, int)
+            or raw_prefix_tokens <= 0
+            or isinstance(raw_suffix_tokens, bool)
+            or not isinstance(raw_suffix_tokens, int)
+            or raw_suffix_tokens <= 0
+        ):
+            raise RuntimeError(
+                "MiniCPM-o duplex preemption has invalid compact rebase "
+                f"coordinates: prefix={raw_prefix_tokens!r}, "
+                f"suffix={raw_suffix_tokens!r}"
+            )
+        if getattr(request, "prompt_embeds", None) is not None:
+            raise RuntimeError(
+                "MiniCPM-o duplex compact preemption rebase does not accept "
+                "scheduler-owned prompt_embeds"
+            )
+        if int(getattr(request, "num_in_flight_tokens", 0)) != 0 or int(
+            getattr(request, "num_output_placeholders", 0)
+        ) != 0:
+            raise RuntimeError(
+                "MiniCPM-o duplex request was preempted with asynchronous "
+                "tokens still in flight; refusing an inexact compact rebase"
+            )
+
+        compact_prompt_len = raw_prefix_tokens + raw_suffix_tokens
+        current_prompt_len = int(getattr(request, "num_prompt_tokens", 0))
+        if current_prompt_len < compact_prompt_len:
+            raise RuntimeError(
+                "MiniCPM-o duplex compact preemption rebase would expand an "
+                "unexpectedly short prompt: "
+                f"current={current_prompt_len}, compact={compact_prompt_len}"
+            )
+
+        raw_token_id = duplex.get("scheduler_token_id", 0)
+        try:
+            scheduler_token_id = max(0, int(raw_token_id))
+        except (TypeError, ValueError):
+            raise RuntimeError(
+                "MiniCPM-o duplex compact preemption rebase has an invalid "
+                f"scheduler token id: {raw_token_id!r}"
+            ) from None
+        compact_prompt = [scheduler_token_id] * compact_prompt_len
+        output_tokens = list(request.output_token_ids)
+
+        request.prompt_token_ids = compact_prompt
+        request.num_prompt_tokens = compact_prompt_len
+        request._all_token_ids.clear()
+        request._all_token_ids.extend(compact_prompt)
+        request._all_token_ids.extend(output_tokens)
+        cache_token_ids = getattr(request, "cache_token_ids", None)
+        if cache_token_ids is not None:
+            request.cache_token_ids = list(compact_prompt)
+        request.num_computed_tokens = 0
+        request.block_hashes.clear()
+        prompt_embed_hashes = getattr(
+            request,
+            "_prompt_embeds_per_block_hashes",
+            None,
+        )
+        if isinstance(prompt_embed_hashes, dict):
+            prompt_embed_hashes.clear()
+
+        session_id = str(duplex.get("session_id") or request.request_id)
+        incarnation = duplex.get("incarnation", 0)
+        epoch = duplex.get("epoch", 0)
+        seq = duplex.get("seq", 0)
+        request.cache_salt = (
+            f"minicpmo45:{session_id}:{incarnation}:preempt-rebase-"
+            f"{epoch}-{seq}-{request.num_preemptions}"
+        )
+        request.skip_reading_prefix_cache = request.get_skip_reading_prefix_cache()
+        request.update_block_hashes()
+        request._minicpmo_duplex_preemption_rebased = True
+        logger.warning(
+            "[duplex_context] PREEMPT_REBASE req=%s old_prompt_tokens=%d "
+            "compact_prompt_tokens=%d prefix_tokens=%d suffix_tokens=%d",
+            request.request_id,
+            current_prompt_len,
+            compact_prompt_len,
+            raw_prefix_tokens,
+            raw_suffix_tokens,
+        )
+        return True
+
     def _free_input_coordinator_request(self, request_id: str) -> None:
         """Prune full-payload coordinator state for a completed request."""
         input_coordinator = getattr(self, "input_coordinator", None)

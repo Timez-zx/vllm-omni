@@ -31,6 +31,27 @@ class DummyReqState:
     pass
 
 
+def test_sync_resumed_prompt_rebase_updates_cached_worker_identity():
+    state = SimpleNamespace(
+        prompt_token_ids=[0] * 100,
+        prompt_embeds=None,
+        num_prompt_tokens=100,
+    )
+    req_data = SimpleNamespace(
+        resumed_req_ids={"req-rebased"},
+        prompt_token_ids={"req-rebased": [7] * 12},
+    )
+
+    OmniGPUModelRunner._sync_resumed_prompt_rebase(
+        state,
+        "req-rebased",
+        req_data,
+    )
+
+    assert state.prompt_token_ids == [7] * 12
+    assert state.num_prompt_tokens == 12
+
+
 class MiMoAudioForConditionalGeneration(torch.nn.Module):
     """Dummy model whose class name must exactly match the production check."""
 
@@ -491,7 +512,12 @@ def test_streaming_input_update_merges_model_intermediate_buffer():
         "duplex": {
             "session_id": "sid",
             "seq": 1,
-        }
+        },
+        "codes": {"ref": [0.1, -0.1]},
+        "meta": {
+            "ref_audio_handle": "minicpmo45-ref:sid:1",
+            "ref_audio_sr": 16000,
+        },
     }
     runner.requests["r1"].additional_information_cpu = runner.model_intermediate_buffer["r1"]
     new_req_data = SimpleNamespace(
@@ -511,6 +537,8 @@ def test_streaming_input_update_merges_model_intermediate_buffer():
     assert info["duplex"]["session_id"] == "sid"
     assert info["duplex"]["seq"] == 2
     assert info["duplex"]["payload"] == {"type": "audio"}
+    assert info["codes"]["ref"] == [0.1, -0.1]
+    assert info["meta"]["ref_audio_handle"] == "minicpmo45-ref:sid:1"
     assert runner.requests["r1"].additional_information_cpu is info
 
 
@@ -598,7 +626,9 @@ def test_full_payload_output_accumulation_hook_matrix():
     assert _make_full_payload_accumulation_runner(model_stage="thinker")._should_accumulate_full_payload_output()
     assert _make_full_payload_accumulation_runner(model_stage="talker")._should_accumulate_full_payload_output()
     assert not _make_full_payload_accumulation_runner(
-        model_stage="code2wav", final_output=True
+        model_stage="code2wav",
+        final_output=True,
+        custom_process_next_stage_input_func=None,
     )._should_accumulate_full_payload_output()
     assert not _make_full_payload_accumulation_runner(
         model_stage="token2audio",

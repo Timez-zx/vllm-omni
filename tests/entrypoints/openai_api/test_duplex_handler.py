@@ -12,6 +12,7 @@ import pytest
 from starlette.websockets import WebSocketDisconnect
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.engine.messages import PhysicalDCompletionWitnessMessage
 from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlRequestError
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import duplex_resource_request_id
 from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
@@ -30,6 +31,7 @@ from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
 from vllm_omni.experimental.fullduplex.minicpmo45.session import (
     MiniCPMO45ServingSessionState,
 )
+from vllm_omni.experimental.fullduplex.openai import serving as duplex_serving
 from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexCapabilities,
     DuplexOverlapPolicy,
@@ -627,6 +629,7 @@ async def test_native_realtime_protocol_preserves_input_turn_policy_hints():
             "audio": "AAAA",
             "format": "pcm_f32le",
             "duration_ms": 240,
+            "input_unit_index": 17,
             "vad": {"is_speech": True, "speech_probability": 0.9},
             "overlap_action": "listen",
         }
@@ -634,6 +637,7 @@ async def test_native_realtime_protocol_preserves_input_turn_policy_hints():
 
     assert translated is not None
     assert translated["duration_ms"] == 240
+    assert translated["input_unit_index"] == 17
     assert translated["vad"] == {"is_speech": True, "speech_probability": 0.9}
     assert translated["overlap_action"] == "listen"
 
@@ -995,6 +999,26 @@ def test_native_realtime_protocol_audio_delta_preserves_sample_rate_hz():
     assert {payload["type"] for payload in audio_events} == {"response.audio.delta"}
     assert {payload["format"] for payload in audio_events} == {"pcm16"}
     assert {payload["sample_rate_hz"] for payload in audio_events} == {24000}
+
+
+def test_native_realtime_protocol_preserves_model_unit_completion_wire_shape():
+    ws = TimedWebSocket()
+    protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
+    event = {
+        "type": "response.model_unit.done",
+        "session_id": "sid-witness",
+        "epoch": 0,
+        "vllm_omni": {
+            "completion_witness": {
+                "stage_id": 1,
+                "engine_request_id": "duplex-sid-witness-stage0-00000001",
+                "physical_sequence": 1,
+                "input_unit_index": 1,
+            }
+        },
+    }
+
+    assert protocol._from_duplex_event(event) == [event]
 
 
 def test_native_realtime_protocol_ignores_removed_legacy_event_switches():
@@ -1501,12 +1525,19 @@ async def test_minicpmo_arrival_vision_preencode_microbatches_stage0_rpc():
 
 
 @pytest.mark.asyncio
-async def test_minicpmo_arrival_vision_preencode_waits_for_ready_result():
+async def test_minicpmo_arrival_vision_preencode_waits_for_ready_result(monkeypatch):
+    monkeypatch.setattr(
+        duplex_serving,
+        "_MINICPMO45_VISION_PREENCODE_BATCH_WINDOW_S",
+        0.001,
+    )
+
     class _SerialPreencodeEngine(FakeEngineClient):
         def __init__(self):
             super().__init__()
             self.calls = []
             self.first_started = asyncio.Event()
+            self.second_started = asyncio.Event()
             self.release_first = asyncio.Event()
             self.inflight = 0
             self.max_inflight = 0
@@ -1519,6 +1550,8 @@ async def test_minicpmo_arrival_vision_preencode_waits_for_ready_result():
             if len(self.calls) == 1:
                 self.first_started.set()
                 await self.release_first.wait()
+            elif len(self.calls) == 2:
+                self.second_started.set()
             self.inflight -= 1
             return [{"supported": True, "encoded_frames": len(args[0])}]
 
@@ -1536,6 +1569,13 @@ async def test_minicpmo_arrival_vision_preencode_waits_for_ready_result():
         )
     )
     await engine.first_started.wait()
+    # If the drain loop incorrectly debounces every batch, changing the window
+    # now would hold the queued backlog for five seconds after the first RPC.
+    monkeypatch.setattr(
+        duplex_serving,
+        "_MINICPMO45_VISION_PREENCODE_BATCH_WINDOW_S",
+        5.0,
+    )
     second = asyncio.create_task(
         handler._preencode_minicpmo45_vision(
             {"session_id": "b", "preencode_ids": ["b"]},
@@ -1548,7 +1588,7 @@ async def test_minicpmo_arrival_vision_preencode_waits_for_ready_result():
             timeout_s=2,
         )
     )
-    await asyncio.sleep(0.11)
+    await asyncio.sleep(0)
     assert len(engine.calls) == 1
     assert engine.max_inflight == 1
     assert not first.done()
@@ -1556,12 +1596,235 @@ async def test_minicpmo_arrival_vision_preencode_waits_for_ready_result():
     assert not third.done()
 
     engine.release_first.set()
+    await asyncio.wait_for(engine.second_started.wait(), timeout=0.25)
     assert await asyncio.gather(first, second, third) == [True, True, True]
     assert engine.max_inflight == 1
     assert [[job["session_id"] for job in batch] for batch in engine.calls] == [
         ["a"],
         ["b", "c"],
     ]
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_arrival_vision_preencode_caps_backlog_without_dropping_jobs(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        duplex_serving,
+        "_MINICPMO45_VISION_PREENCODE_BATCH_WINDOW_S",
+        0.01,
+    )
+    monkeypatch.setattr(
+        duplex_serving,
+        "_MINICPMO45_VISION_PREENCODE_MAX_JOBS_PER_RPC",
+        2,
+    )
+
+    class _CappedPreencodeEngine(FakeEngineClient):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+            self.inflight = 0
+            self.max_inflight = 0
+
+        async def collective_rpc(self, *, method, args, stage_ids, timeout):
+            del method, stage_ids, timeout
+            jobs = list(args[0])
+            self.calls.append(jobs)
+            self.inflight += 1
+            self.max_inflight = max(self.max_inflight, self.inflight)
+            await asyncio.sleep(0)
+            self.inflight -= 1
+            return [{"supported": True, "encoded_frames": len(jobs)}]
+
+    engine = _CappedPreencodeEngine()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session_ids = [f"session-{index}" for index in range(5)]
+
+    results = await asyncio.gather(
+        *(
+            handler._preencode_minicpmo45_vision(
+                {"session_id": session_id, "preencode_ids": [session_id]},
+                timeout_s=2,
+            )
+            for session_id in session_ids
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert results == [True] * len(session_ids)
+    assert engine.max_inflight == 1
+    assert [len(batch) for batch in engine.calls] == [2, 2, 1]
+    assert [job["session_id"] for batch in engine.calls for job in batch] == session_ids
+    assert handler._minicpmo45_vision_preencode_pending == []
+    assert handler._minicpmo45_vision_preencode_flush_task is None
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_arrival_audio_preencode_microbatches_with_per_job_fences(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        duplex_serving,
+        "_MINICPMO45_AUDIO_PREENCODE_BATCH_WINDOW_S",
+        0.001,
+    )
+    monkeypatch.setattr(
+        duplex_serving,
+        "_MINICPMO45_AUDIO_PREENCODE_MAX_JOBS_PER_RPC",
+        2,
+    )
+
+    class _AudioPreencodeEngine(FakeEngineClient):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        async def collective_rpc(self, *, method, args, stage_ids, timeout):
+            jobs = list(args[0])
+            self.calls.append((method, jobs, stage_ids, timeout))
+            return [
+                {
+                    "supported": True,
+                    "job_results": {
+                        job["audio_preencode_id"]: job["audio_preencode_id"] != "audio-3"
+                        for job in jobs
+                    },
+                }
+            ]
+
+    engine = _AudioPreencodeEngine()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    jobs = [
+        {
+            "session_id": f"session-{index}",
+            "audio_preencode_id": f"audio-{index}",
+            "audio_preencode_seq": 1,
+        }
+        for index in range(5)
+    ]
+
+    results = await asyncio.gather(
+        *(
+            handler._preencode_minicpmo45_audio(job, timeout_s=2)
+            for job in jobs
+        )
+    )
+
+    assert results == [True, True, True, False, True]
+    assert [len(call[1]) for call in engine.calls] == [2, 2, 1, 1]
+    assert all(call[0] == "preencode_minicpmo45_audio" for call in engine.calls)
+    assert all(call[2] == [0] for call in engine.calls)
+    assert [
+        job["audio_preencode_id"]
+        for _, batch, _, _ in engine.calls
+        for job in batch
+    ] == [
+        "audio-0",
+        "audio-1",
+        "audio-2",
+        "audio-3",
+        "audio-4",
+        # A persistent false is retried exactly once with the same identity.
+        "audio-3",
+    ]
+    assert handler._minicpmo45_audio_preencode_pending == []
+    assert handler._minicpmo45_audio_preencode_flush_task is None
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_audio_preencode_retries_same_identity_once(monkeypatch):
+    monkeypatch.setattr(
+        duplex_serving,
+        "_MINICPMO45_AUDIO_PREENCODE_BATCH_WINDOW_S",
+        0.001,
+    )
+
+    class _LostAckEngine(FakeEngineClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.identities: list[tuple[int, str]] = []
+
+        async def collective_rpc(self, *, method, args, stage_ids, timeout):
+            del stage_ids, timeout
+            assert method == "preencode_minicpmo45_audio"
+            job = args[0][0]
+            identity = (
+                job["audio_preencode_seq"],
+                job["audio_preencode_id"],
+            )
+            self.identities.append(identity)
+            return [
+                {
+                    "supported": True,
+                    "job_results": {
+                        job["audio_preencode_id"]: len(self.identities) == 2,
+                    },
+                }
+            ]
+
+    engine = _LostAckEngine()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    job = {
+        "session_id": "session-lost-ack",
+        "epoch": 0,
+        "audio_preencode_seq": 7,
+        "audio_preencode_id": "audio-stable",
+    }
+
+    assert await handler._preencode_minicpmo45_audio(job, timeout_s=2) is True
+    assert engine.identities == [
+        (7, "audio-stable"),
+        (7, "audio-stable"),
+    ]
+    assert handler._minicpmo45_audio_preencode_pending == []
+    assert handler._minicpmo45_audio_preencode_flush_task is None
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_audio_preencode_identity_is_monotonic_and_epoch_fenced():
+    gate = asyncio.Event()
+
+    async def _pending() -> bool:
+        await gate.wait()
+        return True
+
+    native = MiniCPMO45ServingSessionState()
+    first_seq, first_id = native.allocate_audio_preencode(epoch=0)
+    first = asyncio.create_task(_pending())
+    native.track_audio_preencode(first_id, seq=first_seq, epoch=0, task=first)
+
+    second_seq, second_id = native.allocate_audio_preencode(epoch=0)
+    second = asyncio.create_task(_pending())
+    native.track_audio_preencode(second_id, seq=second_seq, epoch=0, task=second)
+
+    assert (first_seq, second_seq) == (1, 2)
+    assert first_id != second_id
+    assert native.pop_audio_preencode_task(
+        first_id,
+        seq=first_seq,
+        epoch=0,
+    ) is first
+
+    third_seq, _third_id = native.allocate_audio_preencode(epoch=1)
+    await asyncio.sleep(0)
+    assert third_seq == 3
+    assert second.cancelled()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
 
 
 def test_minicpmo_merge_drops_serving_new_user_turn_marker():
@@ -5077,6 +5340,7 @@ async def test_minicpmo_native_duplex_append_without_format_defaults_to_pcm16():
             "audio": _pcm16_b64(16000),
             "sample_rate_hz": 16000,
             "is_speech": True,
+            "input_unit_index": 17,
         }
     )
     ws.put({"type": "session.close"})
@@ -5090,6 +5354,7 @@ async def test_minicpmo_native_duplex_append_without_format_defaults_to_pcm16():
     assert isinstance(payload, dict)
     assert payload["format"] == "pcm_f32le"
     assert payload["sample_rate_hz"] == 16000
+    assert payload["input_unit_index"] == 17
     samples = np.frombuffer(base64.b64decode(payload["audio"]), dtype="<f4")
     assert samples.shape == (16000,)
     assert samples[:4].tolist() == pytest.approx([1000 / 32768.0] * 4)
@@ -5172,6 +5437,228 @@ async def test_audio_clear_preserves_later_wire_order_append():
     await handler.handle_session(ws)
 
     assert len(engine.appended) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preencode_succeeds", [True, False])
+async def test_native_audio_append_waits_for_sidecar_and_falls_back_without_metadata(
+    monkeypatch,
+    preencode_succeeds,
+):
+    monkeypatch.setattr(
+        duplex_serving,
+        "_MINICPMO45_AUDIO_PREENCODE_BATCH_WINDOW_S",
+        0.001,
+    )
+
+    class _AudioSidecarEngine(FakeEngineClient):
+        def __init__(self):
+            super().__init__()
+            self.preencode_jobs = []
+            self.append_started = asyncio.Event()
+
+        async def collective_rpc(self, *, method, args, stage_ids, timeout):
+            del stage_ids, timeout
+            assert method == "preencode_minicpmo45_audio"
+            jobs = list(args[0])
+            self.preencode_jobs.extend(jobs)
+            return [
+                {
+                    "supported": True,
+                    "job_results": {
+                        job["audio_preencode_id"]: preencode_succeeds
+                        for job in jobs
+                    },
+                }
+            ]
+
+        async def append_duplex_input_async(self, session_id: str, **kwargs):
+            kwargs.pop("expected_epoch", None)
+            result = await super().append_duplex_input_async(session_id, **kwargs)
+            self.append_started.set()
+            return result
+
+    engine = _AudioSidecarEngine()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    ws = TimedWebSocket()
+    ws.put(_native_session_create("sid-audio-sidecar-fence"))
+    ws.put(
+        {
+            "type": "input_audio_buffer.append",
+            "audio": _pcm_f32_b64(16_000),
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16_000,
+            "is_speech": True,
+        }
+    )
+
+    handler_task = asyncio.create_task(handler.handle_session(ws))
+    await asyncio.wait_for(engine.append_started.wait(), timeout=1)
+    ws.put({"type": "session.close"})
+    await asyncio.wait_for(handler_task, timeout=2)
+
+    assert len(engine.preencode_jobs) == (1 if preencode_succeeds else 2)
+    assert len(
+        {
+            (
+                job["audio_preencode_seq"],
+                job["audio_preencode_id"],
+            )
+            for job in engine.preencode_jobs
+        }
+    ) == 1
+    assert len(engine.appended) == 1
+    formal_payload = engine.appended[0][2]
+    assert isinstance(formal_payload, dict)
+    if preencode_succeeds:
+        assert formal_payload["audio_preencode_seq"] == 1
+        assert formal_payload["audio_preencode_id"] == engine.preencode_jobs[0][
+            "audio_preencode_id"
+        ]
+    else:
+        assert "audio_preencode_seq" not in formal_payload
+        assert "audio_preencode_id" not in formal_payload
+
+
+@pytest.mark.asyncio
+async def test_stale_silence_continuation_does_not_consume_audio_preencode_seq(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        duplex_serving,
+        "_MINICPMO45_AUDIO_PREENCODE_BATCH_WINDOW_S",
+        0.001,
+    )
+
+    class _StaleSilenceSidecarEngine(FakeEngineClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.preencode_jobs: list[dict[str, object]] = []
+            self.first_real_started = asyncio.Event()
+            self.release_first_real = asyncio.Event()
+            self.second_real_started = asyncio.Event()
+            self.real_append_count = 0
+
+        async def collective_rpc(self, *, method, args, stage_ids, timeout):
+            del stage_ids, timeout
+            assert method == "preencode_minicpmo45_audio"
+            jobs = list(args[0])
+            self.preencode_jobs.extend(jobs)
+            return [
+                {
+                    "supported": True,
+                    "job_results": {
+                        job["audio_preencode_id"]: True for job in jobs
+                    },
+                }
+            ]
+
+        async def append_duplex_input_async(self, session_id: str, **kwargs):
+            kwargs.pop("expected_epoch", None)
+            payload = kwargs.get("payload")
+            assert isinstance(payload, dict)
+            assert (
+                payload.get("audio")
+                != OmniDuplexSessionHandler._NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO
+            )
+            result = await super().append_duplex_input_async(session_id, **kwargs)
+            self.real_append_count += 1
+            if self.real_append_count == 1:
+                self.first_real_started.set()
+                await self.release_first_real.wait()
+            elif self.real_append_count == 2:
+                self.second_real_started.set()
+            return result
+
+    engine = _StaleSilenceSidecarEngine()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    ws = TimedWebSocket(receive_timeout_s=2.0)
+    event = _native_session_create("sid-stale-silence-sidecar")
+    event["session"]["extra_body"]["auto_response"] = True
+    ws.put(event)
+    ws.put(
+        {
+            "type": "input_audio_buffer.append",
+            "audio": _pcm_f32_b64(16_000, value=0.05),
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16_000,
+        }
+    )
+    handler_task = asyncio.create_task(handler.handle_session(ws))
+
+    await asyncio.wait_for(engine.first_real_started.wait(), timeout=1)
+    session = handler._registry.get("sid-stale-silence-sidecar")
+    assert session is not None
+    session.capabilities.chunk_period_ms = 1
+    request_id = handler._native_stage0_request_id(session, session.epoch)
+    session.bind_request(request_id)
+    response_id = session.begin_response(turn_id=session.turn_id)
+    native = handler._minicpmo_session_state(session)
+    scheduler = native.silence_continuation_scheduler
+    assert scheduler is not None
+
+    silence_payload = handler._native_silence_unit_payload()
+    silence_payload["duplex_turn_id"] = session.turn_id
+    assert await scheduler(
+        silence_payload,
+        request_id=request_id,
+        owner_id=f"response:{response_id}",
+        response_id=response_id,
+        response_owned=True,
+        expected_epoch=session.epoch,
+        expected_incarnation=session.incarnation,
+        expected_model_turn_id=None,
+        send_json=ws.send_json,
+    ) is True
+    assert native.pending_silence_owner_id == f"response:{response_id}"
+
+    # This later real input supersedes the queued silence while the latter is
+    # still waiting on its predecessor. Its before_append fence must reject it
+    # before any audio sidecar identity is allocated.
+    ws.put(
+        {
+            "type": "input_audio_buffer.append",
+            "audio": _pcm_f32_b64(16_000, value=0.07),
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16_000,
+        }
+    )
+
+    async def _wait_until_silence_is_superseded() -> None:
+        while native.pending_silence_owner_id is not None:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(_wait_until_silence_is_superseded(), timeout=1)
+
+    async def _wait_until_second_audio_is_preencoded() -> None:
+        while len(engine.preencode_jobs) < 2:
+            await asyncio.sleep(0)
+
+    # Real audio is immutable and may be encoded while its predecessor is
+    # still in P/D. The stale speculative silence must neither run nor consume
+    # a sequence number.
+    await asyncio.wait_for(_wait_until_second_audio_is_preencoded(), timeout=1)
+    assert not engine.second_real_started.is_set()
+    engine.release_first_real.set()
+    await asyncio.wait_for(engine.second_real_started.wait(), timeout=1)
+    ws.put({"type": "session.close"})
+    await asyncio.wait_for(handler_task, timeout=2)
+
+    assert engine.real_append_count == 2
+    assert [job["audio_preencode_seq"] for job in engine.preencode_jobs] == [1, 2]
+    assert all(
+        job["audio"]
+        != OmniDuplexSessionHandler._NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO
+        for job in engine.preencode_jobs
+    )
 
 
 @pytest.mark.asyncio
@@ -7039,6 +7526,173 @@ async def test_continuous_response_metrics_accumulate_only_owned_model_units():
     assert third_metrics["num_tokens_out"] == 3
     assert third_metrics["vllm_ttft_ms"] == 90.0
     assert third_metrics["vllm_itls_ms"] == [15.0, 16.0]
+
+
+@pytest.mark.asyncio
+async def test_projected_output_does_not_embed_completion_observer():
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    session = DuplexSession(
+        session_id="sid-compact-witness",
+        config=DuplexSessionConfig(
+            extra_body={
+                "auto_response": True,
+                "return_stage_metrics": False,
+                "return_completion_witness": True,
+            }
+        ),
+    )
+    sent: list[dict[str, Any]] = []
+
+    async def send_json(payload: dict[str, Any]) -> None:
+        sent.append(payload)
+
+    await handler._send_one_native_duplex_event(
+        send_json,
+        {
+            "supported": True,
+            "stage_role": "tts",
+            "is_listen": False,
+            "data_plane_request_id": "duplex-sid-compact-witness-e0-stage0",
+            "text": "hello",
+            "audio_data": "audio-a",
+            "audio_format": "pcm16",
+            "audio_duration_ms": 100,
+            "end_of_turn": False,
+            "model_turn_id": 0,
+            "stage_metrics": {
+                "0": {
+                    "input_video_frames": 1,
+                    "arrival_video_frames": 1,
+                    "vision_fallback_frames": 0,
+                },
+                "1": {
+                    "engine_request_id": "duplex-sid-compact-witness-e0-stage0-0000002a",
+                    "engine_prompt_tokens": 12_345,
+                    "num_tokens_in": 99_999,
+                    "num_cached_tokens": 12_343,
+                    "batch_id": 7,
+                    "submit_epoch_s": 100.0,
+                    "completed_epoch_s": 100.125,
+                    "stage_gen_time_ms": 125.0,
+                    "vllm_itls_ms": list(range(1_000)),
+                }
+            },
+        },
+        session=session,
+    )
+
+    delta = next(payload for payload in sent if payload.get("type") == "response.output_audio.delta")
+    metadata = delta["vllm_omni"]
+    assert "stage_metrics" not in metadata
+    assert "completion_witness" not in metadata
+    assert session.accumulate_response_stage_metrics(None) == {}
+
+
+@pytest.mark.asyncio
+async def test_physical_d_witness_bypasses_projector_and_emits_one_event_per_sequence():
+    request_id = "duplex-sid-exact-e0-stage0"
+    witnesses = [
+        PhysicalDCompletionWitnessMessage(
+            request_id=request_id,
+            stage_id=1,
+            replica_id=0,
+            engine_request_id=f"{request_id}-{sequence:08x}",
+            physical_sequence=sequence,
+            input_unit_index=40 + sequence,
+            source=("real_input" if sequence == 1 else "auto_continuation"),
+            prompt_tokens=12_000 + sequence,
+            cached_tokens=11_900 + sequence,
+            local_cached_tokens=100,
+            external_cached_tokens=11_800 + sequence,
+            computed_tokens=100,
+            batch_id=0,
+            submit_epoch_s=100.0 + sequence,
+            completed_epoch_s=100.125 + sequence,
+            service_ms=125.0,
+            input_video_frames=1 if sequence == 1 else 0,
+            arrival_video_frames=1 if sequence == 1 else 0,
+            vision_fallback_frames=0,
+            arrival_audio_units=1 if sequence == 1 else 0,
+            audio_fallback_units=0,
+            kv_transfer_selected_blocks=10 + sequence,
+            kv_transfer_selected_tokens=11_800 + sequence,
+            kv_transfer_selected_bytes=(10 + sequence) * 4096,
+            kv_transfer_write_submit_to_d_ready_ms=-1.0,
+        )
+        for sequence in (1, 2)
+    ]
+    result = {
+        "data_plane_outputs": witnesses,
+    }
+    projected = False
+
+    class RejectingDataPlane:
+        @staticmethod
+        def is_terminal(_request_id):
+            return False
+
+        def project(self, _result, *, context):
+            del context
+            nonlocal projected
+            projected = True
+            raise AssertionError("observer-only messages must not reach the projector")
+
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    handler._serving_runtime_adapter = SimpleNamespace(data_plane=RejectingDataPlane())
+    session = DuplexSession(
+        session_id="sid-exact",
+        config=DuplexSessionConfig(
+            extra_body={
+                "auto_response": True,
+                "return_completion_witness": True,
+            }
+        ),
+    )
+    session.bind_request(request_id)
+    sent: list[dict[str, Any]] = []
+
+    async def send_json(payload: dict[str, Any]) -> None:
+        sent.append(payload)
+
+    close_reason, emitted_response = await handler._send_native_duplex_events(
+        send_json,
+        result,
+        session=session,
+    )
+
+    assert close_reason is None
+    assert emitted_response is False
+    assert projected is False
+    assert [event["type"] for event in sent] == [
+        "response.model_unit.done",
+        "response.model_unit.done",
+    ]
+    completion_witnesses = [event["vllm_omni"]["completion_witness"] for event in sent]
+    assert [witness["physical_sequence"] for witness in completion_witnesses] == [1, 2]
+    assert [witness["input_unit_index"] for witness in completion_witnesses] == [41, 42]
+    assert [witness["source"] for witness in completion_witnesses] == [
+        "real_input",
+        "auto_continuation",
+    ]
+    assert [witness["arrival_audio_units"] for witness in completion_witnesses] == [1, 0]
+    assert [witness["audio_fallback_units"] for witness in completion_witnesses] == [0, 0]
+    assert [
+        witness["kv_transfer_selected_blocks"]
+        for witness in completion_witnesses
+    ] == [11, 12]
+    assert [
+        witness["kv_transfer_selected_tokens"]
+        for witness in completion_witnesses
+    ] == [11_801, 11_802]
+    assert [
+        witness["kv_transfer_selected_bytes"]
+        for witness in completion_witnesses
+    ] == [11 * 4096, 12 * 4096]
+    assert [
+        witness["kv_transfer_write_submit_to_d_ready_ms"]
+        for witness in completion_witnesses
+    ] == [-1.0, -1.0]
+    assert handler._data_plane_outputs_finished(result) is False
 
 
 @pytest.mark.asyncio

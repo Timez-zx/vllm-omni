@@ -179,11 +179,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         # If the request is preempted, skip the already saved chunks.
         if confirmed_num_computed_tokens < self.requests_num_chunks_sent.get(request.external_req_id, 0):
-            logger.warning(
-                f"Enqueue save_async for request {request.external_req_id}, "
-                f"request.num_computed_tokens={request.num_computed_tokens}, "
-                f"request.num_output_placeholders={getattr(request, 'num_output_placeholders', 0)}, "
-                f"previous_chunks_sent={self.requests_num_chunks_sent.get(request.external_req_id, 0)}"
+            # A resumable stream can revisit an already-published cursor while
+            # its next segment is being admitted.  Deduplication is expected;
+            # warning once per model step turns this normal hot path into
+            # substantial synchronous log I/O under multi-user load.
+            logger.debug(
+                "Skip stale save_async request=%s num_computed_tokens=%s "
+                "num_output_placeholders=%s previous_chunks_sent=%s",
+                request.external_req_id,
+                request.num_computed_tokens,
+                getattr(request, "num_output_placeholders", 0),
+                self.requests_num_chunks_sent.get(request.external_req_id, 0),
             )
             return
 

@@ -346,6 +346,11 @@ class RealtimeOutputProjector:
                     "reason": event.get("finish_reason") or "stop",
                 },
             )
+        if event_type == "response.model_unit.done":
+            # Observer-only vLLM-Omni extension. Keep its wire shape stable:
+            # the generic ``duplex.<type>`` wrapper would hide the physical
+            # completion record under an extra ``event`` object.
+            return [dict(event)]
         if event_type == "error":
             raw_error = event.get("error")
             if isinstance(raw_error, dict):

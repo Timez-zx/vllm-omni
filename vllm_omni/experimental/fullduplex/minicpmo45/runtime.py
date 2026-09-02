@@ -80,11 +80,7 @@ def duplex_vision_block_counts(payload: object) -> list[int]:
     raw_frames = payload.get("video_frames")
     if not isinstance(raw_frames, list):
         return []
-    frames = [
-        frame
-        for frame in raw_frames
-        if isinstance(frame, str) and frame
-    ]
+    frames = [frame for frame in raw_frames if isinstance(frame, str) and frame]
     max_slices = _duplex_max_slice_nums(payload, len(frames))
     counts: list[int] = []
     for frame, max_slice_nums in zip(frames, max_slices, strict=True):
@@ -99,8 +95,13 @@ def duplex_vision_block_counts(payload: object) -> list[int]:
     return counts
 
 
-def _duplex_vision_token_count(payload: object) -> int:
-    return sum(duplex_vision_block_counts(payload)) * _DUPLEX_VISION_TOKENS_PER_BLOCK
+def _duplex_vision_token_count(
+    payload: object,
+    *,
+    block_counts: tuple[int, ...] | None = None,
+) -> int:
+    counts = duplex_vision_block_counts(payload) if block_counts is None else block_counts
+    return sum(counts) * _DUPLEX_VISION_TOKENS_PER_BLOCK
 
 
 def _duplex_pcm_sample_count(payload: object) -> int | None:
@@ -116,21 +117,52 @@ def _duplex_pcm_sample_count(payload: object) -> int | None:
     return len(raw) // 4
 
 
-def duplex_payload_is_exact_chunks(payload: object) -> bool:
-    sample_count = _duplex_pcm_sample_count(payload)
+@dataclass(frozen=True)
+class _DuplexPayloadShape:
+    sample_count: int | None
+    vision_block_counts: tuple[int, ...]
+
+
+def _duplex_payload_shape(payload: object) -> _DuplexPayloadShape:
+    """Decode media metadata once for one append planning transaction."""
+    return _DuplexPayloadShape(
+        sample_count=_duplex_pcm_sample_count(payload),
+        vision_block_counts=tuple(duplex_vision_block_counts(payload)),
+    )
+
+
+def duplex_payload_is_exact_chunks(
+    payload: object,
+    *,
+    _shape: _DuplexPayloadShape | None = None,
+) -> bool:
+    sample_count = _duplex_pcm_sample_count(payload) if _shape is None else _shape.sample_count
     return bool(sample_count) and sample_count % _DUPLEX_CHUNK_SAMPLES == 0
 
 
-def duplex_first_append_unit_count(payload: object) -> int | None:
-    sample_count = _duplex_pcm_sample_count(payload)
+def duplex_first_append_unit_count(
+    payload: object,
+    *,
+    _shape: _DuplexPayloadShape | None = None,
+) -> int | None:
+    sample_count = _duplex_pcm_sample_count(payload) if _shape is None else _shape.sample_count
     if not sample_count or sample_count % _DUPLEX_CHUNK_SAMPLES != 0:
         return None
     return max(1, sample_count // _DUPLEX_CHUNK_SAMPLES - 1)
 
 
-def duplex_scheduler_token_budget(payload: object, *, default: int = 64) -> int:
-    vision_tokens = _duplex_vision_token_count(payload)
-    sample_count = _duplex_pcm_sample_count(payload)
+def duplex_scheduler_token_budget(
+    payload: object,
+    *,
+    default: int = 64,
+    _shape: _DuplexPayloadShape | None = None,
+) -> int:
+    shape = _duplex_payload_shape(payload) if _shape is None else _shape
+    vision_tokens = _duplex_vision_token_count(
+        payload,
+        block_counts=shape.vision_block_counts,
+    )
+    sample_count = shape.sample_count
     if sample_count is None:
         return max(1, int(default)) + vision_tokens
     sample_count = max(1, sample_count)
@@ -140,7 +172,26 @@ def duplex_scheduler_token_budget(payload: object, *, default: int = 64) -> int:
     return max(16, min(768, sample_count // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN + 8)) + vision_tokens
 
 
-def duplex_retained_unit_token_budget(payload: object) -> int:
+def duplex_feedback_scheduler_rows(token_ids: object) -> int:
+    """Return prompt rows needed beyond the reserved unit terminator.
+
+    A normal steady append already reserves one row for D's final sampled
+    terminator.  Every earlier D token is replayed into P before the next
+    media unit and therefore needs one additional scheduler-owned prompt row.
+    This also applies to a context rollover: P samples only one uncomputed
+    seed token, so the scheduler has no computed D output rows to retain while
+    Stage0 still replays the authoritative P+D feedback prefix.
+    """
+    if not isinstance(token_ids, (list, tuple)):
+        return 0
+    return max(0, len(token_ids) - 1)
+
+
+def duplex_retained_unit_token_budget(
+    payload: object,
+    *,
+    _shape: _DuplexPayloadShape | None = None,
+) -> int:
     """Return the exact prompt rows for the latest complete model unit.
 
     A steady-state append also carries the previous unit's terminator and
@@ -148,11 +199,12 @@ def duplex_retained_unit_token_budget(payload: object) -> int:
     rollover, so the retained slot contains only ``<unit>``, its audio rows,
     and the camera blocks attached to that unit.
     """
-    sample_count = _duplex_pcm_sample_count(payload)
+    shape = _duplex_payload_shape(payload) if _shape is None else _shape
+    sample_count = shape.sample_count
     if sample_count is None or sample_count < _DUPLEX_CHUNK_SAMPLES:
         return 0
     audio_rows = _DUPLEX_CHUNK_SAMPLES // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN
-    vision_counts = duplex_vision_block_counts(payload)
+    vision_counts = shape.vision_block_counts
     vision_rows = (vision_counts[-1] if vision_counts else 0) * _DUPLEX_VISION_TOKENS_PER_BLOCK
     return 1 + audio_rows + vision_rows
 
@@ -196,18 +248,29 @@ def build_duplex_data_plane_prompt(
     final: bool,
     replace_streaming_prompt: bool = False,
     retained_unit_tokens: int = 0,
+    compact_rebase_prefix_tokens: int = 0,
     context_generation: int = 0,
+    _payload_shape: _DuplexPayloadShape | None = None,
 ) -> dict[str, Any]:
-    token_budget = duplex_scheduler_token_budget(payload)
+    payload_shape = _duplex_payload_shape(payload) if _payload_shape is None else _payload_shape
+    token_budget = duplex_scheduler_token_budget(payload, _shape=payload_shape)
     if seq <= 1:
         context_reserve = duplex_first_append_context_reserve(runtime_config)
         token_budget += context_reserve
-        first_units = duplex_first_append_unit_count(payload)
+        first_units = duplex_first_append_unit_count(payload, _shape=payload_shape)
         if first_units is not None:
-            token_budget = context_reserve + first_units * 12 - 1 + _duplex_vision_token_count(payload)
-    if seq > 1 and duplex_payload_is_exact_chunks(payload):
+            token_budget = (
+                context_reserve
+                + first_units * 12
+                - 1
+                + _duplex_vision_token_count(
+                    payload,
+                    block_counts=payload_shape.vision_block_counts,
+                )
+            )
+    if seq > 1 and duplex_payload_is_exact_chunks(payload, _shape=payload_shape):
         token_budget += 1
-    if final and duplex_payload_is_exact_chunks(payload):
+    if final and duplex_payload_is_exact_chunks(payload, _shape=payload_shape):
         token_budget += 12
     context_reserve = 0
     if replace_streaming_prompt:
@@ -247,6 +310,17 @@ def build_duplex_data_plane_prompt(
             "runtime_config": dict(runtime_config),
             "scheduler_token_budget": token_budget,
             "scheduler_token_id": token_id,
+            # A steady append materializes only its suffix on P.  If vLLM
+            # later preempts that live request and loses the old KV, the
+            # scheduler replaces the cumulative logical prompt with this
+            # compact prefix plus ``scheduler_token_budget``.  Stage0 keeps
+            # the matching embedding snapshot transactionally.  Zero means
+            # the current append already owns the complete prompt (first
+            # append or an ordinary context-window rollover).
+            "compact_rebase_prefix_tokens": max(
+                0,
+                int(compact_rebase_prefix_tokens),
+            ),
             "context_generation": context_generation,
         },
     }
@@ -255,9 +329,7 @@ def build_duplex_data_plane_prompt(
             "replace_streaming_prompt": True,
             "retain_streaming_output_tokens": True,
             "retained_output_insert_offset": context_reserve + max(0, int(retained_unit_tokens)),
-            "streaming_cache_salt": (
-                f"minicpmo45:{fence.session_id}:{fence.incarnation}:context-{context_generation}"
-            ),
+            "streaming_cache_salt": (f"minicpmo45:{fence.session_id}:{fence.incarnation}:context-{context_generation}"),
         }
     return {
         "prompt_token_ids": [token_id] * token_budget,
@@ -273,6 +345,8 @@ class _ContextWindowState:
     retained_unit_tokens: int = 0
     context_generation: int = 0
     last_replace: bool = False
+    last_replace_retained_unit_tokens: int = 0
+    last_compact_rebase_prefix_tokens: int = 0
 
 
 def _coerce_int(value: object) -> int | None:
@@ -380,9 +454,7 @@ class MiniCPMO45DuplexRuntimeExtension:
         configured: list[object] = []
         for stage_id, default in enumerate(defaults):
             policy_stage_id = pd_stage_policy[stage_id] if pd_stage_policy is not None else stage_id
-            max_tokens = _coerce_int(
-                _stage_config_value(runtime_config, "duplex_stage_max_tokens", policy_stage_id)
-            )
+            max_tokens = _coerce_int(_stage_config_value(runtime_config, "duplex_stage_max_tokens", policy_stage_id))
             raw_overrides = _stage_config_value(
                 runtime_config,
                 "duplex_stage_sampling_params",
@@ -441,20 +513,24 @@ class MiniCPMO45DuplexRuntimeExtension:
         while len(self._context_windows) > _MAX_CONTEXT_WINDOW_STATES:
             self._context_windows.popitem(last=False)
 
-        raw_budget = duplex_scheduler_token_budget(payload)
+        payload_shape = _duplex_payload_shape(payload)
+        raw_budget = duplex_scheduler_token_budget(payload, _shape=payload_shape)
         if seq <= 1:
             raw_budget += duplex_first_append_context_reserve(runtime_config)
-            first_units = duplex_first_append_unit_count(payload)
+            first_units = duplex_first_append_unit_count(payload, _shape=payload_shape)
             if first_units is not None:
                 raw_budget = (
                     duplex_first_append_context_reserve(runtime_config)
                     + first_units * 12
                     - 1
-                    + _duplex_vision_token_count(payload)
+                    + _duplex_vision_token_count(
+                        payload,
+                        block_counts=payload_shape.vision_block_counts,
+                    )
                 )
-        elif duplex_payload_is_exact_chunks(payload):
+        elif duplex_payload_is_exact_chunks(payload, _shape=payload_shape):
             raw_budget += 1
-        if final and duplex_payload_is_exact_chunks(payload):
+        if final and duplex_payload_is_exact_chunks(payload, _shape=payload_shape):
             raw_budget += 12
 
         max_output_tokens = _coerce_int(_stage_config_value(runtime_config, "duplex_stage_max_tokens", 0))
@@ -469,25 +545,34 @@ class MiniCPMO45DuplexRuntimeExtension:
         # A retried operation reuses the same seq. Return the same decision and
         # do not advance the estimate twice.
         replace_streaming_prompt = window.last_replace if seq == window.last_seq else False
-        retained_unit_tokens = window.retained_unit_tokens if replace_streaming_prompt else 0
+        retained_unit_tokens = window.last_replace_retained_unit_tokens if replace_streaming_prompt else 0
+        compact_rebase_prefix_tokens = window.last_compact_rebase_prefix_tokens if seq == window.last_seq else 0
         if seq > window.last_seq:
+            compact_rebase_retained_unit_tokens = window.retained_unit_tokens
             replace_streaming_prompt = bool(
-                window.last_seq > 0
-                and window.retained_unit_tokens > 0
-                and window.estimated_tokens >= trigger_tokens
+                window.last_seq > 0 and window.retained_unit_tokens > 0 and window.estimated_tokens >= trigger_tokens
             )
             retained_unit_tokens = window.retained_unit_tokens if replace_streaming_prompt else 0
             if replace_streaming_prompt:
                 window.context_generation += 1
                 window.estimated_tokens = (
-                    duplex_first_append_context_reserve(runtime_config)
-                    + retained_unit_tokens
-                    + max_output_tokens
+                    duplex_first_append_context_reserve(runtime_config) + retained_unit_tokens + max_output_tokens
+                )
+            if not replace_streaming_prompt:
+                compact_rebase_prefix_tokens = (
+                    duplex_first_append_context_reserve(runtime_config) + max(0, compact_rebase_retained_unit_tokens)
+                    if seq > 1
+                    else 0
                 )
             window.estimated_tokens += raw_budget + max_output_tokens
-            window.retained_unit_tokens = duplex_retained_unit_token_budget(payload)
+            window.retained_unit_tokens = duplex_retained_unit_token_budget(
+                payload,
+                _shape=payload_shape,
+            )
             window.last_seq = seq
             window.last_replace = replace_streaming_prompt
+            window.last_replace_retained_unit_tokens = retained_unit_tokens
+            window.last_compact_rebase_prefix_tokens = compact_rebase_prefix_tokens
 
         if replace_streaming_prompt and isinstance(payload, dict):
             payload = {
@@ -508,7 +593,9 @@ class MiniCPMO45DuplexRuntimeExtension:
                 final=final,
                 replace_streaming_prompt=replace_streaming_prompt,
                 retained_unit_tokens=retained_unit_tokens,
+                compact_rebase_prefix_tokens=compact_rebase_prefix_tokens,
                 context_generation=window.context_generation,
+                _payload_shape=payload_shape,
             )
         )
 
@@ -558,6 +645,7 @@ class MiniCPMO45DuplexRuntimeExtension:
 __all__ = [
     "MiniCPMO45DuplexRuntimeExtension",
     "build_duplex_data_plane_prompt",
+    "duplex_feedback_scheduler_rows",
     "duplex_first_append_context_reserve",
     "duplex_first_append_unit_count",
     "duplex_payload_is_exact_chunks",

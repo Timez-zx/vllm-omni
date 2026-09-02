@@ -70,6 +70,24 @@ _DIAG_STAGES = (
     else frozenset(stage.strip() for stage in _DIAG_STAGE_RAW.split(",") if stage.strip())
 )
 _OUTPUT_IPC_FALLBACK_MIN_BYTES = 1 << 20
+_KV_TRANSFER_EVIDENCE_FIELDS = (
+    "kv_transfer_selected_blocks",
+    "kv_transfer_selected_tokens",
+    "kv_transfer_selected_bytes",
+    "kv_transfer_write_submit_to_d_ready_ms",
+)
+_AUXILIARY_PREENCODE_RPC_CONFIG = {
+    "preencode_minicpmo45_vision": (
+        "MINICPMO45_VISION_ENCODER_DEVICE",
+        "_vision_preencode_executor",
+        "minicpmo-vision-sidecar",
+    ),
+    "preencode_minicpmo45_audio": (
+        "MINICPMO45_AUDIO_ENCODER_DEVICE",
+        "_audio_preencode_executor",
+        "minicpmo-audio-sidecar",
+    ),
+}
 
 
 class _StageInputQueue(queue.Queue[tuple[EngineCoreRequestType, Any]]):
@@ -84,16 +102,28 @@ class _StageInputQueue(queue.Queue[tuple[EngineCoreRequestType, Any]]):
         self._auxiliary_dispatch = auxiliary_dispatch
 
     @staticmethod
-    def _is_auxiliary_vision_rpc(item: tuple[EngineCoreRequestType, Any]) -> bool:
+    def _is_auxiliary_preencode_rpc(
+        item: tuple[EngineCoreRequestType, Any],
+    ) -> bool:
         request_type, request = item
         if request_type != EngineCoreRequestType.UTILITY:
             return False
         try:
             _client_idx, _call_id, method_name, args = request
-            return (
-                method_name == "collective_rpc"
-                and bool(args)
-                and args[0] == "preencode_minicpmo45_vision"
+            if method_name != "collective_rpc" or not args:
+                return False
+            rpc_method = args[0]
+            if rpc_method == "preencode_minicpmo45_vision":
+                # Preserve the existing vision admission behavior. The
+                # collective RPC itself only uses the executor when the
+                # vision sidecar device is configured.
+                return True
+            if rpc_method != "preencode_minicpmo45_audio":
+                return False
+            # Audio remains on the ordinary Core path unless its model-owned
+            # sidecar state has explicitly been placed on another device.
+            return bool(
+                os.environ.get("MINICPMO45_AUDIO_ENCODER_DEVICE", "").strip()
             )
         except (TypeError, ValueError, IndexError):
             return False
@@ -105,9 +135,9 @@ class _StageInputQueue(queue.Queue[tuple[EngineCoreRequestType, Any]]):
         timeout: float | None = None,
     ) -> None:
         dispatch = self._auxiliary_dispatch
-        if dispatch is not None and self._is_auxiliary_vision_rpc(item):
+        if dispatch is not None and self._is_auxiliary_preencode_rpc(item):
             # Dispatch from the ZMQ IO thread. The RPC only queues work on the
-            # dedicated single-threaded Encoder sidecar and never interrupts
+            # dedicated single-threaded modality sidecar and never interrupts
             # an executing Thinker-P batch.
             dispatch(item)
             return
@@ -252,11 +282,13 @@ class StageEngineCoreProc(EngineCoreProc):
             else None
         )
         self._vision_preencode_executor: ThreadPoolExecutor | None = None
+        self._audio_preencode_executor: ThreadPoolExecutor | None = None
         super().__init__(*args, **kwargs)
         # The input thread resolves ``self.input_queue`` for each message. Swap
         # the still-unconsumed startup queue so auxiliary vision RPCs can be
         # admitted directly instead of waiting behind the Thinker-P ADD
-        # backlog. Ordinary data ordering is unchanged.
+        # backlog. Ordinary data ordering is unchanged. Audio uses this bypass
+        # only when its dedicated device is explicitly configured.
         old_queue = self.input_queue
         sidecar_queue = _StageInputQueue(
             lambda item: self._handle_client_request(*item),
@@ -293,13 +325,13 @@ class StageEngineCoreProc(EngineCoreProc):
         request_type: EngineCoreRequestType,
         request: Any,
     ) -> None:
-        """Complete vision RPCs only after embeddings enter the side cache."""
+        """Complete sidecar RPCs only after embeddings enter their cache."""
         if request_type != EngineCoreRequestType.UTILITY:
             return super()._handle_client_request(request_type, request)
 
         client_idx, call_id, method_name, args = request
         rpc_method = args[0] if method_name == "collective_rpc" and args else None
-        if rpc_method != "preencode_minicpmo45_vision":
+        if not self._is_auxiliary_preencode_method(rpc_method):
             return super()._handle_client_request(request_type, request)
         if self._reject_utility_in_shutdown(client_idx, call_id, method_name):
             return
@@ -315,7 +347,7 @@ class StageEngineCoreProc(EngineCoreProc):
                 # off the Core busy loop, but do not turn queue admission into
                 # a false cache-ready acknowledgement.
                 result.add_done_callback(
-                    lambda done: self._complete_auxiliary_vision_result(
+                    lambda done: self._complete_auxiliary_preencode_result(
                         done,
                         client_idx=client_idx,
                         output=output,
@@ -332,7 +364,7 @@ class StageEngineCoreProc(EngineCoreProc):
             (client_idx, EngineCoreOutputs(utility_output=output))
         )
 
-    def _complete_auxiliary_vision_result(
+    def _complete_auxiliary_preencode_result(
         self,
         future: Future[Any],
         *,
@@ -350,6 +382,17 @@ class StageEngineCoreProc(EngineCoreProc):
             output.failure_message = f"Call to {method_name} method failed: {str(exc)}"
         self._put_priority_output(
             (client_idx, EngineCoreOutputs(utility_output=output))
+        )
+
+    @staticmethod
+    def _is_auxiliary_preencode_method(method: Any) -> bool:
+        """Return whether this RPC should use direct sidecar plumbing."""
+        if method == "preencode_minicpmo45_vision":
+            return True
+        if method != "preencode_minicpmo45_audio":
+            return False
+        return bool(
+            os.environ.get("MINICPMO45_AUDIO_ENCODER_DEVICE", "").strip()
         )
 
     @staticmethod
@@ -372,26 +415,29 @@ class StageEngineCoreProc(EngineCoreProc):
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
     ) -> Any:
-        """Keep an auxiliary-GPU vision RPC out of the P scheduling loop.
+        """Keep auxiliary-GPU encoder RPCs out of the P scheduling loop.
 
         vLLM utility calls normally execute synchronously on the EngineCore
-        thread. That is correct when the vision tower shares the P GPU, but
-        defeats auxiliary placement: a slower call on the dedicated Encoder
-        GPU would still stop P from admitting and scheduling LLM work. EngineCore
-        already understands ``Future`` utility results, so run only this
-        stateless, single-flight sidecar RPC on a dedicated host thread.
+        thread. That is correct when an encoder shares the P GPU, but defeats
+        auxiliary placement: a slower call on a dedicated Encoder GPU would
+        still stop P from admitting and scheduling LLM work. EngineCore
+        already understands ``Future`` utility results, so run each enabled
+        single-flight sidecar RPC on its dedicated host thread.
         """
-        if (
-            method == "preencode_minicpmo45_vision"
-            and os.environ.get("MINICPMO45_VISION_ENCODER_DEVICE", "").strip()
-        ):
-            executor = self._vision_preencode_executor
+        config = (
+            _AUXILIARY_PREENCODE_RPC_CONFIG.get(method)
+            if isinstance(method, str)
+            else None
+        )
+        if config is not None and os.environ.get(config[0], "").strip():
+            _, executor_attr, thread_name_prefix = config
+            executor = getattr(self, executor_attr, None)
             if executor is None:
                 executor = ThreadPoolExecutor(
                     max_workers=1,
-                    thread_name_prefix="minicpmo-vision-sidecar",
+                    thread_name_prefix=thread_name_prefix,
                 )
-                self._vision_preencode_executor = executor
+                setattr(self, executor_attr, executor)
             collective_rpc = super().collective_rpc
             return executor.submit(
                 collective_rpc,
@@ -403,10 +449,14 @@ class StageEngineCoreProc(EngineCoreProc):
         return super().collective_rpc(method, timeout, args, kwargs)
 
     def shutdown(self) -> None:
-        executor = self._vision_preencode_executor
-        if executor is not None:
-            executor.shutdown(wait=True, cancel_futures=True)
-            self._vision_preencode_executor = None
+        for executor_attr in (
+            "_vision_preencode_executor",
+            "_audio_preencode_executor",
+        ):
+            executor = getattr(self, executor_attr, None)
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
+                setattr(self, executor_attr, None)
         super().shutdown()
 
     def _install_materialized_mm_receiver_cache(self) -> None:
@@ -728,8 +778,8 @@ class StageEngineCoreProc(EngineCoreProc):
         if prepared is not None:
             held_ms = (time.monotonic() - prepared["ready_mono"]) * 1000.0
             prepared_request = prepared["request"]
-            prepared_prompt = list(prepared_request.prompt_token_ids)
-            request_prompt = list(request.prompt_token_ids)
+            prepared_prompt = prepared_request.prompt_token_ids
+            request_prompt = request.prompt_token_ids
             prefix_matches = (
                 len(request_prompt) >= len(prepared_prompt)
                 and request_prompt[: len(prepared_prompt)] == prepared_prompt
@@ -744,12 +794,66 @@ class StageEngineCoreProc(EngineCoreProc):
                 )
                 super().add_request(request, request_wave)
                 return
+            prepared_kv_params = getattr(
+                prepared_request,
+                "pd_transfer_evidence",
+                None,
+            )
+            if not isinstance(prepared_kv_params, dict):
+                prepared_kv_params = getattr(
+                    prepared_request,
+                    "kv_transfer_params",
+                    None,
+                )
+            if isinstance(prepared_kv_params, dict) and any(
+                name in prepared_kv_params
+                for name in _KV_TRANSFER_EVIDENCE_FIELDS
+            ):
+                # The cache-sync request owns the physical NIXL registration,
+                # while this finite D request owns the user-visible output.
+                # Preserve only immutable audit scalars across that boundary;
+                # remote-prefill control fields must stay stripped so D does
+                # not repeat the handshake or import.
+                request.pd_transfer_evidence = {
+                    name: prepared_kv_params.get(name, -1)
+                    for name in _KV_TRANSFER_EVIDENCE_FIELDS
+                }
             self._strip_remote_prefill_params(request)
             # A loading import owns the exact (possibly non-block-aligned)
             # block table under this request id. A full local hit owns no
             # private table and should be matched by normal prefix caching.
             if prepared.get("owns_blocks", False):
                 request.num_computed_tokens = prepared_request.num_computed_tokens
+                # The direct cache-sync request never enters the ordinary
+                # scheduler admission path.  Its connector-populated stats
+                # therefore have to follow the imported block table into the
+                # formal D request.  The cursor may be one token shorter than
+                # the imported prefix because D intentionally replays the last
+                # P token before sampling; preserve the local-prefix-first
+                # split while accounting for that replay.
+                prefill_stats = getattr(request, "prefill_stats", None)
+                prepared_stats = getattr(
+                    prepared_request,
+                    "prefill_stats",
+                    None,
+                )
+                if prefill_stats is not None:
+                    cached_tokens = int(request.num_computed_tokens)
+                    prepared_local = int(
+                        getattr(
+                            prepared_stats,
+                            "num_local_cached_tokens",
+                            0,
+                        )
+                        or 0
+                    )
+                    local_cached_tokens = min(prepared_local, cached_tokens)
+                    external_cached_tokens = cached_tokens - local_cached_tokens
+                    prefill_stats.set(
+                        num_prompt_tokens=int(request.num_prompt_tokens),
+                        num_local_cached_tokens=local_cached_tokens,
+                        num_external_cached_tokens=external_cached_tokens,
+                    )
             if _LOG_INGRESS_DIAG:
                 logger.info(
                     "[PD-D-CONTROL] event=prepared-cache-activate request=%s "
@@ -984,15 +1088,46 @@ class StageEngineCoreProc(EngineCoreProc):
                 self._fail_pd_cache_sync_job(request_id, exc)
         return progressed
 
+    def _publish_finished_pd_blocks(self) -> bool:
+        """Publish P's completed KV immediately after scheduler retirement.
+
+        The stock connector piggybacks finished block metadata on the next
+        ``execute_model`` call.  That couples D readiness to the next P batch's
+        input preparation and forward.  The delta connector exposes an
+        exact-once control message so the existing background NIXL writer can
+        start independently of further model work.
+        """
+        connector = getattr(self.scheduler, "connector", None)
+        take_metadata = getattr(
+            connector,
+            "take_immediate_push_metadata",
+            None,
+        )
+        if not callable(take_metadata):
+            return False
+        metadata = take_metadata()
+        if metadata is None:
+            return False
+
+        # A partial tensor-parallel RPC cannot safely be retried: ranks that
+        # already received the message may have submitted the WRITE. Treat an
+        # RPC error as engine-fatal instead of re-queueing duplicate work.
+        self.model_executor.collective_rpc(
+            "publish_pd_finished_blocks",
+            args=(metadata,),
+        )
+        return True
+
     def _process_engine_step(self) -> bool:
         # Preserve ordinary inference priority. Cache-only work is progressed
         # between scheduler/model steps and when D would otherwise be idle.
         base_has_work = super().has_work()
         model_executed = super()._process_engine_step() if base_has_work else False
+        push_published = self._publish_finished_pd_blocks()
         cache_progressed = self._progress_pd_cache_sync_jobs()
         if not base_has_work and not cache_progressed and self._pd_cache_sync_jobs:
             time.sleep(0.001)
-        return model_executed or cache_progressed
+        return model_executed or push_published or cache_progressed
 
     def process_output_sockets(
         self,

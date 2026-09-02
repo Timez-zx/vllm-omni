@@ -49,6 +49,10 @@ else:
 
 logger = init_logger(__name__)
 
+_LOG_PREFIX_CACHE = __import__("os").environ.get(
+    "VLLM_OMNI_LOG_PREFIX_CACHE", "0"
+) not in ("0", "", "false", "False")
+
 # [encoder share probe] see the call site in execute_model. Events are read one
 # pass late so the probe never synchronizes on the critical path.
 _LOG_ENC = __import__("os").environ.get("VLLM_OMNI_LOG_ENC", "0") not in ("0", "", "false", "False")
@@ -221,6 +225,28 @@ def _filter_mrope_kwargs_for_model(model: object, kwargs: dict[str, Any]) -> dic
 
 
 class OmniGPUModelRunner(GPUModelRunner):
+    @staticmethod
+    def _sync_resumed_prompt_rebase(
+        req_state: CachedRequestState,
+        req_id: str,
+        req_data: object,
+    ) -> None:
+        """Synchronize a scheduler prompt replacement on cached resume."""
+        resumed_ids = getattr(req_data, "resumed_req_ids", ())
+        prompt_map = getattr(req_data, "prompt_token_ids", None)
+        if req_id not in resumed_ids or not isinstance(prompt_map, dict):
+            return
+        prompt_ids = prompt_map.get(req_id)
+        if prompt_ids is None:
+            return
+        if getattr(req_state, "prompt_embeds", None) is not None:
+            raise RuntimeError(
+                "A resumed Omni prompt rebase cannot replace prompt_embeds"
+            )
+        exact_prompt_ids = [int(token_id) for token_id in prompt_ids]
+        req_state.prompt_token_ids = exact_prompt_ids
+        req_state.num_prompt_tokens = len(exact_prompt_ids)
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.model_intermediate_buffer: dict[str, dict[str, Any]] = {}
@@ -796,7 +822,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             # later on as needed.
             if self.omni_prefix_cache is not None and new_req_data.num_computed_tokens > 0:
                 self.omni_prefix_cache.add_prefix_cached_new_req_id(req_id)
-            if self.omni_prefix_cache is not None:
+            if self.omni_prefix_cache is not None and _LOG_PREFIX_CACHE:
                 logger.info(
                     "[prefix-cache] request=%s hit_tokens=%d prompt_tokens=%d",
                     req_id,
@@ -924,6 +950,12 @@ class OmniGPUModelRunner(GPUModelRunner):
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_id in req_data.resumed_req_ids
+            if resumed_from_preemption:
+                self._sync_resumed_prompt_rebase(
+                    req_state,
+                    req_id,
+                    req_data,
+                )
             num_output_tokens = req_data.num_output_tokens[i]
             req_index = self.input_batch.req_id_to_index.get(req_id)
 

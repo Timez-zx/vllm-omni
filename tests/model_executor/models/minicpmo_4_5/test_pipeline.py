@@ -66,20 +66,25 @@ class TestRegistryDeclaration:
         assert pipeline.get_stage(0).extras["is_prefill_only"] is True
         assert pipeline.get_stage(1).extras["is_decode_only"] is True
 
-    def test_pd_deploy_uses_one_gpu_per_stage(self) -> None:
+    def test_pd_deploy_uses_split_thinker_and_colocated_audio_stages(self) -> None:
         deploy = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5_pd_4gpu.yaml")
         pipeline = OMNI_PIPELINES[deploy.pipeline]
         stages = merge_pipeline_deploy(pipeline, deploy)
         assert [stage.yaml_runtime["devices"] for stage in stages] == [
             "0",
             "1",
-            "2",
+            "3",
             "3",
         ]
         assert stages[0].yaml_engine_args["hf_overrides"]["vllm_omni_minicpmo_pd_prefill"] is True
         assert stages[1].yaml_engine_args["hf_overrides"]["vllm_omni_minicpmo_pd_decode"] is True
         assert stages[0].yaml_engine_args["async_chunk"] is False
         assert stages[1].yaml_engine_args["async_chunk"] is False
+        assert stages[0].yaml_engine_args["async_scheduling"] is True
+        assert stages[1].yaml_engine_args["async_scheduling"] is True
+        assert "OmniARAsyncScheduler" in (stages[0].scheduler_cls or "")
+        assert "OmniARAsyncScheduler" in (stages[1].scheduler_cls or "")
+        assert stages[2].yaml_engine_args["async_scheduling"] is False
         assert stages[2].yaml_engine_args["async_chunk"] is True
         assert stages[3].yaml_engine_args["async_chunk"] is True
         talker_sampling = stages[2].yaml_extras["default_sampling_params"]

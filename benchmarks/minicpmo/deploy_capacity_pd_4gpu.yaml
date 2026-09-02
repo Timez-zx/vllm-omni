@@ -1,6 +1,6 @@
 # Formal MiniCPM-o 4.5 native-duplex P/D capacity topology:
 # GPU 0 Thinker-P, GPU 1 Thinker-D, GPU 2 Vision Encoder,
-# GPU 3 Talker + Code2Wav.
+# GPU 3 Audio Encoder + Talker + Code2Wav.
 base_config: ../../vllm_omni/deploy/minicpmo_4_5_pd_4gpu.yaml
 pipeline: minicpmo_4_5_pd
 session_mode: duplex

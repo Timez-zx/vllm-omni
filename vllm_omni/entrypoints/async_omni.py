@@ -27,7 +27,11 @@ from vllm.utils import random_uuid
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import CuMemTag, OmniACK, OmniSleepTask, OmniWakeTask
-from vllm_omni.engine.messages import ErrorMessage, OutputMessage
+from vllm_omni.engine.messages import (
+    ErrorMessage,
+    OutputMessage,
+    PhysicalDCompletionWitnessMessage,
+)
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_base import (
     OmniBase,
@@ -319,7 +323,7 @@ class AsyncOmni(EngineClient, OmniBase):
         *,
         response_stage_id: int | None = None,
         timeout: float | None = 10.0,
-    ) -> list[OmniRequestOutput]:
+    ) -> list[OmniRequestOutput | PhysicalDCompletionWitnessMessage]:
         """Collect the next duplex data-plane output batch for a live request."""
         return await self._get_duplex_request_client().collect_registered_outputs(
             request_id,
@@ -430,7 +434,7 @@ class AsyncOmni(EngineClient, OmniBase):
         *,
         response_stage_id: int | None,
         timeout: float | None,
-    ) -> list[OmniRequestOutput]:
+    ) -> list[OmniRequestOutput | PhysicalDCompletionWitnessMessage]:
         return await self._get_duplex_request_client().collect_outputs(
             request_id,
             req_state,
@@ -919,6 +923,18 @@ class AsyncOmni(EngineClient, OmniBase):
                         else:
                             logger.warning(
                                 "[%s] dropping non-fatal error for unknown req %s",
+                                self._name,
+                                msg.request_id,
+                            )
+                        continue
+
+                    if isinstance(msg, PhysicalDCompletionWitnessMessage):
+                        req_state = self.request_states.get(msg.request_id)
+                        if req_state is not None:
+                            await req_state.queue.put(msg)
+                        else:
+                            logger.debug(
+                                "[%s] dropping completion witness for closed req %s",
                                 self._name,
                                 msg.request_id,
                             )

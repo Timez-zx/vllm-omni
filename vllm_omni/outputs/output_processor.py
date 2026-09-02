@@ -1,4 +1,6 @@
+from collections.abc import Mapping
 from dataclasses import fields as dataclass_fields
+from numbers import Integral
 from typing import Any
 
 import torch
@@ -27,6 +29,14 @@ from vllm_omni.outputs.multimodal_accumulation import (
 from vllm_omni.outputs.output_modality import OutputModality, get_accumulation_strategy
 
 logger = init_logger(__name__)
+
+_ENGINE_INPUT_AUDIT_KEYS = (
+    "duplex_input_video_frames",
+    "duplex_arrival_video_frames",
+    "duplex_vision_fallback_frames",
+    "duplex_arrival_audio_units",
+    "duplex_audio_fallback_units",
+)
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -90,10 +100,95 @@ class OmniRequestState(RequestState):
         # types (e.g. dict[str, str]) for future multi-output models.
         self.mm_type: str | None = None
         self.mm_accumulated: MultimodalPayload = MultimodalPayload()
+        # ``RequestOutput.request_id`` is deliberately the external/logical
+        # request id.  A duplex session can therefore emit many finite engine
+        # requests whose outputs all carry the same public id.  Keep the
+        # current physical prefill snapshot on the request state so every
+        # emitted output can expose an exact engine-completion identity.
+        self.engine_prefill_stats: dict[str, int] | None = None
+        self.engine_input_audit: dict[str, int] = {}
 
     def apply_streaming_update(self, update) -> None:
         super().apply_streaming_update(update)
         self.native_text_stats = RequestStateStats(arrival_time=float(update.arrival_time or 0.0))
+        self.engine_prefill_stats = None
+        self.engine_input_audit = {}
+
+    def record_engine_prefill_stats(self, prefill_stats: Any | None) -> None:
+        """Snapshot vLLM's prefill counters for the current physical input."""
+        if prefill_stats is None:
+            return
+        fields = (
+            "num_prompt_tokens",
+            "num_computed_tokens",
+            "num_cached_tokens",
+            "num_local_cached_tokens",
+            "num_external_cached_tokens",
+            "num_cache_creation_tokens",
+        )
+        self.engine_prefill_stats = {
+            name: int(getattr(prefill_stats, name, 0) or 0) for name in fields
+        }
+
+    def annotate_engine_request_output(
+        self,
+        request_output: RequestOutput | PoolingRequestOutput,
+    ) -> RequestOutput | PoolingRequestOutput:
+        """Attach non-accumulating physical-request metadata to an output."""
+        request_output.engine_request_id = self.request_id
+        request_output.engine_prompt_tokens = int(self.prompt_len)
+        request_output.engine_num_cached_tokens = int(self.num_cached_tokens)
+        request_output.engine_prefill_stats = (
+            dict(self.engine_prefill_stats)
+            if self.engine_prefill_stats is not None
+            else None
+        )
+        request_output.engine_input_audit = dict(self.engine_input_audit)
+        return request_output
+
+    def record_engine_input_audit(self, payload: object) -> None:
+        """Keep fixed-size counters from the current physical runner input."""
+        if not isinstance(payload, Mapping):
+            return
+        candidate = payload.get("duplex")
+        values = candidate if isinstance(candidate, Mapping) else payload
+        for name in _ENGINE_INPUT_AUDIT_KEYS:
+            value = self._coerce_nonnegative_scalar_count(values.get(name))
+            if value is not None:
+                self.engine_input_audit[name] = max(
+                    self.engine_input_audit.get(name, 0),
+                    value,
+                )
+
+    @staticmethod
+    def _coerce_nonnegative_scalar_count(value: object) -> int | None:
+        if isinstance(value, torch.Tensor):
+            if value.device.type != "cpu" or value.numel() != 1:
+                return None
+            value = value.item()
+        if isinstance(value, bool) or not isinstance(value, Integral):
+            return None
+        result = int(value)
+        return result if result >= 0 else None
+
+    @staticmethod
+    def _without_engine_input_audit(payload: object) -> object:
+        """Remove observer-only scalars before multimodal accumulation/handoff."""
+        if not isinstance(payload, Mapping):
+            return payload
+        cleaned = dict(payload)
+        for name in _ENGINE_INPUT_AUDIT_KEYS:
+            cleaned.pop(name, None)
+        nested = cleaned.get("duplex")
+        if isinstance(nested, Mapping):
+            nested_cleaned = dict(nested)
+            for name in _ENGINE_INPUT_AUDIT_KEYS:
+                nested_cleaned.pop(name, None)
+            if nested_cleaned:
+                cleaned["duplex"] = nested_cleaned
+            else:
+                cleaned.pop("duplex", None)
+        return cleaned
 
     def add_multimodal_tensor(self, payload: Any | None, mm_type: str | None) -> None:
         """Accumulate a multimodal tensor payload into the request state.
@@ -104,6 +199,10 @@ class OmniRequestState(RequestState):
         torch.cat calls.
         """
         if payload is None:
+            return
+        self.record_engine_input_audit(payload)
+        payload = self._without_engine_input_audit(payload)
+        if isinstance(payload, Mapping) and not payload:
             return
         try:
             if mm_type:
@@ -171,12 +270,17 @@ class OmniRequestState(RequestState):
         """
         # Pooling-only requests should follow base behavior.
         if self.detokenizer is None and pooling_output is not None:
-            return super().make_request_output(
+            request_output = super().make_request_output(
                 new_token_ids,
                 pooling_output,
                 finish_reason,
                 stop_reason,
                 kv_transfer_params,
+            )
+            return (
+                self.annotate_engine_request_output(request_output)
+                if request_output is not None
+                else None
             )
 
         is_delta = self.output_kind == RequestOutputKind.DELTA
@@ -225,11 +329,13 @@ class OmniRequestState(RequestState):
                 return None
             external_req_id = self.parent_req.external_req_id
 
-        return self._new_request_output(
-            external_req_id,
-            outputs,
-            finished,
-            kv_transfer_params,
+        return self.annotate_engine_request_output(
+            self._new_request_output(
+                external_req_id,
+                outputs,
+                finished,
+                kv_transfer_params,
+            )
         )
 
     def _new_completion_output(
@@ -556,7 +662,17 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             stop_reason = eco.stop_reason
             kv_transfer_params = eco.kv_transfer_params
             routed_experts = eco.routed_experts
-            req_state.num_cached_tokens = eco.num_cached_tokens
+            prefill_stats = getattr(eco, "prefill_stats", None)
+            req_state.record_engine_prefill_stats(prefill_stats)
+            if prefill_stats is not None:
+                req_state.num_cached_tokens = int(prefill_stats.num_cached_tokens)
+                req_state.num_cache_creation_tokens = int(
+                    prefill_stats.num_cache_creation_tokens
+                )
+            else:
+                req_state.num_cached_tokens = int(
+                    getattr(eco, "num_cached_tokens", 0) or 0
+                )
             req_state.is_prefilling = False
 
             is_non_final_audio_chunk = (
@@ -592,6 +708,10 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         was_prefilling = req_state.is_prefilling
         native_stats = req_state.native_text_stats if isinstance(req_state, OmniRequestState) else None
         previous_last_token_ts = native_stats.last_token_ts if native_stats is not None else 0.0
+        if isinstance(req_state, OmniRequestState):
+            req_state.record_engine_prefill_stats(
+                getattr(engine_core_output, "prefill_stats", None)
+            )
 
         # NOTE: We pass ``None`` for  *iteration_stats* to the parent so that
         # the upstream's ``_update_stats_from_output`` logs stats via its own

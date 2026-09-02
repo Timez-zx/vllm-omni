@@ -164,6 +164,18 @@ def _language_model_device(model: object, fallback: torch.device) -> torch.devic
         # necessarily own the language model.
         return fallback
 
+
+def _return_audio_embeddings_to_language_device(
+    model: object,
+    audio_embeds: torch.Tensor,
+) -> torch.Tensor:
+    """Return compact audio embeddings to the vLLM-owned Thinker device."""
+    language_device = _language_model_device(model, audio_embeds.device)
+    if audio_embeds.device != language_device:
+        return audio_embeds.to(device=language_device, non_blocking=True)
+    return audio_embeds
+
+
 # Flash attention imports (optional)
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -961,9 +973,7 @@ class SiglipVisionEmbeddings(nn.Module):
         self.num_patches = self.num_patches_per_side**2
         self.num_positions = self.num_patches
         self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
-        self._uniform_position_ids_cache: dict[
-            tuple[int, int, torch.device], torch.Tensor
-        ] = {}
+        self._uniform_position_ids_cache: dict[tuple[int, int, torch.device], torch.Tensor] = {}
 
     def _create_grid_position_ids(
         self,
@@ -1064,11 +1074,15 @@ class SiglipVisionEmbeddings(nn.Module):
         embeddings = patch_embeds.flatten(2).transpose(1, 2)
         if embeddings.shape[1] != patch_grid_height * patch_grid_width:
             raise ValueError("packed image patches do not match the target grid")
-        position_ids = self._uniform_position_ids(
-            patch_grid_height,
-            patch_grid_width,
-            self.position_embedding.weight.device,
-        ).unsqueeze(0).expand(pixel_values.shape[0], -1)
+        position_ids = (
+            self._uniform_position_ids(
+                patch_grid_height,
+                patch_grid_width,
+                self.position_embedding.weight.device,
+            )
+            .unsqueeze(0)
+            .expand(pixel_values.shape[0], -1)
+        )
         return embeddings + self.position_embedding(position_ids)
 
     def forward(
@@ -1081,11 +1095,15 @@ class SiglipVisionEmbeddings(nn.Module):
         embeddings = patch_embeds.flatten(2).transpose(1, 2)
 
         if patch_attention_mask is None and tgt_sizes is None:
-            position_ids = self._uniform_position_ids(
-                int(patch_embeds.shape[-2]),
-                int(patch_embeds.shape[-1]),
-                self.position_embedding.weight.device,
-            ).unsqueeze(0).expand(pixel_values.shape[0], -1)
+            position_ids = (
+                self._uniform_position_ids(
+                    int(patch_embeds.shape[-2]),
+                    int(patch_embeds.shape[-1]),
+                    self.position_embedding.weight.device,
+                )
+                .unsqueeze(0)
+                .expand(pixel_values.shape[0], -1)
+            )
         else:
             if patch_attention_mask is None:
                 raise ValueError("tgt_sizes requires a patch attention mask")
@@ -1875,11 +1893,7 @@ class Resampler(nn.Module):
             self.pos_embed = self.pos_embed.to(device)
 
         pos_embed = (
-            self.pos_embed[:tgt_h, :tgt_w, :]
-            .reshape(tgt_h * tgt_w, -1)
-            .to(dtype)
-            .unsqueeze(1)
-            .expand(-1, bs, -1)
+            self.pos_embed[:tgt_h, :tgt_w, :].reshape(tgt_h * tgt_w, -1).to(dtype).unsqueeze(1).expand(-1, bs, -1)
         )
         x = self.ln_kv(self.kv_proj(x)).permute(1, 0, 2)
         q = self.ln_q(self.query)
@@ -2887,16 +2901,12 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
                 None,
             )
             if callable(get_usable_length):
-                past_key_values_length = int(
-                    get_usable_length(inputs_embeds.shape[1])
-                )
+                past_key_values_length = int(get_usable_length(inputs_embeds.shape[1]))
             else:
                 # Transformers 5 removed get_usable_length from DynamicCache;
                 # this encoder uses an unbounded cache, so its current length
                 # is the usable length.
-                past_key_values_length = int(
-                    self_attention_cache.get_seq_length()
-                )
+                past_key_values_length = int(self_attention_cache.get_seq_length())
             if inputs_embeds.shape[1] + past_key_values_length > embed_pos.shape[0]:
                 logger.warning("seems the audio is longer than 30s. repeating the last part of the audio")
                 embed_pos_front = embed_pos[past_key_values_length:, :]
@@ -4093,14 +4103,11 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             raw_device = f"cuda:{raw_device}"
         target = torch.device(raw_device)
         if target.type != "cuda":
-            raise ValueError(
-                "MINICPMO45_VISION_ENCODER_DEVICE must select a CUDA device, "
-                f"got {raw_device!r}"
-            )
-        if target.index is not None and target.index >= torch.cuda.device_count():
+            raise ValueError(f"MINICPMO45_VISION_ENCODER_DEVICE must select a CUDA device, got {raw_device!r}")
+        if target.index is not None and target.index >= torch.accelerator.device_count():
             raise ValueError(
                 "MINICPMO45_VISION_ENCODER_DEVICE is not visible in the Thinker-P "
-                f"worker: {raw_device!r}, visible CUDA devices={torch.cuda.device_count()}"
+                f"worker: {raw_device!r}, visible CUDA devices={torch.accelerator.device_count()}"
             )
         source = next(self.vpm.parameters()).device
         if source == target:
@@ -4120,8 +4127,54 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         # vLLM-owned device before its compiler/profile runner is initialized.
         torch.cuda.set_device(source)
         logger.info(
-            "MiniCPM-o vision encoder and resampler moved from %s to %s; "
-            "embeddings return to the Thinker device",
+            "MiniCPM-o vision encoder and resampler moved from %s to %s; embeddings return to the Thinker device",
+            source,
+            target,
+        )
+
+    def _place_audio_encoder_on_configured_device(self) -> None:
+        """Optionally run the audio tower as an inference sidecar.
+
+        The Whisper cache stays with the audio tower. Only the compact pooled
+        embeddings cross back to the vLLM-owned Thinker device.
+        """
+        raw_device = os.environ.get("MINICPMO45_AUDIO_ENCODER_DEVICE", "").strip()
+        if not raw_device or self.apm is None or self.audio_projection_layer is None or self.audio_avg_pooler is None:
+            return
+        if raw_device.isdigit():
+            raw_device = f"cuda:{raw_device}"
+        target = torch.device(raw_device)
+        if target.type != "cuda":
+            raise ValueError(f"MINICPMO45_AUDIO_ENCODER_DEVICE must select a CUDA device, got {raw_device!r}")
+        if target.index is not None and target.index >= torch.accelerator.device_count():
+            raise ValueError(
+                "MINICPMO45_AUDIO_ENCODER_DEVICE is not visible in the Thinker-P "
+                f"worker: {raw_device!r}, visible CUDA devices={torch.accelerator.device_count()}"
+            )
+        source = next(self.apm.parameters()).device
+        if source == target:
+            return
+
+        # Move only after all weights are loaded. Detaching the sidecar from
+        # nn.Module traversal keeps vLLM/Dynamo from treating its device as the
+        # language-model device during compile and profile runs.
+        audio_modules = {
+            "apm": self.apm,
+            "audio_projection_layer": self.audio_projection_layer,
+            "audio_avg_pooler": self.audio_avg_pooler,
+        }
+        for module in audio_modules.values():
+            module.to(device=target).eval()
+        for name, module in audio_modules.items():
+            self._modules.pop(name, None)
+            object.__setattr__(self, name, module)
+
+        # Module.to() may initialize an auxiliary CUDA context. Restore the
+        # vLLM-owned device before its compiler/profile runner is initialized.
+        if source.type == "cuda":
+            torch.cuda.set_device(source)
+        logger.info(
+            "MiniCPM-o audio encoder, projection, and pooler moved from %s to %s; embeddings return to the Thinker device",
             source,
             target,
         )
@@ -4385,6 +4438,8 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         self,
         pixel_values: torch.Tensor,
         tgt_size: tuple[int, int],
+        *,
+        return_on_vision_device: bool = False,
     ) -> torch.Tensor:
         """Encode one exact-shape camera bucket without dynamic padding setup."""
         if pixel_values.ndim != 4:
@@ -4402,9 +4457,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
                 non_blocking=True,
             )
         patch_size = int(self.config.vision_config.patch_size)
-        packed_patch_count = (
-            pixel_values.shape[-2] // patch_size
-        ) * (pixel_values.shape[-1] // patch_size)
+        packed_patch_count = (pixel_values.shape[-2] // patch_size) * (pixel_values.shape[-1] // patch_size)
         if packed_patch_count != tgt_h * tgt_w:
             raise ValueError("uniform target grid does not match pixel tensor shape")
         vision_embedding = self.vpm.forward_uniform(
@@ -4417,27 +4470,28 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         forward_uniform = getattr(self.resampler, "forward_uniform", None)
         if callable(forward_uniform):
             output = forward_uniform(vision_embedding, tgt_h, tgt_w)
+            if return_on_vision_device:
+                return output
             language_device = _language_model_device(self, output.device)
-            return (
-                output.to(device=language_device, non_blocking=True)
-                if output.device != language_device
-                else output
-            )
+            return output.to(device=language_device, non_blocking=True) if output.device != language_device else output
         tgt_sizes = torch.tensor(
             [[tgt_h, tgt_w]] * pixel_values.shape[0],
             dtype=torch.int64,
             device=pixel_values.device,
         )
         output = self.resampler(vision_embedding, tgt_sizes)
+        if return_on_vision_device:
+            return output
         language_device = _language_model_device(self, output.device)
-        return (
-            output.to(device=language_device, non_blocking=True)
-            if output.device != language_device
-            else output
-        )
+        return output.to(device=language_device, non_blocking=True) if output.device != language_device else output
 
     # V2.6 compatible
-    def get_vision_hidden_states(self, data: MiniCPMVImagePixelInputs) -> torch.Tensor:
+    def get_vision_hidden_states(
+        self,
+        data: MiniCPMVImagePixelInputs,
+        *,
+        return_on_vision_device: bool = False,
+    ) -> torch.Tensor:
         pixel_values = data["pixel_values"]
         tgt_sizes = data["tgt_sizes"]
 
@@ -4499,17 +4553,14 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             output = self.resampler(encode_vision(0, B), tgt_sizes)
         else:
             vision_embeddings = [
-                encode_vision(start, min(start + vision_batch_size, B))
-                for start in range(0, B, vision_batch_size)
+                encode_vision(start, min(start + vision_batch_size, B)) for start in range(0, B, vision_batch_size)
             ]
             output = self.resampler(torch.cat(vision_embeddings, dim=0), tgt_sizes)
 
+        if return_on_vision_device:
+            return output
         language_device = _language_model_device(self, output.device)
-        return (
-            output.to(device=language_device, non_blocking=True)
-            if output.device != language_device
-            else output
-        )
+        return output.to(device=language_device, non_blocking=True) if output.device != language_device else output
 
     def _process_vision_input(
         self,
@@ -4584,10 +4635,21 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         else:
             wavforms = wavforms_raw
 
+        audio_device = self.apm.conv1.weight.device
+        wavforms = wavforms.to(
+            device=audio_device,
+            dtype=self.apm.conv1.weight.dtype,
+        )
+
         # list, [[x1, x2], [y1], [z1]]
         audio_feature_lens_raw = data["audio_feature_lens"]
         if isinstance(audio_feature_lens_raw, torch.Tensor):
-            audio_feature_lens_raw = audio_feature_lens_raw.unbind(0)
+            raw_rows = list(audio_feature_lens_raw.unbind(0))
+        else:
+            raw_rows = list(audio_feature_lens_raw)
+        audio_feature_lens_raw = [
+            torch.as_tensor(row, device=audio_device, dtype=torch.long).reshape(-1) for row in raw_rows
+        ]
 
         audio_feature_lens = torch.hstack(audio_feature_lens_raw)
         batch_size, _, max_mel_seq_len = wavforms.shape
@@ -4646,8 +4708,8 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         audio_embeds = audio_embeds.transpose(1, 2)
 
         _, feature_lens_after_pooling = self._get_feat_extract_output_lengths(audio_feature_lens)
-
-        num_audio_tokens = feature_lens_after_pooling
+        num_audio_tokens = [int(length) for length in feature_lens_after_pooling.tolist()]
+        audio_embeds = _return_audio_embeddings_to_language_device(self, audio_embeds)
 
         final_audio_embeds = list[torch.Tensor]()
         idx = 0
@@ -4677,6 +4739,44 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             return int(past_key_values[0][0].shape[2])
         except (IndexError, TypeError, AttributeError):
             return 0
+
+    @staticmethod
+    def audio_streaming_seq_length(
+        max_mel_seq_len: int,
+        *,
+        use_extra_context: bool = False,
+        prefix_extra_frames: int = 1,
+        suffix_extra_frames: int = 1,
+    ) -> int:
+        """Return the Whisper sequence length produced by one streaming unit."""
+        current_seq_len = (int(max_mel_seq_len) - 1) // 2 + 1
+        if use_extra_context:
+            prefix_to_remove = (int(prefix_extra_frames) + 1) // 2 if prefix_extra_frames > 0 else 0
+            suffix_to_remove = (int(suffix_extra_frames) + 1) // 2 if suffix_extra_frames > 0 else 0
+            current_seq_len = current_seq_len - prefix_to_remove - suffix_to_remove
+        return current_seq_len
+
+    def should_reset_audio_past_key_values(
+        self,
+        past_key_values: Any | None,
+        *,
+        max_mel_seq_len: int,
+        use_extra_context: bool = False,
+        prefix_extra_frames: int = 1,
+        suffix_extra_frames: int = 1,
+    ) -> bool:
+        """Return whether the next streaming unit must start a fresh cache."""
+        current_seq_len = self.audio_streaming_seq_length(
+            max_mel_seq_len,
+            use_extra_context=use_extra_context,
+            prefix_extra_frames=prefix_extra_frames,
+            suffix_extra_frames=suffix_extra_frames,
+        )
+        if current_seq_len <= 0:
+            return False
+        cache_length = self.audio_cache_seq_length(past_key_values)
+        apm_max_len = int(self.apm.embed_positions.weight.shape[0])
+        return cache_length + current_seq_len >= apm_max_len
 
     @staticmethod
     def _audio_self_attention_cache(past_key_values: Any) -> Any:
@@ -4729,9 +4829,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
                         layer.values[batch_idx : batch_idx + 1].clone(),
                     )
                 )
-            outputs.append(
-                EncoderDecoderCache(DynamicCache(layer_data), DynamicCache())
-            )
+            outputs.append(EncoderDecoderCache(DynamicCache(layer_data), DynamicCache()))
         return outputs
 
     def get_audio_embedding_streaming_batch(
@@ -4739,6 +4837,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         data: MiniCPMOAudioFeatureInputs,
         *,
         past_key_values: Any | None = None,
+        return_on_audio_device: bool = False,
         use_extra_context: bool = False,
         prefix_extra_frames: int = 1,
         suffix_extra_frames: int = 1,
@@ -4772,26 +4871,30 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             raw_rows = list(audio_feature_lens_raw.unbind(0))
         else:
             raw_rows = list(audio_feature_lens_raw)
-        audio_feature_lens_raw = [
-            torch.as_tensor(row, device=device, dtype=torch.long).reshape(-1)
-            for row in raw_rows
-        ]
+        audio_feature_lens_raw = [torch.as_tensor(row, device=device, dtype=torch.long).reshape(-1) for row in raw_rows]
         audio_feature_lens = torch.hstack(audio_feature_lens_raw)
         batch_size, _, max_mel_seq_len = wavforms.shape
         if len(audio_feature_lens_raw) != batch_size:
             raise ValueError("audio feature lengths do not match the encoder batch")
 
-        current_seq_len = (max_mel_seq_len - 1) // 2 + 1
-        if use_extra_context:
-            prefix_to_remove = (int(prefix_extra_frames) + 1) // 2 if prefix_extra_frames > 0 else 0
-            suffix_to_remove = (int(suffix_extra_frames) + 1) // 2 if suffix_extra_frames > 0 else 0
-            current_seq_len = current_seq_len - prefix_to_remove - suffix_to_remove
+        current_seq_len = self.audio_streaming_seq_length(
+            max_mel_seq_len,
+            use_extra_context=use_extra_context,
+            prefix_extra_frames=prefix_extra_frames,
+            suffix_extra_frames=suffix_extra_frames,
+        )
         if current_seq_len <= 0:
             return [], past_key_values
 
         cache_length = self.audio_cache_seq_length(past_key_values)
         apm_max_len = self.apm.embed_positions.weight.shape[0]
-        if cache_length + current_seq_len >= apm_max_len:
+        if self.should_reset_audio_past_key_values(
+            past_key_values,
+            max_mel_seq_len=max_mel_seq_len,
+            use_extra_context=use_extra_context,
+            prefix_extra_frames=prefix_extra_frames,
+            suffix_extra_frames=suffix_extra_frames,
+        ):
             logger.warning(
                 "audio_past_key_values length %s exceeds %s, reset.",
                 cache_length + current_seq_len,
@@ -4822,12 +4925,15 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         audio_embeds = self.audio_projection_layer(audio_states)
         audio_embeds = self.audio_avg_pooler(audio_embeds.transpose(1, 2)).transpose(1, 2)
         _, feature_lens_after_pooling = self._get_feat_extract_output_lengths(audio_feature_lens)
+        num_audio_tokens = [int(length) for length in feature_lens_after_pooling.tolist()]
+        if not return_on_audio_device:
+            audio_embeds = _return_audio_embeddings_to_language_device(self, audio_embeds)
         final_audio_embeds: list[list[torch.Tensor]] = []
         idx = 0
         for row_lens in audio_feature_lens_raw:
             target_audio_embeds = []
             for _ in range(len(row_lens)):
-                target_audio_embeds.append(audio_embeds[idx, : feature_lens_after_pooling[idx], :])
+                target_audio_embeds.append(audio_embeds[idx, : num_audio_tokens[idx], :])
                 idx += 1
             final_audio_embeds.append(target_audio_embeds)
         return final_audio_embeds, past_key_values
@@ -5013,5 +5119,6 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             loaded_weights.update("audio_projection_layer." + k for k, _ in clean)
 
         self._place_vision_encoder_on_configured_device()
+        self._place_audio_encoder_on_configured_device()
 
         return loaded_weights

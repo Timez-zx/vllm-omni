@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
@@ -50,6 +51,10 @@ class MiniCPMO45ServingSessionState:
     pending_silence_owner_id: str | None = None
     silence_continuation_scheduler: Callable[..., Awaitable[bool]] | None = None
     vision_preencode_tasks: dict[str, tuple[int, asyncio.Task[bool]]] = field(default_factory=dict)
+    audio_preencode_seq: int = 0
+    audio_preencode_tasks: dict[str, tuple[int, int, asyncio.Task[bool]]] = field(
+        default_factory=dict
+    )
 
     def retain_committed_audio(
         self,
@@ -146,3 +151,66 @@ class MiniCPMO45ServingSessionState:
         for task in tasks:
             if not task.done():
                 task.cancel()
+
+    def allocate_audio_preencode(self, *, epoch: int) -> tuple[int, str]:
+        """Allocate a stable identity for one complete PCM model unit.
+
+        The sequence is monotonic for the lifetime of the serving session,
+        including barge-in epochs and resumable WebSocket attachments.  The
+        epoch remains part of the cache fence; the sequence is an ordering
+        aid, not a replacement for that fence.
+        """
+        stale_ids = [
+            preencode_id
+            for preencode_id, (task_epoch, _seq, _task) in self.audio_preencode_tasks.items()
+            if task_epoch != epoch
+        ]
+        stale_tasks = {
+            self.audio_preencode_tasks[preencode_id][2]
+            for preencode_id in stale_ids
+        }
+        for preencode_id in stale_ids:
+            self.audio_preencode_tasks.pop(preencode_id, None)
+        for task in stale_tasks:
+            if not task.done():
+                task.cancel()
+        self.audio_preencode_seq += 1
+        return self.audio_preencode_seq, uuid.uuid4().hex
+
+    def track_audio_preencode(
+        self,
+        preencode_id: str,
+        *,
+        seq: int,
+        epoch: int,
+        task: asyncio.Task[bool],
+    ) -> None:
+        self.audio_preencode_tasks[preencode_id] = (epoch, seq, task)
+
+    def pop_audio_preencode_task(
+        self,
+        preencode_id: str,
+        *,
+        seq: int,
+        epoch: int,
+    ) -> asyncio.Task[bool] | None:
+        item = self.audio_preencode_tasks.pop(preencode_id, None)
+        if item is None:
+            return None
+        task_epoch, task_seq, task = item
+        if task_epoch == epoch and task_seq == seq:
+            return task
+        if not task.done():
+            task.cancel()
+        return None
+
+    def cancel_audio_preencode_tasks(self) -> None:
+        tasks = {task for _, _, task in self.audio_preencode_tasks.values()}
+        self.audio_preencode_tasks.clear()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+    def cancel_preencode_tasks(self) -> None:
+        self.cancel_vision_preencode_tasks()
+        self.cancel_audio_preencode_tasks()

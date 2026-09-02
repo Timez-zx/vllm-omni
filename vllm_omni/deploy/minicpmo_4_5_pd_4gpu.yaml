@@ -1,6 +1,6 @@
 # MiniCPM-o 4.5 native-duplex P/D deployment.
 # GPU 0: Thinker-P; GPU 1: Thinker-D; GPU 2: Vision Encoder;
-# GPU 3: Talker + Code2Wav.
+# GPU 3: Audio Encoder + Talker + Code2Wav.
 pipeline: minicpmo_4_5_pd
 session_mode: duplex
 async_chunk: true
@@ -23,7 +23,10 @@ stages:
     max_model_len: 40960
     max_num_batched_tokens: 32768
     max_num_seqs: 64
-    async_scheduling: false
+    # Keep two engine batches in flight: while GPU0 executes batch N, Core and
+    # the runner prepare batch N+1. This is the stock vLLM async scheduler
+    # contract; no MiniCPM-specific admission or batching policy is involved.
+    async_scheduling: true
     gpu_memory_utilization: 0.9
     enable_prefix_caching: true
     devices: "0"
@@ -31,16 +34,21 @@ stages:
       video: 1
     env:
       VLLM_NIXL_SIDE_CHANNEL_PORT: "5600"
-      # Preserve TP=1 on physical GPU 0, but also expose physical GPU 2 as
-      # logical cuda:1 for the stateless SigLIP + resampler. Their compact
-      # embeddings return to GPU 0 before Thinker-P consumes them.
-      VLLM_OMNI_AUX_VISIBLE_DEVICES: "2"
+      # Preserve TP=1 on physical GPU 0 while giving the two modality
+      # sidecars independent devices. Their compact embeddings return to GPU
+      # 0 before Thinker-P consumes them.
+      VLLM_OMNI_AUX_VISIBLE_DEVICES: "2,3"
       MINICPMO45_VISION_ENCODER_DEVICE: "cuda:1"
-      MINICPMO45_VISION_ENCODER_BATCH_SIZE: "8"
+      MINICPMO45_VISION_ENCODER_BATCH_SIZE: "16"
+      # The stateful Whisper encoder is isolated from vision on physical GPU
+      # 3. Its KV stays there; only compact pooled embeddings return to P.
+      MINICPMO45_AUDIO_ENCODER_DEVICE: "cuda:2"
+      MINICPMO45_AUDIO_ENCODER_BATCH_SIZE: "16"
       # Capacity diagnosis: every arriving frame is encoded and retained until
       # its formal P append consumes the embedding. A production deployment
       # may set positive limits and apply explicit backpressure/drop policy.
       MINICPMO45_MAX_ARRIVAL_VISION_CACHE_ENTRIES: "0"
+      MINICPMO45_MAX_ARRIVAL_AUDIO_CACHE_ENTRIES: "0"
     engine_extras:
       # P/D handoff uses the KV connector, not Omni async-chunk payloads.
       async_chunk: false
@@ -78,7 +86,9 @@ stages:
     max_model_len: 40960
     max_num_batched_tokens: 32768
     max_num_seqs: 64
-    async_scheduling: false
+    # Decode uses the same generic two-batch pipeline. Token dependencies stay
+    # ordered through vLLM's placeholders/GPU forwarding and KV lifetime fence.
+    async_scheduling: true
     gpu_memory_utilization: 0.9
     enable_prefix_caching: true
     devices: "1"

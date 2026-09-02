@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import janus
 import pytest
@@ -23,6 +24,7 @@ from vllm_omni.engine.messages import (
     CollectiveRPCResultMessage,
     ErrorMessage,
     OutputMessage,
+    PhysicalDCompletionWitnessMessage,
     ShutdownRequestMessage,
     StageSubmissionMessage,
 )
@@ -1947,6 +1949,251 @@ async def test_resumable_segment_boundary_builds_stage_metrics() -> None:
     assert routed == [built_metrics]
 
 
+@pytest.mark.asyncio
+async def test_native_duplex_d_completion_witness_is_per_sequence_and_exactly_once() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.output_async_queue = asyncio.Queue()
+    req_state = OrchestratorRequestState(
+        request_id="duplex-session-stage0",
+        sampling_params_list=[_sampling_params(), _sampling_params()],
+        final_stage_id=1,
+    )
+    req_state.streaming.enabled = True
+
+    req_state.stage_submit_ts[1] = 100.0
+    await orchestrator._emit_native_duplex_d_completion_witness(
+        stage_id=1,
+        replica_id=0,
+        engine_request_id="duplex-session-stage0-00000001",
+        req_state=req_state,
+        active_slot={
+            "seq": 1,
+            "input_unit_index": 41,
+            "source": "real_input",
+            "prompt_tokens": 1000,
+            "local_cached_tokens": 128,
+            "external_cached_tokens": 772,
+            "computed_tokens": 100,
+            "kv_transfer_selected_blocks": 49,
+            "kv_transfer_selected_tokens": 772,
+            "kv_transfer_selected_bytes": 200704,
+            "kv_transfer_write_submit_to_d_ready_ms": -1.0,
+            "input_video_frames": 1,
+            "arrival_video_frames": 1,
+            "vision_fallback_frames": 0,
+            "arrival_audio_units": 1,
+            "audio_fallback_units": 0,
+        },
+        completed_epoch_s=100.125,
+    )
+    req_state.stage_submit_ts[1] = 101.0
+    second_slot = {
+        "seq": 2,
+        "input_unit_index": 42,
+        "source": "auto_continuation",
+        "prompt_tokens": 1012,
+        "local_cached_tokens": 128,
+        "external_cached_tokens": 872,
+        "computed_tokens": 12,
+        "input_video_frames": 0,
+        "arrival_video_frames": 0,
+        "vision_fallback_frames": 0,
+        "arrival_audio_units": 0,
+        "audio_fallback_units": 0,
+    }
+    await orchestrator._emit_native_duplex_d_completion_witness(
+        stage_id=1,
+        replica_id=0,
+        engine_request_id="duplex-session-stage0-00000002",
+        req_state=req_state,
+        active_slot=second_slot,
+        completed_epoch_s=101.250,
+    )
+    # A duplicated raw terminal notification for the same physical D request
+    # must not create a second observer event.
+    await orchestrator._emit_native_duplex_d_completion_witness(
+        stage_id=1,
+        replica_id=0,
+        engine_request_id="duplex-session-stage0-00000002",
+        req_state=req_state,
+        active_slot=second_slot,
+        completed_epoch_s=101.251,
+    )
+    # A delayed duplicate from an older sequence is also rejected while the
+    # observer keeps only one scalar high-water mark per session.
+    await orchestrator._emit_native_duplex_d_completion_witness(
+        stage_id=1,
+        replica_id=0,
+        engine_request_id="duplex-session-stage0-00000001",
+        req_state=req_state,
+        active_slot={"seq": 1},
+        completed_epoch_s=101.252,
+    )
+
+    messages = [
+        orchestrator.output_async_queue.get_nowait(),
+        orchestrator.output_async_queue.get_nowait(),
+    ]
+    assert all(isinstance(message, PhysicalDCompletionWitnessMessage) for message in messages)
+    assert [message.physical_sequence for message in messages] == [1, 2]
+    assert [message.input_unit_index for message in messages] == [41, 42]
+    assert [message.source for message in messages] == ["real_input", "auto_continuation"]
+    assert messages[0].input_video_frames == 1
+    assert messages[0].arrival_video_frames == 1
+    assert messages[0].arrival_audio_units == 1
+    assert messages[0].audio_fallback_units == 0
+    assert messages[0].cached_tokens == 900
+    assert (
+        messages[0].computed_tokens + messages[0].local_cached_tokens + messages[0].external_cached_tokens
+        == messages[0].prompt_tokens
+    )
+    assert messages[0].service_ms == pytest.approx(125.0)
+    assert messages[0].kv_transfer_selected_blocks == 49
+    assert messages[0].kv_transfer_selected_tokens == 772
+    assert messages[0].kv_transfer_selected_tokens == messages[0].external_cached_tokens
+    assert messages[0].kv_transfer_selected_bytes == 200704
+    # The connector does not currently carry P's writer-thread timestamp to
+    # D, so this interval must remain unknown instead of using a proxy clock.
+    assert messages[0].kv_transfer_write_submit_to_d_ready_ms == -1.0
+    with pytest.raises(AttributeError):
+        messages[0].source = "auto_continuation"
+    assert orchestrator.output_async_queue.empty()
+
+
+def test_native_duplex_pd_decode_captures_current_unit_frame_audit() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._pd_kv_params = {}
+    source_payload = {
+        "audio": "raw-audio-must-stay-on-p",
+        "video_frames": ["raw-video-must-stay-on-p"],
+    }
+    req_state = OrchestratorRequestState(
+        request_id="duplex-session-stage0",
+        prompt={
+            "model_intermediate_buffer": {
+                "request_id": "duplex-session-stage0",
+                "duplex": {
+                    "payload": source_payload,
+                    "session_id": "session-a",
+                    "data_plane": True,
+                    "special_token_ids": {"eos_token_id": 42},
+                },
+            }
+        },
+        sampling_params_list=[_sampling_params(), _sampling_params()],
+        final_stage_id=1,
+    )
+    req_state.streaming.enabled = True
+    req_state.streaming.segment_token_ids = [99]
+    active_slot = {
+        "seq": 7,
+        "input_video_frames": 0,
+        "arrival_video_frames": 0,
+        "vision_fallback_frames": 0,
+        "arrival_audio_units": 0,
+        "audio_fallback_units": 0,
+    }
+    req_state.streaming.bridge_states["pd_duplex_active_slot"] = active_slot
+    output = SimpleNamespace(
+        kv_transfer_params={"remote_prompt_token_ids": [1, 2, 3]},
+        multimodal_output={
+            "duplex_input_video_frames": 1,
+            "duplex_arrival_video_frames": 1,
+            "duplex_vision_fallback_frames": 0,
+            "duplex_arrival_audio_units": 1,
+            "duplex_audio_fallback_units": 0,
+        },
+    )
+
+    orchestrator._prepare_native_duplex_pd_decode(output, req_state)
+
+    assert active_slot == {
+        "seq": 7,
+        "prompt_tokens": 4,
+        "input_video_frames": 1,
+        "arrival_video_frames": 1,
+        "vision_fallback_frames": 0,
+        "arrival_audio_units": 1,
+        "audio_fallback_units": 0,
+    }
+    assert req_state.streaming.bridge_states["pd_decode_engine_request_id"].endswith("-00000007")
+    assert req_state.streaming.bridge_states["pd_decode_prompt_len"] == 4
+    assert req_state.streaming.bridge_states["pd_decode_last_prompt_token_id"] == 99
+    decode_prompt = req_state.streaming.bridge_states["pd_decode_prompt"]
+    decode_model_buffer = decode_prompt["model_intermediate_buffer"]
+    assert decode_model_buffer == {
+        "request_id": "duplex-session-stage0",
+        "duplex": {
+            "session_id": "session-a",
+            "data_plane": True,
+            "special_token_ids": {"eos_token_id": 42},
+        },
+    }
+    # Building D's compact metadata must not mutate the live P request.
+    assert req_state.prompt["model_intermediate_buffer"]["duplex"]["payload"] is source_payload
+
+
+@pytest.mark.asyncio
+async def test_native_duplex_d_completion_cache_counts_fail_closed_when_absent() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.output_async_queue = asyncio.Queue()
+    req_state = OrchestratorRequestState(
+        request_id="duplex-session-stage0",
+        sampling_params_list=[_sampling_params(), _sampling_params()],
+        final_stage_id=1,
+    )
+    req_state.streaming.enabled = True
+    req_state.stage_submit_ts[1] = 100.0
+
+    await orchestrator._emit_native_duplex_d_completion_witness(
+        stage_id=1,
+        replica_id=0,
+        engine_request_id="duplex-session-stage0-00000001",
+        req_state=req_state,
+        active_slot={"seq": 1, "prompt_tokens": 1000},
+        completed_epoch_s=100.1,
+    )
+
+    message = orchestrator.output_async_queue.get_nowait()
+    assert message.prompt_tokens == 1000
+    assert message.cached_tokens == -1
+    assert message.local_cached_tokens == -1
+    assert message.external_cached_tokens == -1
+    assert message.computed_tokens == -1
+    assert message.kv_transfer_selected_blocks == -1
+    assert message.kv_transfer_selected_tokens == -1
+    assert message.kv_transfer_selected_bytes == -1
+    assert message.kv_transfer_write_submit_to_d_ready_ms == -1.0
+
+
+def test_native_duplex_d_transfer_evidence_accepts_only_proven_scalars() -> None:
+    active_slot = {
+        "kv_transfer_selected_blocks": -1,
+        "kv_transfer_selected_tokens": -1,
+        "kv_transfer_selected_bytes": -1,
+        "kv_transfer_write_submit_to_d_ready_ms": -1.0,
+    }
+
+    Orchestrator._update_native_pd_transfer_evidence(
+        active_slot,
+        {
+            "kv_transfer_selected_blocks": 14,
+            "kv_transfer_selected_tokens": 211,
+            "kv_transfer_selected_bytes": 14 * 4096,
+            # Unknown timings remain negative and must not overwrite the
+            # fail-closed default in the active slot.
+            "kv_transfer_write_submit_to_d_ready_ms": -1.0,
+        },
+    )
+
+    assert active_slot == {
+        "kv_transfer_selected_blocks": 14,
+        "kv_transfer_selected_tokens": 211,
+        "kv_transfer_selected_bytes": 14 * 4096,
+        "kv_transfer_write_submit_to_d_ready_ms": -1.0,
+    }
+
+
 def test_stage_pool_metrics_use_resumable_segment_token_count() -> None:
     class SegmentMetricsOutputProcessor(FakeOutputProcessor):
         def pop_native_text_metrics(self, request_id: str) -> dict[str, Any]:
@@ -1962,7 +2209,18 @@ def test_stage_pool_metrics_use_resumable_segment_token_count() -> None:
     )
     output = SimpleNamespace(
         request_id="req-stream",
+        engine_request_id="req-stream-00000007",
+        engine_prompt_tokens=125,
+        engine_num_cached_tokens=123,
+        engine_input_audit={
+            "duplex_input_video_frames": 1,
+            "duplex_arrival_video_frames": 1,
+            "duplex_vision_fallback_frames": 0,
+            "duplex_arrival_audio_units": 1,
+            "duplex_audio_fallback_units": 0,
+        },
         outputs=[SimpleNamespace(cumulative_token_ids=list(range(11)))],
+        num_cached_tokens=123,
     )
 
     metrics = pool.build_stage_metrics(
@@ -1974,6 +2232,15 @@ def test_stage_pool_metrics_use_resumable_segment_token_count() -> None:
 
     assert metrics.num_tokens_out == 3
     assert metrics.output_unit_count == 3
+    assert metrics.engine_request_id == "req-stream-00000007"
+    assert metrics.engine_prompt_tokens == 125
+    assert metrics.num_cached_tokens == 123
+    assert metrics.input_video_frames == 1
+    assert metrics.arrival_video_frames == 1
+    assert metrics.vision_fallback_frames == 0
+    assert metrics.arrival_audio_units == 1
+    assert metrics.audio_fallback_units == 0
+    assert metrics.completed_epoch_s >= metrics.submit_epoch_s > 0
 
 
 @pytest.mark.asyncio
@@ -2017,6 +2284,37 @@ async def test_stage_pool_submit_initial_rolls_back_output_processor_when_client
 
 
 @pytest.mark.asyncio
+async def test_stage_pool_submit_initial_attributes_engine_death_to_replica() -> None:
+    class DeadStageClient(FakeStageClient):
+        async def add_request_async(self, *args, **kwargs) -> None:
+            raise EngineDeadError("submit failed")
+
+    client = DeadStageClient(stage_type="llm", final_output=False)
+    pool = StagePool(
+        1,
+        [client],
+        output_processor=FakeOutputProcessor(),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    req_state = OrchestratorRequestState(
+        request_id="req-0",
+        sampling_params_list=[_sampling_params(), _sampling_params()],
+        final_stage_id=1,
+    )
+
+    with pytest.raises(EngineDeadError) as exc_info:
+        await pool.submit_initial(
+            "req-0",
+            req_state,
+            SimpleNamespace(request_id="req-0", prompt_token_ids=[1, 2]),
+        )
+
+    assert exc_info.value.vllm_omni_stage_id == 1
+    assert exc_info.value.vllm_omni_replica_id == 0
+    assert pool.get_bound_replica_id("req-0") is None
+
+
+@pytest.mark.asyncio
 async def test_stage_pool_abort_requests_logs_when_binding_is_missing(caplog) -> None:
     stage0 = FakeStageClient(stage_type="llm", final_output=False)
     pool = StagePool(
@@ -2038,6 +2336,284 @@ async def test_stage_pool_abort_requests_logs_when_binding_is_missing(caplog) ->
 
     assert not stage0.abort_calls
     assert "abort: no live binding for req=missing-req in stage-0" in caplog.text
+
+
+def _native_pd_route_state(
+    request_id: str,
+    physical_id: str,
+) -> OrchestratorRequestState:
+    state = OrchestratorRequestState(
+        request_id=request_id,
+        sampling_params_list=[_sampling_params(), _sampling_params()],
+        final_stage_id=1,
+        duplex_identity=SimpleNamespace(),
+    )
+    state.streaming.enabled = True
+    state.streaming.bridge_states.update(
+        {
+            "pd_decode_engine_request_id": physical_id,
+            "pd_duplex_decode_ready": asyncio.Event(),
+        }
+    )
+    return state
+
+
+@pytest.mark.asyncio
+async def test_native_pd_raw_routes_are_exactly_once_and_cross_session_concurrent() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    first = _native_pd_route_state("session-a", "session-a-00000001")
+    second = _native_pd_route_state("session-b", "session-b-00000001")
+    orchestrator.request_states = {
+        first.request_id: first,
+        second.request_id: second,
+    }
+    orchestrator._pd_raw_route_tasks = {}
+    release = asyncio.Event()
+    both_started = asyncio.Event()
+    started: list[str] = []
+
+    async def blocked_route(
+        _stage_id,
+        _replica_id,
+        _output,
+        _req_state,
+        *,
+        physical_id,
+    ) -> None:
+        started.append(physical_id)
+        if len(started) == 2:
+            both_started.set()
+        await release.wait()
+
+    orchestrator._route_native_duplex_pd_prefill_raw = blocked_route
+    orchestrator._schedule_native_duplex_pd_prefill_raw(0, 0, object(), first)
+    # A duplicated raw notification must not create a second task.
+    orchestrator._schedule_native_duplex_pd_prefill_raw(0, 0, object(), first)
+    orchestrator._schedule_native_duplex_pd_prefill_raw(0, 0, object(), second)
+
+    await asyncio.wait_for(both_started.wait(), timeout=1.0)
+    assert sorted(started) == ["session-a-00000001", "session-b-00000001"]
+    assert len(orchestrator._pd_raw_route_tasks) == 2
+
+    tasks = list(orchestrator._pd_raw_route_tasks.values())
+    release.set()
+    await asyncio.gather(*tasks)
+    await asyncio.sleep(0)
+    assert orchestrator._pd_raw_route_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_native_pd_raw_route_error_is_visible_and_unblocks_session() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    state = _native_pd_route_state("session-a", "session-a-00000001")
+    orchestrator.request_states = {state.request_id: state}
+    orchestrator._pd_raw_route_tasks = {}
+    orchestrator._pd_pair = (0, 1)
+    orchestrator.output_async_queue = asyncio.Queue()
+    cleanup = AsyncMock()
+    orchestrator._cleanup_request_ids = cleanup
+
+    async def failing_route(*_args, **_kwargs) -> None:
+        raise RuntimeError("D admission failed")
+
+    orchestrator._route_native_duplex_pd_prefill_raw = failing_route
+    orchestrator._schedule_native_duplex_pd_prefill_raw(0, 0, object(), state)
+    task = orchestrator._pd_raw_route_tasks[state.request_id]
+    await task
+    await asyncio.sleep(0)
+
+    message = orchestrator.output_async_queue.get_nowait()
+    assert isinstance(message, ErrorMessage)
+    assert message.request_id == state.request_id
+    assert message.stage_id == 1
+    assert message.error_type == "PDRawRouteError"
+    assert message.error == "D admission failed"
+    assert state.streaming.bridge_states["pd_duplex_decode_ready"].is_set()
+    assert "D admission failed" in state.streaming.bridge_states["pd_duplex_prefill_raw_error"]
+    cleanup.assert_awaited_once_with(
+        [state.request_id],
+        abort=True,
+        close_duplex_sessions=True,
+    )
+    assert orchestrator._pd_raw_route_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_native_pd_raw_route_engine_death_is_fatal_without_d_replica() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    state = _native_pd_route_state("session-a", "session-a-00000001")
+    orchestrator.request_states = {state.request_id: state}
+    orchestrator._pd_pair = (0, 1)
+    orchestrator.output_async_queue = asyncio.Queue()
+    orchestrator._shutdown_event = asyncio.Event()
+    orchestrator._fatal_error = None
+    orchestrator._fatal_error_stage_id = None
+    d_pool = StagePool(1, [FakeStageClient()], output_processor=FakeOutputProcessor())
+    orchestrator.stage_pools = [None, d_pool]
+    cleanup = AsyncMock()
+    orchestrator._cleanup_request_ids = cleanup
+
+    async def dead_route(*_args, **_kwargs) -> None:
+        error = EngineDeadError("D admission failed")
+        error.vllm_omni_stage_id = 1
+        error.vllm_omni_replica_id = 0
+        raise error
+
+    orchestrator._route_native_duplex_pd_prefill_raw = dead_route
+    await orchestrator._run_native_duplex_pd_prefill_raw(
+        0,
+        0,
+        object(),
+        state,
+        physical_id="session-a-00000001",
+    )
+
+    message = orchestrator.output_async_queue.get_nowait()
+    assert isinstance(message, ErrorMessage)
+    assert message.request_id == state.request_id
+    assert message.stage_id == 1
+    assert message.error_type == "EngineDeadError"
+    assert message.fatal is True
+    assert orchestrator._fatal_error_stage_id == 1
+    assert "D admission failed" in orchestrator._fatal_error
+    assert orchestrator._shutdown_event.is_set()
+    assert d_pool.available_replica_ids() == []
+    cleanup.assert_awaited_once_with(
+        [state.request_id],
+        close_duplex_sessions=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_pd_raw_route_engine_death_is_recoverable_with_live_d_replica() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    state = _native_pd_route_state("session-a", "session-a-00000001")
+    orchestrator.request_states = {state.request_id: state}
+    orchestrator._pd_pair = (0, 1)
+    orchestrator.output_async_queue = asyncio.Queue()
+    orchestrator._shutdown_event = asyncio.Event()
+    orchestrator._fatal_error = None
+    orchestrator._fatal_error_stage_id = None
+    d_pool = StagePool(
+        1,
+        [FakeStageClient(), FakeStageClient()],
+        output_processor=FakeOutputProcessor(),
+    )
+    orchestrator.stage_pools = [None, d_pool]
+    cleanup = AsyncMock()
+    orchestrator._cleanup_request_ids = cleanup
+
+    async def dead_route(*_args, **_kwargs) -> None:
+        error = EngineDeadError("one D replica failed")
+        error.vllm_omni_stage_id = 1
+        error.vllm_omni_replica_id = 0
+        raise error
+
+    orchestrator._route_native_duplex_pd_prefill_raw = dead_route
+    await orchestrator._run_native_duplex_pd_prefill_raw(
+        0,
+        0,
+        object(),
+        state,
+        physical_id="session-a-00000001",
+    )
+
+    message = orchestrator.output_async_queue.get_nowait()
+    assert message.fatal is False
+    assert message.stage_id == 1
+    assert orchestrator._fatal_error is None
+    assert not orchestrator._shutdown_event.is_set()
+    assert d_pool.available_replica_ids() == [1]
+    cleanup.assert_awaited_once_with(
+        [state.request_id],
+        close_duplex_sessions=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_pd_raw_route_cancel_is_joined_and_unblocks_session() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    state = _native_pd_route_state("session-a", "session-a-00000001")
+    orchestrator.request_states = {state.request_id: state}
+    orchestrator._pd_raw_route_tasks = {}
+    started = asyncio.Event()
+
+    async def blocked_route(*_args, **_kwargs) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    orchestrator._route_native_duplex_pd_prefill_raw = blocked_route
+    orchestrator._schedule_native_duplex_pd_prefill_raw(0, 0, object(), state)
+    task = orchestrator._pd_raw_route_tasks[state.request_id]
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+
+    await orchestrator._cancel_pd_raw_route_tasks(
+        [state.request_id],
+        reason="session aborted",
+    )
+
+    assert task.cancelled()
+    assert orchestrator._pd_raw_route_tasks == {}
+    assert state.streaming.bridge_states["pd_duplex_decode_ready"].is_set()
+    assert state.streaming.bridge_states["pd_duplex_prefill_raw_error"] == "session aborted"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_shutdown_cancels_owned_native_pd_raw_routes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[],
+    )
+    state = _native_pd_route_state("session-a", "session-a-00000001")
+    orchestrator.request_states[state.request_id] = state
+    route_task = asyncio.create_task(asyncio.Event().wait())
+    orchestrator._pd_raw_route_tasks[state.request_id] = route_task
+
+    async def no_work() -> None:
+        return None
+
+    monkeypatch.setattr(orchestrator, "_request_handler", no_work)
+    monkeypatch.setattr(orchestrator, "_orchestration_output_handler", no_work)
+
+    await orchestrator.run()
+
+    assert route_task.cancelled()
+    assert orchestrator._pd_raw_route_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_pd_abort_sends_physical_d_request_id_through_logical_binding() -> None:
+    p_client = FakeStageClient(stage_type="llm", final_output=False)
+    d_client = FakeStageClient(stage_type="llm", final_output=False)
+    p_processor = FakeOutputProcessor()
+    d_processor = FakeOutputProcessor()
+    pools = _build_stage_pools(
+        [[p_client], [d_client]],
+        output_processors=[p_processor, d_processor],
+    )
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=pools,
+        pd_config={"pd_pair": (0, 1)},
+    )
+    logical_id = "session-a"
+    physical_id = "session-a-00000007"
+    state = _native_pd_route_state(logical_id, physical_id)
+    orchestrator.request_states[logical_id] = state
+    orchestrator._pd_decode_request_aliases[physical_id] = logical_id
+    pools[1].select_replica_id(logical_id)
+
+    await orchestrator._abort_request_ids([logical_id])
+
+    assert d_client.abort_calls[0] == [physical_id]
+    assert physical_id in d_processor.abort_calls[0]
+    assert pools[1].get_bound_replica_id(logical_id) is None
 
 
 @pytest.mark.asyncio

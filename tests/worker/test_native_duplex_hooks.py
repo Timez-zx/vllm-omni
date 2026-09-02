@@ -10,6 +10,395 @@ import torch
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.mark.parametrize(
+    ("feedback", "delta_len"),
+    [
+        ([101, 151705], 491),
+        ([101, 102, 151705], 492),
+    ],
+)
+def test_minicpmo_duplex_delta_slice_accepts_exact_feedback_expanded_budget(feedback, delta_len):
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+        duplex_feedback_scheduler_rows,
+    )
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    base_budget = 490
+    scheduler_budget = base_budget + duplex_feedback_scheduler_rows(feedback)
+    embeds = torch.arange(delta_len * 2, dtype=torch.float32).reshape(delta_len, 2)
+    token_ids = list(range(delta_len))
+
+    sliced, sliced_ids, delta_start = MiniCPMO45OmniForConditionalGeneration._slice_duplex_prompt_delta(
+        embeds,
+        token_ids,
+        prompt_len=10_000 + delta_len,
+        token_offset=10_001,
+        span_len=delta_len - 1,
+        rebase_prompt=False,
+        scheduler_token_budget=scheduler_budget,
+    )
+
+    assert delta_start == 10_000
+    assert torch.equal(sliced, embeds[1:])
+    assert sliced_ids == token_ids[1:]
+
+
+def test_minicpmo_duplex_delta_slice_rejects_budget_mismatch_and_prefix_replay():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    embeds = torch.zeros((3, 2), dtype=torch.float32)
+    token_ids = [11, 12, 13]
+
+    with pytest.raises(RuntimeError, match="refusing to pad or truncate"):
+        MiniCPMO45OmniForConditionalGeneration._slice_duplex_prompt_delta(
+            embeds,
+            token_ids,
+            prompt_len=103,
+            token_offset=100,
+            span_len=3,
+            rebase_prompt=False,
+            scheduler_token_budget=2,
+        )
+
+    with pytest.raises(RuntimeError, match="prefix KV is unavailable"):
+        MiniCPMO45OmniForConditionalGeneration._slice_duplex_prompt_delta(
+            embeds,
+            token_ids,
+            prompt_len=103,
+            token_offset=99,
+            span_len=3,
+            rebase_prompt=False,
+            scheduler_token_budget=3,
+        )
+
+
+def test_minicpmo_duplex_delta_slice_rebase_owns_complete_prompt():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    embeds = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    token_ids = [11, 12, 13, 14]
+    sliced, sliced_ids, delta_start = MiniCPMO45OmniForConditionalGeneration._slice_duplex_prompt_delta(
+        embeds,
+        token_ids,
+        prompt_len=4,
+        token_offset=2,
+        span_len=2,
+        rebase_prompt=True,
+        scheduler_token_budget=999,
+    )
+
+    assert delta_start == 0
+    assert torch.equal(sliced, embeds[2:])
+    assert sliced_ids == token_ids[2:]
+
+    with pytest.raises(RuntimeError, match="complete prompt"):
+        MiniCPMO45OmniForConditionalGeneration._slice_duplex_prompt_delta(
+            embeds,
+            token_ids,
+            prompt_len=5,
+            token_offset=0,
+            span_len=4,
+            rebase_prompt=True,
+            scheduler_token_budget=4,
+        )
+
+
+def test_minicpmo_pd_prefill_preprocess_materializes_only_the_append_delta():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    class _Helper:
+        @staticmethod
+        def get_or_create_session_state(*_args, **_kwargs):
+            return object()
+
+        @staticmethod
+        def _decode_audio_payload(_payload):
+            return np.zeros(4, dtype=np.float32)
+
+        @staticmethod
+        def _decode_video_frames_payload(_payload):
+            return []
+
+        @staticmethod
+        def _stage_prefill_embeddings_only(*_args, **_kwargs):
+            return {
+                "success": True,
+                "inputs_embeds": torch.tensor(
+                    [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
+                ),
+                "input_token_ids": [11, 12, 13],
+                "rebase_prompt": False,
+                "delta_num_tokens": 3,
+            }
+
+        @staticmethod
+        def stage_padding_token_id():
+            pytest.fail("P must not materialize a full-prefix padding list")
+
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.model_stage = "llm"
+    model._minicpmo_pd_decode = False
+    model._minicpmo_pd_prefill = True
+    model._duplex_data_plane_helper = lambda: _Helper()
+    embedding_lookup_sizes = []
+
+    def get_input_embeddings(ids):
+        embedding_lookup_sizes.append(int(ids.numel()))
+        return torch.zeros((ids.numel(), 2), dtype=torch.float32)
+
+    model.get_input_embeddings = get_input_embeddings
+
+    req_ids, req_embeds, update = model.preprocess(
+        input_ids=torch.zeros(3, dtype=torch.long),
+        duplex_prompt_len=103,
+        duplex_token_offset=100,
+        duplex={
+            "data_plane": True,
+            "session_id": "sid-delta-only",
+            "incarnation": 0,
+            "epoch": 0,
+            "seq": 2,
+            "payload": {},
+            "scheduler_token_budget": 3,
+        },
+    )
+
+    assert req_ids.tolist() == [11, 12, 13]
+    assert req_embeds.tolist() == [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
+    assert update["duplex"]["duplex_prompt_delta_start"] == 100
+    assert update["duplex"]["duplex_prompt_delta_token_ids"] == [11, 12, 13]
+    assert "duplex_prompt_token_ids" not in update["duplex"]
+    assert embedding_lookup_sizes == [1]
+
+
+def test_minicpmo_failed_prefill_does_not_claim_video_frame_consumption():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    class _Helper:
+        @staticmethod
+        def get_or_create_session_state(*_args, **_kwargs):
+            return object()
+
+        @staticmethod
+        def _decode_audio_payload(_payload):
+            return np.zeros(4, dtype=np.float32)
+
+        @staticmethod
+        def _decode_video_frames_payload(_payload):
+            return [object()]
+
+        @staticmethod
+        def _stage_prefill_embeddings_only(*_args, **_kwargs):
+            return {"success": False, "reason": "stale transactional plan"}
+
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(
+        MiniCPMO45OmniForConditionalGeneration
+    )
+    torch.nn.Module.__init__(model)
+    model.model_stage = "llm"
+    model._minicpmo_pd_decode = False
+    model._minicpmo_pd_prefill = True
+    model._duplex_data_plane_helper = lambda: _Helper()
+    model.get_input_embeddings = lambda ids: torch.zeros(
+        (ids.numel(), 2),
+        dtype=torch.float32,
+    )
+
+    _, _, update = model.preprocess(
+        input_ids=torch.zeros(3, dtype=torch.long),
+        duplex_prompt_len=3,
+        duplex_token_offset=0,
+        duplex={
+            "data_plane": True,
+            "session_id": "sid-failed-frame",
+            "incarnation": 0,
+            "epoch": 0,
+            "seq": 1,
+            "payload": {},
+            "scheduler_token_budget": 3,
+        },
+    )
+
+    assert update["duplex"]["success"] is False
+    assert "duplex_input_video_frames" not in update["duplex"]
+    assert "duplex_arrival_video_frames" not in update["duplex"]
+    assert "duplex_vision_fallback_frames" not in update["duplex"]
+
+
+def test_minicpmo_chunk_replay_reuses_prepared_input_and_original_frame_audit():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    state = SimpleNamespace(
+        prepared_append_identity=(0, 1),
+        prepared_inputs_embeds=object(),
+    )
+
+    class _Helper:
+        @staticmethod
+        def get_or_create_session_state(*_args, **_kwargs):
+            return state
+
+        @staticmethod
+        def _decode_audio_payload(_payload):
+            pytest.fail("a cached physical append must not decode audio again")
+
+        @staticmethod
+        def _decode_video_frames_payload(_payload):
+            pytest.fail("a cached physical append must not decode video again")
+
+        @staticmethod
+        def _stage_prefill_embeddings_only(
+            _state,
+            audio_waveform,
+            *,
+            video_frames,
+            **_kwargs,
+        ):
+            assert audio_waveform is None
+            assert video_frames is None
+            return {
+                "success": True,
+                "inputs_embeds": torch.tensor(
+                    [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
+                ),
+                "input_token_ids": [11, 12, 13],
+                "rebase_prompt": False,
+                "delta_num_tokens": 3,
+                "duplex_input_video_frames": 1,
+                "duplex_arrival_video_frames": 1,
+                "duplex_vision_fallback_frames": 0,
+            }
+
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(
+        MiniCPMO45OmniForConditionalGeneration
+    )
+    torch.nn.Module.__init__(model)
+    model.model_stage = "llm"
+    model._minicpmo_pd_decode = False
+    model._minicpmo_pd_prefill = True
+    model._duplex_data_plane_helper = lambda: _Helper()
+    model.get_input_embeddings = lambda ids: torch.zeros(
+        (ids.numel(), 2),
+        dtype=torch.float32,
+    )
+
+    _, _, update = model.preprocess(
+        input_ids=torch.zeros(3, dtype=torch.long),
+        duplex_prompt_len=103,
+        duplex_token_offset=100,
+        duplex={
+            "data_plane": True,
+            "session_id": "sid-replayed-frame",
+            "incarnation": 0,
+            "epoch": 0,
+            "seq": 1,
+            "payload": {"video_frames": ["encoded-payload"]},
+            "scheduler_token_budget": 3,
+        },
+    )
+
+    assert update["duplex"]["duplex_input_video_frames"] == 1
+    assert update["duplex"]["duplex_arrival_video_frames"] == 1
+    assert update["duplex"]["duplex_vision_fallback_frames"] == 0
+
+
+def test_minicpmo_pd_prefill_preprocess_accepts_only_exact_compact_engine_rebase():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    calls = []
+
+    class _Helper:
+        @staticmethod
+        def get_or_create_session_state(*_args, **_kwargs):
+            return object()
+
+        @staticmethod
+        def _decode_audio_payload(_payload):
+            return np.zeros(4, dtype=np.float32)
+
+        @staticmethod
+        def _decode_video_frames_payload(_payload):
+            return []
+
+        @staticmethod
+        def _stage_prefill_embeddings_only(*_args, **kwargs):
+            calls.append(kwargs)
+            return {
+                "success": True,
+                "inputs_embeds": torch.arange(
+                    10,
+                    dtype=torch.float32,
+                ).reshape(5, 2),
+                "input_token_ids": [21, 22, 23, 24, 25],
+                "rebase_prompt": True,
+                "engine_rebase_prompt": True,
+                "delta_num_tokens": 5,
+            }
+
+        @staticmethod
+        def stage_padding_token_id():
+            pytest.fail("P must not materialize a padding prompt")
+
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(
+        MiniCPMO45OmniForConditionalGeneration
+    )
+    torch.nn.Module.__init__(model)
+    model.model_stage = "llm"
+    model._minicpmo_pd_decode = False
+    model._minicpmo_pd_prefill = True
+    model._duplex_data_plane_helper = lambda: _Helper()
+    model.get_input_embeddings = lambda ids: torch.zeros(
+        (ids.numel(), 2),
+        dtype=torch.float32,
+    )
+    duplex = {
+        "data_plane": True,
+        "session_id": "sid-engine-rebase",
+        "incarnation": 0,
+        "epoch": 1,
+        "seq": 2,
+        "payload": {},
+        "scheduler_token_budget": 3,
+        "compact_rebase_prefix_tokens": 2,
+    }
+
+    req_ids, req_embeds, update = model.preprocess(
+        input_ids=torch.zeros(5, dtype=torch.long),
+        duplex_prompt_len=5,
+        duplex_token_offset=0,
+        duplex=duplex,
+    )
+
+    assert calls[0]["engine_rebase"] is True
+    assert req_ids.tolist() == [21, 22, 23, 24, 25]
+    assert req_embeds.shape == (5, 2)
+    assert update["duplex"]["duplex_prompt_delta_start"] == 0
+
+    with pytest.raises(RuntimeError, match="did not install the exact"):
+        model.preprocess(
+            input_ids=torch.zeros(6, dtype=torch.long),
+            duplex_prompt_len=6,
+            duplex_token_offset=0,
+            duplex=duplex,
+        )
+    assert len(calls) == 1
+
+
 def test_gpu_ar_worker_routes_minicpmo_vision_preencode_to_loaded_model():
     from vllm_omni.worker.gpu_ar_worker import GPUARWorker
 
@@ -24,6 +413,32 @@ def test_gpu_ar_worker_routes_minicpmo_vision_preencode_to_loaded_model():
     result = worker.preencode_minicpmo45_vision(jobs)
 
     assert result == {"supported": True, "encoded_frames": 1}
+    assert calls == [jobs]
+
+
+def test_gpu_ar_worker_routes_minicpmo_audio_preencode_to_loaded_model():
+    from vllm_omni.worker.gpu_ar_worker import GPUARWorker
+
+    calls = []
+    model = SimpleNamespace(
+        preencode_duplex_audio=lambda jobs: calls.append(jobs)
+        or {
+            "supported": True,
+            "encoded_jobs": len(jobs),
+            "job_results": {"audio-1": True},
+        }
+    )
+    worker = GPUARWorker.__new__(GPUARWorker)
+    worker.model_runner = SimpleNamespace(model=model)
+    jobs = [{"session_id": "sid-audio", "audio": [0.0, 0.5]}]
+
+    result = worker.preencode_minicpmo45_audio(jobs)
+
+    assert result == {
+        "supported": True,
+        "encoded_jobs": 1,
+        "job_results": {"audio-1": True},
+    }
     assert calls == [jobs]
 
 
@@ -586,6 +1001,11 @@ def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
                 "duplex": {
                     "duplex_prompt_token_ids": [101, 102],
                     "special_token_ids": {"listen_token_id": 701},
+                    "duplex_input_video_frames": 1,
+                    "duplex_arrival_video_frames": 1,
+                    "duplex_vision_fallback_frames": 0,
+                    "duplex_arrival_audio_units": 1,
+                    "duplex_audio_fallback_units": 0,
                 },
             },
             {
@@ -593,6 +1013,11 @@ def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
                 "duplex": {
                     "duplex_prompt_token_ids": [201, 202, 203],
                     "special_token_ids": {"listen_token_id": 702},
+                    "duplex_input_video_frames": 1,
+                    "duplex_arrival_video_frames": 0,
+                    "duplex_vision_fallback_frames": 1,
+                    "duplex_arrival_audio_units": 0,
+                    "duplex_audio_fallback_units": 0,
                 },
             },
         ],
@@ -600,10 +1025,25 @@ def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
 
     prompt_rows = output.multimodal_outputs["duplex_prompt_token_ids"]
     listen_rows = output.multimodal_outputs["meta"]["listen_token_id"]
+    input_frame_rows = output.multimodal_outputs["duplex_input_video_frames"]
+    arrival_frame_rows = output.multimodal_outputs["duplex_arrival_video_frames"]
+    fallback_frame_rows = output.multimodal_outputs["duplex_vision_fallback_frames"]
+    arrival_audio_rows = output.multimodal_outputs["duplex_arrival_audio_units"]
+    fallback_audio_rows = output.multimodal_outputs["duplex_audio_fallback_units"]
     assert to_payload_element(prompt_rows, 0, 0, 2) == [101, 102]
     assert to_payload_element(prompt_rows, 1, 2, 4) == [201, 202, 203]
     assert int(to_payload_element(listen_rows, 0, 0, 2).reshape(-1)[0]) == 701
     assert int(to_payload_element(listen_rows, 1, 2, 4).reshape(-1)[0]) == 702
+    assert to_payload_element(input_frame_rows, 0, 0, 2) == 1
+    assert to_payload_element(input_frame_rows, 1, 2, 4) == 1
+    assert to_payload_element(arrival_frame_rows, 0, 0, 2) == 1
+    assert to_payload_element(arrival_frame_rows, 1, 2, 4) == 0
+    assert to_payload_element(fallback_frame_rows, 0, 0, 2) == 0
+    assert to_payload_element(fallback_frame_rows, 1, 2, 4) == 1
+    assert to_payload_element(arrival_audio_rows, 0, 0, 2) == 1
+    assert to_payload_element(arrival_audio_rows, 1, 2, 4) == 0
+    assert to_payload_element(fallback_audio_rows, 0, 0, 2) == 0
+    assert to_payload_element(fallback_audio_rows, 1, 2, 4) == 0
 
 
 def test_minicpmo_stage0_rejects_invalid_resolved_ref_audio():
@@ -1001,9 +1441,26 @@ def test_minicpmo_stage0_data_plane_prefill_matches_official_hd_slice_format():
         max_slice_nums=4,
         preencoded_vision=[[torch.ones((64, 2)), torch.full((64, 2), 2.0)]],
         seq=1,
+        vision_input_source="arrival",
     )
     assert preencoded["success"] is True
     assert preencoded["input_token_ids"] == ([1, 12] + [0] * 64 + [13, 14] + [0] * 64 + [15, 11])
+    assert preencoded["duplex_input_video_frames"] == 1
+    assert preencoded["duplex_arrival_video_frames"] == 1
+    assert preencoded["duplex_vision_fallback_frames"] == 0
+
+    # Chunked execution may preprocess the same physical request again. The
+    # prepared append remains authoritative even if the replay no longer has
+    # the one-shot arrival-cache marker.
+    cached_preencoded = runtime._stage_prefill_embeddings_only(
+        preencoded_state,
+        None,
+        video_frames=None,
+        seq=1,
+    )
+    assert cached_preencoded["duplex_input_video_frames"] == 1
+    assert cached_preencoded["duplex_arrival_video_frames"] == 1
+    assert cached_preencoded["duplex_vision_fallback_frames"] == 0
 
 
 def test_minicpmo_native_duplex_preprocess_batch_prepares_vision_across_sessions():
@@ -1091,6 +1548,260 @@ def test_minicpmo_native_duplex_preprocess_batch_prepares_vision_across_sessions
     assert "frame_blocks" not in infos["req-a"][_MINICPMO45_BATCHED_VISION_KEY]
     assert "frame_blocks" not in infos["req-b"][_MINICPMO45_BATCHED_VISION_KEY]
     assert infos["req-a"][_MINICPMO45_BATCHED_VISION_KEY]["processed"] == {"processed": [1]}
+
+
+def test_minicpmo_native_duplex_preprocess_batch_batches_audio_only_and_reuses_pcm():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        _MINICPMO45_BATCHED_VISION_KEY,
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    class _Helper:
+        def __init__(self):
+            self.states = {}
+            self.decode_calls = []
+            self.audio_batch_calls = []
+            self.stage_calls = []
+
+        def get_or_create_session_state(self, session_id, incarnation, **_kwargs):
+            return self.states.setdefault(
+                (session_id, incarnation),
+                SimpleNamespace(prepared_append_identity=None),
+            )
+
+        def _decode_audio_payload(self, payload):
+            marker = int(payload["audio_marker"])
+            self.decode_calls.append(marker)
+            return np.full(4, marker, dtype=np.float32)
+
+        @staticmethod
+        def _prepare_streaming_audio_append(_state, audio_waveform):
+            return ("audio-plan", int(audio_waveform[0]))
+
+        def _stage_audio_embeddings_batch(self, prepared):
+            self.audio_batch_calls.append(list(prepared))
+            return True
+
+        @staticmethod
+        def _decode_video_frames_payload(_payload):
+            return []
+
+        def _stage_prefill_embeddings_only(
+            self,
+            _state,
+            audio_waveform,
+            *,
+            preprocessed_audio=None,
+            **_kwargs,
+        ):
+            self.stage_calls.append((audio_waveform, preprocessed_audio))
+            return {
+                "success": True,
+                "inputs_embeds": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+                "input_token_ids": [1, 11],
+                "rebase_prompt": True,
+            }
+
+    helper = _Helper()
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.model_stage = "llm"
+    model._minicpmo_pd_decode = False
+    model._minicpmo_pd_prefill = True
+    model._duplex_data_plane_helper = lambda: helper
+    model.get_input_embeddings = lambda ids: torch.zeros((ids.numel(), 2))
+    infos = {
+        f"req-{marker}": {
+            "duplex": {
+                "data_plane": True,
+                "session_id": f"session-{marker}",
+                "incarnation": 0,
+                "epoch": 0,
+                "seq": 1,
+                "payload": {"audio_marker": marker},
+                "scheduler_token_budget": 2,
+            }
+        }
+        for marker in (1, 2)
+    }
+
+    model.preprocess_batch(
+        req_ids=["req-1", "req-2"],
+        model_intermediate_buffer=infos,
+        device=torch.device("cpu"),
+    )
+
+    assert sorted(helper.decode_calls) == [1, 2]
+    assert len(helper.audio_batch_calls) == 1
+    assert len(helper.audio_batch_calls[0]) == 2
+    cached = infos["req-1"][_MINICPMO45_BATCHED_VISION_KEY]
+    prepared_waveform = cached["audio_waveform"]
+    assert cached["audio_plan"] == ("audio-plan", 1)
+    model.preprocess(
+        input_ids=torch.tensor([1, 11]),
+        duplex_prompt_len=2,
+        duplex_token_offset=0,
+        **infos["req-1"],
+    )
+
+    # The request-local transactional commit consumes the batch-prepared PCM
+    # and Mel plan without decoding the payload a second time.
+    assert sorted(helper.decode_calls) == [1, 2]
+    assert helper.stage_calls == [(prepared_waveform, ("audio-plan", 1))]
+    assert infos["req-1"][_MINICPMO45_BATCHED_VISION_KEY] == {}
+    model._minicpmo45_audio_prepare_executor.shutdown(wait=True)
+
+
+def test_minicpmo_native_duplex_preprocess_batch_never_speculates_two_appends_for_one_session():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        _MINICPMO45_BATCHED_VISION_KEY,
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    class _Helper:
+        def __init__(self):
+            self.states = {}
+            self.prepared_markers = []
+
+        def get_or_create_session_state(self, session_id, incarnation, **_kwargs):
+            return self.states.setdefault(
+                (session_id, incarnation),
+                SimpleNamespace(prepared_append_identity=None),
+            )
+
+        @staticmethod
+        def _decode_audio_payload(payload):
+            return np.full(4, int(payload["audio_marker"]), dtype=np.float32)
+
+        def _prepare_streaming_audio_append(self, _state, audio_waveform):
+            marker = int(audio_waveform[0])
+            self.prepared_markers.append(marker)
+            return ("audio-plan", marker)
+
+        @staticmethod
+        def _stage_audio_embeddings_batch(_prepared):
+            return True
+
+    helper = _Helper()
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.model_stage = "llm"
+    model._minicpmo_pd_decode = False
+    model._duplex_data_plane_helper = lambda: helper
+
+    def info(session_id, seq, marker):
+        return {
+            "duplex": {
+                "data_plane": True,
+                "session_id": session_id,
+                "incarnation": 0,
+                "epoch": 0,
+                "seq": seq,
+                "payload": {"audio_marker": marker},
+            }
+        }
+
+    infos = {
+        "same-1": info("same", 1, 1),
+        "same-2": info("same", 2, 2),
+        "other": info("other", 1, 3),
+    }
+    model.preprocess_batch(
+        req_ids=["same-1", "same-2", "other"],
+        model_intermediate_buffer=infos,
+        device=torch.device("cpu"),
+    )
+
+    assert sorted(helper.prepared_markers) == [1, 3]
+    assert _MINICPMO45_BATCHED_VISION_KEY in infos["same-1"]
+    assert _MINICPMO45_BATCHED_VISION_KEY not in infos["same-2"]
+    assert _MINICPMO45_BATCHED_VISION_KEY in infos["other"]
+    model._minicpmo45_audio_prepare_executor.shutdown(wait=True)
+
+
+def test_minicpmo_audio_batch_commits_complete_cohorts_and_falls_back_only_singletons():
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+        _MiniCPMO45PreparedAudioAppend,
+        _MiniCPMO45PreparedAudioUnit,
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    class _AudioTarget:
+        def __init__(self):
+            self.batch_sizes = []
+
+        @staticmethod
+        def audio_cache_seq_length(cache):
+            return int(cache)
+
+        @staticmethod
+        def combine_audio_past_key_values(caches):
+            assert len(set(caches)) == 1
+            return ("combined", caches[0])
+
+        def get_audio_embedding_streaming_batch(self, data, *, past_key_values, **_kwargs):
+            batch_size = int(data["audio_features"].shape[0])
+            self.batch_sizes.append(batch_size)
+            outputs = [
+                [torch.full((1, 2), float(row + 1))]
+                for row in range(batch_size)
+            ]
+            return outputs, ("next", past_key_values)
+
+        @staticmethod
+        def split_audio_past_key_values(cache, batch_size):
+            return [(cache, row) for row in range(batch_size)]
+
+        @staticmethod
+        def should_reset_audio_past_key_values(_cache, **_kwargs):
+            return False
+
+    def prepared(session_id, cache_len, marker):
+        unit = _MiniCPMO45PreparedAudioUnit(
+            chunk_idx=1,
+            batch_feature={
+                "audio_features": torch.full((1, 80, 4), float(marker)),
+                "audio_feature_lens": torch.tensor([4]),
+            },
+            consumed_samples=4,
+        )
+        plan = _MiniCPMO45PreparedAudioAppend(
+            start_chunk_idx=1,
+            start_buffer_len=0,
+            units=[unit],
+            remaining_audio_buffer=np.empty(0, dtype=np.float32),
+            mel_snapshot_after=object(),
+        )
+        state = _MiniCPMO45Stage0SessionState(
+            session_id=session_id,
+            audio_chunk_idx=1,
+            audio_past_key_values=cache_len,
+        )
+        return plan, state
+
+    target = _AudioTarget()
+    runtime = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
+    runtime.stage_model = target
+    runtime.thinker = target
+    cohort_a = prepared("cohort-a", 10, 1)
+    cohort_b = prepared("cohort-b", 10, 2)
+    singleton = prepared("singleton", 11, 3)
+
+    encoded = runtime._stage_audio_embeddings_batch(
+        [cohort_a, cohort_b, singleton]
+    )
+
+    assert encoded is True
+    assert target.batch_sizes == [2]
+    for plan, _state in (cohort_a, cohort_b):
+        assert plan.encoded is True
+        assert plan.audio_past_key_values is not None
+        assert plan.units[0].audio_embeds is not None
+    singleton_plan, _singleton_state = singleton
+    assert singleton_plan.encoded is False
+    assert singleton_plan.audio_past_key_values is None
+    assert singleton_plan.units[0].audio_embeds is None
 
 
 def test_minicpmo_arrival_preencode_bypasses_request_local_vision_encoder():
@@ -1272,6 +1983,8 @@ def test_minicpmo_stage0_speech_append_sets_pending_context_once():
     )
 
     assert result["success"] is True
+    assert result["rebase_prompt"] is True
+    assert result["delta_num_tokens"] == len(result["input_token_ids"])
     assert state.pending_speech_context is True
     assert state.pending_speech_append_identity == (0, 1)
 
@@ -1285,6 +1998,8 @@ def test_minicpmo_stage0_speech_append_sets_pending_context_once():
     )
 
     assert cached["success"] is True
+    assert cached["rebase_prompt"] is True
+    assert cached["delta_num_tokens"] == len(cached["input_token_ids"])
     assert state.pending_speech_context is False
     assert state.pending_speech_append_identity == (0, 1)
 
@@ -1297,6 +2012,7 @@ def test_minicpmo_stage0_speech_append_sets_pending_context_once():
     )
 
     assert next_seq["success"] is True
+    assert next_seq["rebase_prompt"] is False
     assert state.pending_speech_context is True
     assert state.pending_speech_append_identity == (0, 2)
 
@@ -1620,9 +2336,115 @@ def test_minicpmo_stage0_context_rollover_keeps_latest_complete_unit():
     assert result["success"] is True
     assert result["input_token_ids"] == [50, 1, 11, 21, 3, 2, 1, 11]
     assert result["context_rollover"] is True
+    assert result["rebase_prompt"] is True
+    assert result["delta_num_tokens"] == len(result["input_token_ids"])
     assert state.context_rollovers == 1
     assert state.current_segment_output_tokens == []
     assert state.last_unit_input_token_ids == [1, 11]
+
+
+def test_minicpmo_stage0_steady_suffix_keeps_lazy_exact_preemption_rebase():
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    class _StageModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(256, 2)
+
+        def get_input_embeddings(self):
+            return self.embed
+
+        def get_audio_hidden_states(self, data):
+            return [torch.tensor([[0.5, 0.5]], dtype=torch.float32)]
+
+    runtime = MiniCPMO45Stage0DuplexRuntime.__new__(
+        MiniCPMO45Stage0DuplexRuntime
+    )
+    runtime.stage_model = _StageModel()
+    runtime.thinker = runtime.stage_model
+    runtime.tokenizer = SimpleNamespace(
+        unk_token_id=0,
+        convert_tokens_to_ids=lambda token: {
+            "<unit>": 1,
+            "</unit>": 2,
+            "<|listen|>": 3,
+            "<|speak|>": 4,
+            "<|tts_bos|>": 5,
+            "<|tts_eos|>": 6,
+            "<|tts_pad|>": 7,
+            "<|chunk_eos|>": 8,
+            "<|chunk_tts_eos|>": 9,
+            "<|turn_eos|>": 10,
+            "<|audio|>": 11,
+        }.get(token, 0),
+        encode=lambda text, add_special_tokens=False: [],
+    )
+    runtime.processor = SimpleNamespace(get_streaming_chunk_size=lambda: 4)
+    runtime.device = "cpu"
+    runtime._init_token_ids()
+    retained_unit = torch.cat(
+        [runtime._embed_token(1), runtime._embed_token(11)],
+        dim=0,
+    )
+    context_embed = runtime._embed_token(50)
+    state = _MiniCPMO45Stage0SessionState(
+        session_id="sid-preempt-rebase",
+        audio_chunk_idx=1,
+        context_embeds=[context_embed],
+        context_token_ids=[50],
+        pending_terminator_token=3,
+        last_terminator_token=3,
+        last_unit_inputs_embeds=retained_unit,
+        last_unit_input_token_ids=[1, 11],
+        current_segment_output_tokens=[21, 3],
+        pd_feedback_token_ids=[21, 3],
+    )
+
+    steady = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(4, dtype=np.float32),
+        epoch=9,
+        seq=2,
+    )
+
+    assert steady["success"] is True
+    assert steady["rebase_prompt"] is False
+    assert steady["input_token_ids"] == [21, 3, 2, 1, 11]
+    assert steady["inputs_embeds"].shape[0] == 5
+    assert state.prepared_inputs_embeds is steady["inputs_embeds"]
+    assert len(state.prepared_rebase_prefix_embeds) == 2
+    assert state.prepared_rebase_prefix_embeds[0] is context_embed
+    assert state.prepared_rebase_prefix_embeds[1] is retained_unit
+    assert state.prepared_rebase_prefix_token_ids == (50, 1, 11)
+
+    rebased = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(4, dtype=np.float32),
+        epoch=9,
+        seq=2,
+        engine_rebase=True,
+    )
+
+    assert rebased["success"] is True
+    assert rebased["rebase_prompt"] is True
+    assert rebased["engine_rebase_prompt"] is True
+    assert rebased["input_token_ids"] == [50, 1, 11, 21, 3, 2, 1, 11]
+    assert rebased["inputs_embeds"].shape[0] == 8
+
+    audio_chunk_idx = state.audio_chunk_idx
+    stale = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(4, dtype=np.float32),
+        epoch=9,
+        seq=3,
+        engine_rebase=True,
+    )
+    assert stale["success"] is False
+    assert "identity" in stale["reason"]
+    assert state.audio_chunk_idx == audio_chunk_idx
 
 
 def test_minicpmo_stage0_data_plane_model_owned_turn_boundary_preserves_audio_cache():
@@ -1929,6 +2751,112 @@ def test_minicpmo_stage0_short_audio_buffers_without_context_mutation():
     assert result["reason"]
     assert len(state.audio_buffer) >= 1600
     assert state.context_embeds == []
+
+
+def test_minicpmo_stage0_sampler_bulk_metadata_preserves_row_fallbacks():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    metadata = SimpleNamespace(
+        temperature=torch.tensor([0.1, 0.2]),
+        top_k=torch.tensor(7),
+        top_p=torch.tensor([]),
+        invalid="not-a-number",
+    )
+    read = MiniCPMO45OmniForConditionalGeneration._sampling_metadata_values
+
+    assert read(metadata, "temperature", 4, 0.7) == pytest.approx([0.1, 0.2, 0.2, 0.2])
+    assert read(metadata, "top_k", 4, 100) == [7.0] * 4
+    assert read(metadata, "top_p", 4, 0.8) == [0.8] * 4
+    assert read(metadata, "missing", 4, 0.8) == [0.8] * 4
+    assert read(metadata, "invalid", 4, 0.8) == [0.8] * 4
+    assert read(metadata, "temperature", 0, 0.7) == []
+
+
+def test_minicpmo_stage0_sampler_bulk_metadata_is_seed_exact_and_keeps_logits():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    class _Tokenizer:
+        eos_token_id = 3
+        unk_token_id = -1
+        bad_token_ids = []
+        all_special_ids = []
+
+        def convert_tokens_to_ids(self, token):
+            return {
+                "<unit>": 1,
+                "</unit>": 2,
+                "<|listen|>": 3,
+                "<|speak|>": 4,
+                "<|tts_bos|>": 5,
+                "<|tts_eos|>": 6,
+                "<|tts_pad|>": 7,
+                "<|chunk_eos|>": 8,
+                "<|chunk_tts_eos|>": 9,
+                "<|turn_eos|>": 10,
+            }.get(token, -1)
+
+    def make_model():
+        model = MiniCPMO45OmniForConditionalGeneration.__new__(
+            MiniCPMO45OmniForConditionalGeneration
+        )
+        model.model_stage = "llm"
+        model.thinker = SimpleNamespace(get_tokenizer=lambda: _Tokenizer())
+        return model
+
+    def make_metadata():
+        return SimpleNamespace(
+            all_greedy=False,
+            all_random=True,
+            temperature=torch.tensor([0.8, 1.2]),
+            top_k=torch.tensor([1, 1]),
+            top_p=torch.tensor([1.0, 1.0]),
+            generators={
+                0: torch.Generator().manual_seed(101),
+                1: torch.Generator().manual_seed(202),
+            },
+            prompt_token_ids=torch.tensor([[1, 1], [1, 1]]),
+            output_token_ids=[[4], [4]],
+        )
+
+    logits = torch.full((2, 32), float("-inf"))
+    logits[0, 8] = 10.0
+    logits[1, 11] = 10.0
+    original_logits = logits.clone()
+
+    reference_model = make_model()
+    reference_metadata = make_metadata()
+    token_ids = reference_model._minicpmo45_native_duplex_token_ids()
+    reference_ids = []
+    for row_idx in range(2):
+        sampled = reference_model._sample_minicpmo45_native_duplex_row(
+            logits[row_idx : row_idx + 1].clone(),
+            reference_metadata,
+            row_idx=row_idx,
+            token_ids=token_ids,
+            temperature=float(reference_metadata.temperature[row_idx].item()),
+            top_k=int(reference_metadata.top_k[row_idx].item()),
+            top_p=float(reference_metadata.top_p[row_idx].item()),
+        )
+        reference_model._record_minicpmo45_duplex_terminator(row_idx, sampled, token_ids)
+        reference_ids.append(sampled)
+    reference_states = {
+        row_idx: generator.get_state()
+        for row_idx, generator in reference_metadata.generators.items()
+    }
+
+    model = make_model()
+    metadata = make_metadata()
+    sampled = model.sample(logits, metadata)
+
+    assert sampled is not None
+    assert sampled.sampled_token_ids.tolist() == [[token_id] for token_id in reference_ids]
+    assert torch.equal(logits, original_logits)
+    for row_idx, generator in metadata.generators.items():
+        assert torch.equal(generator.get_state(), reference_states[row_idx])
 
 
 def test_minicpmo_stage0_native_sampler_penalizes_repeated_text_token():

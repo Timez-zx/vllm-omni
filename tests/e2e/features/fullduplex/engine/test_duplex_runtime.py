@@ -22,9 +22,11 @@ from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
     DuplexSessionRuntimeManager,
 )
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
+from vllm_omni.experimental.fullduplex.minicpmo45 import runtime as minicpm_runtime
 from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
     MiniCPMO45DuplexRuntimeExtension,
     build_duplex_data_plane_prompt,
+    duplex_feedback_scheduler_rows,
     duplex_scheduler_token_budget,
     duplex_vision_block_counts,
 )
@@ -449,6 +451,20 @@ def test_duplex_scheduler_token_budget_ignores_client_budget_fields():
     )
 
 
+@pytest.mark.parametrize(
+    ("feedback", "expected"),
+    [
+        (None, 0),
+        ([], 0),
+        ([151705], 0),
+        ([101, 151705], 1),
+        ([101, 102, 151705], 2),
+    ],
+)
+def test_duplex_feedback_scheduler_rows_excludes_reserved_terminator(feedback, expected):
+    assert duplex_feedback_scheduler_rows(feedback) == expected
+
+
 def test_duplex_scheduler_token_budget_counts_official_hd_slices():
     image = Image.new("RGB", (960, 540), color="white")
     encoded = BytesIO()
@@ -463,6 +479,60 @@ def test_duplex_scheduler_token_budget_counts_official_hd_slices():
     # Official grid selection uses one global image plus a 2x1 crop grid.
     assert duplex_vision_block_counts(payload) == [3]
     assert duplex_scheduler_token_budget(payload) == 12 + 3 * 66
+
+
+def test_minicpmo_plan_append_decodes_media_shape_once_per_transaction(monkeypatch):
+    image = Image.new("RGB", (960, 540), color="white")
+    encoded = BytesIO()
+    image.save(encoded, format="JPEG")
+    payload = {
+        "audio": base64.b64encode(np.zeros(16_000, dtype=np.float32).tobytes()).decode(),
+        "format": "pcm_f32le",
+        "video_frames": [base64.b64encode(encoded.getvalue()).decode()],
+        "max_slice_nums": 4,
+    }
+    vision_calls = 0
+    audio_calls = 0
+    original_vision = minicpm_runtime.duplex_vision_block_counts
+    original_audio = minicpm_runtime._duplex_pcm_sample_count
+
+    def counted_vision(payload):
+        nonlocal vision_calls
+        vision_calls += 1
+        return original_vision(payload)
+
+    def counted_audio(payload):
+        nonlocal audio_calls
+        audio_calls += 1
+        return original_audio(payload)
+
+    monkeypatch.setattr(
+        minicpm_runtime,
+        "duplex_vision_block_counts",
+        counted_vision,
+    )
+    monkeypatch.setattr(
+        minicpm_runtime,
+        "_duplex_pcm_sample_count",
+        counted_audio,
+    )
+    extension = MiniCPMO45DuplexRuntimeExtension()
+    for seq in (1, 2, 2):
+        extension.plan_append(
+            request_id="req-shape-once",
+            fence=DuplexFence("sid-shape-once"),
+            session_config={},
+            runtime_config={"duplex_first_append_context_tokens": 48},
+            seq=seq,
+            turn_seq=seq,
+            mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+            payload=payload,
+            final=False,
+            sampling_params=SamplingParams(max_tokens=20),
+        )
+
+    assert vision_calls == 3
+    assert audio_calls == 3
 
 
 def test_minicpmo_context_window_starts_fresh_lineage_with_one_retained_unit():
@@ -502,6 +572,67 @@ def test_minicpmo_context_window_starts_fresh_lineage_with_one_retained_unit():
     assert rollover["model_intermediate_buffer"]["meta"]["retain_streaming_output_tokens"] is True
     # 48 context + 11 retained-unit rows + 13 rows for the current steady unit.
     assert len(rollover["prompt_token_ids"]) == 72
+    rollover_duplex = rollover["model_intermediate_buffer"]["duplex"]
+    assert rollover_duplex["compact_rebase_prefix_tokens"] == 0
+
+
+def test_minicpmo_steady_append_declares_exact_lazy_preemption_rebase_prefix():
+    extension = MiniCPMO45DuplexRuntimeExtension()
+    fence = DuplexFence("sid-preemption-rebase")
+    payload = {
+        "audio": base64.b64encode(np.zeros(16_000, dtype=np.float32).tobytes()).decode(),
+        "format": "pcm_f32le",
+    }
+    runtime_config = {
+        "duplex_first_append_context_tokens": 48,
+        "duplex_context_window_trigger_tokens": 36_000,
+    }
+
+    first = extension.plan_append(
+        request_id="req-preemption-rebase",
+        fence=fence,
+        session_config={},
+        runtime_config=runtime_config,
+        seq=1,
+        turn_seq=1,
+        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+        payload=payload,
+        final=False,
+        sampling_params=SamplingParams(max_tokens=20),
+    )
+    second = extension.plan_append(
+        request_id="req-preemption-rebase",
+        fence=fence,
+        session_config={},
+        runtime_config=runtime_config,
+        seq=2,
+        turn_seq=2,
+        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+        payload=payload,
+        final=False,
+        sampling_params=SamplingParams(max_tokens=20),
+    )
+    second_retry = extension.plan_append(
+        request_id="req-preemption-rebase",
+        fence=fence,
+        session_config={},
+        runtime_config=runtime_config,
+        seq=2,
+        turn_seq=2,
+        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+        payload=payload,
+        final=False,
+        sampling_params=SamplingParams(max_tokens=20),
+    )
+
+    first_duplex = first.prompt["model_intermediate_buffer"]["duplex"]
+    second_duplex = second.prompt["model_intermediate_buffer"]["duplex"]
+    retry_duplex = second_retry.prompt["model_intermediate_buffer"]["duplex"]
+    assert first_duplex["compact_rebase_prefix_tokens"] == 0
+    # 48 immutable context rows + the latest complete 11-row audio unit.
+    assert second_duplex["compact_rebase_prefix_tokens"] == 59
+    assert retry_duplex["compact_rebase_prefix_tokens"] == 59
+    assert second_duplex["scheduler_token_budget"] == 13
 
 
 def test_resource_state_rejects_fence_regression_and_requires_explicit_fence():

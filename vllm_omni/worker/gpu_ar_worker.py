@@ -169,6 +169,22 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
             raise RuntimeError("Direct P/D cache sync requires NixlDeltaPushConnectorWorker")
         return worker.poll_direct_cache_sync()
 
+    def publish_pd_finished_blocks(self, metadata) -> bool:
+        """Wake P's NIXL writer without waiting for another model batch."""
+        from vllm_omni.engine.nixl_delta_push_connector import (
+            NixlDeltaPushConnectorWorker,
+        )
+
+        connector = get_kv_transfer_group()
+        worker = getattr(connector, "connector_worker", None)
+        if not isinstance(worker, NixlDeltaPushConnectorWorker):
+            raise RuntimeError(
+                "Immediate P/D publication requires "
+                "NixlDeltaPushConnectorWorker"
+            )
+        worker.start_load_kv(metadata)
+        return True
+
     @torch.inference_mode()
     def preencode_minicpmo45_vision(
         self,
@@ -179,4 +195,20 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         preencode = getattr(model, "preencode_duplex_vision", None)
         if not callable(preencode):
             return {"supported": False, "encoded_frames": 0}
+        return preencode(jobs)
+
+    @torch.inference_mode()
+    def preencode_minicpmo45_audio(
+        self,
+        jobs: list[dict[str, object]],
+    ) -> dict[str, object]:
+        """Run MiniCPM arrival-side audio encoding without an LLM request."""
+        model = getattr(self.model_runner, "model", None)
+        preencode = getattr(model, "preencode_duplex_audio", None)
+        if not callable(preencode):
+            return {
+                "supported": False,
+                "encoded_jobs": 0,
+                "job_results": {},
+            }
         return preencode(jobs)

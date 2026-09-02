@@ -107,6 +107,48 @@ class StageMetricsMessage(EngineQueueMessage, kw_only=True):
     stage_submit_ts: float | None = None
 
 
+class PhysicalDCompletionWitnessMessage(EngineQueueMessage, kw_only=True, frozen=True):
+    """Observer-only record for one completed physical duplex D request.
+
+    This message contains scalars only.  It is routed to the owning duplex
+    request queue, but must be removed before the model output projector.
+    """
+
+    type: Literal["physical_d_completion_witness"] = "physical_d_completion_witness"
+    request_id: str
+    stage_id: int
+    replica_id: int | None = None
+    engine_request_id: str
+    physical_sequence: int
+    input_unit_index: int
+    source: Literal["real_input", "auto_continuation"]
+    prompt_tokens: int
+    cached_tokens: int
+    local_cached_tokens: int
+    external_cached_tokens: int
+    computed_tokens: int
+    batch_id: int
+    submit_epoch_s: float
+    completed_epoch_s: float
+    service_ms: float
+    input_video_frames: int
+    arrival_video_frames: int
+    vision_fallback_frames: int
+    arrival_audio_units: int
+    audio_fallback_units: int
+    # Request-scoped NIXL delta evidence. ``selected_tokens`` is the exact
+    # semantic suffix supplied by P and therefore matches
+    # ``external_cached_tokens`` when both are available. ``selected_blocks``
+    # and ``selected_bytes`` describe the block-granular WRITE (including its
+    # final-block padding); bytes are aggregated across the D tensor-parallel
+    # ranks. A negative value means the connector could not prove the scalar
+    # without adding hot-path synchronization or a new wire round trip.
+    kv_transfer_selected_blocks: int = -1
+    kv_transfer_selected_tokens: int = -1
+    kv_transfer_selected_bytes: int = -1
+    kv_transfer_write_submit_to_d_ready_ms: float = -1.0
+
+
 class CollectiveRPCResultMessage(EngineQueueMessage, kw_only=True):
     type: Literal["collective_rpc_result"] = "collective_rpc_result"
     rpc_id: str

@@ -18,6 +18,7 @@ import vllm_omni.engine.orchestrator as orchestrator_module
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
     OrchestratorRequestState,
+    _extend_native_pd_feedback_budget,
     _OrchestratorDuplexStagePort,
 )
 from vllm_omni.engine.stage_pool import StagePool
@@ -326,9 +327,7 @@ async def test_duplex_prewarm_runs_after_first_stage0_submission() -> None:
 
 @pytest.mark.asyncio
 async def test_native_pd_preregisters_physical_d_slot_during_p() -> None:
-    port, stage_pools, request_states, _prewarm, submission = (
-        _duplex_stage_port_submission()
-    )
+    port, stage_pools, request_states, _prewarm, submission = _duplex_stage_port_submission()
     schedule_early = MagicMock()
     port._pd_pair = (0, 1)
     port._schedule_pd_early_cache_sync = schedule_early
@@ -350,6 +349,32 @@ async def test_native_pd_preregisters_physical_d_slot_during_p() -> None:
         engine_request_id="req-duplex-00000007",
         prompt_token_ids=[1, 2],
     )
+    assert "pd_duplex_predicted_prompt_token_ids" not in request_states["req-duplex"].streaming.bridge_states
+
+
+@pytest.mark.asyncio
+async def test_native_pd_next_submit_observes_background_route_error() -> None:
+    port, stage_pools, request_states, _prewarm, submission = _duplex_stage_port_submission()
+    port._pd_pair = (0, 1)
+    state = request_states[submission.context.request_id]
+    decode_ready = asyncio.Event()
+    decode_ready.set()
+    state.streaming.bridge_states.update(
+        {
+            "pd_duplex_decode_ready": decode_ready,
+            "pd_duplex_prefill_raw_error": "RuntimeError: D admission failed",
+        }
+    )
+    update = DuplexStageSubmission(
+        context=submission.context,
+        prompt={"prompt_token_ids": [3, 4]},
+        already_submitted=True,
+    )
+
+    with pytest.raises(RuntimeError, match="previous native P/D route failed"):
+        await port.submit(update)
+
+    stage_pools[0].submit_update.assert_not_awaited()
 
 
 def test_native_pd_prefix_prediction_tracks_append_and_rollover() -> None:
@@ -377,6 +402,123 @@ def test_native_pd_prefix_prediction_tracks_append_and_rollover() -> None:
         bridge,
         already_submitted=True,
     ) == [5, 9, 6, 7]
+
+
+@pytest.mark.asyncio
+async def test_native_pd_feedback_extends_stage0_scheduler_budget() -> None:
+    port, stage_pools, request_states, _prewarm, submission = _duplex_stage_port_submission()
+    port._pd_pair = (0, 1)
+    state = request_states[submission.context.request_id]
+    ready = asyncio.Event()
+    ready.set()
+    state.streaming.bridge_states["pd_duplex_decode_ready"] = ready
+    state.streaming.bridge_states["pd_duplex_feedback_token_ids"] = [81, 82, 93]
+    original_prompt = {
+        "prompt_token_ids": [7, 7, 7],
+        "model_intermediate_buffer": {
+            "duplex": {
+                "seq": 2,
+                "scheduler_token_id": 7,
+                "scheduler_token_budget": 3,
+            }
+        },
+    }
+    update = DuplexStageSubmission(
+        context=submission.context,
+        prompt=original_prompt,
+        already_submitted=True,
+    )
+
+    await port.submit(update)
+
+    submitted_request = stage_pools[0].submit_update.await_args.args[2]
+    assert submitted_request.prompt_token_ids == [7, 7, 7, 7, 7]
+    submitted_duplex = submitted_request.model_intermediate_buffer["duplex"]
+    assert submitted_duplex["pd_feedback_token_ids"] == [81, 82, 93]
+    assert submitted_duplex["scheduler_token_budget"] == 5
+    assert original_prompt["prompt_token_ids"] == [7, 7, 7]
+    assert "pd_feedback_token_ids" not in original_prompt["model_intermediate_buffer"]["duplex"]
+
+
+@pytest.mark.parametrize(
+    "rollover_marker",
+    [
+        {"meta": {"replace_streaming_prompt": True}},
+        {"payload": {"duplex_context_rollover": True}},
+    ],
+)
+def test_native_pd_feedback_expands_rollover_budget(rollover_marker: dict) -> None:
+    model_buffer = {
+        "duplex": {
+            "scheduler_token_id": 7,
+            "scheduler_token_budget": 3,
+        }
+    }
+    if "meta" in rollover_marker:
+        model_buffer["meta"] = rollover_marker["meta"]
+    else:
+        model_buffer["duplex"]["payload"] = rollover_marker["payload"]
+    prompt = {
+        "prompt_token_ids": [7, 7, 7],
+        "model_intermediate_buffer": model_buffer,
+    }
+
+    _extend_native_pd_feedback_budget(prompt, [81, 82, 93])
+
+    assert prompt["prompt_token_ids"] == [7, 7, 7, 7, 7]
+    assert model_buffer["duplex"]["scheduler_token_budget"] == 5
+    assert model_buffer["duplex"]["pd_feedback_token_ids"] == [81, 82, 93]
+
+
+def test_native_pd_talker_metadata_is_compact() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    metadata = {"duplex_prompt_token_ids": [999] * 32}
+    completion = SimpleNamespace(
+        token_ids=[21, 22, 9308],
+        multimodal_output=SimpleNamespace(metadata=metadata),
+    )
+    output = SimpleNamespace(outputs=[completion])
+    req_state = OrchestratorRequestState(request_id="req-compact")
+    req_state.streaming.bridge_states["pd_decode_prompt"] = {
+        "prompt_token_ids": [10, 20, 30, 40],
+    }
+    req_state.streaming.bridge_states["pd_duplex_special_token_ids"] = {
+        "tts_bos_token_id": 9301,
+    }
+
+    orchestrator._ensure_native_duplex_pd_talker_metadata(output, req_state)
+
+    assert "duplex_prompt_token_ids" not in metadata
+    assert metadata["duplex_prompt_len"] == 4
+    assert metadata["duplex_last_prompt_token_id"] == 40
+    assert metadata["duplex_segment_token_ids"] == [21, 22, 9308]
+    assert metadata["special_token_ids"] == {"tts_bos_token_id": 9301}
+
+
+def test_native_pd_talker_metadata_uses_scalars_after_prompt_release() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    metadata = {"duplex_prompt_token_ids": [999] * 32}
+    completion = SimpleNamespace(
+        token_ids=[21, 22, 9308],
+        multimodal_output=SimpleNamespace(metadata=metadata),
+    )
+    output = SimpleNamespace(outputs=[completion])
+    req_state = OrchestratorRequestState(request_id="req-compact-scalars")
+    req_state.streaming.bridge_states.update(
+        {
+            "pd_decode_prompt_len": 4,
+            "pd_decode_last_prompt_token_id": 40,
+            "pd_duplex_special_token_ids": {"tts_bos_token_id": 9301},
+        }
+    )
+
+    orchestrator._ensure_native_duplex_pd_talker_metadata(output, req_state)
+
+    assert "duplex_prompt_token_ids" not in metadata
+    assert metadata["duplex_prompt_len"] == 4
+    assert metadata["duplex_last_prompt_token_id"] == 40
+    assert metadata["duplex_segment_token_ids"] == [21, 22, 9308]
+    assert metadata["special_token_ids"] == {"tts_bos_token_id": 9301}
 
 
 @pytest.mark.asyncio
@@ -475,10 +617,7 @@ async def test_native_pd_decode_finish_keeps_talker_request_resumable() -> None:
     await orchestrator._route_output(1, 0, output, req_state, None)
 
     orchestrator._forward_to_next_stage.assert_awaited_once()
-    assert (
-        orchestrator._forward_to_next_stage.await_args.kwargs["is_final_update"]
-        is False
-    )
+    assert orchestrator._forward_to_next_stage.await_args.kwargs["is_final_update"] is False
 
 
 @pytest.mark.asyncio

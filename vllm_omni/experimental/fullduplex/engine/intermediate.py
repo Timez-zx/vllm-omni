@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from typing import TypedDict
 
+NATIVE_PROMPT_TOKEN_IDS_KEY = "duplex_prompt_token_ids"
+NATIVE_PROMPT_LEN_KEY = "duplex_prompt_len"
+NATIVE_LAST_PROMPT_TOKEN_KEY = "duplex_last_prompt_token_id"
+NATIVE_SEGMENT_TOKEN_IDS_KEY = "duplex_segment_token_ids"
+
 
 class DuplexIntermediateBuffer(TypedDict, total=False):
     """Structured keys carried through ``model_intermediate_buffer``.
@@ -62,6 +67,31 @@ def build_duplex_intermediate_buffer(
 def set_ref_audio(buffer: dict[str, object], waveform: object, sample_rate_hz: int) -> None:
     buffer.setdefault("codes", {})["ref"] = waveform
     buffer.setdefault("meta", {})["ref_audio_sr"] = int(sample_rate_hz)
+
+
+def set_ref_audio_handle(buffer: dict[str, object], handle: str) -> None:
+    """Attach the stable session reference without copying its waveform."""
+    buffer.setdefault("meta", {})["ref_audio_handle"] = str(handle)
+
+
+def set_native_prompt_handoff_metadata(
+    buffer: dict[str, object],
+    *,
+    prompt_len: int,
+    last_prompt_token: int | None,
+    current_segment_token_ids: list[int],
+) -> None:
+    """Store the O(segment) Thinker-to-Talker boundary contract.
+
+    Native MiniCPM Talker conditioning needs the prompt boundary, not another
+    copy of the complete cached prompt.  Keep the small current segment once in
+    ``meta``; the actual Talker condition remains in ``ids.tts``.
+    """
+    meta = buffer.setdefault("meta", {})
+    meta["prompt_len"] = max(0, int(prompt_len))
+    if last_prompt_token is not None:
+        meta["last_prompt_token"] = int(last_prompt_token)
+    meta["current_segment_token_ids"] = [int(token_id) for token_id in current_segment_token_ids]
 
 
 def set_tts_handoff(buffer: dict[str, object], token_ids: object | None, hidden_states: object | None) -> None:

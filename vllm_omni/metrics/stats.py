@@ -43,6 +43,16 @@ class StageRequestStats:
     replica_id: int | None = None
     final_output_type: str | None = None
     request_id: str | None = None
+    engine_request_id: str | None = None
+    engine_prompt_tokens: int = 0
+    num_cached_tokens: int = 0
+    input_video_frames: int = 0
+    arrival_video_frames: int = 0
+    vision_fallback_frames: int = 0
+    arrival_audio_units: int = 0
+    audio_fallback_units: int = 0
+    submit_epoch_s: float = 0.0
+    completed_epoch_s: float = 0.0
     postprocess_time_ms: float = 0.0
     diffusion_metrics: dict[str, int] = None
     audio_generated_frames: int = 0
@@ -119,6 +129,15 @@ STAGE_EXCLUDE = {
     "stage_stats",
     "stage_id",
     "request_id",
+    "engine_request_id",
+    "engine_prompt_tokens",
+    "input_video_frames",
+    "arrival_video_frames",
+    "vision_fallback_frames",
+    "arrival_audio_units",
+    "audio_fallback_units",
+    "submit_epoch_s",
+    "completed_epoch_s",
     "rx_transfer_bytes",
     "rx_decode_time_ms",
     "rx_in_flight_time_ms",
@@ -469,8 +488,20 @@ class OrchestratorAggregator:
         if current is None:
             current = {
                 "stage_id": sid,
+                "request_id": evt.request_id,
+                "engine_request_id": evt.engine_request_id,
+                "engine_prompt_tokens": int(evt.engine_prompt_tokens),
+                "batch_id": int(evt.batch_id),
                 "final_output_type": evt.final_output_type,
                 defs.NUM_TOKENS_IN: int(evt.num_tokens_in),
+                "num_cached_tokens": int(evt.num_cached_tokens),
+                "input_video_frames": int(evt.input_video_frames),
+                "arrival_video_frames": int(evt.arrival_video_frames),
+                "vision_fallback_frames": int(evt.vision_fallback_frames),
+                "arrival_audio_units": int(evt.arrival_audio_units),
+                "audio_fallback_units": int(evt.audio_fallback_units),
+                "submit_epoch_s": float(evt.submit_epoch_s),
+                "completed_epoch_s": float(evt.completed_epoch_s),
                 defs.NUM_TOKENS_OUT: int(evt.num_tokens_out),
                 defs.STAGE_GEN_TIME_MS: float(evt.stage_gen_time_ms),
                 defs.POSTPROCESS_TIME_MS: float(evt.postprocess_time_ms),
@@ -492,8 +523,30 @@ class OrchestratorAggregator:
             }
             return current
 
+        current["request_id"] = evt.request_id
+        current["engine_request_id"] = evt.engine_request_id
+        current["engine_prompt_tokens"] = int(evt.engine_prompt_tokens)
+        current["batch_id"] = int(evt.batch_id)
+        current["num_cached_tokens"] = int(evt.num_cached_tokens)
+        current["submit_epoch_s"] = float(evt.submit_epoch_s)
+        current["completed_epoch_s"] = float(evt.completed_epoch_s)
         current[defs.NUM_TOKENS_IN] = int(current.get(defs.NUM_TOKENS_IN, 0)) + int(evt.num_tokens_in)
         current[defs.NUM_TOKENS_OUT] = int(current.get(defs.NUM_TOKENS_OUT, 0)) + int(evt.num_tokens_out)
+        current["input_video_frames"] = int(current.get("input_video_frames", 0)) + int(
+            evt.input_video_frames
+        )
+        current["arrival_video_frames"] = int(current.get("arrival_video_frames", 0)) + int(
+            evt.arrival_video_frames
+        )
+        current["vision_fallback_frames"] = int(
+            current.get("vision_fallback_frames", 0)
+        ) + int(evt.vision_fallback_frames)
+        current["arrival_audio_units"] = int(
+            current.get("arrival_audio_units", 0)
+        ) + int(evt.arrival_audio_units)
+        current["audio_fallback_units"] = int(
+            current.get("audio_fallback_units", 0)
+        ) + int(evt.audio_fallback_units)
         current[defs.STAGE_GEN_TIME_MS] = float(current.get(defs.STAGE_GEN_TIME_MS, 0.0)) + float(evt.stage_gen_time_ms)
         current[defs.POSTPROCESS_TIME_MS] = float(current.get(defs.POSTPROCESS_TIME_MS, 0.0)) + float(
             evt.postprocess_time_ms

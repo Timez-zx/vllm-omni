@@ -6,14 +6,18 @@ import hashlib
 import os
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, field
 from threading import Lock, RLock
 from typing import Any
 
 import numpy as np
+from vllm.logger import init_logger
 
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import MiniCPMO45DuplexPolicy
+
+logger = init_logger(__name__)
 
 _MINICPMO45_SPECIAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS
 _MINICPMO45_OPTIONAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.OPTIONAL_TOKEN_FIELDS
@@ -21,6 +25,10 @@ _MINICPMO45_PROCESSOR_LOAD_LOCK = Lock()
 _MINICPMO45_LOG_PREP_DIAG = os.environ.get("MINICPMO45_LOG_PREP_DIAG", "0") not in ("0", "", "false", "False")
 _DEFAULT_MAX_ARRIVAL_VISION_CACHE_ENTRIES = 0
 _MINICPMO45_MAX_RETIRED_VISION_KEYS = 256
+_MINICPMO45_MAX_RETIRED_VISION_SESSIONS = 4_096
+_DEFAULT_MAX_ARRIVAL_AUDIO_CACHE_ENTRIES = 0
+_MINICPMO45_MAX_RETIRED_AUDIO_KEYS = 512
+_MINICPMO45_MAX_RETIRED_AUDIO_SESSIONS = 4_096
 
 
 def _max_arrival_vision_cache_entries() -> int | None:
@@ -28,6 +36,19 @@ def _max_arrival_vision_cache_entries() -> int | None:
     raw = os.environ.get(
         "MINICPMO45_MAX_ARRIVAL_VISION_CACHE_ENTRIES",
         str(_DEFAULT_MAX_ARRIVAL_VISION_CACHE_ENTRIES),
+    )
+    try:
+        value = int(raw)
+        return value if value > 0 else None
+    except ValueError:
+        return None
+
+
+def _max_arrival_audio_cache_entries() -> int | None:
+    """Return the encoded-audio result limit, or ``None`` when unbounded."""
+    raw = os.environ.get(
+        "MINICPMO45_MAX_ARRIVAL_AUDIO_CACHE_ENTRIES",
+        str(_DEFAULT_MAX_ARRIVAL_AUDIO_CACHE_ENTRIES),
     )
     try:
         value = int(raw)
@@ -48,8 +69,17 @@ class _MiniCPMO45Stage0SessionState:
     prepared_append_identity: tuple[int | None, int] | None = None
     prepared_inputs_embeds: Any | None = None
     prepared_input_token_ids: list[int] = field(default_factory=list)
+    # Bounded references used only if vLLM preempts the live P request.  The
+    # steady path must not concatenate/materialize a second prompt tensor.
+    prepared_rebase_prefix_embeds: tuple[Any, ...] = ()
+    prepared_rebase_prefix_token_ids: tuple[int, ...] = ()
     prepared_result: dict[str, Any] = field(default_factory=dict)
     audio_past_key_values: Any | None = None
+    # Once a formal append consumes an arrival-side audio result, the
+    # auxiliary GPU owns the Whisper/Mel lineage. A later cache miss must fail
+    # closed instead of silently continuing from this intentionally incomplete
+    # request-local audio state.
+    audio_sidecar_active: bool = False
     pending_terminator_token: int | None = None
     last_terminator_token: int | None = None
     pending_speech_context: bool = False
@@ -91,6 +121,18 @@ class _MiniCPMO45PreparedAudioAppend:
     feature_ms: float = 0.0
     audio_past_key_values: Any | None = None
     encoded: bool = False
+    arrival_preencoded: bool = False
+    arrival_preencode_seq: int | None = None
+    arrival_preencode_id: str | None = None
+
+
+@dataclass
+class _MiniCPMO45ArrivalAudioLineage:
+    """GPU2-owned streaming-audio state independent of formal P progress."""
+
+    epoch: int
+    next_seq: int
+    state: _MiniCPMO45Stage0SessionState
 
 
 class MiniCPMO45Stage0DuplexRuntime:
@@ -111,9 +153,27 @@ class MiniCPMO45Stage0DuplexRuntime:
             tuple[tuple[Any, ...], tuple[int, ...]],
         ] = OrderedDict()
         self._arrival_vision_cache: OrderedDict[tuple[str, int, int, str], list[Any]] = OrderedDict()
+        self._arrival_vision_cache_pending: dict[tuple[str, int, int, str], object] = {}
         self._arrival_vision_retired: OrderedDict[tuple[str, int, int, str], None] = OrderedDict()
+        self._arrival_vision_retired_sessions: OrderedDict[tuple[str, int], None] = OrderedDict()
         self._arrival_vision_cache_lock = Lock()
         self._vision_execution_lock = RLock()
+        self._arrival_audio_cache: OrderedDict[
+            tuple[str, int, int, int, str],
+            _MiniCPMO45PreparedAudioAppend,
+        ] = OrderedDict()
+        self._arrival_audio_lineages: dict[
+            tuple[str, int],
+            _MiniCPMO45ArrivalAudioLineage,
+        ] = {}
+        self._arrival_audio_retired: OrderedDict[
+            tuple[str, int, int, int, str],
+            None,
+        ] = OrderedDict()
+        self._arrival_audio_retired_sessions: OrderedDict[tuple[str, int], None] = OrderedDict()
+        self._arrival_audio_cache_lock = Lock()
+        self._audio_execution_lock = RLock()
+        self._audio_prepare_executor: ThreadPoolExecutor | None = None
         self.thinker = getattr(stage_model, "thinker", None) or getattr(stage_model, "model", None) or stage_model
         self.processor = (
             getattr(stage_model, "processor", None)
@@ -314,19 +374,55 @@ class MiniCPMO45Stage0DuplexRuntime:
             lock = Lock()
             self._arrival_vision_cache_lock = lock
         session_prefix = (str(session_id), int(incarnation))
+        pending = getattr(self, "_arrival_vision_cache_pending", None)
+        if not isinstance(pending, dict):
+            pending = {}
+            self._arrival_vision_cache_pending = pending
+        retired_sessions = getattr(
+            self,
+            "_arrival_vision_retired_sessions",
+            None,
+        )
+        if not isinstance(retired_sessions, OrderedDict):
+            retired_sessions = OrderedDict()
+            self._arrival_vision_retired_sessions = retired_sessions
+        retired = getattr(self, "_arrival_vision_retired", None)
+        if not isinstance(retired, OrderedDict):
+            retired = OrderedDict()
+            self._arrival_vision_retired = retired
+
+        reservations: list[tuple[tuple[str, int, int, str], object, list[Any]]] = []
         with lock:
+            if session_prefix in retired_sessions:
+                return 0
             stale = [key for key in cache if key[:2] == session_prefix and key[2] != int(epoch)]
             for key in stale:
                 cache.pop(key, None)
-            encoded = 0
-            for preencode_id, blocks in zip(preencode_ids, frame_blocks, strict=True):
+            stale_pending = [key for key in pending if key[:2] == session_prefix and key[2] != int(epoch)]
+            for key in stale_pending:
+                pending.pop(key, None)
+            for preencode_id, blocks in zip(
+                preencode_ids,
+                frame_blocks,
+                strict=True,
+            ):
                 if not isinstance(preencode_id, str) or not preencode_id:
                     continue
                 key = (*session_prefix, int(epoch), preencode_id)
-                retired = getattr(self, "_arrival_vision_retired", None)
-                if isinstance(retired, OrderedDict) and key in retired:
-                    retired.pop(key, None)
+                if key in retired:
                     continue
+                reservation = object()
+                pending[key] = reservation
+                reservations.append((key, reservation, blocks))
+
+        # GPU -> CPU copies may synchronize the producing stream. They must not
+        # hold the global cache metadata lock, otherwise one slow copy blocks
+        # every session's take/retire operation. Retirement is rechecked after
+        # the copies, under the lock, so a late speculative write still cannot
+        # resurrect a frame that the formal path has already fenced.
+        prepared: list[tuple[tuple[str, int, int, str], object, list[Any]]] = []
+        try:
+            for key, reservation, blocks in reservations:
                 cpu_blocks: list[Any] = []
                 for block in blocks:
                     detach = getattr(block, "detach", None)
@@ -335,6 +431,20 @@ class MiniCPMO45Stage0DuplexRuntime:
                     if callable(to):
                         cached = to(device="cpu")
                     cpu_blocks.append(cached)
+                prepared.append((key, reservation, cpu_blocks))
+        except BaseException:
+            with lock:
+                for key, reservation, _blocks in reservations:
+                    if pending.get(key) is reservation:
+                        pending.pop(key, None)
+            raise
+
+        with lock:
+            encoded = 0
+            for key, reservation, cpu_blocks in prepared:
+                if pending.get(key) is not reservation:
+                    continue
+                pending.pop(key, None)
                 cache[key] = cpu_blocks
                 cache.move_to_end(key)
                 encoded += 1
@@ -372,6 +482,7 @@ class MiniCPMO45Stage0DuplexRuntime:
             retired = OrderedDict()
             self._arrival_vision_retired = retired
         cache = getattr(self, "_arrival_vision_cache", None)
+        pending = getattr(self, "_arrival_vision_cache_pending", None)
         keys = [
             (str(session_id), int(incarnation), int(epoch), preencode_id)
             for preencode_id in preencode_ids
@@ -381,6 +492,8 @@ class MiniCPMO45Stage0DuplexRuntime:
             for key in keys:
                 if isinstance(cache, OrderedDict):
                     cache.pop(key, None)
+                if isinstance(pending, dict):
+                    pending.pop(key, None)
                 retired[key] = None
                 retired.move_to_end(key)
             while len(retired) > _MINICPMO45_MAX_RETIRED_VISION_KEYS:
@@ -414,16 +527,497 @@ class MiniCPMO45Stage0DuplexRuntime:
     ) -> None:
         cache = getattr(self, "_arrival_vision_cache", None)
         lock = getattr(self, "_arrival_vision_cache_lock", None)
+        pending = getattr(self, "_arrival_vision_cache_pending", None)
         retired = getattr(self, "_arrival_vision_retired", None)
-        if not isinstance(cache, OrderedDict) or lock is None:
+        retired_sessions = getattr(
+            self,
+            "_arrival_vision_retired_sessions",
+            None,
+        )
+        if lock is None:
             return
         prefix = (str(session_id), int(incarnation))
         with lock:
-            for key in [key for key in cache if key[:2] == prefix]:
-                cache.pop(key, None)
+            if isinstance(cache, OrderedDict):
+                for key in [key for key in cache if key[:2] == prefix]:
+                    cache.pop(key, None)
+            if isinstance(pending, dict):
+                for key in [key for key in pending if key[:2] == prefix]:
+                    pending.pop(key, None)
             if isinstance(retired, OrderedDict):
                 for key in [key for key in retired if key[:2] == prefix]:
                     retired.pop(key, None)
+            if not isinstance(retired_sessions, OrderedDict):
+                retired_sessions = OrderedDict()
+                self._arrival_vision_retired_sessions = retired_sessions
+            retired_sessions[prefix] = None
+            retired_sessions.move_to_end(prefix)
+            while len(retired_sessions) > _MINICPMO45_MAX_RETIRED_VISION_SESSIONS:
+                retired_sessions.popitem(last=False)
+
+    @staticmethod
+    def _arrival_audio_job_identity(
+        job: dict[str, object],
+    ) -> tuple[str, int, int, int, str] | None:
+        session_id = job.get("session_id")
+        preencode_id = job.get("audio_preencode_id")
+        if not isinstance(session_id, str) or not session_id:
+            return None
+        if not isinstance(preencode_id, str) or not preencode_id:
+            return None
+        try:
+            incarnation = int(job.get("incarnation", 0))
+            epoch = int(job.get("epoch", 0))
+            seq = int(job["audio_preencode_seq"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if seq < 0:
+            return None
+        return session_id, incarnation, epoch, seq, preencode_id
+
+    def _new_arrival_audio_lineage(
+        self,
+        *,
+        session_id: str,
+        epoch: int,
+        first_seq: int,
+    ) -> _MiniCPMO45ArrivalAudioLineage:
+        state = _MiniCPMO45Stage0SessionState(session_id=session_id)
+        self._configure_streaming_processor(state)
+        return _MiniCPMO45ArrivalAudioLineage(
+            epoch=int(epoch),
+            next_seq=int(first_seq),
+            state=state,
+        )
+
+    def _encode_prepared_audio_explicit(
+        self,
+        plan: _MiniCPMO45PreparedAudioAppend,
+        state: _MiniCPMO45Stage0SessionState,
+    ) -> bool:
+        """Encode one plan without swapping a process-global audio KV field."""
+        target = next(
+            (
+                candidate
+                for candidate in (self.stage_model, self.thinker)
+                if callable(
+                    getattr(
+                        candidate,
+                        "get_audio_embedding_streaming_batch",
+                        None,
+                    )
+                )
+            ),
+            None,
+        )
+        if target is None or not plan.units:
+            return False
+        cache = state.audio_past_key_values
+        try:
+            for unit in plan.units:
+                outputs, cache = target.get_audio_embedding_streaming_batch(
+                    unit.batch_feature,
+                    past_key_values=cache,
+                    use_extra_context=True,
+                    prefix_extra_frames=0 if unit.chunk_idx == 0 else 2,
+                    suffix_extra_frames=2,
+                    return_on_audio_device=True,
+                )
+                if len(outputs) != 1:
+                    raise ValueError("streaming audio sidecar returned wrong batch size")
+                audio_embeds = self._cat_nested_tensors(outputs[0])
+                if audio_embeds is None:
+                    raise ValueError("streaming audio sidecar returned empty embeddings")
+                unit.audio_embeds = audio_embeds
+            plan.audio_past_key_values = cache
+            plan.encoded = True
+            return True
+        except Exception:
+            logger.exception(
+                "MiniCPM-o arrival audio explicit encoding failed for session %s chunk %s",
+                state.session_id,
+                plan.start_chunk_idx,
+            )
+            plan.audio_past_key_values = None
+            plan.encoded = False
+            for unit in plan.units:
+                unit.audio_embeds = None
+            return False
+
+    def _commit_arrival_audio_plan(
+        self,
+        *,
+        identity: tuple[str, int, int, int, str],
+        lineage: _MiniCPMO45ArrivalAudioLineage,
+        plan: _MiniCPMO45PreparedAudioAppend,
+    ) -> bool:
+        """Advance GPU2's lineage and retain only the compact P input rows."""
+        if not plan.encoded or not plan.units:
+            return False
+        next_cache = plan.audio_past_key_values
+        if next_cache is None:
+            return False
+
+        # A Whisper KV snapshot can be O(100 MiB) per session.  It remains only
+        # in the latest GPU2 lineage; each unconsumed slot stores its ~80 KiB
+        # pooled embedding on CPU, never a versioned KV copy.
+        key = identity
+        prefix = key[:2]
+        with self._arrival_audio_cache_lock:
+            if prefix in self._arrival_audio_retired_sessions:
+                return False
+            if key in self._arrival_audio_retired:
+                return False
+        try:
+            next_audio_buffer = np.asarray(
+                plan.remaining_audio_buffer,
+                dtype=np.float32,
+            ).copy()
+            cpu_embeds = []
+            for unit in plan.units:
+                block = self._as_2d_tensor(unit.audio_embeds)
+                cpu_embeds.append(block.detach().to(device="cpu"))
+        except Exception:
+            logger.exception(
+                "MiniCPM-o arrival audio CPU materialization failed for session %s seq %s",
+                identity[0],
+                identity[3],
+            )
+            return False
+
+        state = lineage.state
+        processor = self._configure_streaming_processor(state)
+        mel_processor = getattr(processor, "_streaming_mel_processor", None)
+        get_mel_snapshot = getattr(mel_processor, "get_snapshot", None)
+        previous_mel_snapshot = None
+        if callable(get_mel_snapshot):
+            try:
+                previous_mel_snapshot = get_mel_snapshot()
+            except Exception:
+                logger.exception(
+                    "MiniCPM-o arrival audio failed to snapshot Mel state for session %s seq %s",
+                    identity[0],
+                    identity[3],
+                )
+                return False
+
+        # Retirement may race the CPU copies above. Hold the metadata lock from
+        # the final fence through the lineage/cache commit so a retired job can
+        # never advance authoritative streaming state.
+        with self._arrival_audio_cache_lock:
+            if prefix in self._arrival_audio_retired_sessions:
+                return False
+            if key in self._arrival_audio_retired:
+                return False
+            previous_audio_buffer = state.audio_buffer
+            previous_audio_chunk_idx = state.audio_chunk_idx
+            previous_audio_cache = state.audio_past_key_values
+            previous_lineage_seq = lineage.next_seq
+            previous_plan_values = (
+                plan.audio_past_key_values,
+                plan.mel_snapshot_after,
+                plan.remaining_audio_buffer,
+                plan.arrival_preencoded,
+                plan.arrival_preencode_seq,
+                plan.arrival_preencode_id,
+            )
+            previous_unit_values = [
+                (unit.audio_embeds, unit.batch_feature)
+                for unit in plan.units
+            ]
+            try:
+                if not self._restore_streaming_mel_snapshot(
+                    processor,
+                    plan.mel_snapshot_after,
+                ):
+                    return False
+                state.audio_buffer = next_audio_buffer
+                state.audio_chunk_idx = plan.start_chunk_idx + len(plan.units)
+                state.audio_past_key_values = next_cache
+                for unit, cpu_embed in zip(plan.units, cpu_embeds, strict=True):
+                    unit.audio_embeds = cpu_embed
+                    unit.batch_feature = None
+                plan.audio_past_key_values = None
+                plan.mel_snapshot_after = None
+                plan.remaining_audio_buffer = next_audio_buffer.copy()
+                plan.arrival_preencoded = True
+                plan.arrival_preencode_seq = identity[3]
+                plan.arrival_preencode_id = identity[4]
+                self._arrival_audio_cache[key] = plan
+                self._arrival_audio_cache.move_to_end(key)
+                limit = _max_arrival_audio_cache_entries()
+                if limit is not None:
+                    while len(self._arrival_audio_cache) > limit:
+                        self._arrival_audio_cache.popitem(last=False)
+                lineage.next_seq += 1
+                return True
+            except Exception:
+                state.audio_buffer = previous_audio_buffer
+                state.audio_chunk_idx = previous_audio_chunk_idx
+                state.audio_past_key_values = previous_audio_cache
+                lineage.next_seq = previous_lineage_seq
+                (
+                    plan.audio_past_key_values,
+                    plan.mel_snapshot_after,
+                    plan.remaining_audio_buffer,
+                    plan.arrival_preencoded,
+                    plan.arrival_preencode_seq,
+                    plan.arrival_preencode_id,
+                ) = previous_plan_values
+                for unit, (audio_embeds, batch_feature) in zip(
+                    plan.units,
+                    previous_unit_values,
+                    strict=True,
+                ):
+                    unit.audio_embeds = audio_embeds
+                    unit.batch_feature = batch_feature
+                self._arrival_audio_cache.pop(key, None)
+                if previous_mel_snapshot is not None:
+                    try:
+                        self._restore_streaming_mel_snapshot(
+                            processor,
+                            previous_mel_snapshot,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "MiniCPM-o arrival audio Mel rollback failed for session %s seq %s",
+                            identity[0],
+                            identity[3],
+                        )
+                logger.exception(
+                    "MiniCPM-o arrival audio commit failed for session %s seq %s",
+                    identity[0],
+                    identity[3],
+                )
+                return False
+
+    def preencode_arrival_audio(
+        self,
+        jobs: list[dict[str, object]],
+    ) -> dict[str, object]:
+        """Advance ordered streaming-audio lineages on the auxiliary GPU.
+
+        Jobs from different sessions are encoded together when their Whisper
+        cache shapes match. Multiple jobs from one session are processed in
+        successive waves so a later unit always observes its parent's KV.
+        """
+        parsed: dict[
+            tuple[str, int],
+            list[tuple[tuple[str, int, int, int, str], dict[str, object]]],
+        ] = {}
+        results: dict[str, bool] = {}
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            identity = self._arrival_audio_job_identity(job)
+            if identity is None:
+                continue
+            parsed.setdefault(identity[:2], []).append((identity, job))
+            results[identity[4]] = False
+        for records in parsed.values():
+            records.sort(key=lambda item: item[0][3])
+
+        with self._audio_execution_lock:
+            queues: dict[
+                tuple[str, int],
+                list[tuple[tuple[str, int, int, int, str], dict[str, object]]],
+            ] = {}
+            for prefix, records in parsed.items():
+                first_identity = records[0][0]
+                with self._arrival_audio_cache_lock:
+                    retired_session = prefix in self._arrival_audio_retired_sessions
+                if retired_session:
+                    continue
+                lineage = self._arrival_audio_lineages.get(prefix)
+                if lineage is None or lineage.epoch != first_identity[2]:
+                    # An epoch change is an explicit lineage boundary. Old
+                    # embeddings and Whisper state cannot update the new one.
+                    lineage = self._new_arrival_audio_lineage(
+                        session_id=first_identity[0],
+                        epoch=first_identity[2],
+                        first_seq=first_identity[3],
+                    )
+                    self._arrival_audio_lineages[prefix] = lineage
+                    with self._arrival_audio_cache_lock:
+                        stale = [key for key in self._arrival_audio_cache if key[:2] == prefix]
+                        for key in stale:
+                            self._arrival_audio_cache.pop(key, None)
+                queues[prefix] = records
+
+            while queues:
+                wave: list[
+                    tuple[
+                        tuple[str, int, int, int, str],
+                        dict[str, object],
+                        _MiniCPMO45ArrivalAudioLineage,
+                    ]
+                ] = []
+                for prefix, records in list(queues.items()):
+                    if not records:
+                        queues.pop(prefix, None)
+                        continue
+                    identity, job = records[0]
+                    lineage = self._arrival_audio_lineages[prefix]
+                    # The worker may have committed this exact identity even
+                    # when the RPC response was lost or timed out upstream.
+                    # Treat the retained plan as the durable acknowledgement
+                    # before applying the next-sequence gate.  The original
+                    # commit already advanced ``next_seq``; replay must not do
+                    # so a second time.
+                    with self._arrival_audio_cache_lock:
+                        already_cached = identity in self._arrival_audio_cache
+                    if already_cached:
+                        results[identity[4]] = True
+                        records.pop(0)
+                        if not records:
+                            queues.pop(prefix, None)
+                        continue
+                    if identity[2] != lineage.epoch or identity[3] != lineage.next_seq:
+                        # A gap cannot be reconstructed from later PCM. Leave
+                        # this session failed without advancing its lineage.
+                        queues.pop(prefix, None)
+                        continue
+                    wave.append((identity, job, lineage))
+
+                if not wave:
+                    break
+
+                def prepare(
+                    item: tuple[
+                        tuple[str, int, int, int, str],
+                        dict[str, object],
+                        _MiniCPMO45ArrivalAudioLineage,
+                    ],
+                ) -> tuple[
+                    tuple[str, int, int, int, str],
+                    _MiniCPMO45ArrivalAudioLineage,
+                    _MiniCPMO45PreparedAudioAppend | None,
+                ]:
+                    identity, job, lineage = item
+                    payload = job.get("payload")
+                    if not isinstance(payload, dict):
+                        payload = job
+                    try:
+                        waveform = self._decode_audio_payload(payload)
+                        plan = self._prepare_streaming_audio_append(
+                            lineage.state,
+                            waveform,
+                        )
+                    except Exception:
+                        plan = None
+                    return identity, lineage, plan
+
+                executor = self._audio_prepare_executor
+                if executor is None:
+                    executor = ThreadPoolExecutor(
+                        max_workers=8,
+                        thread_name_prefix="minicpmo-audio-sidecar-prepare",
+                    )
+                    self._audio_prepare_executor = executor
+                prepared_all = list(executor.map(prepare, wave))
+                prepared = [item for item in prepared_all if item[2] is not None]
+                for identity, _lineage, plan in prepared_all:
+                    if plan is None:
+                        queues.pop(identity[:2], None)
+                batchable = [(plan, lineage.state) for _identity, lineage, plan in prepared if plan is not None]
+                if len(batchable) >= 2:
+                    self._stage_audio_embeddings_batch(
+                        batchable,
+                        return_on_audio_device=True,
+                    )
+                for identity, lineage, plan in prepared:
+                    assert plan is not None
+                    if not plan.encoded:
+                        self._encode_prepared_audio_explicit(plan, lineage.state)
+                    success = self._commit_arrival_audio_plan(
+                        identity=identity,
+                        lineage=lineage,
+                        plan=plan,
+                    )
+                    results[identity[4]] = success
+                    prefix = identity[:2]
+                    records = queues.get(prefix)
+                    if success and records and records[0][0] == identity:
+                        records.pop(0)
+                        if not records:
+                            queues.pop(prefix, None)
+                    elif not success:
+                        queues.pop(prefix, None)
+
+        encoded_jobs = sum(1 for success in results.values() if success)
+        return {
+            "supported": True,
+            "encoded_jobs": encoded_jobs,
+            "job_results": results,
+        }
+
+    def take_arrival_audio_append(
+        self,
+        *,
+        session_id: str,
+        incarnation: int,
+        epoch: int | None,
+        audio_preencode_seq: int | None,
+        audio_preencode_id: str,
+    ) -> _MiniCPMO45PreparedAudioAppend | None:
+        if epoch is None or audio_preencode_seq is None or not audio_preencode_id:
+            return None
+        key = (
+            str(session_id),
+            int(incarnation),
+            int(epoch),
+            int(audio_preencode_seq),
+            str(audio_preencode_id),
+        )
+        with self._arrival_audio_cache_lock:
+            return self._arrival_audio_cache.pop(key, None)
+
+    def retire_arrival_audio_append(
+        self,
+        *,
+        session_id: str,
+        incarnation: int,
+        epoch: int,
+        audio_preencode_seq: int,
+        audio_preencode_id: str,
+    ) -> None:
+        key = (
+            str(session_id),
+            int(incarnation),
+            int(epoch),
+            int(audio_preencode_seq),
+            str(audio_preencode_id),
+        )
+        with self._arrival_audio_cache_lock:
+            self._arrival_audio_cache.pop(key, None)
+            self._arrival_audio_retired[key] = None
+            self._arrival_audio_retired.move_to_end(key)
+            while len(self._arrival_audio_retired) > _MINICPMO45_MAX_RETIRED_AUDIO_KEYS:
+                self._arrival_audio_retired.popitem(last=False)
+
+    def discard_arrival_audio_session(
+        self,
+        session_id: str,
+        incarnation: int,
+    ) -> None:
+        prefix = (str(session_id), int(incarnation))
+        # Serialize teardown with the stateful encoder. This is infrequent and
+        # prevents a late completion from resurrecting a closed session.
+        with self._audio_execution_lock:
+            self._arrival_audio_lineages.pop(prefix, None)
+            with self._arrival_audio_cache_lock:
+                for key in [key for key in self._arrival_audio_cache if key[:2] == prefix]:
+                    self._arrival_audio_cache.pop(key, None)
+                for key in [key for key in self._arrival_audio_retired if key[:2] == prefix]:
+                    self._arrival_audio_retired.pop(key, None)
+                self._arrival_audio_retired_sessions[prefix] = None
+                self._arrival_audio_retired_sessions.move_to_end(prefix)
+                while len(self._arrival_audio_retired_sessions) > _MINICPMO45_MAX_RETIRED_AUDIO_SESSIONS:
+                    self._arrival_audio_retired_sessions.popitem(last=False)
+
+    def arrival_audio_cache_size(self) -> int:
+        with self._arrival_audio_cache_lock:
+            return len(self._arrival_audio_cache)
 
     def _stage_prefill_embeddings_only(
         self,
@@ -440,6 +1034,8 @@ class MiniCPMO45Stage0DuplexRuntime:
         is_speech: bool = False,
         final: bool = False,
         context_rollover: bool = False,
+        engine_rebase: bool = False,
+        vision_input_source: str = "request_fallback",
     ) -> dict[str, Any]:
         """Build scheduler-owned Stage0 input embeddings for one audio append.
 
@@ -457,7 +1053,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                 import torch
 
                 if torch.cuda.is_available():
-                    torch.cuda.synchronize(self._model_device())
+                    torch.accelerator.synchronize(self._model_device())
             except Exception:
                 pass
 
@@ -469,11 +1065,58 @@ class MiniCPMO45Stage0DuplexRuntime:
             and state.prepared_inputs_embeds is not None
         ):
             result = dict(state.prepared_result)
-            result["inputs_embeds"] = state.prepared_inputs_embeds
-            result["input_token_ids"] = list(state.prepared_input_token_ids)
+            if engine_rebase:
+                if not state.prepared_rebase_prefix_embeds and not bool(result.get("rebase_prompt", False)):
+                    return self._stage_prefill_result(
+                        False,
+                        start_time,
+                        "engine rebase has no exact prepared compact prompt",
+                    )
+                import torch
+
+                rebase_parts = [
+                    *state.prepared_rebase_prefix_embeds,
+                    state.prepared_inputs_embeds,
+                ]
+                result["inputs_embeds"] = torch.cat(
+                    [self._as_2d_tensor(embed) for embed in rebase_parts],
+                    dim=0,
+                )
+                result["input_token_ids"] = [
+                    *state.prepared_rebase_prefix_token_ids,
+                    *state.prepared_input_token_ids,
+                ]
+                result["rebase_prompt"] = True
+                result["engine_rebase_prompt"] = True
+                result["delta_num_tokens"] = len(result["input_token_ids"])
+            else:
+                result["inputs_embeds"] = state.prepared_inputs_embeds
+                result["input_token_ids"] = list(state.prepared_input_token_ids)
             return result
+        if engine_rebase:
+            return self._stage_prefill_result(
+                False,
+                start_time,
+                "engine rebase append identity does not match the prepared prompt",
+            )
         self._require_special_token_ids()
-        if audio_waveform is None or len(audio_waveform) == 0:
+        prepared_audio = preprocessed_audio
+        # A first append and an explicit context rollover own every embedding
+        # row in the scheduler prompt.  A steady append owns only its suffix;
+        # the prefix remains authoritative in the engine KV cache.
+        append_start_chunk_idx = (
+            prepared_audio.start_chunk_idx
+            if prepared_audio is not None
+            else state.audio_chunk_idx
+        )
+        rebase_prompt = bool(context_rollover or append_start_chunk_idx == 0)
+        if prepared_audio is None and state.audio_sidecar_active:
+            return self._stage_prefill_result(
+                False,
+                start_time,
+                "arrival audio lineage is active but this append has no encoded result",
+            )
+        if prepared_audio is None and (audio_waveform is None or len(audio_waveform) == 0):
             return self._stage_prefill_result(False, start_time, "empty audio")
         # Omni duplex: encode this append's camera frames up front so the unit
         # loop can interleave one <image> block per unit, mirroring official
@@ -498,11 +1141,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                     materialized: list[Any] = []
                     for block in blocks:
                         to = getattr(block, "to", None)
-                        materialized.append(
-                            to(device=model_device, non_blocking=True)
-                            if callable(to)
-                            else block
-                        )
+                        materialized.append(to(device=model_device, non_blocking=True) if callable(to) else block)
                     frame_blocks.append(materialized)
             else:
                 frame_blocks = self._stage_vision_embeddings(
@@ -519,14 +1158,21 @@ class MiniCPMO45Stage0DuplexRuntime:
         if prep_diag is not None:
             prep_diag["vision_consume_ms"] = (time.perf_counter() - vision_start) * 1000.0
         chunk_size = self._streaming_chunk_size(processor)
-        prepared_audio = preprocessed_audio
         if prepared_audio is not None and (
             prepared_audio.start_chunk_idx != state.audio_chunk_idx
             or prepared_audio.start_buffer_len != len(state.audio_buffer)
             or not prepared_audio.units
         ):
             # A stale speculative preparation must never advance the session.
-            # Fall back to the exact request-local path.
+            # Once GPU2 owns the lineage, request-local state deliberately has
+            # no Whisper KV and cannot be an exact fallback.
+            if prepared_audio.arrival_preencoded or state.audio_sidecar_active:
+                return self._stage_prefill_result(
+                    False,
+                    start_time,
+                    "arrival audio result does not match formal consumption order",
+                )
+            # Runner-local speculation can still use the exact fallback.
             prepared_audio = None
         if prepared_audio is None:
             state.audio_buffer = np.concatenate([state.audio_buffer, np.asarray(audio_waveform, dtype=np.float32)])
@@ -666,9 +1312,15 @@ class MiniCPMO45Stage0DuplexRuntime:
                     token_ids.extend([self._vision_embedding_placeholder_token_id()] * int(crop_block.shape[0]))
                     embed_parts.append(self._embed_token(self.slice_end_token_id))
                     token_ids.append(int(self.slice_end_token_id))
-            embed_parts.append(audio_embeds)
+            audio_block = self._as_2d_tensor(audio_embeds)
+            if getattr(audio_block, "device", None) != self._model_device():
+                audio_block = audio_block.to(
+                    device=self._model_device(),
+                    non_blocking=True,
+                )
+            embed_parts.append(audio_block)
             token_ids.extend(
-                [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
+                [self._audio_embedding_placeholder_token_id()] * int(audio_block.shape[0])
             )
             latest_unit_embed_parts = list(embed_parts[unit_embed_offset:])
             latest_unit_token_ids = list(token_ids[unit_token_offset:])
@@ -688,12 +1340,18 @@ class MiniCPMO45Stage0DuplexRuntime:
             )
         if prepared_audio is not None:
             state.audio_buffer = prepared_audio.remaining_audio_buffer
-            if prepared_audio.encoded and hasattr(self.thinker, "audio_past_key_values"):
-                state.audio_past_key_values = prepared_audio.audio_past_key_values
-            self._restore_streaming_mel_snapshot(
-                processor,
-                prepared_audio.mel_snapshot_after,
-            )
+            if prepared_audio.arrival_preencoded:
+                # GPU2 owns the authoritative Mel/Whisper lineage. Formal P
+                # advances only its lightweight consumption watermark.
+                state.audio_sidecar_active = True
+                state.audio_past_key_values = None
+            else:
+                if prepared_audio.encoded and hasattr(self.thinker, "audio_past_key_values"):
+                    state.audio_past_key_values = prepared_audio.audio_past_key_values
+                self._restore_streaming_mel_snapshot(
+                    processor,
+                    prepared_audio.mel_snapshot_after,
+                )
             audio_feature_ms = prepared_audio.feature_ms
         state.audio_chunk_idx = current_audio_chunk_idx
         # Match official streaming_prefill: per chunk feed ONLY <unit>+audio. The assistant
@@ -703,6 +1361,22 @@ class MiniCPMO45Stage0DuplexRuntime:
         prompt_suffix_len = 0
 
         import torch
+
+        compact_rebase_prefix_parts: tuple[Any, ...] = ()
+        compact_rebase_prefix_token_ids: tuple[int, ...] = ()
+        if not rebase_prompt and retained_unit_embeds is not None:
+            # Keep one exact, bounded recovery snapshot alongside the suffix.
+            # It is never concatenated on the normal path: these are immutable
+            # prefix component references, while ``inputs_embeds`` below is
+            # the already-materialized append suffix.
+            compact_rebase_prefix_parts = (
+                *state.context_embeds,
+                retained_unit_embeds,
+            )
+            compact_rebase_prefix_token_ids = (
+                *state.context_token_ids,
+                *retained_unit_token_ids,
+            )
 
         if context_rollover:
             retained_parts = list(state.context_embeds)
@@ -716,6 +1390,12 @@ class MiniCPMO45Stage0DuplexRuntime:
         sync_device()
         assembly_start = time.perf_counter()
         inputs_embeds = torch.cat([self._as_2d_tensor(embed) for embed in embed_parts], dim=0)
+        if int(inputs_embeds.shape[0]) != len(token_ids):
+            raise RuntimeError(
+                "MiniCPM-o duplex Stage0 produced mismatched embedding and "
+                f"token rows: embeddings={int(inputs_embeds.shape[0])}, "
+                f"tokens={len(token_ids)}"
+            )
         sync_device()
         if prep_diag is not None:
             prep_diag.update(
@@ -738,7 +1418,29 @@ class MiniCPMO45Stage0DuplexRuntime:
                 "runtime_impl": "scheduler_data_plane",
                 "context_rollover": context_rollover,
                 "context_rollovers": state.context_rollovers,
+                "rebase_prompt": rebase_prompt,
+                "delta_num_tokens": len(token_ids),
             }
+        )
+        # Persist the physical source with the prepared append. vLLM may call
+        # preprocess again while chunking/replaying one request; those later
+        # calls must report the original consumption instead of relabelling an
+        # arrival-cache hit as a request-local fallback.
+        input_video_frames = len(video_frames) if isinstance(video_frames, list) else 0
+        result["duplex_input_video_frames"] = input_video_frames
+        result["duplex_arrival_video_frames"] = input_video_frames if vision_input_source == "arrival" else 0
+        result["duplex_vision_fallback_frames"] = (
+            input_video_frames if input_video_frames and vision_input_source != "arrival" else 0
+        )
+        result["duplex_arrival_audio_units"] = (
+            units_built
+            if prepared_audio is not None and prepared_audio.arrival_preencoded
+            else 0
+        )
+        result["duplex_audio_fallback_units"] = (
+            units_built
+            if prepared_audio is None or not prepared_audio.arrival_preencoded
+            else 0
         )
         if prep_diag is not None:
             prep_diag["stage_total_ms"] = (time.time() - start_time) * 1000.0
@@ -758,6 +1460,22 @@ class MiniCPMO45Stage0DuplexRuntime:
             state.prepared_append_identity = append_identity
             state.prepared_inputs_embeds = inputs_embeds
             state.prepared_input_token_ids = list(token_ids)
+            if rebase_prompt:
+                state.prepared_rebase_prefix_embeds = ()
+                state.prepared_rebase_prefix_token_ids = ()
+            else:
+                compact_prefix_rows = sum(
+                    int(self._as_2d_tensor(embed).shape[0]) for embed in compact_rebase_prefix_parts
+                )
+                if compact_prefix_rows != len(compact_rebase_prefix_token_ids):
+                    raise RuntimeError(
+                        "MiniCPM-o duplex compact rebase prefix embedding/token "
+                        "row mismatch: "
+                        f"embeddings={compact_prefix_rows}, "
+                        f"tokens={len(compact_rebase_prefix_token_ids)}"
+                    )
+                state.prepared_rebase_prefix_embeds = compact_rebase_prefix_parts
+                state.prepared_rebase_prefix_token_ids = compact_rebase_prefix_token_ids
             state.prepared_result = {k: v for k, v in result.items() if k not in {"inputs_embeds", "input_token_ids"}}
         return result
 
@@ -1045,6 +1763,8 @@ class MiniCPMO45Stage0DuplexRuntime:
     def _stage_audio_embeddings_batch(
         self,
         prepared: list[tuple[_MiniCPMO45PreparedAudioAppend, _MiniCPMO45Stage0SessionState]],
+        *,
+        return_on_audio_device: bool = False,
     ) -> bool:
         """Encode equal-shaped audio units from independent sessions together."""
         if len(prepared) < 2:
@@ -1056,6 +1776,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                 if callable(getattr(candidate, "get_audio_embedding_streaming_batch", None))
                 and callable(getattr(candidate, "combine_audio_past_key_values", None))
                 and callable(getattr(candidate, "split_audio_past_key_values", None))
+                and callable(getattr(candidate, "should_reset_audio_past_key_values", None))
             ),
             None,
         )
@@ -1101,7 +1822,19 @@ class MiniCPMO45Stage0DuplexRuntime:
                         else:
                             raise ValueError("missing streaming audio feature length")
                         feature_lens.append(lens)
-                    combined_cache = target.combine_audio_past_key_values([record[3] for record in records])
+                    prefix_extra_frames = 0 if records[0][1].chunk_idx == 0 else 2
+                    reset_cache = target.should_reset_audio_past_key_values(
+                        records[0][3],
+                        max_mel_seq_len=int(features.shape[-1]),
+                        use_extra_context=True,
+                        prefix_extra_frames=prefix_extra_frames,
+                        suffix_extra_frames=2,
+                    )
+                    combined_cache = (
+                        None
+                        if reset_cache
+                        else target.combine_audio_past_key_values([record[3] for record in records])
+                    )
                     outputs, combined_cache = target.get_audio_embedding_streaming_batch(
                         {
                             "audio_features": features,
@@ -1109,8 +1842,9 @@ class MiniCPMO45Stage0DuplexRuntime:
                         },
                         past_key_values=combined_cache,
                         use_extra_context=True,
-                        prefix_extra_frames=0 if records[0][1].chunk_idx == 0 else 2,
+                        prefix_extra_frames=prefix_extra_frames,
                         suffix_extra_frames=2,
+                        return_on_audio_device=return_on_audio_device,
                     )
                     if len(outputs) != len(records):
                         raise ValueError("batched audio encoder returned wrong batch size")
@@ -1133,15 +1867,32 @@ class MiniCPMO45Stage0DuplexRuntime:
                         unit.audio_embeds = audio_embeds
                         cache_by_plan[id(plan)] = split_cache
 
-            # Only mark a plan preencoded when every unit participated in a
-            # batch. Otherwise its request-local fallback must own the cache.
+            # Commit each plan independently. Mixed cache-length cohorts are
+            # normal in long sessions: one cohort may form a useful batch while
+            # another is a singleton.  Discarding every completed cohort just
+            # because one plan could not batch makes the request-local path
+            # redundantly run the successful Whisper forwards again.
+            encoded_any = False
             for plan, _state in prepared:
-                if not all(unit.audio_embeds is not None for unit in plan.units):
-                    raise ValueError("not every audio unit was batched")
-                plan.audio_past_key_values = cache_by_plan[id(plan)]
-                plan.encoded = True
-            return True
+                if all(unit.audio_embeds is not None for unit in plan.units):
+                    plan.audio_past_key_values = cache_by_plan[id(plan)]
+                    plan.encoded = True
+                    encoded_any = True
+                    continue
+                # A partially encoded multi-unit plan cannot mix the explicit
+                # batch cache with the request-local mutable cache. Clear only
+                # that plan and let its ordinary transactional path own all of
+                # its units.
+                plan.audio_past_key_values = None
+                plan.encoded = False
+                for unit in plan.units:
+                    unit.audio_embeds = None
+            return encoded_any
         except Exception:
+            logger.exception(
+                "MiniCPM-o batched arrival audio encoding failed for sessions %s",
+                [state.session_id for _plan, state in prepared],
+            )
             for plan, _state in prepared:
                 plan.audio_past_key_values = None
                 plan.encoded = False
@@ -1150,6 +1901,22 @@ class MiniCPMO45Stage0DuplexRuntime:
             return False
 
     def _stage_audio_embeddings(
+        self,
+        batch_feature: Any,
+        *,
+        state: _MiniCPMO45Stage0SessionState | None = None,
+    ) -> Any | None:
+        lock = getattr(self, "_audio_execution_lock", None)
+        if lock is None:
+            lock = RLock()
+            self._audio_execution_lock = lock
+        with lock:
+            return self._stage_audio_embeddings_unlocked(
+                batch_feature,
+                state=state,
+            )
+
+    def _stage_audio_embeddings_unlocked(
         self,
         batch_feature: Any,
         *,
@@ -1687,7 +2454,11 @@ class MiniCPMO45Stage0DuplexRuntime:
                             dim=0,
                         ).to(device=device, dtype=dtype)
                         if callable(get_hidden_uniform):
-                            hidden = get_hidden_uniform(pixels_tensor, tgt_key)
+                            hidden = get_hidden_uniform(
+                                pixels_tensor,
+                                tgt_key,
+                                return_on_vision_device=True,
+                            )
                         else:
                             pixels = list(pixels_tensor.unbind(0))
                             tgt_sizes = torch.tensor(
@@ -1695,7 +2466,10 @@ class MiniCPMO45Stage0DuplexRuntime:
                                 dtype=torch.int64,
                                 device=device,
                             )
-                            hidden = get_hidden({"pixel_values": pixels, "tgt_sizes": tgt_sizes})
+                            hidden = get_hidden(
+                                {"pixel_values": pixels, "tgt_sizes": tgt_sizes},
+                                return_on_vision_device=True,
+                            )
                         if len(hidden) != len(chunk):
                             return None
                         for record, block in zip(chunk, hidden, strict=True):

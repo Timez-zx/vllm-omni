@@ -1,4 +1,7 @@
+from collections import OrderedDict
 from dataclasses import dataclass
+from threading import Lock
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -12,6 +15,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     Resampler,
     SiglipVisionConfig,
     SiglipVisionTransformer,
+    _return_audio_embeddings_to_language_device,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -96,6 +100,18 @@ class _FakeAudioEncoder:
         )
 
 
+class _DevicePlacementWitness(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+        self.moved_to: torch.device | None = None
+
+    def to(self, *args, **kwargs):
+        del args
+        self.moved_to = torch.device(kwargs["device"])
+        return self
+
+
 class _FakeVisionModel:
     def __init__(self, vision_batch_size: int) -> None:
         self.config = _VisionConfig(vision_batch_size=vision_batch_size)
@@ -164,7 +180,13 @@ class _FakeShapeBucketVisionTarget(torch.nn.Module):
         self.vpm = torch.nn.Linear(1, 1, bias=False)
         self.calls: list[tuple[list[tuple[int, ...]], list[list[int]], list[int]]] = []
 
-    def get_vision_hidden_states(self, data: dict[str, object]) -> torch.Tensor:
+    def get_vision_hidden_states(
+        self,
+        data: dict[str, object],
+        *,
+        return_on_vision_device: bool = False,
+    ) -> torch.Tensor:
+        assert return_on_vision_device is True
         pixels = data["pixel_values"]
         tgt_sizes = data["tgt_sizes"]
         assert isinstance(pixels, list)
@@ -323,6 +345,92 @@ def test_retired_arrival_vision_key_rejects_late_sidecar_write() -> None:
     )
 
 
+def test_arrival_vision_cache_copies_blocks_outside_metadata_lock() -> None:
+    class TrackingLock:
+        held = False
+
+        def __enter__(self):
+            self.held = True
+
+        def __exit__(self, *_args):
+            self.held = False
+
+    class CopyWitness:
+        def __init__(self, lock):
+            self.lock = lock
+
+        def detach(self):
+            return self
+
+        def to(self, *, device):
+            assert device == "cpu"
+            assert self.lock.held is False
+            return "cpu-block"
+
+    runtime = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
+    lock = TrackingLock()
+    runtime._arrival_vision_cache = OrderedDict()
+    runtime._arrival_vision_retired = OrderedDict()
+    runtime._arrival_vision_cache_lock = lock
+
+    assert (
+        runtime.cache_arrival_vision_embeddings(
+            session_id="session-a",
+            incarnation=1,
+            epoch=2,
+            preencode_ids=["frame-1"],
+            frame_blocks=[[CopyWitness(lock)]],
+        )
+        == 1
+    )
+    assert runtime.take_arrival_vision_embeddings(
+        session_id="session-a",
+        incarnation=1,
+        epoch=2,
+        preencode_ids=["frame-1"],
+    ) == [["cpu-block"]]
+
+
+def test_discarded_arrival_vision_session_rejects_inflight_and_late_writes() -> None:
+    runtime = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
+    runtime._arrival_vision_cache = OrderedDict()
+    runtime._arrival_vision_cache_pending = {}
+    runtime._arrival_vision_retired = OrderedDict()
+    runtime._arrival_vision_retired_sessions = OrderedDict()
+    runtime._arrival_vision_cache_lock = Lock()
+
+    class DiscardDuringCopy:
+        def detach(self):
+            return self
+
+        def to(self, *, device):
+            assert device == "cpu"
+            runtime.discard_arrival_vision_session("session-a", 1)
+            return "late-cpu-block"
+
+    assert (
+        runtime.cache_arrival_vision_embeddings(
+            session_id="session-a",
+            incarnation=1,
+            epoch=2,
+            preencode_ids=["frame-1"],
+            frame_blocks=[[DiscardDuringCopy()]],
+        )
+        == 0
+    )
+    assert (
+        runtime.cache_arrival_vision_embeddings(
+            session_id="session-a",
+            incarnation=1,
+            epoch=2,
+            preencode_ids=["frame-2"],
+            frame_blocks=[[torch.ones(1)]],
+        )
+        == 0
+    )
+    assert runtime.arrival_vision_cache_size() == 0
+
+
 @pytest.mark.parametrize(
     ("audio_encoder_layer", "expected_value", "expected_hidden_states"),
     [(-1, 2.0, False), (0, 1.0, True)],
@@ -345,6 +453,61 @@ def test_audio_encoder_retains_layers_only_for_nonfinal_selection(
 
     assert audio_encoder.output_hidden_states == [expected_hidden_states]
     torch.testing.assert_close(result[0], torch.full((2, 4), expected_value))
+
+
+def test_audio_sidecar_is_moved_and_detached_from_module_tree(monkeypatch) -> None:
+    model = object.__new__(MiniCPMO45OmniLLMForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    apm = _DevicePlacementWitness()
+    projection = _DevicePlacementWitness()
+    pooler = _DevicePlacementWitness()
+    model.apm = apm
+    model.audio_projection_layer = projection
+    model.audio_avg_pooler = pooler
+
+    monkeypatch.setenv("MINICPMO45_AUDIO_ENCODER_DEVICE", "2")
+    monkeypatch.setattr(torch.accelerator, "device_count", lambda: 4)
+    model._place_audio_encoder_on_configured_device()
+
+    expected_device = torch.device("cuda:2")
+    assert apm.moved_to == expected_device
+    assert projection.moved_to == expected_device
+    assert pooler.moved_to == expected_device
+    assert not {"apm", "audio_projection_layer", "audio_avg_pooler"}.intersection(model._modules)
+    assert model.apm is apm
+    assert model.audio_projection_layer is projection
+    assert model.audio_avg_pooler is pooler
+
+
+def test_audio_embedding_return_uses_language_model_device() -> None:
+    class TransferWitness:
+        device = torch.device("cuda:2")
+
+        def __init__(self) -> None:
+            self.transfer: dict[str, object] | None = None
+
+        def to(self, **kwargs):
+            self.transfer = kwargs
+            return "on-thinker"
+
+    model = SimpleNamespace(
+        llm=SimpleNamespace(
+            model=SimpleNamespace(
+                embed_tokens=SimpleNamespace(
+                    weight=SimpleNamespace(device=torch.device("cuda:0")),
+                ),
+            ),
+        ),
+    )
+    embeddings = TransferWitness()
+
+    result = _return_audio_embeddings_to_language_device(model, embeddings)
+
+    assert result == "on-thinker"
+    assert embeddings.transfer == {
+        "device": torch.device("cuda:0"),
+        "non_blocking": True,
+    }
 
 
 def test_uniform_vision_fast_path_matches_full_mask_path() -> None:
@@ -386,6 +549,12 @@ def test_uniform_vision_fast_path_matches_full_mask_path() -> None:
 
 class _StreamingAudioHarness:
     audio_cache_seq_length = staticmethod(MiniCPMO45OmniLLMForConditionalGeneration.audio_cache_seq_length)
+    audio_streaming_seq_length = staticmethod(
+        MiniCPMO45OmniLLMForConditionalGeneration.audio_streaming_seq_length
+    )
+    should_reset_audio_past_key_values = (
+        MiniCPMO45OmniLLMForConditionalGeneration.should_reset_audio_past_key_values
+    )
     _audio_self_attention_cache = staticmethod(MiniCPMO45OmniLLMForConditionalGeneration._audio_self_attention_cache)
     combine_audio_past_key_values = classmethod(
         MiniCPMO45OmniLLMForConditionalGeneration.combine_audio_past_key_values.__func__
