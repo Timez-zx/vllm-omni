@@ -2,11 +2,11 @@
 
 This benchmark measures sustainable long-session serving capacity for continuous audio-video MiniCPM-o sessions. See the root [workflow](../../workflow.md) for the current result and interpretation.
 
-**Current status (2026-09-10):** the same serving version passes **20 users × 300 s** and fails **24 users × 300 s**. Minimum per-user post-window RTF: 1.000659 / 0.991656; maximum inherited backlog: 217.8 / 7645.8 ms. All 6,000 / 7,200 inputs complete with zero AV fallback, preemption or protocol-audit failures. This is one measurement per load, not an exact capacity ceiling or a dialogue-quality certificate. Older 8/9/10-user results in [sliding-window history](sliding_window.en.md) ([中文](sliding_window.md)) predate these optimizations.
+**Current capacity (2026-09-10): 21 users**, the highest passing tested load. At 21 users × 300 s, all 6,300 inputs complete, minimum per-user post-window RTF is **1.000787**, and maximum inherited backlog is **339.3 ms**, with zero units above 500 ms. At 22 users, RTF still passes (minimum 1.000383), but two users exceed the backlog bound in five units (maximum 523.0 ms). Both have valid sender timing and zero AV fallback, preemption or protocol-audit failures. The same serving version also passes 20 users and fails 24. One run per load does not certify unlimited sessions or dialogue quality. Older results in [sliding-window history](sliding_window.en.md) ([中文](sliding_window.md)) predate these optimizations.
 
 `--functional-only` explicitly excludes capacity certification; `--quality-capture` preserves received text/PCM after measurement without live-path disk writes. `--post-stream-s` controls observation after input ends (default 30), not input cadence or RTF. Internal speech/numerical probes are synchronizing diagnostics and remain off for capacity. Earlier fixes and evidence limits: [generation and serving audit](sliding_quality.en.md) ([中文](sliding_quality.md)).
 
-**Capacity gate:** every user's post-window long RTF must be >1 AND every post-window inherited backlog must be ≤500 ms. Backlog is previous D completion minus current complete-input readiness, clipped at zero, not current-unit execution. Any exceedance fails despite later recovery. `--max-backlog-ms` defaults to 500 and affects offline classification only. These measurements used archived uncommitted source snapshots; subsequently committing the matching code does not retroactively make them clean-build runs.
+**Capacity gate:** every user's post-window long RTF must be >1 AND every post-window inherited backlog must be ≤500 ms. Backlog is previous D completion minus current complete-input readiness, clipped at zero, not current-unit execution. Any exceedance fails despite later recovery. `--max-backlog-ms` defaults to 500 and affects offline classification only. The 21/22-user runs use clean commit `38157bae`; earlier 20/24-user measurements used matching serving sources in archived uncommitted snapshots, which are not retroactively relabeled clean-build runs.
 
 ## Reproduce the current result
 
@@ -15,7 +15,7 @@ Use the `omni` environment (Python 3.12, vLLM 0.26.0) and an unused output direc
 ```bash
 OMP_NUM_THREADS=1 /home/ubuntu/miniconda3/envs/omni/bin/python \
   benchmarks/minicpmo/run_pd_placement.py \
-  --topology d-talker --users 20 --duration-s 300 \
+  --topology d-talker --users 21 --duration-s 300 \
   --kv-window-tokens 18000 --pinned-prefix-tokens 128 \
   --kv-cache-dtype fp8 --triton-disable-q-quantization \
   --no-triton-force-2d-attention --triton-decode-split-k-threshold 32 \
@@ -23,7 +23,7 @@ OMP_NUM_THREADS=1 /home/ubuntu/miniconda3/envs/omni/bin/python \
   --mps --quality-capture --out-dir /path/to/new-run-directory
 ```
 
-Change only `--users` and the output directory for 24 users. The runner uses independent 12 s warmup sessions, then fresh 300 s histories and 30 s output observation. The 18K window, pin128, BF16 Q and D-only split-K threshold 32 are explicit overrides, not all YAML defaults. Raw results: `/home/ubuntu/data/experiments/minicpm-pd-backlog-diag-20260910/batch-policy-clean-{20,24}x300-r1/`.
+Change only `--users` and the output directory for 20, 22 or 24 users. The runner uses independent 12 s warmup sessions, then fresh 300 s histories and 30 s output observation. The 18K window, pin128, BF16 Q and D-only split-K threshold 32 are explicit overrides, not all YAML defaults. Raw results: `/home/ubuntu/data/experiments/minicpm-pd-backlog-diag-20260910/batch-policy-clean-{20,21,22,24}x300-r1/`; the 21/22-user directories include concise `RESULTS.md` reports.
 
 ## Topology
 
@@ -80,7 +80,7 @@ The application maintains session history. Thinker-P appends one native one-seco
 - Start from context zero; no preconditioning in current capacity runs.
 - Current measurement: 18,000-token Thinker window plus 128 pinned prefix tokens; logical history grows to approximately 66k over 300 seconds. Logical-position limit: 262,144.
 
-The current 20/24-user points contain 6,000/7,200 measured units. Every unit must have a client-visible physical-D completion witness and every video frame must be accounted for. Fallback, truncation, missing D-prefix evidence, or an incomplete terminal set invalidates the run.
+The current 21/22-user boundary points contain 6,300/6,600 measured units. Every unit must have a client-visible physical-D completion witness and every video frame must be accounted for. Fallback, truncation, missing D-prefix evidence, or an incomplete terminal set invalidates the run.
 
 ## Metrics
 

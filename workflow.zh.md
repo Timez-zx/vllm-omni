@@ -2,7 +2,7 @@
 
 英文版本：[workflow.md](workflow.md)。
 
-**最新结论（2026-09-10）：同一修复版，20 用户通过、24 用户失败。** 此前 12 用户失败不能当作 GPU 上限。现在主要慢在 P 的 GPU 排队/执行和 D 多步执行，但仍有 CPU 准备与控制开销，不能宣称所有工程问题已排除或达到绝对硬件上限。
+**当前容量（2026-09-10）：21 用户，当前配置下的最高通过档；22 用户轻微超出积压门槛。** 判据与300 s跨滑窗测试范围见下文，不代表无限时长稳定保证或硬件理论上限。此前12用户失败已被工程修复结果更新；P的GPU排队/执行和D多步执行是当前主要延迟项，仍有CPU准备与控制开销。
 
 ## 当前设置与判据
 
@@ -15,9 +15,13 @@ GPU0=Thinker-P，GPU1=Thinker-D+Talker，GPU2=Vision/Audio Encoder，GPU3=Code2W
 | 当前版本 / 用户数 | 完成输入 | 最低满窗后 RTF | 最大继承积压 | >500 ms 轮数 | 判定 |
 |---|---:|---:|---:|---:|---|
 | O，20 用户 | 6000/6000 | 1.000659 | 217.8 ms | 0 | 本次通过 |
+| 38157bae，21 用户 | 6300/6300 | 1.000787 | 339.3 ms | 0 | 本次通过，当前容量 |
+| 38157bae，22 用户 | 6600/6600 | 1.000383 | 523.0 ms | 5 | 失败 |
 | O，24 用户 | 7200/7200 | 0.991656 | 7645.8 ms | 1889 | 失败 |
 
-以上有效点均源码稳定、发送有效、AV 完整消费、零 fallback/preemption，协议审计 0 FAIL/UNKNOWN。24 用户中22人最终 RTF>1，但所有人都曾超过500 ms积压门槛；最终追回不算通过。每档一次300 s，不证明精确或稳定容量上限；输入周期固定，自主生成的 decode 数量并不固定。开发中间点保存在下方诊断记录，不混作当前版本容量。
+以上四档服务源码和完整部署配置一致；测量内源码稳定、发送有效、AV完整消费、零fallback/preemption，协议审计0 FAIL/UNKNOWN。21用户每人至少216轮在满窗后，最大积压339.3 ms，全部通过。22用户长期RTF全部通过，但2人共5轮积压超过500 ms；24用户中22人最终RTF>1，但所有人都曾超过积压门槛。最终追回不算通过。
+
+21/22用户使用已提交的`38157bae`、干净工作树；21用户最大发送误差6.628 ms，P/D最多驻留1134块。原始记录与命令：[21用户结果](/home/ubuntu/data/experiments/minicpm-pd-backlog-diag-20260910/batch-policy-clean-21x300-r1/RESULTS.md)、[22用户结果](/home/ubuntu/data/experiments/minicpm-pd-backlog-diag-20260910/batch-policy-clean-22x300-r1/RESULTS.md)。每档一次300 s，仅确认本配置的最高通过档为21，不证明无限时长稳定。输入周期固定，自主生成的decode数量并不固定。
 
 ## 已修复与剩余问题
 
@@ -35,7 +39,7 @@ GPU0=Thinker-P，GPU1=Thinker-D+Talker，GPU2=Vision/Audio Encoder，GPU3=Code2W
 
 同轮60s硬件采样：P / D+Talker平均GPU busy为81.5% / 74.1%，SM active为76.9% / 50.9%，DRAM read active为4.6% / 49.0%；不是持续满载或理论峰值证明。P attention每块128线程、28,928B共享内存，每SM102,400B最多容纳3块，对应25%warp容量；低warp比例不等于75%资源可自由使用，也不证明kernel最优。旧版10s CUDA trace确认forward主要在执行kernel；Nsight stop/flush和native栈采样的扰动及后续积压均排除容量结论。
 
-原始数据、每项修复、失败尝试、测试和命令见[本轮诊断](/home/ubuntu/data/experiments/minicpm-pd-backlog-diag-20260910/WRITE_PROGRESS.md)，当前复现命令见[benchmark README](benchmarks/minicpmo/README.md#reproduce-the-current-result)。这是输入消费/协议证据，不认证正常对话语义、完整音频播放SLO或无限时长。测量时源码未提交，因此归档中的正式 clean-build 认证为 false；后续提交不会改写该记录。
+原始数据、每项修复、失败尝试、测试和命令见[本轮诊断](/home/ubuntu/data/experiments/minicpm-pd-backlog-diag-20260910/WRITE_PROGRESS.md)，当前复现命令见[benchmark README](benchmarks/minicpmo/README.md#reproduce-the-current-result)。这是输入消费/协议证据，不认证正常对话语义、完整音频播放SLO或无限时长。20/24用户测量时源码未提交，归档中的clean-build认证仍为false；后续提交不改写旧记录。21/22用户补测为干净源码、无诊断的有效容量测量。
 
 ## 提交前功能复核（2026-09-10）
 

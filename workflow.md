@@ -2,7 +2,7 @@
 
 Chinese version: [workflow.zh.md](workflow.zh.md).
 
-**Latest result (2026-09-10): the same repaired version passes 20 users and fails 24.** The earlier 12-user failure was not a GPU ceiling. P GPU queueing/execution and multi-step D execution now dominate, but CPU preparation/control remains; neither exhaustive elimination of engineering issues nor an absolute hardware limit is established.
+**Current capacity (2026-09-10): 21 users, the highest passing tested load under this configuration; 22 narrowly exceeds the backlog limit.** Criteria and the 300 s cross-window scope are below; this is not an unlimited-duration guarantee or a theoretical hardware limit. Engineering repairs supersede the earlier 12-user failure. P GPU queueing/execution and multi-step D execution now dominate, with CPU preparation/control still present.
 
 ## Current setup and criteria
 
@@ -15,9 +15,13 @@ Real HD4 video at 1 FPS and 200 ms audio chunks form native one-second units; ra
 | Current version / users | Completed inputs | Minimum post-window RTF | Maximum inherited backlog | Units >500 ms | Result |
 |---|---:|---:|---:|---:|---|
 | O, 20 users | 6000/6000 | 1.000659 | 217.8 ms | 0 | Pass in this run |
+| 38157bae, 21 users | 6300/6300 | 1.000787 | 339.3 ms | 0 | Pass; current capacity |
+| 38157bae, 22 users | 6600/6600 | 1.000383 | 523.0 ms | 5 | Fail |
 | O, 24 users | 7200/7200 | 0.991656 | 7645.8 ms | 1889 | Fail |
 
-Both points have stable sources, valid sender timing, complete AV consumption, zero fallback/preemption, and 0 FAIL/UNKNOWN protocol checks. At 24 users, 22 eventually achieve RTF>1, but all exceed the 500 ms backlog limit at some point; catching up does not count as passing. One 300 s run per load does not establish an exact or stable ceiling. Periodic inputs do not imply constant autonomous decode work. Intermediate development results remain in the diagnostic record and are not current-version capacity points.
+All four loads use identical serving sources and resolved deployment configurations. Sources remain stable during measurement; sender timing and complete AV consumption pass, with zero fallback/preemption and 0 FAIL/UNKNOWN protocol checks. At 21 users, every user completes at least 216 post-window units and stays within 339.3 ms backlog. At 22, all users pass long RTF, but two users exceed 500 ms in five units. At 24, 22 users eventually achieve RTF>1, but all exceed the backlog limit. Catching up does not erase violations.
+
+The 21/22-user runs use committed `38157bae` with clean worktrees. At 21, maximum sender drift is 6.628 ms and P/D residency is bounded at 1134 blocks. Raw evidence and commands: [21-user result](/home/ubuntu/data/experiments/minicpm-pd-backlog-diag-20260910/batch-policy-clean-21x300-r1/RESULTS.md), [22-user result](/home/ubuntu/data/experiments/minicpm-pd-backlog-diag-20260910/batch-policy-clean-22x300-r1/RESULTS.md). One 300 s run per load establishes 21 as the highest passing tested point, not unlimited-duration stability. Periodic inputs do not imply constant autonomous decode work.
 
 ## Repairs and remaining issues
 
@@ -35,7 +39,7 @@ In that slow cohort, audio's critical-path contribution is only 3.6 ms, KV postâ
 
 Same-run 60 s hardware means for P / D+Talker: GPU busy 81.5% / 74.1%, SM active 76.9% / 50.9%, DRAM read active 4.6% / 49.0%. These do not prove continuous saturation or theoretical peak throughput. P attention uses 128 threads and 28,928 B shared memory per block; 102,400 B per SM permits at most three blocks, or 25% warp capacity. Low warp occupancy therefore does not mean 75% freely usable resources, nor prove an optimal kernel. Earlier 10 s CUDA tracing confirms that forward spans mostly execute kernels. Profiler-stop and native-stack-capture stalls and subsequent backlog are excluded from capacity evidence.
 
-Evidence, repairs, failed attempts, tests and commands: [diagnostic record](/home/ubuntu/data/experiments/minicpm-pd-backlog-diag-20260910/WRITE_PROGRESS.md); the current reproduction command is in the [benchmark README](benchmarks/minicpmo/README.md#reproduce-the-current-result). This is input-consumption/protocol evidence, not certification of dialogue semantics, complete playback SLOs or unlimited duration. Sources were uncommitted during measurement, so archived clean-build certification remains false; a later commit does not rewrite that record.
+Evidence, repairs, failed attempts, tests and commands: [diagnostic record](/home/ubuntu/data/experiments/minicpm-pd-backlog-diag-20260910/WRITE_PROGRESS.md); the current reproduction command is in the [benchmark README](benchmarks/minicpmo/README.md#reproduce-the-current-result). This is input-consumption/protocol evidence, not certification of dialogue semantics, complete playback SLOs or unlimited duration. The 20/24-user runs used uncommitted sources, so their archived clean-build certification remains false; committing later does not rewrite old records. The 21/22-user follow-ups are valid uninstrumented capacity measurements from clean source trees.
 
 ## Pre-commit functional verification (2026-09-10)
 
