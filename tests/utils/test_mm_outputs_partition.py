@@ -54,6 +54,9 @@ def test_partition_duplex_audio_transcript_metadata_to_client_mm():
         "meta.duplex_turn_id": torch.tensor([2], dtype=torch.int32),
         "meta.llm_output_text_utf8": torch.tensor([104, 105], dtype=torch.uint8),
         "meta.audio_text_total_chars": torch.tensor([2], dtype=torch.int32),
+        "meta.llm_output_text_is_delta": torch.tensor(True),
+        "meta.cache_epoch": torch.tensor(1, dtype=torch.int64),
+        "meta.chunk_seq": torch.tensor(42, dtype=torch.int64),
         "meta.tts_is_last_chunk": torch.tensor([1], dtype=torch.int32),
         "meta.turn_end": torch.tensor([1], dtype=torch.int32),
         "meta.native_duplex_segment_text": "hi",
@@ -63,6 +66,9 @@ def test_partition_duplex_audio_transcript_metadata_to_client_mm():
 
     assert "meta.llm_output_text_utf8" in client
     assert "meta.audio_text_total_chars" in client
+    assert "meta.llm_output_text_is_delta" in client
+    assert "meta.cache_epoch" in client
+    assert "meta.chunk_seq" in client
     assert "meta.duplex_epoch" in client
     assert "meta.duplex_turn_id" in client
     assert "meta.tts_is_last_chunk" in client

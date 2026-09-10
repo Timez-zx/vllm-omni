@@ -47,6 +47,8 @@ class MiniCPMO45ServingSessionState:
     data_plane_restart_requested: bool = False
     continuation_owner_id: str | None = None
     continuation_units: int = 0
+    continuation_schedule_task: asyncio.Task[None] | None = None
+    continuation_schedule_owner_id: str | None = None
     pending_silence_task: asyncio.Task[bool] | None = None
     pending_silence_owner_id: str | None = None
     silence_continuation_scheduler: Callable[..., Awaitable[bool]] | None = None
@@ -77,6 +79,13 @@ class MiniCPMO45ServingSessionState:
         return reserved_bytes
 
     def clear_continuation(self) -> None:
+        scheduling = self.continuation_schedule_task
+        self.continuation_schedule_task = None
+        self.continuation_schedule_owner_id = None
+        if scheduling is not None and not scheduling.done():
+            # Cancel only the timer/decision, never an already-submitted
+            # silence append (which remains in the wire-order sequencer).
+            scheduling.cancel()
         self.continuation_owner_id = None
         self.continuation_units = 0
         self.pending_silence_task = None

@@ -1,0 +1,15 @@
+# FP8-weight placement comparison:
+# GPU 0 Vision Encoder + Audio Encoder + Thinker-P, GPU 1 Thinker-D,
+# GPU 2 Talker, GPU 3 Code2Wav. Encoder and Code2Wav modules remain in their
+# model-native dtype; the vLLM AR stages use FP8 weights.
+base_config: deploy_capacity_pd_4gpu_encoders_on_p.yaml
+
+stages:
+  - stage_id: 0
+    quantization: fp8
+
+  - stage_id: 1
+    quantization: fp8
+
+  - stage_id: 2
+    quantization: fp8

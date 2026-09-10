@@ -2060,16 +2060,60 @@ async def test_native_duplex_d_completion_witness_is_per_sequence_and_exactly_on
     assert orchestrator.output_async_queue.empty()
 
 
-def test_native_duplex_pd_decode_captures_current_unit_frame_audit() -> None:
+@pytest.mark.parametrize("offset,previous", [(-1, []), (True, [1]), ("2", [1, 2]), (2, None), (2, [1])])
+def test_native_pd_rejects_missing_or_invalid_delta_prefix(offset, previous):
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._pd_kv_params = {}
+    state = SimpleNamespace(request_id="test", streaming=SimpleNamespace(
+        bridge_states={"pd_duplex_remote_prompt_token_ids": previous}))
+    output = SimpleNamespace(kv_transfer_params={
+        "remote_prompt_token_offset": offset, "remote_prompt_token_ids": [3]})
+    with pytest.raises(RuntimeError, match="prompt offset|matching prefix"):
+        orchestrator._prepare_native_duplex_pd_decode(output, state)
+    assert orchestrator._pd_kv_params == {}
+
+
+def test_pd_decode_connector_gets_full_length_not_delta_control_fields():
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._pd_kv_params = {"test": {"remote_request_id": "test",
+        "remote_prompt_token_offset": 20000, "remote_prompt_token_ids": [7, 8]}}
+    orchestrator._pd_bootstrap_addr = None
+    orchestrator._pd_prefill_engine_id = None
+    result = orchestrator._build_pd_decode_params("test", _sampling_params())
+    params = result.extra_args["kv_transfer_params"]
+    assert params["remote_prompt_tokens"] == 20002
+    assert "remote_prompt_token_offset" not in params
+    assert "remote_prompt_token_ids" not in params
+
+
+@pytest.mark.parametrize("shared_tokens", [[], [7], [99]])
+@pytest.mark.parametrize("raw_boundary", [True, False])
+@pytest.mark.parametrize("boundary_tokens", [[99], [], [7], [99, 100]])
+@pytest.mark.parametrize("delta", [False, True])
+def test_native_duplex_pd_decode_captures_current_unit_frame_audit(
+    shared_tokens, raw_boundary, boundary_tokens, delta
+) -> None:
+    import torch
+
+    from vllm_omni.experimental.fullduplex.minicpmo45.sampling_state import (
+        SAMPLING_STATE_KEY,
+        SAMPLING_STATE_WIRE_KEY,
+        DecodeSamplingState,
+        pack_sampling_state,
+    )
+    policy_state = pack_sampling_state(DecodeSamplingState(current_segment_output_tokens=[99]),
+                                       incarnation=0, epoch=None, seq=None)
     orchestrator = object.__new__(Orchestrator)
     orchestrator._pd_kv_params = {}
     source_payload = {
         "audio": "raw-audio-must-stay-on-p",
         "video_frames": ["raw-video-must-stay-on-p"],
+        "is_speech": True,
     }
     req_state = OrchestratorRequestState(
         request_id="duplex-session-stage0",
         prompt={
+            "cache_salt": "native-session-a",
             "model_intermediate_buffer": {
                 "request_id": "duplex-session-stage0",
                 "duplex": {
@@ -2084,7 +2128,9 @@ def test_native_duplex_pd_decode_captures_current_unit_frame_audit() -> None:
         final_stage_id=1,
     )
     req_state.streaming.enabled = True
-    req_state.streaming.segment_token_ids = [99]
+    # The detached P route may run after Talker/Code2Wav overwrote this
+    # shared polling scratchpad. Only the P output owns its boundary token.
+    req_state.streaming.segment_token_ids = shared_tokens
     active_slot = {
         "seq": 7,
         "input_video_frames": 0,
@@ -2097,6 +2143,7 @@ def test_native_duplex_pd_decode_captures_current_unit_frame_audit() -> None:
     output = SimpleNamespace(
         kv_transfer_params={"remote_prompt_token_ids": [1, 2, 3]},
         multimodal_output={
+            SAMPLING_STATE_WIRE_KEY: torch.tensor(policy_state),
             "duplex_input_video_frames": 1,
             "duplex_arrival_video_frames": 1,
             "duplex_vision_fallback_frames": 0,
@@ -2104,8 +2151,24 @@ def test_native_duplex_pd_decode_captures_current_unit_frame_audit() -> None:
             "duplex_audio_fallback_units": 0,
         },
     )
+    if delta:
+        req_state.streaming.bridge_states["pd_duplex_remote_prompt_token_ids"] = [1, 2]
+        output.kv_transfer_params.update(remote_prompt_token_offset=2, remote_prompt_token_ids=[3])
+    if raw_boundary:
+        output.new_token_ids = boundary_tokens
+    else:
+        output.outputs = [SimpleNamespace(token_ids=boundary_tokens)]
+
+    if boundary_tokens != [99]:
+        # A good shared scratchpad must not conceal a bad/empty P boundary.
+        message = "exactly one sampled token" if len(boundary_tokens) != 1 else "sampling state does not match"
+        with pytest.raises(RuntimeError, match=message):
+            orchestrator._prepare_native_duplex_pd_decode(output, req_state)
+        return
 
     orchestrator._prepare_native_duplex_pd_decode(output, req_state)
+
+    assert req_state.streaming.bridge_states["pd_decode_prompt"]["prompt_token_ids"] == [1, 2, 3, 99]
 
     assert active_slot == {
         "seq": 7,
@@ -2120,6 +2183,7 @@ def test_native_duplex_pd_decode_captures_current_unit_frame_audit() -> None:
     assert req_state.streaming.bridge_states["pd_decode_prompt_len"] == 4
     assert req_state.streaming.bridge_states["pd_decode_last_prompt_token_id"] == 99
     decode_prompt = req_state.streaming.bridge_states["pd_decode_prompt"]
+    assert decode_prompt["cache_salt"] == "native-session-a"
     decode_model_buffer = decode_prompt["model_intermediate_buffer"]
     assert decode_model_buffer == {
         "request_id": "duplex-session-stage0",
@@ -2127,10 +2191,37 @@ def test_native_duplex_pd_decode_captures_current_unit_frame_audit() -> None:
             "session_id": "session-a",
             "data_plane": True,
             "special_token_ids": {"eos_token_id": 42},
+            "payload": {"is_speech": True, SAMPLING_STATE_KEY: policy_state},
+            "pd_media_prefix_tokens": 3,
         },
     }
     # Building D's compact metadata must not mutate the live P request.
     assert req_state.prompt["model_intermediate_buffer"]["duplex"]["payload"] is source_payload
+    # Production releases the full D prompt at submission, before completion.
+    req_state.streaming.bridge_states.pop("pd_decode_prompt")
+    req_state.streaming.bridge_states["pd_duplex_feedback_token_ids"] = [99]
+    orchestrator._capture_native_pd_sampling_feedback(output, req_state)
+    assert req_state.streaming.bridge_states["pd_duplex_feedback_sampling_state"] == policy_state
+    req_state.streaming.bridge_states["pd_duplex_feedback_token_ids"] = [100]
+    with pytest.raises(RuntimeError, match="does not match"):
+        orchestrator._capture_native_pd_sampling_feedback(output, req_state)
+
+
+def test_native_pd_early_registration_preserves_cache_namespace(monkeypatch):
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._pd_pair = (0, 1)
+    orchestrator.stage_pools = {1: SimpleNamespace(stage_vllm_config=SimpleNamespace(model_config=None))}
+    orchestrator._build_pd_early_cache_params = lambda *args: _sampling_params()
+    orchestrator._build_pd_mrope_features = lambda *args: None
+    state = SimpleNamespace(prompt={"cache_salt": "native-session-a"},
+                            sampling_params_list=[None, _sampling_params()], pd_mrope_feature_metadata=None)
+
+    def build(**kwargs):
+        return SimpleNamespace(request_id=kwargs["request_id"], cache_salt=kwargs["prompt"].get("cache_salt"))
+
+    monkeypatch.setattr("vllm_omni.engine.orchestrator.build_engine_core_request_from_tokens", build)
+    request = orchestrator._build_pd_early_cache_request("p", state, prompt_token_ids=[0] * 16)
+    assert request.cache_salt == "native-session-a"
 
 
 @pytest.mark.asyncio

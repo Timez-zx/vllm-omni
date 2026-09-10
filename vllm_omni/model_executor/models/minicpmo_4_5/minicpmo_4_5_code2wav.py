@@ -19,6 +19,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
+from vllm_omni.experimental.fullduplex.minicpmo45 import speech_probe
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .batched_token2wav import (
@@ -553,6 +554,9 @@ class MiniCPMO45Code2Wav(nn.Module):
             raise _batch_error("empty_nonfinal_chunk", request_ids=invalid_empty)
 
         buckets: dict[tuple[Any, ...], list[_WorkItem]] = {}
+        if speech_probe.ENABLED:
+            probe_forward_id = speech_probe.new_batch_id()
+            probe_buckets: dict[str, dict[str, int | None]] = {}
         for item in compute_items:
             buckets.setdefault(self._bucket_key(item), []).append(item)
         undersized = [
@@ -627,6 +631,14 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
         for bucket in buckets.values():
             batch_size = len(bucket)
+            if speech_probe.ENABLED:
+                probe_bucket_id = speech_probe.new_batch_id()
+                for row_index, item in enumerate(bucket):
+                    probe_buckets[item.state_id] = {
+                        "bucket_id": probe_bucket_id,
+                        "bucket_size": batch_size,
+                        "bucket_row_index": row_index,
+                    }
             try:
                 features = self.backend.prepare_prompt(
                     bucket[0].prompt_cache_id,
@@ -675,6 +687,43 @@ class MiniCPMO45Code2Wav(nn.Module):
                     )
                 )
 
+        if speech_probe.ENABLED:
+            for item in items:
+                old_state = self._states.get(item.state_id)
+                next_state = pending.get(item.state_id)
+                speech_probe.emit(
+                    "code2wav",
+                    request_id=item.request_id,
+                    physical_request_id=item.state_id,
+                    forward_id=probe_forward_id,
+                    forward_size=len(items),
+                    forward_row_index=item.output_index,
+                    **probe_buckets.get(
+                        item.state_id,
+                        {
+                            "bucket_id": None,
+                            "bucket_size": 0,
+                            "bucket_row_index": None,
+                        },
+                    ),
+                    epoch=item.duplex_epoch,
+                    model_turn_id=item.duplex_turn_id,
+                    cache_epoch=item.cache_epoch,
+                    chunk_seq=item.chunk_seq,
+                    previous_cache_epoch=old_state.cache_epoch if old_state is not None else None,
+                    previous_chunk_seq=old_state.chunk_seq if old_state is not None else None,
+                    prompt_cache_id=item.prompt_cache_id,
+                    prompt_wav=item.prompt_wav,
+                    used_previous_state=item.previous is not None,
+                    next_state_exists=next_state is not None,
+                    has_payload=item.has_payload,
+                    last_chunk=item.last_chunk,
+                    turn_end=item.turn_end,
+                    tts_finished=item.tts_is_last_chunk,
+                    codes=speech_probe.values(item.tokens),
+                    segment_text=bytes(speech_probe.values(item.segment_text_utf8)).decode("utf-8"),
+                    **speech_probe.audio_summary(outputs[item.output_index]),
+                )
         self._commit_runtime_prompt_owners(items)
         for request_id, state in pending.items():
             if state is None:
@@ -692,7 +741,16 @@ class MiniCPMO45Code2Wav(nn.Module):
                 # processor before the full-duplex data plane consumes them.
                 "meta.duplex_epoch": [torch.tensor(item.duplex_epoch, dtype=torch.int32) for item in items],
                 "meta.duplex_turn_id": [torch.tensor(item.duplex_turn_id, dtype=torch.int32) for item in items],
+                "meta.cache_epoch": [torch.tensor(item.cache_epoch, dtype=torch.int64) for item in items],
+                "meta.chunk_seq": [torch.tensor(item.chunk_seq, dtype=torch.int64) for item in items],
                 "meta.llm_output_text_utf8": [item.segment_text_utf8 for item in items],
+                "meta.llm_output_text_is_delta": [
+                    torch.tensor(
+                        item.has_payload and item.duplex_epoch >= 0 and item.duplex_turn_id >= 0,
+                        dtype=torch.bool,
+                    )
+                    for item in items
+                ],
                 "meta.tts_is_last_chunk": [torch.tensor(item.tts_is_last_chunk, dtype=torch.bool) for item in items],
                 "meta.segment_end": [torch.tensor(item.segment_end, dtype=torch.bool) for item in items],
                 "meta.turn_end": [torch.tensor(item.turn_end, dtype=torch.bool) for item in items],

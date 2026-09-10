@@ -29,9 +29,12 @@ _CLIENT_MM_ROOT_KEYS: frozenset[str] = frozenset(
 _CLIENT_MM_META_KEYS: frozenset[str] = frozenset(
     {
         "audio_text_total_chars",
+        "cache_epoch",
+        "chunk_seq",
         "duplex_epoch",
         "duplex_turn_id",
         "llm_output_text_utf8",
+        "llm_output_text_is_delta",
         "segment_end",
         "tts_is_last_chunk",
         "turn_end",

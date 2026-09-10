@@ -8,6 +8,7 @@ from time import monotonic, time
 from typing import Any
 
 import numpy as np
+import torch
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_events import KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
@@ -107,6 +108,7 @@ def _compact_native_duplex_prompt_metadata(
     multimodal_output: Any,
     *,
     current_segment_token_ids: Iterable[int] | None = None,
+    native_segment: bool = False,
 ) -> Any:
     """Replace MiniCPM's O(context) prompt snapshot with boundary metadata.
 
@@ -119,7 +121,17 @@ def _compact_native_duplex_prompt_metadata(
         return multimodal_output
     raw_prompt_ids = multimodal_output.get(NATIVE_PROMPT_TOKEN_IDS_KEY)
     if raw_prompt_ids is None:
+        # Decode steps do not rerun media preprocessing, so they need not
+        # repeat the prompt snapshot emitted by the unit's prefill step.
+        # Nevertheless the terminal segment IDs MUST replace the previous
+        # unit's IDs; otherwise an earlier listen decision masks new speech.
+        if native_segment and current_segment_token_ids is not None:
+            return {
+                **multimodal_output,
+                NATIVE_SEGMENT_TOKEN_IDS_KEY: torch.tensor(list(current_segment_token_ids), dtype=torch.int64),
+            }
         return multimodal_output
+    tensor_payload = isinstance(raw_prompt_ids, torch.Tensor)
     if hasattr(raw_prompt_ids, "detach"):
         raw_prompt_ids = raw_prompt_ids.detach().cpu().tolist()
     if isinstance(raw_prompt_ids, tuple):
@@ -143,10 +155,22 @@ def _compact_native_duplex_prompt_metadata(
     compact[NATIVE_LAST_PROMPT_TOKEN_KEY] = prompt_ids[-1] if prompt_ids else None
     if current_segment_token_ids is not None:
         compact[NATIVE_SEGMENT_TOKEN_IDS_KEY] = [int(token_id) for token_id in current_segment_token_ids]
+    if tensor_payload:
+        # EngineCore's multimodal wire channel is dict[str, Tensor]. Preserve
+        # that contract when compacting a model output; Python ints/lists are
+        # valid inside local bridge payloads but fail typed msgpack decoding.
+        for key in (NATIVE_PROMPT_LEN_KEY, NATIVE_LAST_PROMPT_TOKEN_KEY, NATIVE_SEGMENT_TOKEN_IDS_KEY):
+            if key not in compact:
+                continue
+            if compact[key] is None:
+                compact.pop(key)
+            else:
+                compact[key] = torch.tensor(compact[key], dtype=torch.int64)
     return compact
 
 
-LOG_DUPLEX_CADENCE = os.environ.get("VLLM_OMNI_LOG_DUPLEX_CADENCE", "0") == "1"
+LOG_DUPLEX_CADENCE = os.environ.get("VLLM_OMNI_LOG_DUPLEX_CADENCE", "0") in {"1", "units"}
+LOG_DUPLEX_STEPS = os.environ.get("VLLM_OMNI_LOG_DUPLEX_CADENCE", "0") == "1"
 
 
 class SampledLogprobContractError(RuntimeError):
@@ -453,12 +477,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         connector.update_connector_output(KVConnectorOutput(finished_recving={request.request_id}))
         self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
 
-        # Match vLLM's ordinary WAITING_FOR_REMOTE_KVS completion path.  A
-        # full-prompt import must replay the last prompt token so the model can
-        # produce the first sampled token; otherwise scheduler admission sees
-        # zero new tokens.  The imported partial block remains request-owned.
-        if request.num_computed_tokens == request.num_tokens:
-            request.num_computed_tokens = request.num_tokens - 1
+        # This is a cache-only import, not an inference request. Preserve ALL
+        # imported KV, including the partial block. Only formal D admission
+        # can decide whether its own prompt needs a final-token replay. Native
+        # MiniCPM appends P's sampled token: backing up here would recompute an
+        # audio embedding as a plain placeholder token and corrupt generation.
 
         lineage_id = getattr(request, "kv_lineage_id", None)
         revision = int(getattr(request, "kv_lineage_revision", 0))
@@ -623,6 +646,22 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return False
 
+    def _preempt_request(self, request: Request, timestamp: float) -> None:
+        # Upstream does not emit a per-request warning for this path. Keep
+        # capacity audits from silently treating KV recomputation as ordinary
+        # input work, especially for native multimodal streaming requests.
+        logger.warning(
+            "[kv-preemption] stage=%s request=%s preempted computed=%d "
+            "prompt=%d tokens=%d free_blocks=%d",
+            self.vllm_config.model_config.stage_id,
+            request.request_id,
+            request.num_computed_tokens,
+            request.num_prompt_tokens,
+            request.num_tokens,
+            self.kv_cache_manager.block_pool.get_num_free_blocks(),
+        )
+        super()._preempt_request(request, timestamp)
+
     def add_request(self, request: Request) -> None:
         if getattr(self, "_prefill_microbatch_window_s", 0.0) > 0:
             self._prefill_scheduler_admit_mono[request.request_id] = monotonic()
@@ -631,14 +670,35 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if LOG_DUPLEX_CADENCE:
             self._init_duplex_cadence_counters()
             self._duplex_admit_generation[request.request_id] += 1
+            # Preserve native non-P/D input identity as well as finite-P/D
+            # request identity. Protocol audio deltas are not one-to-one with
+            # real input units and cannot measure sustained input progress.
+            input_seq: int | str = "-"
+            input_origin = "-"
+            input_unit_index: int | str = "-"
+            model_buffer = getattr(request, "model_intermediate_buffer", None)
+            duplex = model_buffer.get("duplex") if isinstance(model_buffer, dict) else None
+            if isinstance(duplex, dict):
+                input_seq = duplex.get("seq", "-")
+                payload = duplex.get("payload")
+                if isinstance(payload, dict):
+                    input_origin = (
+                        "continuation"
+                        if payload.get("duplex_input_source") == "auto_continuation"
+                        else "client"
+                    )
+                    input_unit_index = payload.get("input_unit_index", "-")
             logger.info(
                 "[duplex_cadence] stage=%s ADMIT req=%s generation=%s "
-                "admit_epoch=%.6f prompt_tokens=%s",
+                "admit_epoch=%.6f prompt_tokens=%s input_seq=%s input_origin=%s input_unit_index=%s",
                 self.vllm_config.model_config.stage_id,
                 request.request_id,
                 self._duplex_admit_generation[request.request_id],
                 time(),
                 getattr(request, "num_prompt_tokens", "?"),
+                input_seq,
+                input_origin,
+                input_unit_index,
             )
         super().add_request(request)
 
@@ -766,7 +826,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     len(self.waiting),
                     len(self.running),
                 )
-        if LOG_DUPLEX_CADENCE and scheduler_output.num_scheduled_tokens:
+        if LOG_DUPLEX_STEPS and scheduler_output.num_scheduled_tokens:
             self._init_duplex_cadence_counters()
             scheduled_epoch = time()
             batch_reqs = len(scheduler_output.num_scheduled_tokens)
@@ -904,7 +964,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
         handoff_diag_start = monotonic()
-        if LOG_DUPLEX_CADENCE and scheduler_output.num_scheduled_tokens:
+        if LOG_DUPLEX_STEPS and scheduler_output.num_scheduled_tokens:
             self._init_duplex_cadence_counters()
             runner_done_epoch = time()
             for req_id in scheduler_output.num_scheduled_tokens:
@@ -1133,6 +1193,22 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
                 finish_reason = request.get_finished_reason()
+                if LOG_DUPLEX_CADENCE:
+                    logger.info(
+                        "[duplex_cadence] stage=%s UNIT_DONE req=%s generation=%s done_epoch=%.6f "
+                        "context_tokens=%s output_tokens=%s max_tokens=%s last_token=%s "
+                        "stop_reason=%s finish_reason=%s",
+                        self.vllm_config.model_config.stage_id,
+                        req_id,
+                        self._duplex_admit_generation.get(req_id, 0),
+                        time(),
+                        request.num_prompt_tokens,
+                        request.num_output_tokens,
+                        request.max_tokens,
+                        new_token_ids[-1] if new_token_ids else None,
+                        request.stop_reason,
+                        finish_reason,
+                    )
                 # Native duplex P keeps one resumable request so the model's
                 # streaming encoder/session state survives across input units.
                 # A P/D connector normally publishes KV only from the terminal
@@ -1155,12 +1231,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                             "P/D streaming segment ended without connector metadata: "
                             f"request={request.request_id}"
                         )
-                    # D must hash and allocate the same cumulative logical
-                    # prompt as P.  These IDs are scheduler metadata only; D
-                    # loads the actual KV and does not repeat media encoding.
-                    kv_transfer_params["remote_prompt_token_ids"] = list(
-                        (request.prompt_token_ids or ())[: request.num_computed_tokens]
-                    )
+                    # The paired D completion gates the next P segment, so
+                    # the API already owns the previous published prefix.
+                    # Echo only its extension, not the full logical history.
+                    prompt_ids = request.prompt_token_ids or ()
+                    end = min(len(prompt_ids), request.num_computed_tokens)
+                    start = getattr(request, "_omni_pd_published_prompt_tokens", 0)
+                    if not 0 <= start <= end:
+                        start = 0
+                    kv_transfer_params["remote_prompt_token_offset"] = start
+                    kv_transfer_params["remote_prompt_token_ids"] = list(prompt_ids[start:end])
+                    request._omni_pd_published_prompt_tokens = end
                 else:
                     # Native duplex D normally uses one finite request per
                     # slot, while compatibility paths may retain a streaming
@@ -1227,6 +1308,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             mm_output = _compact_native_duplex_prompt_metadata(
                 mm_output,
                 current_segment_token_ids=current_segment_token_ids,
+                native_segment=bool(
+                    self.vllm_config.model_config.stage_id == 0
+                    and isinstance(getattr(request, "model_intermediate_buffer", None), dict)
+                    and isinstance(request.model_intermediate_buffer.get("duplex"), dict)
+                    and request.model_intermediate_buffer["duplex"].get("data_plane")
+                ),
             )
 
             # Get prompt logprobs for this request.
@@ -1526,6 +1613,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             for info in update_infos
         )
         if replace_streaming_prompt:
+            # A rebase rewrites prefix identity, even at an equal/greater length.
+            session._omni_pd_published_prompt_tokens = 0
             self._replace_streaming_session(session, update)
             return
         super()._update_request_as_session(session, update)

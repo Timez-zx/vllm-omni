@@ -25,6 +25,7 @@ class MiniCPMO45DataPlaneContext:
     active_response_turn_id: int | None = None
     active_response_id: str | None = None
     auto_responds: bool = False
+    require_native_audio_chunk_identity: bool = False
     response_format: str = "wav"
     speed: float | None = None
     modalities: tuple[str, ...] = ()
@@ -45,6 +46,8 @@ class _RequestState:
     pending_audio_without_text: list[dict[str, object]] = field(default_factory=list)
     terminal: bool = False
     turns: dict[int | None, _TurnState] = field(default_factory=dict)
+    output_owner: tuple[int, int] | None = None
+    last_payload_key: tuple[int, int, int, int] | None = None
 
     def turn(self, turn_id: int | None) -> _TurnState:
         return self.turns.setdefault(turn_id, _TurnState())
@@ -185,6 +188,63 @@ class MiniCPMO45DataPlaneSession:
         if context.auto_responds and (stale_turn or stale_epoch):
             return
 
+        if context.auto_responds and request_state is not None and output_turn_id is not None:
+            owner = (context.epoch if output_epoch is None else output_epoch, output_turn_id)
+            previous_owner = request_state.output_owner
+            if previous_owner is not None and owner < previous_owner:
+                # The API may not have consumed the next turn yet. Do not let
+                # a late previous-turn result reset its pending audio cursor.
+                return
+            if owner != previous_owner:
+                # A persistent engine request can contain many model turns.
+                # Its unlabelled audio must never acquire another turn's text.
+                request_state.pending_audio_without_text.clear()
+                if previous_owner is not None and owner[0] != previous_owner[0]:
+                    request_state.turns.clear()
+                    request_state.audio_offset = 0
+                request_state.output_owner = owner
+            if request_state.turn(output_turn_id).turn_eos_done:
+                return
+
+        text_is_delta = _bool_metadata(mm_output, ("llm_output_text_is_delta",), default=False)
+        native_audio_payload = any(
+            (_audio_num_samples(mm_output[key]) or 0) > 0 for key in ("audio", "model_outputs") if key in mm_output
+        ) or bool(_llm_output_text(mm_output))
+        native_audio_payload = native_audio_payload or _bool_metadata(
+            mm_output, ("tts_is_last_chunk", "turn_end"), default=False
+        )
+        if context.require_native_audio_chunk_identity and native_audio_payload and not text_is_delta:
+            # The current native serving adapter declares this producer
+            # contract out of band. A worker/IPC boundary must not silently
+            # turn a lost delta flag into the legacy cumulative-text path.
+            # Standalone legacy callers retain their explicitly selected mode.
+            yield runtime_result(
+                stage_role="tts",
+                error_code="runtime_data_plane_invalid_chunk_identity",
+                error="Native audio output lost its required text-delta and chunk-identity contract.",
+                data_plane_request_id=request_id,
+            )
+            return
+        if text_is_delta:
+            # Code2Wav's producer has already attached each segment's text
+            # once. Equal strings in different payloads are genuine repeated
+            # speech, not cumulative snapshots. Deduplicate by stream identity
+            # instead of deleting matching strings or prefixes.
+            cache_epoch = _first_metadata_int(mm_output, "cache_epoch")
+            chunk_seq = _first_metadata_int(mm_output, "chunk_seq")
+            payload_key = (output_epoch, output_turn_id, cache_epoch, chunk_seq)
+            if request_state is None or any(value is None or value < 0 for value in payload_key):
+                yield runtime_result(
+                    stage_role="tts",
+                    error_code="runtime_data_plane_invalid_chunk_identity",
+                    error="Native text deltas require a request, epoch, model turn, cache epoch and chunk sequence.",
+                    data_plane_request_id=request_id,
+                )
+                return
+            if request_state.last_payload_key is not None and payload_key <= request_state.last_payload_key:
+                return
+            request_state.last_payload_key = payload_key
+
         mm_text = _llm_output_text(mm_output)
         if mm_text:
             text = mm_text
@@ -246,12 +306,17 @@ class MiniCPMO45DataPlaneSession:
 
         text_turn_id = output_turn_id if output_turn_id is not None else context.turn_id
         text_turn_state = request_state.turn(text_turn_id) if request_state is not None else None
+
+        def text_delta() -> str:
+            if text_is_delta:
+                return text if isinstance(text, str) else ""
+            return self.segment_text_delta(request_id, text, turn_id=text_turn_id)
+
         if audio_chunks:
-            delta_text = self.segment_text_delta(request_id, text, turn_id=text_turn_id)
+            delta_text = text_delta()
             last_idx = len(audio_chunks) - 1
             sample_rate_hz = _sample_rate_hz(mm_output)
             audio_text_marks = _audio_text_marks(mm_output)
-            fallback_marks = _fallback_audio_text_marks(audio_chunks, delta_text)
             audio_results: list[dict[str, object]] = []
             for idx, (audio, duration_ms) in enumerate(audio_chunks):
                 native_result = runtime_result(
@@ -272,9 +337,10 @@ class MiniCPMO45DataPlaneSession:
                 if audio_text_marks and idx == last_idx:
                     native_result["audio_text_marks"] = audio_text_marks
                     native_result["audio_text_marks_are_cumulative"] = True
-                elif idx < len(fallback_marks) and fallback_marks[idx]:
-                    native_result["audio_text_marks"] = fallback_marks[idx]
-                    native_result["audio_text_marks_are_cumulative"] = True
+                # Without native alignment, the generic runtime bridge marks
+                # this group's end using the response's cumulative text/audio
+                # cursors. Local delta-text/chunk offsets are not cumulative
+                # response coordinates and must not be published as such.
                 audio_results.append(native_result)
 
             if context.auto_responds:
@@ -291,7 +357,12 @@ class MiniCPMO45DataPlaneSession:
                     or context.active_response_turn_id == output_turn_id
                 )
                 turn_has_text = text_turn_state is not None and text_turn_state.has_text
-                if not future_model_turn and not response_turn_bound and not turn_has_text:
+                # Native non-LISTEN units may contain speech without text.
+                # Their epoch/turn owner was validated above: emit them now,
+                # preserving the model's actual turn_end rather than treating
+                # a TTS segment boundary as an empty completed response.
+                native_audio_owner = output_epoch is not None and output_turn_id is not None
+                if not native_audio_owner and not future_model_turn and not response_turn_bound and not turn_has_text:
                     if request_state is not None:
                         if tts_segment_end:
                             request_state.pending_audio_without_text.clear()
@@ -318,19 +389,16 @@ class MiniCPMO45DataPlaneSession:
             pending_audio = request_state.pending_audio_without_text
             request_state.pending_audio_without_text = []
             if pending_audio:
-                delta_text = self.segment_text_delta(request_id, text, turn_id=text_turn_id)
+                delta_text = text_delta()
                 if delta_text:
                     pending_audio[0]["text"] = delta_text
                     if text_turn_state is not None:
                         text_turn_state.has_text = True
-                    total_duration_ms = sum(
-                        max(0, int(result.get("audio_duration_ms", 0) or 0)) for result in pending_audio
-                    )
-                    if total_duration_ms > 0 and not pending_audio[-1].get("audio_text_marks"):
-                        pending_audio[-1]["audio_text_marks"] = [
-                            {"text_chars": len(delta_text), "audio_end_ms": total_duration_ms}
-                        ]
-                        pending_audio[-1]["audio_text_marks_are_cumulative"] = True
+                    # The newly attached text belongs to the entire buffered
+                    # group, not its first chunk. Let the response owner form
+                    # one cumulative boundary after the last buffered chunk.
+                    for idx, result in enumerate(pending_audio):
+                        result["audio_text_mark"] = idx == len(pending_audio) - 1
                     if unit_end_of_turn:
                         pending_audio[-1]["end_of_turn"] = True
                     if tts_segment_end:
@@ -339,10 +407,39 @@ class MiniCPMO45DataPlaneSession:
                     return
                 request_state.pending_audio_without_text = pending_audio
 
+        if text_is_delta and isinstance(text, str) and text:
+            # A real text delta may accompany a terminal/control payload with
+            # no PCM. Deliver it on its own response, without claiming that
+            # the already-sent audio spoke these new characters.
+            if text_turn_state is not None:
+                text_turn_state.has_text = True
+            yield runtime_result(
+                stage_role="tts",
+                is_listen=False,
+                data_plane_request_id=request_id,
+                model_turn_id=output_turn_id,
+                text=text,
+                audio_data="",
+                audio_format=context.response_format,
+                audio_text_mark=False,
+                end_of_turn=unit_end_of_turn,
+                abort_data_plane_request=tts_segment_end,
+            )
+            return
+
         if tts_segment_end:
             if unit_end_of_turn and request_state is not None and request_state.pending_audio_without_text:
-                request_state.pending_audio_without_text[-1]["end_of_turn"] = True
-                request_state.pending_audio_without_text[-1]["abort_data_plane_request"] = True
+                pending_audio = request_state.pending_audio_without_text
+                request_state.pending_audio_without_text = []
+                if context.active_response_id is not None and (
+                    output_turn_id is None or context.active_response_turn_id == output_turn_id
+                ):
+                    # A bound response can legitimately continue with audio
+                    # only. Drain its own buffered audio before ending it.
+                    pending_audio[-1]["end_of_turn"] = True
+                    pending_audio[-1]["abort_data_plane_request"] = True
+                    yield from pending_audio
+                    return
             terminal_result = runtime_result(
                 stage_role="tts",
                 is_listen=False,
@@ -376,9 +473,7 @@ class MiniCPMO45DataPlaneSession:
             return
 
         if request_id is not None and context.auto_responds and unit_end_of_turn and context.active_response_id is None:
-            # The legacy projector only removed the request-scoped pending
-            # buffer here when no explicit model-turn key was present.
-            if request_state is not None and output_turn_id is None:
+            if request_state is not None:
                 request_state.pending_audio_without_text.clear()
             terminal_result = runtime_result(
                 stage_role="tts",
@@ -816,22 +911,3 @@ def _decode_text_tensor(value: object) -> str:
         return raw.decode("utf-8", errors="ignore")
     except Exception:
         return ""
-
-
-def _fallback_audio_text_marks(
-    audio_chunks: list[tuple[str, int]],
-    delta_text: str,
-) -> list[list[dict[str, int]] | None]:
-    if not delta_text:
-        return []
-    total_duration_ms = sum(max(0, int(duration_ms)) for _, duration_ms in audio_chunks)
-    cumulative_duration_ms = 0
-    marks: list[list[dict[str, int]] | None] = []
-    for _, duration_ms in audio_chunks:
-        cumulative_duration_ms += max(0, int(duration_ms))
-        if total_duration_ms <= 0:
-            marks.append(None)
-            continue
-        text_chars = int(len(delta_text) * min(1.0, cumulative_duration_ms / float(total_duration_ms)))
-        marks.append([{"text_chars": max(0, text_chars), "audio_end_ms": max(0, cumulative_duration_ms)}])
-    return marks

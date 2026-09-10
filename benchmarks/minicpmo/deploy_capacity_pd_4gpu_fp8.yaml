@@ -1,0 +1,14 @@
+# FP8-weight control for the canonical MiniCPM-o native-duplex P/D topology.
+# Vision/Audio Encoder and Code2Wav remain in their model-native dtype because
+# they are not vLLM quantized-linear stages.
+base_config: deploy_capacity_pd_4gpu.yaml
+
+stages:
+  - stage_id: 0
+    quantization: fp8
+
+  - stage_id: 1
+    quantization: fp8
+
+  - stage_id: 2
+    quantization: fp8

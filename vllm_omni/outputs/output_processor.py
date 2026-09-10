@@ -9,6 +9,7 @@ from vllm.outputs import CompletionOutput, PoolingRequestOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.tokenizers import TokenizerLike
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
+from vllm.v1.engine.detokenizer import FastIncrementalDetokenizer, SlowIncrementalDetokenizer
 from vllm.v1.engine.output_processor import OutputProcessor as VLLMOutputProcessor
 from vllm.v1.engine.output_processor import (
     OutputProcessorOutput,
@@ -24,6 +25,7 @@ from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalP
 from vllm_omni.outputs.multimodal_accumulation import (
     drain_delta_payload,
     is_non_final_delta_audio_chunk,
+    release_native_segment_content,
     replace_snapshot_keys,
 )
 from vllm_omni.outputs.output_modality import OutputModality, get_accumulation_strategy
@@ -573,6 +575,17 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             log_stats=self.log_stats,
             stream_interval=self.stream_interval,
         )
+        buffer = getattr(request, "model_intermediate_buffer", None)
+        if (
+            isinstance(buffer, dict)
+            and isinstance(buffer.get("duplex"), dict)
+            and isinstance(req_state.detokenizer, FastIncrementalDetokenizer)
+        ):
+            # Native DecodeStream primes from the full logical prompt on its
+            # first step, even when GPU KV is a bounded sliding window. Reuse
+            # vLLM's bounded-prefix incremental path for recurring duplex
+            # requests; preserve text, token counts and stop-string handling.
+            req_state.detokenizer = SlowIncrementalDetokenizer(self.tokenizer, request)
         self.request_states[request_id] = req_state
         if parent_req:
             self.parent_requests[parent_req.request_id] = parent_req
@@ -610,6 +623,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         # that would trigger upstream's `assert detokenizer is not None`.
         upstream_outputs: list[EngineCoreOutput] = []
         mm_only_outputs: list[EngineCoreOutput] = []
+        completed_native_states: list[OmniRequestState] = []
 
         for eco in engine_core_outputs:
             req_state = self.request_states.get(eco.request_id)
@@ -622,6 +636,11 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 if mm_output is not None:
                     mm_type = getattr(eco, "output_type", None) or default_mm_type
                     req_state.add_multimodal_tensor(mm_output, mm_type)
+                if (
+                    getattr(eco, "is_segment_finished", False)
+                    and "duplex_segment_token_ids" in req_state.mm_accumulated
+                ):
+                    completed_native_states.append(req_state)
 
             # Route: if no detokenizer and no pooling output, handle locally
             # to avoid upstream's assert on detokenizer.
@@ -640,6 +659,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             iteration_stats=iteration_stats,
         )
         processed.request_outputs.extend(mm_request_outputs)
+        for state in completed_native_states:
+            release_native_segment_content(state.mm_accumulated)
         return processed
 
     def _process_mm_only_outputs(

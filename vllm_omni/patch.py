@@ -19,11 +19,121 @@ from vllm.v1.request import StreamingUpdate as _OriginalStreamingUpdate
 
 import vllm_omni.logger  # noqa: F401
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEngineCoreRequest
+from vllm_omni.engine.pinned_prefix_window import install_pinned_prefix_window
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.layers.rotary_embedding import OmniMRotaryEmbedding
 from vllm_omni.request import OmniRequest, OmniStreamingUpdate
 
 _PATCH_LOGGER = logging.getLogger("vllm_omni.patch")
+
+install_pinned_prefix_window()
+
+
+def _patch_triton_query_quantization():
+    """Opt out of FP8 Q with an explicit, compile-hashed instance setting.
+
+    Stored KV remains FP8. The existing Triton kernel dequantizes loaded KV
+    to Q's dtype, so BF16 models retain BF16 attention dot operands instead
+    of additionally quantizing Q and the probability operand to FP8.
+    Unset/false preserves upstream behavior; no forward-time config lookup.
+    """
+    from functools import wraps
+
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
+
+    original = TritonAttentionImpl.__init__
+    if getattr(original, "_vllm_omni_triton_q_precision_hook", False):
+        return
+
+    @wraps(original)
+    def configured_init(self, *args, **kwargs):
+        config = get_current_vllm_config_or_none()
+        additional = getattr(config, "additional_config", None)
+        disabled = additional.get("triton_disable_q_quantization", False) if isinstance(additional, dict) else False
+        if not isinstance(disabled, bool):
+            raise ValueError("additional_config.triton_disable_q_quantization must be a boolean")
+        original(self, *args, **kwargs)
+        self._omni_triton_q_quantization_disabled = disabled
+        if disabled:
+            self.supports_quant_query_input = False
+            _PATCH_LOGGER.info(
+                "Triton attention: Q quantization disabled; KV storage dtype=%s",
+                getattr(self, "kv_cache_dtype", "unknown"),
+            )
+
+    configured_init._vllm_omni_triton_q_precision_hook = True
+    TritonAttentionImpl.__init__ = configured_init
+
+
+_patch_triton_query_quantization()
+
+
+def _patch_triton_attention_execution_path():
+    """Per-instance native attention dispatch; no quantization/batching change.
+
+    This removes the 2D/3D split-reduction choice, not all sources of batch
+    dependent rounding. Small decode batches may lose split-K parallelism.
+    An explicit split-K threshold sizes scratch buffers before graph capture.
+    """
+    from copy import copy
+    from functools import wraps
+
+    import torch
+
+    from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadataBuilder
+
+    original_init = TritonAttentionMetadataBuilder.__init__
+    if getattr(original_init, "_vllm_omni_triton_force_2d_hook", False):
+        return
+    original_build = TritonAttentionMetadataBuilder.build
+
+    @wraps(original_init)
+    def configured_init(self, kv_cache_spec, layer_names, vllm_config, device, *args, **kwargs):
+        additional = getattr(vllm_config, "additional_config", None)
+        force_2d = additional.get("triton_force_2d_attention", False) if isinstance(additional, dict) else False
+        split_threshold = additional.get("triton_decode_split_k_threshold") if isinstance(additional, dict) else None
+        if not isinstance(force_2d, bool):
+            raise ValueError("additional_config.triton_force_2d_attention must be a boolean")
+        if split_threshold is not None:
+            if type(split_threshold) is not int or not 1 <= split_threshold <= vllm_config.scheduler_config.max_num_seqs:
+                raise ValueError("triton_decode_split_k_threshold must be an integer in [1, max_num_seqs]")
+            if force_2d:
+                raise ValueError("triton_decode_split_k_threshold conflicts with triton_force_2d_attention")
+        original_init(self, kv_cache_spec, layer_names, vllm_config, device, *args, **kwargs)
+        self._omni_triton_force_2d_attention = force_2d
+        if split_threshold is not None:
+            if self.decode_cudagraph_enabled and split_threshold not in vllm_config.compilation_config.cudagraph_capture_sizes:
+                raise ValueError("triton_decode_split_k_threshold must be a CUDA graph capture size")
+            # Preserve native buffer dtype/layout and stable captured addresses.
+            # Native dispatch still restricts split-K to decode (max_query_len=1).
+            self.seq_threshold_3D = split_threshold
+            for name in ("softmax_segm_output", "softmax_segm_max", "softmax_segm_expsum"):
+                buffer = getattr(self, name)
+                setattr(self, name, torch.empty((split_threshold, *buffer.shape[1:]),
+                                               dtype=buffer.dtype, device=buffer.device))
+            _PATCH_LOGGER.info("Triton attention: decode split-K threshold=%d", split_threshold)
+        if force_2d:
+            _PATCH_LOGGER.info("Triton attention: 2D execution forced; quantization and batching unchanged")
+
+    @wraps(original_build)
+    def configured_build(self, *args, **kwargs):
+        metadata = original_build(self, *args, **kwargs)
+        if self._omni_triton_force_2d_attention:
+            # Do not mutate metadata owned by an underlying builder/cache.
+            # Tensor buffers retain their original identity and contents.
+            metadata = copy(metadata)
+            metadata.seq_threshold_3D = 0
+        return metadata
+
+    configured_init._vllm_omni_triton_force_2d_hook = True
+    TritonAttentionMetadataBuilder.__init__ = configured_init
+    TritonAttentionMetadataBuilder.build = configured_build
+
+
+# The pinned-prefix subclass installed above calls this base via super(), so
+# its compact KV view and R-SWA mask are preserved in both execution modes.
+_patch_triton_attention_execution_path()
 
 # =============================================================================
 # Patch ModelConfig.is_mm_prefix_lm to support omni-specific models
@@ -328,8 +438,8 @@ def _patch_chat_template_registry():
         )
 
         if "qwen3_omni_moe" not in _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK:
-            _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK["qwen3_omni_moe"] = (
-                lambda _: CHAT_TEMPLATES_DIR / "template_chatml.jinja"
+            _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK["qwen3_omni_moe"] = lambda _: (
+                CHAT_TEMPLATES_DIR / "template_chatml.jinja"
             )
     except ImportError:
         pass

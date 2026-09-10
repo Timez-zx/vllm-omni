@@ -73,6 +73,8 @@ class ServingRuntimeSessionState(Protocol):
     data_plane_restart_requested: bool
     continuation_owner_id: str | None
     continuation_units: int
+    continuation_schedule_task: asyncio.Task[None] | None
+    continuation_schedule_owner_id: str | None
     pending_silence_task: asyncio.Task[bool] | None
     pending_silence_owner_id: str | None
     silence_continuation_scheduler: Callable[..., Awaitable[bool]] | None

@@ -240,7 +240,7 @@ def test_physical_d_kv_transfer_summary_validates_delta_without_inventing_timing
         {
             "request_id": "bench-a",
             "sequence": 1,
-            "external_cached_tokens": 17,
+            "external_cached_tokens": 18,
             "kv_transfer_selected_blocks": 2,
             "kv_transfer_selected_tokens": 18,
             "kv_transfer_selected_bytes": 16_384,
@@ -263,7 +263,7 @@ def test_physical_d_kv_transfer_summary_validates_delta_without_inventing_timing
     assert summary["full_hit_records"] == 1
     assert summary["non_full_hit_records"] == 1
     assert summary["selected_tokens"]["max"] == 18.0
-    assert summary["remote_replay_tokens"]["max"] == 1.0
+    assert summary["remote_replay_tokens"]["max"] == 0.0
     assert summary["selected_blocks"]["max"] == 2.0
     assert summary["selected_bytes"]["max"] == 16_384.0
     assert summary["write_submit_to_d_ready_ms"]["count"] == 1
@@ -289,10 +289,22 @@ def test_physical_d_kv_transfer_summary_rejects_unproven_non_full_hit() -> None:
     assert summary["valid"] is False
     assert summary["mismatches"] == 1
     reasons = summary["mismatch_examples"][0]["reasons"]
-    assert "selected_tokens_not_external_plus_one_replay" in reasons
+    assert "selected_tokens_not_external_cached_tokens" in reasons
     assert "non_full_hit_missing_selected_blocks" in reasons
     assert "selected_bytes_unavailable_or_negative" in reasons
     assert "invalid_write_submit_to_d_ready_ms" in reasons
+
+
+def test_physical_d_kv_transfer_rejects_obsolete_remote_token_replay() -> None:
+    summary = _physical_d_kv_transfer_summary([{
+        "external_cached_tokens": 17,
+        "kv_transfer_selected_blocks": 2,
+        "kv_transfer_selected_tokens": 18,
+        "kv_transfer_selected_bytes": 16_384,
+        "kv_transfer_write_submit_to_d_ready_ms": -1.0,
+    }])
+    assert summary["valid"] is False
+    assert summary["mismatch_examples"][0]["reasons"] == ["selected_tokens_not_external_cached_tokens"]
 
 
 def test_pd_long_horizon_reports_recoverable_tail_and_backlog() -> None:

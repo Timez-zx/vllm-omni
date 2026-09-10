@@ -404,8 +404,29 @@ def test_native_pd_prefix_prediction_tracks_append_and_rollover() -> None:
     ) == [5, 9, 6, 7]
 
 
+def test_native_pd_prefix_prediction_copies_normalized_history_without_reconverting():
+    class NormalizedInt(int):
+        def __int__(self):
+            raise AssertionError("old prefix was normalized at its source")
+
+    history = [NormalizedInt(7)] * 64000
+    result = _OrchestratorDuplexStagePort._native_pd_prefix_prediction(
+        {"prompt_token_ids": [8]},
+        {"pd_duplex_remote_prompt_token_ids": history},
+        already_submitted=True,
+    )
+    assert result == [7] * 64000 + [8]
+    result[0] = 9
+    assert history[0] == 7
+
+
 @pytest.mark.asyncio
 async def test_native_pd_feedback_extends_stage0_scheduler_budget() -> None:
+    from vllm_omni.experimental.fullduplex.minicpmo45.sampling_state import (
+        DecodeSamplingState,
+        pack_sampling_state,
+    )
+
     port, stage_pools, request_states, _prewarm, submission = _duplex_stage_port_submission()
     port._pd_pair = (0, 1)
     state = request_states[submission.context.request_id]
@@ -413,6 +434,8 @@ async def test_native_pd_feedback_extends_stage0_scheduler_budget() -> None:
     ready.set()
     state.streaming.bridge_states["pd_duplex_decode_ready"] = ready
     state.streaming.bridge_states["pd_duplex_feedback_token_ids"] = [81, 82, 93]
+    policy_state = pack_sampling_state(DecodeSamplingState(), incarnation=0, epoch=0, seq=1)
+    state.streaming.bridge_states["pd_duplex_feedback_sampling_state"] = policy_state
     original_prompt = {
         "prompt_token_ids": [7, 7, 7],
         "model_intermediate_buffer": {
@@ -436,6 +459,7 @@ async def test_native_pd_feedback_extends_stage0_scheduler_budget() -> None:
     submitted_duplex = submitted_request.model_intermediate_buffer["duplex"]
     assert submitted_duplex["pd_feedback_token_ids"] == [81, 82, 93]
     assert submitted_duplex["scheduler_token_budget"] == 5
+    assert submitted_duplex["pd_feedback_sampling_state"] == policy_state
     assert original_prompt["prompt_token_ids"] == [7, 7, 7]
     assert "pd_feedback_token_ids" not in original_prompt["model_intermediate_buffer"]["duplex"]
 

@@ -30,6 +30,7 @@ from typing import Any
 # setting them to ``0`` so provenance describes the effective environment
 # unambiguously.
 DIAGNOSTIC_ENV_VARS = (
+    "MINICPMO45_NUMERICAL_PROBE_DIR",
     "MINICPMO45_LOG_PREP_DIAG",
     "VLLM_OMNI_DIAG_STAGE",
     "VLLM_OMNI_LOG_AUDIO_CHUNKS",
@@ -64,6 +65,10 @@ DIAGNOSTIC_CLI_FLAGS = (
 PROVENANCE_ENV_VARS = (
     "CUDA_HOME",
     "CUDA_VISIBLE_DEVICES",
+    "CUDA_MPS_PIPE_DIRECTORY",
+    "CUDA_MPS_LOG_DIRECTORY",
+    "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE",
+    "CUDA_MPS_CLIENT_PRIORITY",
     "HF_HOME",
     "NIXL_PLUGIN_DIR",
     "PYTHONPATH",

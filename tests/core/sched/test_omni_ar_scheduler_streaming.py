@@ -28,6 +28,19 @@ from vllm_omni.core.sched.omni_ar_scheduler import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_cache_only_import_keeps_last_media_kv_position():
+    sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched.connector = MagicMock()
+    sched.kv_cache_manager = MagicMock()
+    sched._connector_finished = MagicMock()
+    req = SimpleNamespace(request_id="cache-only", num_computed_tokens=279, num_tokens=279,
+                          pd_cache_sync_retain=True, kv_transfer_params=None)
+    sched.complete_direct_pd_cache_sync(req)
+    assert req.num_computed_tokens == 279
+    sched.kv_cache_manager.cache_blocks.assert_called_once_with(req, 279)
+    sched.kv_cache_manager.free.assert_not_called()
+
+
 def _make_scheduler(*, stage_id: int = 0) -> OmniARScheduler:
     sched = OmniARScheduler.__new__(OmniARScheduler)
     sched._new_prompt_len_snapshot = {}
@@ -60,6 +73,27 @@ def _make_update(prompt_token_ids: list[int] | None = None) -> StreamingUpdate:
     )
 
 
+def test_preemption_is_visible_to_capacity_audit(mocker) -> None:
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    from benchmarks.minicpmo.analyze_rtf import PREEMPTION_OR_EVICTION
+
+    sched = _make_scheduler(stage_id=2)
+    sched.kv_cache_manager = MagicMock()
+    sched.kv_cache_manager.block_pool.get_num_free_blocks.return_value = 0
+    session = _make_request()
+    session.num_computed_tokens = 2
+    base = mocker.patch.object(Scheduler, "_preempt_request")
+    warning = mocker.patch("vllm_omni.core.sched.omni_ar_scheduler.logger.warning")
+
+    sched._preempt_request(session, 123.0)
+
+    base.assert_called_once_with(session, 123.0)
+    text = warning.call_args.args[0] % warning.call_args.args[1:]
+    assert PREEMPTION_OR_EVICTION.search(text)
+    assert "stage=2" in text and "free_blocks=0" in text
+
+
 def test_native_duplex_output_compacts_prompt_snapshot() -> None:
     latent = object()
     original = {
@@ -81,6 +115,62 @@ def test_native_duplex_output_compacts_prompt_snapshot() -> None:
         "meta": {"tts_bos_token_id": 99},
     }
     assert original["duplex_prompt_token_ids"] == [[10, 20, 30]]
+
+
+def test_compact_tensor_prompt_metadata_survives_engine_wire_roundtrip():
+    import torch
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+    from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
+
+    compact = _compact_native_duplex_prompt_metadata(
+        {"duplex_prompt_token_ids": torch.tensor([[10, 20, 30]]), "latent": torch.zeros(2, 4)},
+        current_segment_token_ids=[40, 41],
+    )
+    output = OmniEngineCoreOutputs(outputs=[OmniEngineCoreOutput(
+        request_id="test", new_token_ids=[40], multimodal_output=compact,
+    )])
+    decoded = MsgpackDecoder(OmniEngineCoreOutputs).decode(MsgpackEncoder().encode(output))
+    metadata = decoded.outputs[0].multimodal_output
+    assert metadata["duplex_prompt_len"].item() == 3
+    assert metadata["duplex_last_prompt_token_id"].item() == 30
+    assert metadata["duplex_segment_token_ids"].tolist() == [40, 41]
+
+
+def test_native_segment_snapshots_replace_instead_of_concatenating():
+    import torch
+
+    from vllm_omni.outputs.mm_outputs import MultimodalPayload
+    from vllm_omni.outputs.output_modality import TensorAccumulationStrategy
+
+    first = MultimodalPayload.from_dict({
+        "latent": torch.ones(1, 4),
+        "duplex_prompt_len": torch.tensor(100),
+        "duplex_segment_token_ids": torch.tensor([40]),
+    })
+    second = MultimodalPayload.from_dict({
+        "latent": torch.ones(1, 4),
+        "duplex_prompt_len": torch.tensor(100),
+        "duplex_segment_token_ids": torch.tensor([40, 41]),
+    })
+    merged = first.merged_with(second)
+    merged.consolidate_tensors(TensorAccumulationStrategy.CONCAT_DIM0)
+    merged.consolidate_metadata()
+    assert merged["duplex_prompt_len"].item() == 100
+    assert merged["duplex_segment_token_ids"].tolist() == [40, 41]
+    assert merged["latent"].shape == (2, 4)
+
+
+def test_native_decode_end_refreshes_segment_without_prompt_snapshot():
+    import torch
+
+    payload = {"latent": torch.ones(1, 4)}
+    compact = _compact_native_duplex_prompt_metadata(
+        payload, current_segment_token_ids=[151706, 42, 151718], native_segment=True,
+    )
+    assert compact["duplex_segment_token_ids"].tolist() == [151706, 42, 151718]
+    assert "duplex_prompt_len" not in compact
+    assert "duplex_segment_token_ids" not in payload
 
 
 def test_preempted_minicpmo_duplex_request_rebases_to_exact_compact_prompt() -> None:
@@ -223,6 +313,35 @@ def test_resumable_pd_segment_publishes_cumulative_prompt_identity() -> None:
     assert output.is_segment_finished is True
     assert output.kv_transfer_params["remote_request_id"] == session.request_id
     assert output.kv_transfer_params["remote_prompt_token_ids"] == [1, 2, 3]
+    assert output.kv_transfer_params["remote_prompt_token_offset"] == 0
+    assert session._omni_pd_published_prompt_tokens == 3
+
+
+def test_resumable_pd_prompt_echo_is_incremental_and_owned() -> None:
+    session = _make_request()
+    session.status = RequestStatus.RUNNING
+    session.resumable = True
+    session.num_computed_tokens = session.num_prompt_tokens
+    session._omni_pd_published_prompt_tokens = 2
+    outputs = _run_resumable_segment_stop(session, pd_segment=True)
+    params = outputs[session.client_index].outputs[0].kv_transfer_params
+    assert params["remote_prompt_token_offset"] == 2
+    assert params["remote_prompt_token_ids"] == [3]
+    session.prompt_token_ids[-1] = 99
+    assert params["remote_prompt_token_ids"] == [3]
+    assert session._omni_pd_published_prompt_tokens == 3
+
+
+def test_resumable_pd_rebase_discards_published_prompt_offset() -> None:
+    sched = _make_scheduler()
+    sched._replace_streaming_session = MagicMock()
+    session = _make_request()
+    session._omni_pd_published_prompt_tokens = 3
+    update = _make_update([4, 5, 6])  # Equal length is still a different prefix.
+    update.model_intermediate_buffer = {"meta": {"replace_streaming_prompt": True}}
+    sched._update_request_as_session(session, update)
+    assert session._omni_pd_published_prompt_tokens == 0
+    sched._replace_streaming_session.assert_called_once_with(session, update)
 
 
 def test_finite_pd_decode_segment_exposes_allocated_transfer_evidence() -> None:

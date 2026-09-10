@@ -182,7 +182,225 @@ def test_native_duplex_compact_handoff_does_not_copy_full_prompt() -> None:
     assert info["meta"]["prompt_len"] == len(prompt_ids)
     assert info["meta"]["last_prompt_token"] == 9304
     assert info["meta"]["current_segment_token_ids"] == segment_ids
-    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[-3:-1])
+    from vllm_omni.experimental.fullduplex.engine.intermediate import get_tts_handoff
+
+    assert torch.equal(get_tts_handoff(info)[1], latent[-3:-1])
+
+
+@pytest.mark.parametrize("p_decision", [9301, 9304, 20, 9310])
+@pytest.mark.parametrize("d_ids", [[21, 22, 9308], [21, 9310, 9309], [9310, 21, 9308]])
+def test_pd_handoff_pairs_tokens_with_hidden_after_feed_and_skips_only_p_decision(p_decision, d_ids):
+    from vllm_omni.engine.orchestrator import Orchestrator
+    from vllm_omni.outputs.mm_outputs import MultimodalPayload
+
+    special_ids = {
+        "tts_bos_token_id": 9301,
+        "tts_eos_token_id": 9302,
+        "listen_token_id": 9303,
+        "speak_token_id": 9304,
+        "chunk_eos_token_id": 9308,
+        "chunk_tts_eos_token_id": 9309,
+        "turn_eos_token_id": 9310,
+    }
+    # Actual vLLM finite D forwards these INPUTS. The final sampled
+    # CHUNK_EOS has no hidden row; the P decision has one.
+    input_ids = [p_decision, *d_ids[:-1]]
+    latent = torch.tensor([[token, -token] for token in input_ids], dtype=torch.float32)
+    source = _output(prompt_ids=[101, p_decision], output_ids=d_ids, latent=latent)
+    source.outputs[0].multimodal_output = MultimodalPayload.from_dict({"latent": latent})
+    request_state = SimpleNamespace(
+        streaming=SimpleNamespace(
+            bridge_states={
+                "pd_decode_prompt_len": 2,
+                "pd_decode_last_prompt_token_id": p_decision,
+                "pd_duplex_special_token_ids": special_ids,
+            }
+        )
+    )
+    Orchestrator._ensure_native_duplex_pd_talker_metadata(source, request_state)
+    converted = llm2tts([source], prompt=[{}])[0]["model_intermediate_buffer"]
+    assert converted["ids"]["tts"] == d_ids[:-1]
+    # Official: feed token, get its hidden, then include it iff j != 0.
+    expected = torch.tensor([[token, -token] for token in d_ids[:-1]], dtype=torch.float32)
+    from vllm_omni.experimental.fullduplex.engine.intermediate import get_tts_handoff
+
+    hidden = get_tts_handoff(converted)[1]
+    assert isinstance(hidden, torch.Tensor) and hidden.device.type == "cpu"
+    assert torch.equal(hidden, expected)
+    assert hidden.data_ptr() != latent.data_ptr()
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+    restored = MsgpackDecoder().decode(MsgpackEncoder().encode(converted))
+    assert torch.equal(get_tts_handoff(restored)[1], expected)
+    assert restored["ids"]["tts"] == d_ids[:-1]
+    assert converted["meta"]["segment_end"] is True
+    assert converted["meta"]["turn_end"] is (d_ids[-2] == 9310)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_native_binary_handoff_owns_values_across_untyped_request_transport(dtype):
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+    from vllm_omni.experimental.fullduplex.engine.intermediate import get_tts_handoff, set_tts_handoff
+
+    source = torch.arange(24, dtype=dtype).reshape(3, 8)
+    expected = source.clone()
+    buffer = {"native_duplex": True}
+    set_tts_handoff(buffer, [1, 2, 3], source)
+    source.zero_()
+    restored = MsgpackDecoder().decode(MsgpackEncoder().encode(buffer))
+    ids, hidden = get_tts_handoff(restored)
+    assert ids == [1, 2, 3]
+    assert torch.equal(hidden.float(), expected.float())
+    set_tts_handoff(restored, [], [])
+    assert get_tts_handoff(restored) == ([], [])
+
+
+@pytest.mark.parametrize("p_decision,turn_end", [(9304, False), (9310, True), (9308, False)])
+def test_pd_empty_unit_continues_or_flushes_audio_using_bos_only(p_decision, turn_end):
+    special_ids = {
+        "tts_bos_token_id": 9301, "tts_eos_token_id": 9302,
+        "listen_token_id": 9303, "speak_token_id": 9304,
+        "chunk_eos_token_id": 9308, "chunk_tts_eos_token_id": 9309,
+        "turn_eos_token_id": 9310,
+    }
+    context = SimpleNamespace(bridge_states={"duplex": {"epoch": 0, "model_turn_id": 0}})
+
+    def handoff(decision, ids):
+        source = _output(
+            prompt_ids=[101, decision], output_ids=ids,
+            latent=torch.zeros((len(ids), 2)),
+            multimodal_output={
+                "duplex_pd_decode": True, "duplex_prompt_len": 2,
+                "duplex_last_prompt_token_id": decision,
+                "duplex_segment_token_ids": ids, "meta": special_ids,
+            },
+        )
+        return llm2tts([source], prompt=[{}], _streaming_context=context)[0]
+
+    first = handoff(9304, [21, 9308])["model_intermediate_buffer"]
+    assert first["meta"]["turn_start"] is True
+    empty = handoff(p_decision, [9308])
+    info = empty["model_intermediate_buffer"]
+    assert info["ids"]["tts"] == []
+    assert info["hidden_states"]["tts"] == []
+    assert empty["prompt_token_ids"] == [0]
+    assert info["meta"]["next_stage_prompt_len"] == 1
+    assert info["meta"]["native_duplex_segment_text"] == ""
+    assert info["meta"]["native_duplex_audio_only"] is True
+    assert info["meta"]["turn_start"] is False
+    assert info["meta"]["turn_end"] is turn_end
+    assert context.bridge_states["duplex"]["model_turn_id"] == int(turn_end)
+    following = handoff(9304, [22, 9308])["model_intermediate_buffer"]
+    assert following["meta"]["turn_start"] is turn_end
+    assert following["meta"]["turn_end"] is False
+    assert following["meta"]["native_duplex_audio_only"] is False
+
+    from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
+
+    host = SimpleNamespace(_send_side_request_payload={})
+    merge = OmniConnectorModelRunnerMixin._accumulate_payload
+    merge(host, "req-1", first)
+    merged_empty = merge(host, "req-1", info)
+    assert merged_empty["ids"]["tts"] == []
+    assert merged_empty["hidden_states"]["tts"] == []
+    assert merged_empty["meta"]["turn_end"] is turn_end
+    merged_next = merge(host, "req-1", following)
+    assert merged_next["ids"]["tts"] == [22]
+    assert merged_next["meta"]["turn_end"] is False
+    assert merged_next["meta"]["native_duplex_audio_only"] is False
+
+
+@pytest.mark.parametrize("new_turn_ids", [[22, 9308], [9308]])
+def test_pd_listen_does_not_consume_next_talker_turn_reset(new_turn_ids):
+    special = {
+        "tts_bos_token_id": 9301, "tts_eos_token_id": 9302,
+        "listen_token_id": 9303, "speak_token_id": 9304,
+        "chunk_eos_token_id": 9308, "chunk_tts_eos_token_id": 9309,
+        "turn_eos_token_id": 9310,
+    }
+    context = SimpleNamespace(bridge_states={"duplex": {"epoch": 0, "model_turn_id": 0}})
+
+    def handoff(ids):
+        source = _output(
+            prompt_ids=[101, 9304], output_ids=ids, latent=torch.zeros((len(ids), 2)),
+            multimodal_output={
+                "duplex_pd_decode": True, "duplex_prompt_len": 2,
+                "duplex_last_prompt_token_id": 9304,
+                "duplex_segment_token_ids": ids, "meta": special,
+            },
+        )
+        return llm2tts([source], prompt=[{}], _streaming_context=context)
+
+    # Several LISTEN units are observed before the first real TTS request.
+    for _ in range(3):
+        assert handoff([9303]) == []
+    assert "minicpmo45_tts_lifecycle" not in context.bridge_states
+    first = handoff([21, 9308])[0]["model_intermediate_buffer"]
+    assert first["meta"]["turn_start"] is True
+    assert first["meta"]["replace_streaming_prompt"] is True
+    continuation = handoff([23, 9308])[0]["model_intermediate_buffer"]
+    assert continuation["meta"]["turn_start"] is False
+    assert "replace_streaming_prompt" not in continuation["meta"]
+
+    final = handoff([9310, 9308])[0]["model_intermediate_buffer"]
+    assert final["meta"]["turn_end"] is True
+    assert context.bridge_states["duplex"]["model_turn_id"] == 1
+    for _ in range(3):
+        assert handoff([9303]) == []
+    # The source cursor now sees turn 1, but Talker still owns turn 0's KV.
+    assert context.bridge_states["minicpmo45_tts_handoff"]["turn_id"] == 1
+    assert context.bridge_states["minicpmo45_tts_lifecycle"]["turn_id"] == 0
+    following = handoff(new_turn_ids)[0]["model_intermediate_buffer"]
+    assert following["meta"]["turn_start"] is True
+    assert following["meta"]["replace_streaming_prompt"] is True
+    assert following["duplex"]["turn_id"] == 1
+    assert context.bridge_states["minicpmo45_tts_lifecycle"]["turn_id"] == 1
+
+
+def test_pd_listen_does_not_forward_preceding_text_to_talker():
+    # Runtime.decide_output normally intercepts this final LISTEN first.
+    source = _output(
+        prompt_ids=[101, 9304], output_ids=[21, 9310, 9303], latent=torch.zeros((3, 2)),
+        multimodal_output={
+            "duplex_pd_decode": True, "duplex_prompt_len": 2,
+            "duplex_last_prompt_token_id": 9304,
+            "meta": {
+                "tts_bos_token_id": 9301, "tts_eos_token_id": 9302,
+                "listen_token_id": 9303, "speak_token_id": 9304,
+                "chunk_eos_token_id": 9308, "chunk_tts_eos_token_id": 9309,
+                "turn_eos_token_id": 9310,
+            },
+        },
+    )
+    assert llm2tts([source], prompt=[{}]) == []
+
+
+def test_pd_invalid_boundary_reports_bounded_completion_evidence():
+    source = _output(
+        prompt_ids=[101, 9304], output_ids=[21, 999], latent=torch.zeros((2, 2)),
+        multimodal_output={
+            "duplex_pd_decode": True, "duplex_prompt_len": 2,
+            "duplex_last_prompt_token_id": 9304,
+            "duplex_segment_token_ids": list(range(20)),
+            "meta": {
+                "tts_bos_token_id": 9301, "tts_eos_token_id": 9302,
+                "listen_token_id": 9303, "speak_token_id": 9304,
+                "chunk_eos_token_id": 9308, "chunk_tts_eos_token_id": 9309,
+                "turn_eos_token_id": 9310,
+            },
+        },
+    )
+    source.outputs[0].finish_reason = "stop"
+    source.outputs[0].stop_reason = 999
+    with pytest.raises(ValueError, match="must end at a model unit terminator") as caught:
+        llm2tts([source], prompt=[{}])
+    message = str(caught.value)
+    assert "request_id=req-1" in message
+    assert "finish_reason='stop' stop_reason=999" in message
+    assert "prompt_last=9304" in message
+    assert "segment_count=20 segment_tail=[12, 13, 14, 15, 16, 17, 18, 19]" in message
+    assert "completion_tail=[21, 999] latent_rows=2" in message
+    assert "expected_unit_ends=[9303, 9308, 9309]" in message
 
 
 def test_native_duplex_ref_audio_is_published_once_per_session() -> None:

@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import gc
 import io
 import json
 import math
@@ -38,6 +39,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from benchmarks.minicpmo.clean_server import collect_provenance  # noqa: E402
+from benchmarks.minicpmo.client_gc import defer_cyclic_gc  # noqa: E402
 from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
     PCM16_BYTES_PER_SAMPLE,
     PCM16_SAMPLE_RATE,
@@ -59,6 +61,15 @@ class MediaAsset:
     pcm16: bytes
     frames: list[str]
     duration_s: float
+
+
+def _align_loop_media(pcm16: bytes, frames: list[str]) -> tuple[bytes, list[str], float]:
+    """Use the same complete-second source segment for both looping tracks."""
+    bytes_per_second = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE
+    units = min(len(frames), len(pcm16) // bytes_per_second)
+    if units < 1:
+        raise ValueError("Looped AV source must contain a complete second")
+    return pcm16[:units * bytes_per_second], frames[:units], float(units)
 
 
 def _percentile(values: list[float], q: float) -> float | None:
@@ -151,21 +162,29 @@ class GPUSampler:
 
             pynvml.nvmlInit()
             handles = {gpu_id: pynvml.nvmlDeviceGetHandleByIndex(gpu_id) for gpu_id in self.gpu_ids}
-            while not self._stop.is_set():
+
+            def read_sample():
                 now = time.monotonic()
+                batch = {}
                 for gpu_id, handle in handles.items():
                     util = pynvml.nvmlDeviceGetUtilizationRates(handle)
                     memory = pynvml.nvmlDeviceGetMemoryInfo(handle)
                     power = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0
-                    self.samples[gpu_id].append(
-                        {
-                            "at_s": now,
-                            "gpu_pct": float(util.gpu),
-                            "memory_pct": float(util.memory),
-                            "memory_gib": memory.used / (1024**3),
-                            "power_w": power,
-                        }
-                    )
+                    batch[gpu_id] = {
+                        "at_s": now,
+                        "gpu_pct": float(util.gpu),
+                        "memory_pct": float(util.memory),
+                        "memory_gib": memory.used / (1024**3),
+                        "power_w": power,
+                    }
+                return batch
+
+            while not self._stop.is_set():
+                # NVML calls can block. Sampling must not pause every user's
+                # sender/receiver on the shared asyncio event loop.
+                batch = await asyncio.to_thread(read_sample)
+                for gpu_id, sample in batch.items():
+                    self.samples[gpu_id].append(sample)
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=self.interval_s)
                 except TimeoutError:
@@ -256,7 +275,11 @@ class UserSession:
         first_media_arrival_epoch_s: list[float] = []
         model_unit_ready_at: list[float] = []
         model_unit_ready_epoch_s: list[float] = []
+        planned_model_ready_epoch_s: list[float] = []
         send_drift_ms: list[float] = []
+        wakeup_drift_ms: list[float] = []
+        send_duration_ms: list[float] = []
+        late_sends: list[dict[str, Any]] = []
         arrival_jitter_ms: list[float] = []
         admitted = False
         errors: list[str] = []
@@ -282,7 +305,7 @@ class UserSession:
                 # grow quadratically with session length.
                 extra_body: dict[str, object] = {
                     "return_stage_metrics": False,
-                    "return_completion_witness": True,
+                    "return_completion_witness": getattr(self.args, "completion_mode", "physical-d") == "physical-d",
                 }
                 if self.args.context_window_trigger_tokens is not None:
                     extra_body["context_window_trigger_tokens"] = self.args.context_window_trigger_tokens
@@ -311,6 +334,7 @@ class UserSession:
                     )
                     deadline = stream_started_at + chunk_index * CHUNK_MS / 1000 + jitter_ms / 1000
                     await asyncio.sleep(max(0.0, deadline - time.monotonic()))
+                    woke_at = time.monotonic()
                     chunk = self._media_chunk(chunk_index)
                     event: dict[str, object] = {
                         "type": "input_audio_buffer.append",
@@ -332,6 +356,7 @@ class UserSession:
                             precondition_frames_sent += 1
                         else:
                             formal_frames_sent += 1
+                    send_started_at = time.monotonic()
                     await client.send(event)
                     sent_at = time.monotonic()
                     sent_epoch_s = time.time()
@@ -353,9 +378,21 @@ class UserSession:
                             # one-second audio unit and may submit its P append.
                             model_unit_ready_at.append(sent_at)
                             model_unit_ready_epoch_s.append(sent_epoch_s)
+                            planned_model_ready_epoch_s.append(sent_epoch_s + deadline - sent_at)
                     if chunk_index >= self.context_age_units * CHUNKS_PER_UNIT:
                         send_drift_ms.append((sent_at - deadline) * 1000)
+                        wakeup_drift_ms.append((woke_at - deadline) * 1000)
+                        send_duration_ms.append((sent_at - send_started_at) * 1000)
                         arrival_jitter_ms.append(jitter_ms)
+                        if (sent_at - deadline) * 1000 > self.args.max_send_drift_ms:
+                            late_sends.append({
+                                "input_unit_index": unit_index + 1,
+                                "chunk_index": chunk_index,
+                                "sent_epoch_s": sent_epoch_s,
+                                "lateness_ms": (sent_at - deadline) * 1000,
+                                "wakeup_lateness_ms": (woke_at - deadline) * 1000,
+                                "send_duration_ms": (sent_at - send_started_at) * 1000,
+                            })
 
                 # Integer model units need no semantic turn commit. Drain on
                 # exact real-input identities carried by the physical-D
@@ -372,6 +409,13 @@ class UserSession:
                 event_cursor = 0
                 drain_deadline = stream_finished_at + self.args.post_stream_s
                 while True:
+                    if getattr(self.args, "completion_mode", "physical-d") == "nonpd":
+                        # Persistent native Thinker generations have no finite
+                        # D witness. Observe a fixed drain and audit actual
+                        # UNIT_DONE boundaries from the scheduler trace.
+                        await asyncio.sleep(max(0.0, drain_deadline - time.monotonic()))
+                        drain_exit_reason = "nonpd_trace_drain"
+                        break
                     current_events = client.events.events
                     for event in current_events[event_cursor:]:
                         identity = _pd_stage1_identity(event)
@@ -379,12 +423,17 @@ class UserSession:
                         if input_unit_index in expected_input_unit_indices:
                             observed_input_unit_indices.add(input_unit_index)
                     event_cursor = len(current_events)
-                    if observed_input_unit_indices == expected_input_unit_indices:
-                        drain_exit_reason = "exact_pd_terminal_set_complete"
-                        break
                     remaining = drain_deadline - time.monotonic()
                     if remaining <= 0:
-                        drain_exit_reason = "post_stream_timeout"
+                        # D completion does not drain Talker/Code2Wav. Keep a
+                        # fixed, bounded output observation window even after
+                        # the exact input set completes. This is observation,
+                        # not proof that unobservable downstream queues emptied.
+                        drain_exit_reason = (
+                            "exact_pd_terminal_set_complete_audio_observed"
+                            if observed_input_unit_indices == expected_input_unit_indices
+                            else "post_stream_timeout"
+                        )
                         break
                     await asyncio.sleep(min(0.05, remaining))
                 measurement_done_at = time.monotonic()
@@ -462,8 +511,28 @@ class UserSession:
                 self.context_age_units + self.args.duration_s + 1,
             )
         )
+        quality_capture = None
+        if getattr(self.args, "quality_capture_dir", None) is not None:
+            from benchmarks.minicpmo.quality_capture import export_quality_capture
+
+            # All measurement and reception have ended. No extra callbacks,
+            # serialization or disk I/O are added to the live input pipeline.
+            quality_capture = await asyncio.to_thread(
+                export_quality_capture, client.events,
+                Path(self.args.quality_capture_dir) / f"user-{self.uid}",
+                origin_s=formal_started_at,
+                metadata={
+                    "session_id": self.session_id, "media": str(self.media.path),
+                    "media_offset_units": self.media_offset_units,
+                    "input_audio_loop_s": self.media.duration_s,
+                    "input_video_loop_s": len(self.media.frames),
+                    "window_tokens": self.args.context_window_trigger_tokens,
+                    "duration_s": self.args.duration_s,
+                },
+            )
         return {
             "uid": self.uid,
+            "quality_capture": quality_capture,
             "session_id": self.session_id,
             "phase_s": round(self.phase_s, 6),
             "context_age_units": self.context_age_units,
@@ -487,6 +556,7 @@ class UserSession:
                     "input_unit_index": self.context_age_units + index + 1,
                     "first_media_arrival_at_s": round(first_epoch, 6),
                     "model_unit_ready_at_s": round(ready_epoch, 6),
+                    "planned_model_unit_ready_at_s": round(planned_model_ready_epoch_s[index], 6),
                     "input_aggregation_ms": round(
                         max(model_unit_ready_at[index] - first_media_arrival_at[index], 0.0)
                         * 1000.0,
@@ -512,6 +582,7 @@ class UserSession:
             ),
             "drain_exit_reason": drain_exit_reason,
             "pd_completion_witness": {
+                "applicable": getattr(self.args, "completion_mode", "physical-d") == "physical-d",
                 "source": "client-visible physical D completion witness",
                 "expected": len(expected_input_unit_indices),
                 "completed": len(pd_completions),
@@ -547,6 +618,11 @@ class UserSession:
                 "records": pd_completions,
             },
             "progress_events": len(completion_at),
+            "text_event_samples": [
+                {key: value for key, value in event.items() if key in {"type", "delta", "text", "transcript"}}
+                for event in client.events.events
+                if "text" in str(event.get("type", "")) or "transcript" in str(event.get("type", ""))
+            ][:20],
             "first_unit_to_first_progress_ms": (
                 round((completion_at[0] - first_media_arrival_at[0]) * 1000, 2)
                 if completion_at and first_media_arrival_at
@@ -561,6 +637,10 @@ class UserSession:
                 else None
             ),
             "send_drift_ms": _summary(send_drift_ms),
+            "send_drift_max_unrounded_ms": max(send_drift_ms, default=None),
+            "late_sends": late_sends,
+            "wakeup_drift_ms": _summary(wakeup_drift_ms),
+            "websocket_send_duration_ms": _summary(send_duration_ms),
             "scheduled_arrival_jitter_ms": _summary(arrival_jitter_ms),
             "listen_units": event_types["response.listen"],
             "audio_units": event_types["response.audio.delta"],
@@ -874,40 +954,83 @@ def _audio_cadence(
 ) -> dict[str, Any]:
     arrivals: list[float] = []
     durations_ms: list[float] = []
-    previous_cumulative_ms: dict[str, float] = {}
+    previous_chunks: dict[str, tuple[float, float]] = {}
+    playback_ends: dict[str, float] = {}
+    playback_slack_ms: list[float] = []
+    underruns_ms: list[float] = []
+    speech_responses: set[str] = set()
+    completed_responses: set[str] = set()
+    malformed_chunks = 0
+    timeline: list[dict[str, Any]] = []
     for event, received_at in zip(client.events.events, client.events.event_received_at_s, strict=True):
-        if (
-            not not_before_s <= received_at <= not_after_s
-            or event.get("type") != "response.audio.delta"
-        ):
+        if not not_before_s <= received_at <= not_after_s:
             continue
-        response_id = client.events.response_id(event) or "unknown"
-        metadata = event.get("metadata")
-        cumulative = metadata.get("audio_duration_ms") if isinstance(metadata, dict) else None
-        if isinstance(cumulative, int | float):
-            previous = previous_cumulative_ms.get(response_id, 0.0)
-            duration = float(cumulative) - previous
-            previous_cumulative_ms[response_id] = float(cumulative)
-        else:
-            delta = event.get("delta") or event.get("audio")
-            duration = (
-                len(base64.b64decode(delta)) / (2 * client.events.output_sample_rate_hz) * 1000
-                if isinstance(delta, str)
-                else 0.0
-            )
+        response_id = client.events.response_id(event)
+        kind = event.get("type")
+        if kind in {"response.audio.done", "response.done"} and response_id:
+            timeline.append({"type": kind, "response_id": response_id, "at_s": received_at})
+            completed_responses.add(response_id)
+            previous_chunks.pop(response_id, None)
+            playback_ends.pop(response_id, None)
+        if kind == "response.speak" and response_id:
+            timeline.append({"type": kind, "response_id": response_id, "at_s": received_at})
+            speech_responses.add(response_id)
+            completed_responses.discard(response_id)
+        if kind != "response.audio.delta":
+            continue
+        # Measure the delivered PCM, not cumulative metadata spanning a
+        # preconditioning boundary. The native benchmark uses PCM16 output.
+        delta = event.get("delta") or event.get("audio")
+        rate = event.get("sample_rate_hz", client.events.output_sample_rate_hz)
+        try:
+            if not response_id or not isinstance(delta, str) or not isinstance(rate, int) or rate <= 0:
+                raise ValueError("invalid audio chunk")
+            payload = base64.b64decode(delta, validate=True)
+            if not payload or len(payload) % 2:
+                raise ValueError("invalid PCM16 size")
+            duration = len(payload) / (2 * rate) * 1000
+        except (ValueError, TypeError):
+            malformed_chunks += 1
+            continue
+        speech_responses.add(response_id)
+        completed_responses.discard(response_id)
+        previous = previous_chunks.get(response_id)
+        if previous is not None:
+            playback_slack_ms.append((received_at - previous[0]) * 1000 - previous[1])
+        previous_chunks[response_id] = (received_at, duration)
+        play_until = playback_ends.get(response_id)
+        if play_until is None:
+            play_until = received_at + 0.2
+        elif received_at > play_until:
+            underruns_ms.append((received_at - play_until) * 1000)
+            # Rebuffer after a real starvation; buffered audio from earlier
+            # chunks is retained otherwise. Never compare separate responses.
+            play_until = received_at + 0.2
+        playback_ends[response_id] = play_until + duration / 1000
         arrivals.append(received_at)
-        durations_ms.append(max(0.0, duration))
-
-    playback_slack_ms = [
-        (arrivals[index] - arrivals[index - 1]) * 1000 - durations_ms[index - 1]
-        for index in range(1, len(arrivals))
-    ]
+        durations_ms.append(duration)
+        # Built offline after sending ends: no new per-chunk logging or
+        # server-side tracing on the capacity critical path.
+        timeline.append({"type": kind, "response_id": response_id, "at_s": received_at, "duration_ms": duration})
     return {
         "chunks": len(arrivals),
+        "last_received_epoch_s": (
+            arrivals[-1] + time.time() - time.monotonic() if arrivals else None
+        ),
         "chunk_duration_ms": _summary(durations_ms),
         "playback_slack_samples_ms": [round(value, 2) for value in playback_slack_ms],
         "playback_slack_ms": _summary(playback_slack_ms),
-        "underruns_with_200ms_buffer": sum(value > 200 for value in playback_slack_ms),
+        "underruns_with_200ms_buffer": len(underruns_ms),
+        "underrun_duration_ms": _summary(underruns_ms),
+        "malformed_chunks": malformed_chunks,
+        "timeline": timeline,
+        "speech_responses": len(speech_responses),
+        "unfinished_speech_response_ids": sorted(speech_responses - completed_responses),
+        "observation_complete": bool(arrivals) and not malformed_chunks and not (
+            speech_responses - completed_responses
+        ),
+        "definition": "PCM delivery within each response, accumulated 200 ms playback buffer; "
+        "no first-audio SLO or internal Talker/Code2Wav queue witness",
     }
 
 
@@ -946,6 +1069,10 @@ async def _main(args: argparse.Namespace) -> dict[str, Any]:
             path,
             frame_max_side=args.frame_max_side,
         )
+        if args.loop_media:
+            # Both tracks must restart at the SAME boundary. Otherwise a
+            # fractional audio tail accumulates seconds of AV drift in long runs.
+            pcm16, frames, duration_s = _align_loop_media(pcm16, frames)
         media_assets.append(MediaAsset(path, pcm16, frames, duration_s))
     ref_audio = _ref_audio_data_url(Path(args.ref_audio))
     rng = random.Random(args.seed)
@@ -1070,11 +1197,14 @@ async def _main(args: argparse.Namespace) -> dict[str, Any]:
                 else "development_or_diagnostic"
             ),
             "formal_capacity_candidate": formal_capacity_candidate,
+            "completion_mode": getattr(args, "completion_mode", "physical-d"),
             "users": args.users,
             "duration_s": args.duration_s,
             "workload_profile": args.workload_profile,
             "phase_window_s": args.phase_window_s,
             "arrival_jitter_ms": args.arrival_jitter_ms,
+            "max_send_drift_ms": args.max_send_drift_ms,
+            "client_cyclic_gc_enabled": gc.isenabled(),
             "context_age_max_units": args.context_age_max_units,
             "seed": args.seed,
             "media": [str(media.path.resolve()) for media in media_assets],
@@ -1085,6 +1215,9 @@ async def _main(args: argparse.Namespace) -> dict[str, Any]:
             "frame_max_side": args.frame_max_side,
             "max_slice_nums": args.max_slice_nums,
             "context_window_trigger_tokens": args.context_window_trigger_tokens or 36_000,
+            "expected_kv_window_tokens": args.expected_kv_window_tokens,
+            "min_post_window_units": args.min_post_window_units,
+            "max_backlog_ms": args.max_backlog_ms,
             "force_listen_count": args.force_listen_count,
             "close_timeout_s": args.close_timeout_s,
             "post_stream_s": args.post_stream_s,
@@ -1137,6 +1270,7 @@ async def _main(args: argparse.Namespace) -> dict[str, Any]:
             Counter(result["drain_exit_reason"] for result in results)
         ),
         "pd_completion_witness": {
+            "applicable": getattr(args, "completion_mode", "physical-d") == "physical-d",
             "source": "client-visible physical D completion witness",
             "expected": pd_expected,
             "completed": pd_completed,
@@ -1161,16 +1295,42 @@ async def _main(args: argparse.Namespace) -> dict[str, Any]:
         "gpu": gpu_report,
         "users": results,
     }
+    if getattr(args, "completion_mode", "physical-d") == "nonpd":
+        summary["config"].update({
+            "measurement_classification": "nonpd_traced_placement_comparison",
+            "formal_capacity_candidate": False,
+            "frame_audit_required": False,
+            "audio_sidecar_audit_required": False,
+            "unit_timing_origins": {
+                "first_media_arrival_at_s": "client sent the first video-bearing 200 ms chunk",
+                "model_unit_ready_at_s": "client sent the fifth 200 ms chunk",
+                "input_ready_to_done_ms": "complete 1 s input to native Thinker UNIT_DONE",
+            },
+            "measurement_cutoff": (
+                "fixed post-stream drain; analyze_nonpd_placement audits input identities and UNIT_DONE"
+            ),
+        })
     return summary
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--completion-mode", choices=("physical-d", "nonpd"), default="physical-d",
+        help="Non-P/D uses scheduler UNIT_DONE traces, not physical-D witnesses.",
+    )
     parser.add_argument("--url", default="ws://127.0.0.1:8113/v1/realtime")
     parser.add_argument("--users", type=int, required=True)
     parser.add_argument("--duration-s", type=int, default=12)
     parser.add_argument("--phase-window-s", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=20260828)
+    parser.add_argument(
+        "--max-send-drift-ms", type=float, default=10.0,
+        help=(
+            "Reject capacity evidence if any send misses its jittered deadline "
+            "by more than this (default: 10 ms, 5%% of a 200 ms chunk)"
+        ),
+    )
     parser.add_argument("--timeout-s", type=float, default=30.0)
     parser.add_argument(
         "--close-timeout-s",
@@ -1183,8 +1343,8 @@ def main() -> None:
         type=float,
         default=30.0,
         help=(
-            "maximum exact input-unit drain time after the final input; timeout "
-            "makes the measurement incomplete"
+            "fixed output observation window after the final input, including "
+            "Talker/Code2Wav after D finishes; missing D records remain incomplete"
         ),
     )
     parser.add_argument("--connect-stagger-s", type=float, default=0.5)
@@ -1224,12 +1384,19 @@ def main() -> None:
         ),
     )
     parser.add_argument("--context-window-trigger-tokens", type=int)
+    parser.add_argument("--expected-kv-window-tokens", type=int, default=0,
+                        help="Audit expectation only; does not configure model attention")
+    parser.add_argument("--min-post-window-units", type=int, default=120)
+    parser.add_argument("--max-backlog-ms", type=float, default=500.0,
+                        help="Offline capacity gate only: maximum inherited wait for previous D completion")
     parser.add_argument(
         "--force-listen-count",
         type=int,
         help="diagnostic control: force this many model units to stop at the listen decision",
     )
     parser.add_argument("--out", required=True)
+    parser.add_argument("--quality-capture-dir", type=Path,
+                        help="Opt-in full text/PCM export after measurement; no live-path disk writes")
     args = parser.parse_args()
     if args.context_age_max_units is None:
         args.context_age_max_units = (
@@ -1245,6 +1412,10 @@ def main() -> None:
         parser.error("--users and --duration-s must be positive")
     if args.phase_window_s < 0:
         parser.error("--phase-window-s must be non-negative")
+    if not math.isfinite(args.max_send_drift_ms) or args.max_send_drift_ms <= 0:
+        parser.error("--max-send-drift-ms must be finite and positive")
+    if not math.isfinite(args.max_backlog_ms) or args.max_backlog_ms < 0:
+        parser.error("--max-backlog-ms must be finite and nonnegative")
     if args.close_timeout_s <= 0:
         parser.error("--close-timeout-s must be positive")
     if args.post_stream_s < 0:
@@ -1262,7 +1433,8 @@ def main() -> None:
     if args.force_listen_count is not None and args.force_listen_count < 0:
         parser.error("--force-listen-count must be non-negative")
 
-    result = asyncio.run(_main(args))
+    with defer_cyclic_gc():
+        result = asyncio.run(_main(args))
     output = Path(args.out)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")

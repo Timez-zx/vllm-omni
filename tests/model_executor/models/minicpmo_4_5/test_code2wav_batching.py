@@ -189,6 +189,27 @@ def _forward(model, infos, placeholder_counts=None, request_ids=None):
     )
 
 
+def test_speech_probe_records_terminal_reset_and_next_epoch(tmp_path, monkeypatch):
+    import json
+
+    from vllm_omni.experimental.fullduplex.minicpmo45 import speech_probe
+
+    monkeypatch.setattr(speech_probe, "ENABLED", True)
+    monkeypatch.setattr(speech_probe, "DIRECTORY", str(tmp_path))
+    model, _ = _model()
+    _forward(model, [_info("external", 0, [10, 11])], request_ids=["physical"])
+    _forward(model, [_info("external", 1, [11], last_chunk=True)], request_ids=["physical"])
+    _forward(model, [_info("external", 0, [20, 21], cache_epoch=1)], request_ids=["physical"])
+    records = [json.loads(line) for line in next(tmp_path.glob("speech-*.jsonl")).read_text().splitlines()]
+    assert records[0]["physical_request_id"] == "physical"
+    assert records[1]["used_previous_state"] is True
+    assert records[1]["next_state_exists"] is False
+    assert records[2]["used_previous_state"] is False
+    assert records[2]["cache_epoch"] == 1
+    assert records[2]["codes"] == [20, 21]
+    assert records[2]["audio_finite"] is True
+
+
 def test_adapter_runs_true_batch_cfg_and_splits_request_caches():
     token2wav = _FakeToken2Wav()
     adapter = BatchedToken2Wav(token2wav)
@@ -212,6 +233,41 @@ def test_adapter_runs_true_batch_cfg_and_splits_request_caches():
     assert cache0.data_ptr() != cache1.data_ptr()
     assert cache0[0, 0, 0, 0, 0].item() == 10
     assert cache1[0, 0, 0, 0, 0].item() == 20
+
+
+def test_speech_probe_distinguishes_forward_from_exact_shape_compute_bucket(tmp_path, monkeypatch):
+    import json
+
+    from vllm_omni.experimental.fullduplex.minicpmo45 import speech_probe
+
+    monkeypatch.setattr(speech_probe, "ENABLED", True)
+    monkeypatch.setattr(speech_probe, "DIRECTORY", str(tmp_path))
+    model, backend = _model()
+    _forward(model, [_info("a", 0, [10, 11]), _info("b", 0, [20, 21]), _info("c", 0, [30, 31, 32])])
+    _forward(model, [_info("a", 1, [], last_chunk=True)])
+    records = [json.loads(line) for line in next(tmp_path.glob("speech-*.jsonl")).read_text().splitlines()]
+    assert backend.hift.calls == [2, 1]
+    assert len({row["forward_id"] for row in records[:3]}) == 1
+    assert all(row["forward_size"] == 3 for row in records[:3])
+    assert records[0]["bucket_id"] == records[1]["bucket_id"] != records[2]["bucket_id"]
+    assert [row["bucket_size"] for row in records] == [2, 2, 1, 0]
+    assert [row["bucket_row_index"] for row in records] == [0, 1, 0, None]
+    assert records[3]["bucket_id"] is None  # Empty flush is not a compute batch.
+    assert records[3]["forward_id"] != records[0]["forward_id"]
+
+
+def test_disabled_speech_probe_does_not_allocate_batch_identity(monkeypatch):
+    from vllm_omni.experimental.fullduplex.minicpmo45 import speech_probe
+
+    monkeypatch.setattr(speech_probe, "ENABLED", False)
+
+    def forbidden():
+        raise AssertionError("Disabled probe must not allocate batch identity")
+
+    monkeypatch.setattr(speech_probe, "new_batch_id", forbidden)
+    model, backend = _model()
+    _forward(model, [_info("a", 0, [10, 11]), _info("b", 0, [20, 21])])
+    assert backend.hift.calls == [2]
 
 
 def test_fade_in_out_limits_overlap_to_available_previous_audio():
@@ -306,6 +362,9 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
     assert "meta" not in payload
     assert payload["meta.duplex_epoch"][0].item() == 3
     assert payload["meta.duplex_turn_id"][0].item() == 7
+    assert payload["meta.cache_epoch"][0].item() == 0
+    assert payload["meta.chunk_seq"][0].item() == 1
+    assert payload["meta.llm_output_text_is_delta"][0].item() is True
     torch.testing.assert_close(
         payload["meta.llm_output_text_utf8"][0],
         segment_text_utf8,
@@ -342,6 +401,39 @@ def test_initial_empty_segment_marker_initializes_stream_without_audio():
 
     assert output.multimodal_outputs["model_outputs"][0].numel() > 0
     assert "duplex" in model._states
+
+
+def test_code2wav_native_payload_identity_survives_batch_reordering_and_empty_terminal():
+    model, _ = _model()
+    a, b = _info("a", 0, [10, 11], cache_epoch=4), _info("b", 0, [20, 21], cache_epoch=8)
+    for info, turn in ((a, 2), (b, 5)):
+        info["meta"].update(duplex_epoch=3, duplex_turn_id=turn)
+    _forward(model, [a, b])
+
+    b_final = _info("b", 1, [], last_chunk=True, cache_epoch=8)
+    b_final["meta"].update(
+        duplex_epoch=3,
+        duplex_turn_id=5,
+        turn_end=True,
+        code_flat_numel=0,
+        llm_output_text_utf8=torch.tensor(list("尾文本".encode()), dtype=torch.uint8),
+    )
+    a_body = _info("a", 1, [12, 13], cache_epoch=4)
+    a_body["meta"].update(duplex_epoch=3, duplex_turn_id=2)
+    mm = _forward(model, [b_final, a_body]).multimodal_outputs
+
+    assert [item.item() for item in mm["meta.cache_epoch"]] == [8, 4]
+    assert [item.item() for item in mm["meta.chunk_seq"]] == [1, 1]
+    assert [item.item() for item in mm["meta.duplex_turn_id"]] == [5, 2]
+    assert [item.item() for item in mm["meta.llm_output_text_is_delta"]] == [True, True]
+    assert mm["model_outputs"][0].numel() == 0
+    assert mm["meta.llm_output_text_utf8"][0].tolist() == list("尾文本".encode())
+
+
+def test_code2wav_legacy_and_prewarm_outputs_do_not_claim_native_text_deltas():
+    model, _ = _model()
+    mm = _forward(model, [_info("legacy", 0, [10, 11]), {}], request_ids=["legacy", "prewarm"])
+    assert [flag.item() for flag in mm.multimodal_outputs["meta.llm_output_text_is_delta"]] == [False, False]
 
 
 def test_shared_runtime_prompt_recreates_missing_file_before_second_owner(tmp_path, monkeypatch):

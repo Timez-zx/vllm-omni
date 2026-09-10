@@ -19,10 +19,12 @@
 
 import os
 import time
-from collections.abc import Iterable
+from collections.abc import Generator, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
+from dataclasses import dataclass
 from functools import cached_property
+from threading import Lock
 from typing import Any
 
 import torch
@@ -36,9 +38,18 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.topk_topp_sampler import random_sample
 
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import MiniCPMO45DuplexPolicy
-from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRow
+from vllm_omni.experimental.fullduplex.minicpmo45.sampling_state import (
+    SAMPLING_STATE_KEY,
+    SAMPLING_STATE_WIRE_KEY,
+    pack_sampling_state,
+    resume_sampling_rng,
+    snapshot_sampling_rng,
+    unpack_sampling_state,
+)
+from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplerOutput, DuplexSamplingRow
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMDummyInputsBuilder,
     MiniCPMO45OmniLLMMultiModalProcessor,
@@ -53,6 +64,18 @@ logger = init_logger(__name__)
 
 _MINICPMO45_BATCHED_VISION_KEY = "_minicpmo45_batched_vision"
 _MINICPMO45_LOG_PREP_DIAG = os.environ.get("MINICPMO45_LOG_PREP_DIAG", "0") not in ("0", "", "false", "False")
+
+
+@dataclass
+class _MiniCPMFilteredDraw:
+    logits: torch.Tensor
+    top_k: int
+    top_p: float
+    generator: torch.Generator | None
+    token_ids: dict[str, int] | None = None
+    repetition_tokens: tuple[int, ...] = ()
+    temperature: float = 1.0
+    greedy: bool = False
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -82,6 +105,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        # Audio, vision and P can enter the lazy runtime concurrently. Publish
+        # exactly one helper, otherwise a later constructor discards the first
+        # encoder's arrival cache and the first frame is encoded again on P.
+        self._minicpmo45_helper_init_lock = Lock()
         self.have_multimodal_outputs = True
         config: MiniCPMOConfig = vllm_config.model_config.hf_config
         multimodal_config = vllm_config.model_config.multimodal_config
@@ -102,6 +129,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # Native KV prefix caching remains enabled and authoritative for model
         # execution.
         self._minicpmo_pd_thinker = self._minicpmo_pd_prefill or self._minicpmo_pd_decode
+        self._minicpmo45_numerical_probe_dir = os.environ.get("MINICPMO45_NUMERICAL_PROBE_DIR")
         self.omni_pooler_payload_include_hidden = self._minicpmo_pd_decode or not self._minicpmo_pd_thinker
         self.requires_full_prefix_cached_hidden_states = not self._minicpmo_pd_thinker
         self.requires_full_prefix_cached_multimodal_outputs = not self._minicpmo_pd_thinker
@@ -182,6 +210,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         """Apply MiniCPM duplex policy before the standard model sampler."""
         del sampling_metadata
         self._minicpmo45_active_duplex_rows = [row.row_idx for row in rows]
+        self._minicpmo45_sampling_rows = rows
+        self._minicpmo45_duplex_row_requests = {row.row_idx: row.request_id for row in rows}
         self._minicpmo45_duplex_row_sessions = {
             row.row_idx: (row.session_id, row.incarnation) for row in rows if row.session_id is not None
         }
@@ -199,9 +229,25 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if self.model_stage != "llm" or not rows or logits.ndim != 2:
             return
 
+        if getattr(self, "_minicpmo_pd_decode", False):
+            states = getattr(self, "_minicpmo45_pd_sampling_states", None)
+            if states is None:
+                states = self._minicpmo45_pd_sampling_states = {}
+            for row in rows:
+                if not row.should_sample:
+                    continue
+                if row.request_id not in states:
+                    payload = row.payload or {}
+                    state, identity = unpack_sampling_state(payload.get(SAMPLING_STATE_KEY))
+                    if identity != (row.incarnation, row.epoch, row.seq):
+                        raise ValueError("Stale MiniCPM P/D sampling state identity")
+                    states[row.request_id] = state
+            # The P policy has already applied explicit force-listen and sampled
+            # the first token. D must continue it, not force LISTEN a second time.
+            return
+
         token_ids = self._minicpmo45_native_duplex_token_ids()
         listen_id = int(token_ids.get("listen_token_id", -1))
-        turn_eos_id = int(token_ids.get("turn_eos_token_id", -1))
         if listen_id < 0 or listen_id >= logits.shape[-1]:
             return
 
@@ -213,33 +259,25 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if not isinstance(force_listen_segments, set):
             force_listen_segments = set()
             self._minicpmo45_force_listen_applied_segments = force_listen_segments
-        helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
-        helper_sessions = getattr(helper, "sessions", None) if helper is not None else None
         for row in rows:
+            if not row.should_sample:
+                continue
             row_idx = row.row_idx
             if row_idx < 0 or row_idx >= logits.shape[0]:
                 continue
             payload = row.payload
             if not isinstance(payload, dict):
                 continue
+            state = self._minicpmo45_duplex_state_for_row(row_idx)
+            if getattr(state, "current_segment_output_tokens", None):
+                # Explicit force-listen is evaluated once per unit, not again
+                # when TURN_EOS occurs inside that unit.
+                continue
             force_listen = payload.get("force_listen") is True
-            is_speech = payload.get("is_speech")
             segment_key = (row.request_id, row.seq if row.seq is not None else -1)
-            session_key = (row.session_id, row.incarnation) if row.session_id is not None else None
-            if turn_eos_id >= 0 and session_key is not None:
-                state = helper_sessions.get(session_key) if isinstance(helper_sessions, dict) else None
-                pending_speech_context = (
-                    bool(getattr(state, "pending_speech_context", False)) if state is not None else False
-                )
-                if is_speech is True:
-                    if state is not None:
-                        with suppress(Exception):
-                            state.last_terminator_token = None
-                else:
-                    turn_ended = bool(getattr(state, "current_turn_ended", True)) if state is not None else False
-                    if turn_ended and not pending_speech_context:
-                        force_listen = True
-
+            # The native model may initiate a reply over silence. An input RMS
+            # tag must neither force LISTEN nor overwrite its previous control
+            # decision; only an explicit caller/model-config instruction may.
             if not force_listen:
                 continue
             if force_listen and segment_key in force_listen_segments:
@@ -333,8 +371,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         delta_len = int(delta_embeds.shape[0])
         if delta_len != len(delta_token_ids):
             raise RuntimeError(
-                "MiniCPM-o duplex embedding/token row mismatch: "
-                f"embeddings={delta_len}, tokens={len(delta_token_ids)}"
+                f"MiniCPM-o duplex embedding/token row mismatch: embeddings={delta_len}, tokens={len(delta_token_ids)}"
             )
         if prompt_len < 0 or token_offset < 0 or span_len < 0:
             raise RuntimeError(
@@ -407,12 +444,24 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             return input_ids, embeds, {}
 
         if self._minicpmo_pd_decode:
+            media_prefix = duplex.get("pd_media_prefix_tokens")
+            token_offset = kwargs.get("duplex_token_offset")
+            if media_prefix is not None and (token_offset is None or int(token_offset) < int(media_prefix)):
+                raise RuntimeError(
+                    "MiniCPM D must import the complete media KV prefix; "
+                    "refusing to recompute audio/video placeholders as text embeddings "
+                    f"(offset={token_offset}, media_prefix={media_prefix})"
+                )
             # P already encoded the cumulative AV prompt and D loads its KV.
             # P's first sampled decision token is D's sole local prompt
             # suffix, so a normal token embedding is exact. Re-running the AV
             # processor here would both duplicate prefill and defeat P/D.
             embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
             decode_info = {key: value for key, value in duplex.items() if key != "payload"}
+            payload = duplex.get("payload") or {}
+            decode_info["payload"] = {
+                key: payload[key] for key in (SAMPLING_STATE_KEY, "force_listen", "is_speech") if key in payload
+            }
             decode_info.setdefault(
                 "special_token_ids",
                 self._minicpmo45_native_duplex_token_ids(),
@@ -465,8 +514,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 int,
             ):
                 raise RuntimeError(
-                    "MiniCPM-o duplex append requires an exact integer "
-                    "scheduler token budget before Stage0 consumption"
+                    "MiniCPM-o duplex append requires an exact integer scheduler token budget before Stage0 consumption"
                 )
             expected_delta_start = prompt_len_for_preflight - scheduler_token_budget
             if expected_delta_start < 0:
@@ -489,9 +537,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                         f"(offset={token_offset_for_preflight}, "
                         f"delta_start={expected_delta_start})"
                     )
-                expected_rebase_prompt_len = (
-                    raw_rebase_prefix + scheduler_token_budget
-                )
+                expected_rebase_prompt_len = raw_rebase_prefix + scheduler_token_budget
                 if prompt_len_for_preflight != expected_rebase_prompt_len:
                     raise RuntimeError(
                         "MiniCPM-o duplex prefix KV is unavailable but the "
@@ -536,6 +582,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 epoch=epoch,
                 seq=seq,
                 force_listen=bool(payload.get("force_listen", False)),
+                sampling_state=duplex.get("pd_feedback_sampling_state"),
             )
         video_frames = None
         preprocessed_vision = None
@@ -633,8 +680,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 )
             if video_frames:
                 logger.info(
-                    "[MINICPM-FRAME-CONSUMED] req=%s seq=%s frames=%d "
-                    "source=%s done_epoch=%.6f",
+                    "[MINICPM-FRAME-CONSUMED] req=%s seq=%s frames=%d source=%s done_epoch=%.6f",
                     kwargs.get("request_id", "?"),
                     seq,
                     len(video_frames),
@@ -659,6 +705,16 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             token_offset = max(0, int(token_offset))
         except (TypeError, ValueError):
             token_offset = 0
+        if not result.get("rebase_prompt", False) and scheduler_token_budget != len(delta_input_token_ids):
+            logger.error(
+                "[duplex-budget] session=%s seq=%s budget=%s rows=%d feedback=%s delta_tail=%s",
+                session_id,
+                seq,
+                scheduler_token_budget,
+                len(delta_input_token_ids),
+                pd_feedback,
+                delta_input_token_ids[-16:],
+            )
         req_embeds, input_token_ids, delta_start = self._slice_duplex_prompt_delta(
             delta_embeds,
             delta_input_token_ids,
@@ -758,11 +814,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             self._minicpmo45_vision_prepare_executor = executor
         cpu_start = time.perf_counter() if _MINICPMO45_LOG_PREP_DIAG else 0.0
         prepared = [item for item in executor.map(prepare, jobs) if item is not None]
-        cpu_prepare_ms = (
-            (time.perf_counter() - cpu_start) * 1000.0
-            if _MINICPMO45_LOG_PREP_DIAG
-            else 0.0
-        )
+        cpu_prepare_ms = (time.perf_counter() - cpu_start) * 1000.0 if _MINICPMO45_LOG_PREP_DIAG else 0.0
         if not prepared:
             return {"supported": True, "encoded_frames": 0}
         try:
@@ -930,18 +982,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             raw_audio_preencode_id = payload.get("audio_preencode_id")
             raw_audio_preencode_seq = payload.get("audio_preencode_seq")
             try:
-                audio_preencode_seq = (
-                    int(raw_audio_preencode_seq)
-                    if raw_audio_preencode_seq is not None
-                    else None
-                )
+                audio_preencode_seq = int(raw_audio_preencode_seq) if raw_audio_preencode_seq is not None else None
             except (TypeError, ValueError):
                 audio_preencode_seq = None
-            if (
-                isinstance(raw_audio_preencode_id, str)
-                and raw_audio_preencode_id
-                and audio_preencode_seq is not None
-            ):
+            if isinstance(raw_audio_preencode_id, str) and raw_audio_preencode_id and audio_preencode_seq is not None:
                 take_preencoded_audio = getattr(
                     helper,
                     "take_arrival_audio_append",
@@ -986,11 +1030,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             # Later appends then take the exact serial fallback after the first
             # request commits, rather than racing the same processor snapshot.
             audio_session = (session_id, incarnation)
-            if (
-                not audio_arrival_hit
-                and state is not None
-                and audio_session not in claimed_audio_sessions
-            ):
+            if not audio_arrival_hit and state is not None and audio_session not in claimed_audio_sessions:
                 claimed_audio_sessions.add(audio_session)
                 audio_items.append(item)
 
@@ -1137,10 +1177,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                     thread_name_prefix="minicpmo-audio-prepare",
                 )
                 self._minicpmo45_audio_prepare_executor = audio_executor
-            audio_futures = {
-                item[1]: audio_executor.submit(prepare_audio, item)
-                for item in audio_items
-            }
+            audio_futures = {item[1]: audio_executor.submit(prepare_audio, item) for item in audio_items}
 
         cpu_prepare_start = time.perf_counter() if _MINICPMO45_LOG_PREP_DIAG else 0.0
         prepared_items = []
@@ -1152,11 +1189,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                     thread_name_prefix="minicpmo-vision-prepare",
                 )
                 self._minicpmo45_vision_prepare_executor = executor
-            prepared_items = [
-                prepared
-                for prepared in executor.map(prepare_vision, pending)
-                if prepared is not None
-            ]
+            prepared_items = [prepared for prepared in executor.map(prepare_vision, pending) if prepared is not None]
         cpu_prepare_ms = (time.perf_counter() - cpu_prepare_start) * 1000.0 if _MINICPMO45_LOG_PREP_DIAG else 0.0
 
         frame_blocks_batch = None
@@ -1197,9 +1230,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         prepared_audio = [
             (audio_results[item[1]][1], item[4])
             for item in audio_items
-            if item[1] in audio_results
-            and audio_results[item[1]][1] is not None
-            and item[4] is not None
+            if item[1] in audio_results and audio_results[item[1]][1] is not None and item[4] is not None
         ]
         if len(prepared_audio) >= 2:
             helper._stage_audio_embeddings_batch(prepared_audio)
@@ -1258,13 +1289,16 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
         if helper is not None:
             return helper
-        from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import MiniCPMO45Stage0DuplexRuntime
+        with self._minicpmo45_helper_init_lock:
+            helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
+            if helper is None:
+                from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import MiniCPMO45Stage0DuplexRuntime
 
-        model_path = getattr(getattr(self.vllm_config, "model_config", None), "model", None)
-        device = str(self._module_device(self.thinker if self.thinker is not None else self))
-        helper = MiniCPMO45Stage0DuplexRuntime(self, model_path=model_path, device=device)
-        self._minicpmo45_duplex_data_plane_helper = helper
-        return helper
+                model_path = getattr(getattr(self.vllm_config, "model_config", None), "model", None)
+                device = str(self._module_device(self.thinker if self.thinker is not None else self))
+                helper = MiniCPMO45Stage0DuplexRuntime(self, model_path=model_path, device=device)
+                self._minicpmo45_duplex_data_plane_helper = helper
+            return helper
 
     def get_multimodal_embeddings(self, **kwargs):
         # Delegate to the active stage submodule when it implements MM encoding.
@@ -1339,14 +1373,46 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                     inputs_embeds[0] if inputs_embeds is not None and added_batch_dim else inputs_embeds
                 )
 
-            # Run thinker
-            thinker_output = self.thinker(
-                input_ids=thinker_input_ids,
-                positions=thinker_positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=thinker_inputs_embeds,
-                **kwargs,
-            )
+            # vLLM's fused residual updates may modify inputs_embeds in-place.
+            # A correctness probe must snapshot inputs BEFORE that forward.
+            probe_embeds = None
+            if getattr(self, "_minicpmo_pd_thinker", False) and getattr(self, "_minicpmo45_numerical_probe_dir", None):
+                from vllm_omni.experimental.fullduplex.minicpmo45.numerical_probe import capture_forward, selected_rows
+
+                if selected_rows(kwargs.get("minicpmo_numerical_probe_rows")):
+                    probe_embeds = thinker_inputs_embeds.detach().clone()
+                    if self._minicpmo_pd_decode:
+                        capture_forward(
+                            self,
+                            None,
+                            thinker_positions,
+                            None,
+                            None,
+                            rows=kwargs.get("minicpmo_numerical_probe_rows"),
+                            phase="before_backbone_forward",
+                        )
+
+            # Layer I/O is a separate opt-in eager correctness diagnostic.
+            # Default execution never installs hooks or copies layer tensors.
+            if probe_embeds is not None and os.environ.get("MINICPMO45_NUMERICAL_PROBE_LAYER_IO") == "1":
+                from vllm_omni.experimental.fullduplex.minicpmo45.numerical_probe import capture_layer0_io
+
+                with capture_layer0_io(self, thinker_positions, rows=kwargs.get("minicpmo_numerical_probe_rows")):
+                    thinker_output = self.thinker(
+                        input_ids=thinker_input_ids,
+                        positions=thinker_positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=thinker_inputs_embeds,
+                        **kwargs,
+                    )
+            else:
+                thinker_output = self.thinker(
+                    input_ids=thinker_input_ids,
+                    positions=thinker_positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=thinker_inputs_embeds,
+                    **kwargs,
+                )
 
             input_embedding_states = None
             if isinstance(thinker_output, tuple):
@@ -1358,6 +1424,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             # Ensure correct shape: (batch_size, seq_len, hidden_dim)
             if added_batch_dim:
                 text_hidden_states = text_hidden_states.squeeze(0)
+
+            if probe_embeds is not None:
+                from vllm_omni.experimental.fullduplex.minicpmo45.numerical_probe import capture_forward
+
+                capture_forward(
+                    self,
+                    thinker_input_ids,
+                    thinker_positions,
+                    probe_embeds,
+                    text_hidden_states,
+                    rows=kwargs.get("minicpmo_numerical_probe_rows"),
+                )
 
             # D's generated hidden rows are sufficient for MiniCPM's native
             # duplex Thinker->Talker bridge. P therefore exports KV only; an
@@ -1398,10 +1476,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                     "duplex_arrival_audio_units",
                     "duplex_audio_fallback_units",
                 ):
-                    audit_rows = [
-                        max(0, int(duplex_info.get(audit_key, 0) or 0))
-                        for duplex_info in duplex_rows
-                    ]
+                    audit_rows = [max(0, int(duplex_info.get(audit_key, 0) or 0)) for duplex_info in duplex_rows]
                     # Presence is significant even when every row is zero:
                     # formal sidecar audits must distinguish an observed
                     # zero fallback count from a counter that was never
@@ -1420,13 +1495,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                     if isinstance(key, str) and isinstance(value, int) and value >= 0
                 }
                 if special_keys:
+                    # Known CPU IDs are metadata, not GPU model inputs. Keep
+                    # their one-element shape for the existing tensor wire
+                    # format, but do not enqueue H2D copies (and synchronization)
+                    # after each backbone forward just to copy them back out.
                     multimodal_outputs["meta"] = {
                         key: [
-                            torch.tensor(
-                                [int(value)],
-                                dtype=torch.long,
-                                device=text_hidden_states.device,
-                            )
+                            (int(value),)
                             if isinstance(value, int) and value >= 0
                             else None
                             for duplex_info in duplex_rows
@@ -1458,6 +1533,25 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         raise ValueError(f"Unsupported model stage: {self.model_stage}")
 
+    @property
+    def requires_request_sample_eligibility(self):
+        # The runner sees this outer model, not the inner Talker. Without
+        # forwarding the capability, incomplete prefill chunks would still
+        # advance the model-owned codec sampler.
+        return self.model_stage == "tts"
+
+    @property
+    def supports_omni_decode_step_metadata(self):
+        # The existing runner hook executes even when the model uses CUDA
+        # graph replay. Keep it entirely disabled for ordinary serving.
+        from vllm_omni.experimental.fullduplex.minicpmo45 import speech_probe
+
+        return self.model_stage == "tts" and speech_probe.ENABLED
+
+    def update_decode_step_metadata(self, **kwargs):
+        if self.supports_omni_decode_step_metadata:
+            self.talker.capture_speech_step_metadata(**kwargs)
+
     def make_omni_output(self, model_outputs, **kwargs):
         if self.model_stage != "tts":
             return model_outputs
@@ -1472,6 +1566,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         return self.model.compute_logits(hidden_states)
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        decode_states = getattr(self, "_minicpmo45_pd_sampling_states", {})
+        for request_id in finished_req_ids:
+            decode_states.pop(request_id, None)
         request_sessions = getattr(self, "_minicpmo45_duplex_request_sessions", None)
         helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
         sessions = getattr(helper, "sessions", None) if helper is not None else None
@@ -1533,15 +1630,64 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             return None
 
         batch_size = int(logits.shape[0])
-        temperatures = self._sampling_metadata_values(
-            sampling_metadata, "temperature", batch_size, 0.7
-        )
+        temperatures = self._sampling_metadata_values(sampling_metadata, "temperature", batch_size, 0.7)
         top_ks = self._sampling_metadata_values(sampling_metadata, "top_k", batch_size, 100)
         top_ps = self._sampling_metadata_values(sampling_metadata, "top_p", batch_size, 0.8)
 
-        sampled_ids: list[int] = []
+        rng_rows = {row.row_idx: row for row in getattr(self, "_minicpmo45_sampling_rows", ())}
+        sampled_ids: list[int] = [0] * batch_size
+        # Only reorder independent rows. With an unseeded/shared generator,
+        # retain native row-major RNG draws (boundary then text for each row).
+        generators = getattr(sampling_metadata, "generators", {})
+        row_generators = [generators.get(i) for i in range(batch_size)]
+        states = [self._minicpmo45_duplex_state_for_row(i) for i in range(batch_size)]
+        owned_states = [id(state) for state in states if state is not None]
+        batch_feedback = (
+            logits.is_cuda and batch_size > 1
+            and len(set(owned_states)) == len(owned_states)
+            and (getattr(sampling_metadata, "all_greedy", False)
+                 or (all(g is not None for g in row_generators)
+                     and len({id(g) for g in row_generators}) == batch_size))
+        )
+        pending: list[tuple[int, Generator[torch.Tensor | _MiniCPMFilteredDraw, int | None, int], int | None]] = []
+        row_rng: dict[int, Any] = {}
+        skipped_request_ids: list[str] = []
         for row_idx in range(logits.shape[0]):
-            sampled = self._sample_minicpmo45_native_duplex_row(
+            row = rng_rows.get(row_idx)
+            if row is not None and not row.should_sample:
+                # Intermediate prefill chunks have no model decision yet.
+                # vLLM drops this placeholder using its existing discard mask.
+                skipped_request_ids.append(row.request_id)
+                continue
+            state = self._minicpmo45_duplex_state_for_row(row_idx)
+            generator = None
+            if getattr(self, "_minicpmo_pd_thinker", False) and not getattr(sampling_metadata, "all_greedy", False):
+                generator = getattr(sampling_metadata, "generators", {}).get(row_idx)
+                row = rng_rows.get(row_idx)
+                if row is not None:
+                    identity = (row.request_id, row.incarnation, row.epoch, row.seq)
+                    resume_sampling_rng(state, generator, identity)
+            segment = getattr(state, "current_segment_output_tokens", [])
+            if (
+                getattr(self, "_minicpmo_pd_decode", False)
+                and len(segment) == 1
+                and segment[0]
+                in {
+                    token_ids.get(key, -1)
+                    for key in ("listen_token_id", "chunk_eos_token_id", "chunk_tts_eos_token_id")
+                }
+            ):
+                # P already ended this unit. D only installs KV and feeds that
+                # terminator (as the native decoder does); expose the same
+                # boundary without sampling or recording a second decision.
+                snapshot_sampling_rng(state, generator)
+                sampled_ids[row_idx] = segment[0]
+                continue
+            sample_row = (
+                self._sample_minicpmo45_native_duplex_row_steps if batch_feedback
+                else self._sample_minicpmo45_native_duplex_row
+            )
+            sampled = sample_row(
                 logits[row_idx : row_idx + 1],
                 sampling_metadata,
                 row_idx=row_idx,
@@ -1550,14 +1696,50 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 top_k=int(top_ks[row_idx]),
                 top_p=top_ps[row_idx],
             )
+            if batch_feedback:
+                pending.append((row_idx, sampled, None))
+                row_rng[row_idx] = generator
+                continue
             self._record_minicpmo45_duplex_terminator(row_idx, sampled, token_ids)
-            sampled_ids.append(sampled)
-        return SamplerOutput(
+            snapshot_sampling_rng(state, generator)
+            sampled_ids[row_idx] = sampled
+        # Run the same per-row CUDA sampling operations, but collect decisions
+        # once per phase instead of .item() twice per user. No extra RNG draw
+        # for forced boundaries, P-ended units, or intermediate prefill chunks.
+        while pending:
+            decisions = []
+            for row_idx, steps, feedback in pending:
+                try:
+                    decision = steps.send(feedback)
+                except StopIteration as finished:
+                    sampled_ids[row_idx] = finished.value
+                    self._record_minicpmo45_duplex_terminator(row_idx, finished.value, token_ids)
+                    snapshot_sampling_rng(states[row_idx], row_rng[row_idx])
+                else:
+                    decisions.append((row_idx, steps, decision))
+            draws = self._materialize_minicpmo45_draws([d for _, _, d in decisions])
+            values = torch.cat([d.reshape(-1) for d in draws]).cpu().tolist() if draws else []
+            pending = [(i, steps, int(value)) for (i, steps, _), value in zip(decisions, values)]
+        return DuplexSamplerOutput(
             sampled_token_ids=torch.tensor(sampled_ids, device=logits.device, dtype=torch.int32).unsqueeze(-1),
             logprobs_tensors=None,
+            skipped_sampling_request_ids=tuple(skipped_request_ids),
         )
 
     def _sample_minicpmo45_native_duplex_row(
+        self, logits: torch.Tensor, sampling_metadata: SamplingMetadata, **kwargs: Any,
+    ) -> int:
+        """Native row-major fallback for shared/unseeded RNG and CPU callers."""
+        steps = self._sample_minicpmo45_native_duplex_row_steps(logits, sampling_metadata, **kwargs)
+        feedback = None
+        while True:
+            try:
+                draw = self._materialize_minicpmo45_draws([steps.send(feedback)])[0]
+                feedback = int(draw.item())
+            except StopIteration as finished:
+                return finished.value
+
+    def _sample_minicpmo45_native_duplex_row_steps(
         self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
@@ -1567,13 +1749,16 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         temperature: float,
         top_k: int,
         top_p: float,
-    ) -> int:
+    ) -> Generator[torch.Tensor | _MiniCPMFilteredDraw, int | None, int]:
         chunk_eos_id = token_ids.get("chunk_eos_token_id", -1)
         generator = getattr(sampling_metadata, "generators", {}).get(row_idx)
         output_token_ids = getattr(sampling_metadata, "output_token_ids", None) or []
         raw_recent_tokens = output_token_ids[row_idx] if row_idx < len(output_token_ids) else []
         recent_tokens = [int(token_id) for token_id in raw_recent_tokens if isinstance(token_id, int) and token_id >= 0]
         state = self._minicpmo45_duplex_state_for_row(row_idx)
+        if getattr(self, "_minicpmo_pd_decode", False) and state is not None:
+            # Include P's first sampled token in native chunk/character limits.
+            recent_tokens = list(state.current_segment_output_tokens)
         if chunk_eos_id >= 0 and chunk_eos_id < logits.shape[-1]:
             max_speak_tokens = int(
                 getattr(
@@ -1595,110 +1780,115 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             # If it does not choose chunk_eos, mask that token before the
             # normal text/listen/turn sampling pass below.
             if getattr(sampling_metadata, "all_greedy", False):
-                boundary_sample = int(torch.argmax(logits, dim=-1).item())
+                boundary_sample = yield torch.argmax(logits, dim=-1)
             else:
-                boundary_probs = F.softmax(logits, dim=-1)
-                boundary_sample = int(torch.multinomial(boundary_probs, num_samples=1, generator=generator).item())
+                boundary_sample = yield _MiniCPMFilteredDraw(logits, 0, 1.0, generator)
             if boundary_sample == chunk_eos_id:
                 return int(chunk_eos_id)
 
-        logits = logits.clone()
-        forbidden = self._minicpmo45_native_forbidden_token_ids(token_ids)
-        if forbidden:
-            valid_forbidden = [token_id for token_id in forbidden if 0 <= token_id < logits.shape[-1]]
-            if valid_forbidden:
-                logits[:, valid_forbidden] = float("-inf")
-
         generated_tokens = getattr(state, "generated_tokens", None)
         repetition_tokens = generated_tokens if generated_tokens else recent_tokens
-        repetition_penalty = 1.05
-        if repetition_penalty != 1.0 and repetition_tokens:
-            history_size = MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE
-            for token_id in set(repetition_tokens[-history_size:]):
-                if token_id < 0 or token_id >= logits.shape[-1]:
-                    continue
-                logits[0, token_id] /= repetition_penalty
-
-        if getattr(sampling_metadata, "all_greedy", False) or temperature <= 0:
-            sampled = int(torch.argmax(logits, dim=-1).item())
-            self._record_minicpmo45_duplex_generation_token(row_idx, sampled)
-            sampled = self._maybe_cut_minicpmo45_native_duplex_text_chunk(
-                sampled,
-                recent_tokens,
-                token_ids,
-            )
-            return self._finalize_minicpmo45_native_duplex_sample(row_idx, sampled, token_ids)
-
-        logits = logits / temperature
-        logits = self._top_k_top_p_filter(logits, top_k=top_k, top_p=top_p)
-        probs = F.softmax(logits, dim=-1)
-        sampled = int(torch.multinomial(probs, num_samples=1, generator=generator).item())
-        self._record_minicpmo45_duplex_generation_token(row_idx, sampled)
-        sampled = self._maybe_cut_minicpmo45_native_duplex_text_chunk(
-            sampled,
-            recent_tokens,
-            token_ids,
+        sampled = yield _MiniCPMFilteredDraw(
+            logits, top_k, top_p, generator, token_ids=token_ids,
+            repetition_tokens=tuple(repetition_tokens[-MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE:]),
+            temperature=temperature,
+            greedy=bool(getattr(sampling_metadata, "all_greedy", False) or temperature <= 0),
         )
+        self._record_minicpmo45_duplex_generation_token(row_idx, sampled)
         return self._finalize_minicpmo45_native_duplex_sample(
             row_idx,
             sampled,
             token_ids,
         )
 
-    def _maybe_cut_minicpmo45_native_duplex_text_chunk(
-        self,
-        sampled: int,
-        recent_tokens: list[int],
-        token_ids: dict[str, int],
-    ) -> int:
-        chunk_eos_id = token_ids.get("chunk_eos_token_id", -1)
-        if chunk_eos_id < 0:
-            return int(sampled)
-        special_ids = self._minicpmo45_native_special_token_ids(token_ids)
-        if sampled in special_ids:
-            return int(sampled)
-        max_chars = int(
-            getattr(
-                self,
-                "max_speak_chars_per_chunk",
-                MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK,
-            )
-            or MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK
-        )
-        if max_chars <= 0:
-            return int(sampled)
-        tokenizer = self._minicpmo45_tokenizer()
-        decode = getattr(tokenizer, "decode", None)
-        if not callable(decode):
-            return int(sampled)
-        candidate_tokens = self._minicpmo45_current_chunk_tokens(recent_tokens, token_ids)
-        candidate_tokens.append(int(sampled))
-        try:
-            text = decode(candidate_tokens, skip_special_tokens=True)
-        except TypeError:
-            text = decode(candidate_tokens)
-        except Exception:
-            return int(sampled)
-        return int(chunk_eos_id) if isinstance(text, str) and len(text) >= max_chars else int(sampled)
+    def _materialize_minicpmo45_draws(
+        self, decisions: list[torch.Tensor | _MiniCPMFilteredDraw]
+    ) -> list[torch.Tensor]:
+        # The caller only groups independent session RNG streams. Shared or
+        # unseeded streams retain the original one-row, boundary-then-text
+        # order. Native batched draws retain each independent row's RNG stream.
+        outputs: dict[int, torch.Tensor] = {}
+        groups: dict[tuple, list[tuple[int, _MiniCPMFilteredDraw]]] = {}
+        for i, decision in enumerate(decisions):
+            if isinstance(decision, torch.Tensor):
+                outputs[i] = decision
+            else:
+                policy = None if decision.token_ids is None else tuple(sorted(decision.token_ids.items()))
+                key = (decision.top_k, decision.top_p, decision.temperature, decision.greedy, policy)
+                groups.setdefault(key, []).append((i, decision))
+        for (top_k, top_p, temperature, greedy, _), group in groups.items():
+            logits = group[0][1].logits if len(group) == 1 else torch.cat([d.logits for _, d in group])
+            token_ids = group[0][1].token_ids
+            if token_ids is not None:
+                if len(group) == 1:
+                    logits = logits.clone()
+                self._mask_minicpmo45_forbidden_tokens(logits, token_ids)
+                if len(group) == 1:
+                    self._apply_minicpmo45_repetition_penalty(logits, group[0][1].repetition_tokens, 1.05)
+                else:
+                    pairs = [
+                        (row, token) for row, (_, decision) in enumerate(group)
+                        for token in set(decision.repetition_tokens)
+                        if 0 <= token < logits.shape[-1]
+                    ]
+                    if pairs:
+                        rows, columns = torch.tensor(pairs, device=logits.device, dtype=torch.long).unbind(1)
+                        logits[rows, columns] = logits[rows, columns] / 1.05
+                if not greedy:
+                    logits = logits / temperature
+            if greedy:
+                draws = torch.argmax(logits, dim=-1).reshape(-1, 1)
+                for row, (i, _) in enumerate(group):
+                    outputs[i] = draws[row : row + 1]
+                continue
+            probs = F.softmax(self._top_k_top_p_filter(logits, top_k=top_k, top_p=top_p), dim=-1)
+            generators = {row: decision.generator for row, (_, decision) in enumerate(group)}
+            if (
+                probs.is_cuda and len(group) > 1
+                and all(g is not None for g in generators.values())
+                and len({id(g) for g in generators.values()}) == len(group)
+            ):
+                draws = random_sample(probs, generators, use_fp64_gumbel=False).reshape(-1, 1)
+                for row, (i, _) in enumerate(group):
+                    outputs[i] = draws[row : row + 1]
+                continue
+            for row, (i, decision) in enumerate(group):
+                outputs[i] = self._draw_minicpmo45_token(probs[row : row + 1], decision.generator)
+        return [outputs[i] for i in range(len(decisions))]
 
     @staticmethod
-    def _minicpmo45_current_chunk_tokens(
-        tokens: list[int],
-        token_ids: dict[str, int],
-    ) -> list[int]:
-        boundaries = {
-            token_ids.get("listen_token_id", -1),
-            token_ids.get("chunk_eos_token_id", -1),
-            token_ids.get("chunk_tts_eos_token_id", -1),
-            token_ids.get("turn_eos_token_id", -1),
-        }
-        start = 0
-        for idx, token_id in enumerate(tokens):
-            if token_id in boundaries:
-                start = idx + 1
-        return list(tokens[start:])
+    def _draw_minicpmo45_token(probs: torch.Tensor, generator: torch.Generator | None) -> torch.Tensor:
+        if not probs.is_cuda:
+            return torch.multinomial(probs, num_samples=1, generator=generator)
+        # These are internal softmax probabilities. Reuse vLLM's draw for the
+        # same exponential noise/RNG sequence without multinomial's repeated
+        # full-vocabulary validity reductions. The probability buffer is dead
+        # after this draw; random_sample may safely modify it in place.
+        return random_sample(
+            probs, {0: generator} if generator is not None else {}, use_fp64_gumbel=False
+        ).reshape(1, 1)
+
+    @staticmethod
+    def _apply_minicpmo45_repetition_penalty(
+        logits: torch.Tensor, history: list[int] | tuple[int, ...], penalty: float,
+    ) -> None:
+        # Preserve the released decoder's rule: divide either sign once per
+        # distinct token in the recent history, including already-masked logits.
+        # A scalar CUDA update per token otherwise launches hundreds of kernels
+        # for every row of every decode step. No RNG or sampling policy changes.
+        token_ids = [
+            token_id
+            for token_id in set(history[-MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE :])
+            if 0 <= token_id < logits.shape[-1]
+        ]
+        if token_ids:
+            indices = torch.tensor(token_ids, device=logits.device, dtype=torch.long)
+            logits[0, indices] = logits[0, indices] / penalty
 
     def _minicpmo45_duplex_state_for_row(self, row_idx: int):
+        if getattr(self, "_minicpmo_pd_decode", False):
+            request_id = getattr(self, "_minicpmo45_duplex_row_requests", {}).get(row_idx)
+            return getattr(self, "_minicpmo45_pd_sampling_states", {}).get(request_id)
         row_sessions = getattr(self, "_minicpmo45_duplex_row_sessions", None)
         session_key = row_sessions.get(row_idx) if isinstance(row_sessions, dict) else None
         if not session_key:
@@ -1706,6 +1896,27 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
         sessions = getattr(helper, "sessions", None) if helper is not None else None
         return sessions.get(session_key) if isinstance(sessions, dict) else None
+
+    def snapshot_duplex_sampling_outputs(self, request_ids: list[str]) -> dict[str, Any]:
+        """Freeze CPU policy state after sampling, before async cleanup/output."""
+        if not getattr(self, "_minicpmo_pd_thinker", False):
+            return {}
+        rows = {row.request_id: row for row in getattr(self, "_minicpmo45_sampling_rows", ())}
+        snapshots = []
+        for request_id in request_ids:
+            row = rows.get(request_id)
+            state = (
+                self._minicpmo45_duplex_state_for_row(row.row_idx) if row is not None and row.should_sample else None
+            )
+            snapshots.append(
+                # This is integer metadata, not a tensor for model execution.
+                # A frozen tuple also avoids CPU tensor cloning/serialization
+                # repeatedly releasing and reacquiring the GIL on output threads.
+                tuple(pack_sampling_state(state, incarnation=row.incarnation, epoch=row.epoch, seq=row.seq))
+                if state is not None
+                else None
+            )
+        return {SAMPLING_STATE_WIRE_KEY: snapshots} if any(item is not None for item in snapshots) else {}
 
     def _minicpmo45_duplex_payload_for_row(self, row_idx: int) -> dict[str, Any] | None:
         row_payloads = getattr(self, "_minicpmo45_duplex_row_payloads", None)
@@ -1875,6 +2086,23 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         tokenizer = self._minicpmo45_tokenizer()
         bad_token_ids = getattr(tokenizer, "bad_token_ids", []) if tokenizer is not None else []
         return MiniCPMO45DuplexPolicy.native_forbidden_token_ids(token_ids, bad_token_ids=bad_token_ids)
+
+    def _mask_minicpmo45_forbidden_tokens(self, logits: torch.Tensor, token_ids: dict[str, int]) -> None:
+        # Cache only derived indices, never session state. The content key also
+        # detects an in-place tokenizer/config change; dtype does not affect IDs.
+        forbidden = tuple(self._minicpmo45_native_forbidden_token_ids(token_ids))
+        vocab_size = logits.shape[-1]
+        key = (logits.device, vocab_size, forbidden)
+        cached = getattr(self, "_minicpmo45_forbidden_index_cache", None)
+        if cached is None or cached[0] != key:
+            indices = torch.tensor(
+                [token_id for token_id in forbidden if 0 <= token_id < vocab_size],
+                dtype=torch.long,
+                device=logits.device,
+            )
+            cached = self._minicpmo45_forbidden_index_cache = (key, indices)
+        if cached[1].numel():
+            logits.index_fill_(-1, cached[1], float("-inf"))
 
     def _minicpmo45_native_special_token_ids(self, token_ids: dict[str, int]) -> set[int]:
         tokenizer = self._minicpmo45_tokenizer()

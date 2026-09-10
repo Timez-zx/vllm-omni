@@ -1,0 +1,5 @@
+# Leave-one-out diagnostic: only Code2Wav moves off the shared GPU.
+base_config: deploy_capacity_nonpd_colocated_fp8.yaml
+stages:
+  - stage_id: 2
+    devices: "2"

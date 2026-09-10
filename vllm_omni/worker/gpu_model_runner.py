@@ -1680,6 +1680,14 @@ class OmniGPUModelRunner(GPUModelRunner):
                 extra_args_list.append(sp.extra_args if sp and sp.extra_args else {})
             model_kwargs_extra["sampling_extra_args"] = extra_args_list
 
+        if getattr(self.model, "_minicpmo45_numerical_probe_dir", None):
+            # Diagnostic-only ownership snapshot for THIS forward. The
+            # sampler's model-owned rows are updated after forward and may
+            # still describe a different, previous batch at capture time.
+            from vllm_omni.experimental.fullduplex.minicpmo45.numerical_probe import snapshot_runner_rows
+
+            model_kwargs_extra["minicpmo_numerical_probe_rows"] = snapshot_runner_rows(self)
+
         return model_kwargs_extra
 
     def _process_additional_information_updates(

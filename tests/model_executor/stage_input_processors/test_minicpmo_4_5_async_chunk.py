@@ -72,6 +72,28 @@ def _codes(payload) -> list[int]:
     return payload.codes.audio.tolist()
 
 
+def test_speech_probe_records_exact_codec_windows(tmp_path, monkeypatch):
+    import json
+
+    from vllm_omni.experimental.fullduplex.minicpmo45 import speech_probe
+
+    monkeypatch.setattr(speech_probe, "ENABLED", True)
+    monkeypatch.setattr(speech_probe, "DIRECTORY", str(tmp_path))
+    manager = _manager()
+    request = _request("external", "physical")
+    tts2code2wav_async_chunk(manager, _duplex_delta(*range(25)), request, False)
+    tts2code2wav_async_chunk(manager, _duplex_delta(turn_end=True), request, True)
+    tts2code2wav_async_chunk(manager, _duplex_delta(*range(25), turn_id=8), request, False)
+    records = [json.loads(line) for line in next(tmp_path.glob("speech-*.jsonl")).read_text().splitlines()]
+    assert records[0]["physical_request_id"] == "physical"
+    assert records[0]["codes"] == [4218, 4218, 4218, *range(25)]
+    assert records[1]["codes"] == [22, 23, 24]
+    assert records[1]["last_chunk"] is True
+    assert records[2]["cache_epoch"] == 1
+    assert records[2]["chunk_seq"] == 0
+    assert records[2]["left_context"] == [4218, 4218, 4218]
+
+
 @pytest.mark.parametrize(("count", "emitted"), [(24, False), (25, True), (26, True)])
 def test_first_chunk_threshold_is_25_generated_codes(count: int, emitted: bool) -> None:
     manager = _manager()
@@ -281,10 +303,7 @@ def test_empty_duplex_boundary_uses_zero_length_transport_placeholder() -> None:
     assert boundary.meta.code_flat_numel == 0
     assert boundary.meta.last_chunk is False
     assert boundary.meta.is_segment_finished.item() is False
-    torch.testing.assert_close(
-        boundary.meta.llm_output_text_utf8,
-        torch.tensor(list(b"boundary"), dtype=torch.uint8),
-    )
+    assert boundary.meta.llm_output_text_utf8.numel() == 0
 
 
 def test_duplex_segments_preserve_stream_state_without_closing_turn() -> None:
@@ -321,10 +340,9 @@ def test_duplex_segments_preserve_stream_state_without_closing_turn() -> None:
     assert second.meta.chunk_seq == first.meta.chunk_seq + 1
     assert second.meta.duplex_epoch == 3
     assert second.meta.duplex_turn_id == 7
-    torch.testing.assert_close(
-        second.meta.llm_output_text_utf8,
-        torch.tensor(list(b"second"), dtype=torch.uint8),
-    )
+    # Both short units are retained until a later payload can carry audio.
+    assert first.meta.llm_output_text_utf8.numel() == 0
+    assert second.meta.llm_output_text_utf8.numel() == 0
     assert second.meta.tts_is_last_chunk is True
     assert second.meta.turn_end is False
     assert first.meta.is_segment_finished.item() is False
@@ -353,6 +371,7 @@ def test_duplex_short_units_wait_for_minimum_stream_body() -> None:
     assert first.meta.code_flat_numel == 0
     assert first.meta.last_chunk is False
     assert first.meta.tts_is_last_chunk is True
+    assert first.meta.llm_output_text_utf8.numel() == 0
     assert second is not None
     assert _codes(second) == [4218, 4218, 4218, 10, 11, 12, 13, 14]
     assert second.meta.code_flat_numel == 8
@@ -360,6 +379,52 @@ def test_duplex_short_units_wait_for_minimum_stream_body() -> None:
         second.meta.llm_output_text_utf8,
         torch.tensor(list(b"firstfirst"), dtype=torch.uint8),
     )
+
+
+def test_duplex_control_text_waits_for_audio_and_is_emitted_exactly_once() -> None:
+    manager = _manager()
+    request = _request("native")
+    boundary = tts2code2wav_async_chunk(manager, _duplex_delta(text="重复"), request, True)
+    body = tts2code2wav_async_chunk(manager, _duplex_delta(*range(25), text="重复"), request, False)
+    # This callback repeats the same unit text but has no new PCM/code data.
+    finish = tts2code2wav_async_chunk(manager, _duplex_delta(text="重复"), request, True)
+    next_body = tts2code2wav_async_chunk(manager, _duplex_delta(*range(25), text="后续"), request, False)
+
+    assert boundary.meta.code_flat_numel == 0
+    assert boundary.meta.llm_output_text_utf8.numel() == 0
+    assert body.meta.llm_output_text_utf8.tolist() == list("重复重复".encode())
+    assert finish.meta.llm_output_text_utf8.numel() == 0
+    assert next_body.meta.llm_output_text_utf8.tolist() == list("后续".encode())
+    assert [part.meta.chunk_seq for part in (boundary, body, finish, next_body)] == [0, 1, 2, 3]
+
+
+def test_duplex_terminal_without_pcm_flushes_all_pending_text_once_and_resets_owner() -> None:
+    manager = _manager()
+    request = _request("native")
+    boundary = tts2code2wav_async_chunk(manager, _duplex_delta(text="未出声"), request, True)
+    final = tts2code2wav_async_chunk(manager, _duplex_delta(text="结束", turn_end=True), request, True)
+    duplicate = tts2code2wav_async_chunk(manager, _duplex_delta(text="结束", turn_end=True), request, True)
+    next_turn = tts2code2wav_async_chunk(manager, _duplex_delta(*range(25), text="新轮次", turn_id=8), request, False)
+
+    assert boundary.meta.llm_output_text_utf8.numel() == 0
+    assert final.meta.code_flat_numel == 0
+    assert final.meta.turn_end is True
+    assert final.meta.llm_output_text_utf8.tolist() == list("未出声结束".encode())
+    assert duplicate is None
+    assert next_turn.meta.llm_output_text_utf8.tolist() == list("新轮次".encode())
+    assert next_turn.meta.cache_epoch == final.meta.cache_epoch + 1
+    assert next_turn.meta.chunk_seq == 0
+
+
+def test_duplex_pending_text_is_isolated_between_users() -> None:
+    manager = _manager()
+    a, b = _request("a"), _request("b")
+    tts2code2wav_async_chunk(manager, _duplex_delta(text="甲"), a, True)
+    tts2code2wav_async_chunk(manager, _duplex_delta(text="乙"), b, True)
+    b_audio = tts2code2wav_async_chunk(manager, _duplex_delta(*range(25), text="二"), b, False)
+    a_audio = tts2code2wav_async_chunk(manager, _duplex_delta(*range(25), text="一"), a, False)
+    assert b_audio.meta.llm_output_text_utf8.tolist() == list("乙二".encode())
+    assert a_audio.meta.llm_output_text_utf8.tolist() == list("甲一".encode())
 
 
 def test_duplex_empty_finish_callback_does_not_replay_previous_text() -> None:

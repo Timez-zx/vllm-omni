@@ -1690,10 +1690,7 @@ async def test_minicpmo_arrival_audio_preencode_microbatches_with_per_job_fences
             return [
                 {
                     "supported": True,
-                    "job_results": {
-                        job["audio_preencode_id"]: job["audio_preencode_id"] != "audio-3"
-                        for job in jobs
-                    },
+                    "job_results": {job["audio_preencode_id"]: job["audio_preencode_id"] != "audio-3" for job in jobs},
                 }
             ]
 
@@ -1712,22 +1709,13 @@ async def test_minicpmo_arrival_audio_preencode_microbatches_with_per_job_fences
         for index in range(5)
     ]
 
-    results = await asyncio.gather(
-        *(
-            handler._preencode_minicpmo45_audio(job, timeout_s=2)
-            for job in jobs
-        )
-    )
+    results = await asyncio.gather(*(handler._preencode_minicpmo45_audio(job, timeout_s=2) for job in jobs))
 
     assert results == [True, True, True, False, True]
     assert [len(call[1]) for call in engine.calls] == [2, 2, 1, 1]
     assert all(call[0] == "preencode_minicpmo45_audio" for call in engine.calls)
     assert all(call[2] == [0] for call in engine.calls)
-    assert [
-        job["audio_preencode_id"]
-        for _, batch, _, _ in engine.calls
-        for job in batch
-    ] == [
+    assert [job["audio_preencode_id"] for _, batch, _, _ in engine.calls for job in batch] == [
         "audio-0",
         "audio-1",
         "audio-2",
@@ -1812,11 +1800,14 @@ async def test_minicpmo_audio_preencode_identity_is_monotonic_and_epoch_fenced()
 
     assert (first_seq, second_seq) == (1, 2)
     assert first_id != second_id
-    assert native.pop_audio_preencode_task(
-        first_id,
-        seq=first_seq,
-        epoch=0,
-    ) is first
+    assert (
+        native.pop_audio_preencode_task(
+            first_id,
+            seq=first_seq,
+            epoch=0,
+        )
+        is first
+    )
 
     third_seq, _third_id = native.allocate_audio_preencode(epoch=1)
     await asyncio.sleep(0)
@@ -2326,7 +2317,7 @@ async def test_auto_response_committed_overlap_does_not_precreate_empty_response
     session_id = "sid-auto-overlap-no-empty-response"
     request_id = f"duplex-{session_id}-e0-stage0"
 
-    def _stage_output(samples: int, *, turn_end: bool = False):
+    def _stage_output(samples: int, *, turn_end: bool = False, chunk_seq: int = 0):
         return SimpleNamespace(
             request_id=request_id,
             finished=False,
@@ -2340,6 +2331,9 @@ async def test_auto_response_committed_overlap_does_not_precreate_empty_response
                             "turn_end": turn_end,
                             "duplex_turn_id": 0,
                             "duplex_epoch": 0,
+                            "cache_epoch": 0,
+                            "chunk_seq": chunk_seq,
+                            "llm_output_text_is_delta": True,
                         },
                     },
                 )
@@ -2378,7 +2372,7 @@ async def test_auto_response_committed_overlap_does_not_precreate_empty_response
     }
     engine = FakeEngineClient(
         append_results=[first_append, promoted_append],
-        collect_outputs=[[_stage_output(4800, turn_end=True)]],
+        collect_outputs=[[_stage_output(4800, turn_end=True, chunk_seq=1)]],
         collect_delay_s=0.1,
     )
     handler = OmniDuplexSessionHandler(
@@ -2887,6 +2881,7 @@ def _duplex_tts_output(
     turn_end: bool = False,
     turn_id: int = 0,
     token_ids: list[int] | None = None,
+    explicit_epoch: bool = True,
 ):
     return SimpleNamespace(
         request_id=request_id,
@@ -2898,7 +2893,7 @@ def _duplex_tts_output(
             "meta.tts_is_last_chunk": np.array([int(tts_is_last_chunk)], dtype=np.int32),
             "meta.turn_end": np.array([int(turn_end)], dtype=np.int32),
             "meta.duplex_turn_id": np.array([turn_id], dtype=np.int32),
-            "meta.duplex_epoch": np.array([0], dtype=np.int32),
+            **({"meta.duplex_epoch": np.array([0], dtype=np.int32)} if explicit_epoch else {}),
         },
     )
 
@@ -3073,7 +3068,7 @@ def test_duplex_turn_end_is_not_swallowed_by_finished_segment_fallback():
     assert not any(result.get("end_of_turn") is True for result in duplicate)
 
 
-def test_duplex_auto_response_discards_terminal_only_audio_before_response_creation():
+def test_duplex_legacy_auto_response_discards_terminal_only_audio_before_response_creation():
     data_plane = _test_data_plane()
     request_id = "duplex-sid-terminal-only-audio-e0-stage0"
     session = DuplexSession(
@@ -3086,6 +3081,7 @@ def test_duplex_auto_response_discards_terminal_only_audio_before_response_creat
         samples=3840,
         finished=False,
         text="",
+        explicit_epoch=False,
     )
 
     assert _project_data_plane(data_plane, {"data_plane_outputs": [first_audio]}, session=session) == []
@@ -3098,6 +3094,7 @@ def test_duplex_auto_response_discards_terminal_only_audio_before_response_creat
         tts_is_last_chunk=True,
         turn_end=True,
         token_ids=[151645],
+        explicit_epoch=False,
     )
     results = _project_data_plane(data_plane, {"data_plane_outputs": [terminal]}, session=session)
 
@@ -3108,7 +3105,7 @@ def test_duplex_auto_response_discards_terminal_only_audio_before_response_creat
     assert not data_plane.is_terminal(request_id)
 
 
-def test_duplex_auto_response_releases_buffered_audio_when_transcript_arrives():
+def test_duplex_legacy_auto_response_releases_buffered_audio_when_transcript_arrives():
     data_plane = _test_data_plane()
     request_id = "duplex-sid-delayed-transcript-e0-stage0"
     session = DuplexSession(
@@ -3120,6 +3117,7 @@ def test_duplex_auto_response_releases_buffered_audio_when_transcript_arrives():
         samples=100,
         finished=False,
         text="",
+        explicit_epoch=False,
     )
 
     assert _project_data_plane(data_plane, {"data_plane_outputs": [audio_before_text]}, session=session) == []
@@ -3129,6 +3127,7 @@ def test_duplex_auto_response_releases_buffered_audio_when_transcript_arrives():
         samples=200,
         finished=False,
         text="hello",
+        explicit_epoch=False,
     )
     results = _project_data_plane(data_plane, {"data_plane_outputs": [audio_with_text]}, session=session)
 
@@ -3136,7 +3135,7 @@ def test_duplex_auto_response_releases_buffered_audio_when_transcript_arrives():
     assert [result["text"] for result in results] == ["", "hello"]
 
 
-def test_duplex_auto_response_releases_buffered_audio_on_text_only_terminal():
+def test_duplex_auto_response_does_not_attach_next_turn_text_to_buffered_audio():
     data_plane = _test_data_plane()
     request_id = "duplex-sid-delayed-terminal-text-e0-stage0"
     session = DuplexSession(
@@ -3149,6 +3148,7 @@ def test_duplex_auto_response_releases_buffered_audio_on_text_only_terminal():
         finished=False,
         text="",
         turn_id=1,
+        explicit_epoch=False,
     )
 
     assert _project_data_plane(data_plane, {"data_plane_outputs": [audio_before_text]}, session=session) == []
@@ -3162,6 +3162,7 @@ def test_duplex_auto_response_releases_buffered_audio_on_text_only_terminal():
         turn_end=True,
         turn_id=1,
         token_ids=[151645],
+        explicit_epoch=False,
     )
     terminal_results = list(
         data_plane.project(
@@ -3173,6 +3174,7 @@ def test_duplex_auto_response_releases_buffered_audio_on_text_only_terminal():
     assert len(terminal_results) == 1
     assert terminal_results[0]["audio_data"] == ""
     assert terminal_results[0]["end_of_turn"] is True
+    assert not data_plane.has_pending_audio(request_id)
 
     text_only_terminal = SimpleNamespace(
         request_id=request_id,
@@ -3189,11 +3191,91 @@ def test_duplex_auto_response_releases_buffered_audio_on_text_only_terminal():
     results = _project_data_plane(data_plane, {"data_plane_outputs": [text_only_terminal]}, session=session)
 
     assert len(results) == 1
-    assert results[0]["audio_data"] == "wav-100"
-    assert results[0]["text"] == "hello"
+    assert results[0]["audio_data"] == ""
+    assert results[0]["text"] == ""
+    assert results[0]["model_turn_id"] == 2
     assert results[0]["end_of_turn"] is True
     assert results[0]["abort_data_plane_request"] is True
     assert not data_plane.has_pending_audio(request_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("later_text", ["", "后续文字"])
+@pytest.mark.parametrize("final_audio", [False, True])
+async def test_owned_native_audio_only_response_through_real_handler(monkeypatch, later_text, final_audio):
+    """A TTS segment is not a model turn; text is not required to speak."""
+    request_id = "duplex-sid-owned-audio-only-e0-stage0"
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    session = DuplexSession(
+        session_id="sid-owned-audio-only",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    session.capabilities = DuplexCapabilities.minicpmo45_native()
+    session.bind_request(request_id)
+    data_plane = _test_data_plane()
+    ws = TimedWebSocket()
+
+    async def no_engine_continuation(*args, **kwargs):
+        # The regression covers the real projection/response lifecycle, not
+        # execution of the next engine unit or the audio encoder itself.
+        return None
+
+    monkeypatch.setattr(handler, "_maybe_continue_native_response", no_engine_continuation)
+
+    async def deliver(text="", *, turn_end=False, audio=True, epoch=0, turn_id=0):
+        output = _duplex_tts_output(
+            request_id=request_id,
+            samples=0,
+            finished=False,
+            text=text,
+            tts_is_last_chunk=True,
+            turn_end=turn_end,
+            turn_id=turn_id,
+        )
+        output.multimodal_output["meta.duplex_epoch"] = epoch
+        output.multimodal_output["audio"] = [np.ones(2400, dtype=np.float32)] if audio else []
+        for result in _project_data_plane(data_plane, {"data_plane_outputs": [output]}, session=session):
+            await handler._send_one_native_duplex_event(
+                ws.send_json, result, session=session, expected_epoch=session.epoch
+            )
+
+    await deliver()
+    response_id = session.active_response_id
+    assert response_id is not None
+    assert session.active_response_turn_id == 0
+    assert session.turn_id == 0
+    assert ws.sent_types() == ["response.created", "response.speak", "response.output_audio.delta"]
+    assert ws.sent[-1]["audio"] == "wav-2400"
+    assert ws.sent[-1]["text"] == ""
+    assert ws.sent[-1]["end_of_turn"] is False
+
+    await deliver(later_text)
+    assert session.active_response_id == response_id
+    assert session.turn_id == 0
+    assert ws.sent[-1]["text"] == later_text
+    assert ws.sent[-1]["end_of_turn"] is False
+
+    await deliver(turn_end=True, audio=final_audio)
+    assert session.active_response_id is None
+    assert session.turn_id == 1
+    assert session.active_request_id == request_id
+    assert ws.sent_types().count("response.created") == 1
+    assert ws.sent_types().count("response.done") == 1
+    assert "response.listen" not in ws.sent_types()
+    audio_events = [event for event in ws.sent if event["type"] == "response.output_audio.delta"]
+    assert len(audio_events) == 3
+    assert {event["response_id"] for event in audio_events} == {response_id}
+    assert [event["end_of_turn"] for event in audio_events] == [False, False, True]
+    assert audio_events[-1]["audio"] == ("wav-2400" if final_audio else "")
+    assert not data_plane.has_pending_audio(request_id)
+
+    # Duplicate terminal, late same-turn audio and wrong-epoch audio cannot
+    # create another response or consume the next turn's output.
+    event_count = len(ws.sent)
+    await deliver(turn_end=True)
+    await deliver("late")
+    await deliver("wrong epoch", epoch=1, turn_id=1)
+    assert len(ws.sent) == event_count
 
 
 @pytest.mark.asyncio
@@ -3394,7 +3476,11 @@ async def test_minicpmo_auto_response_continuation_has_no_semantic_unit_cap():
             session=session,
             expected_epoch=session.epoch,
         )
-    await asyncio.sleep(0.02)
+        # Nine successive periods, not nine duplicate notifications while
+        # the same background scheduling decision is still pending.
+        scheduling = handler._minicpmo_session_state(session).continuation_schedule_task
+        assert scheduling is not None
+        await scheduling
 
     assert len(engine.appended) == 9
     assert all(payload["duplex_turn_id"] == 0 for _, _, payload, _ in engine.appended)
@@ -4433,6 +4519,80 @@ async def test_cancel_active_response_keeps_truncated_history_in_serving():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("acknowledged_ms", [0, 24840])
+async def test_close_discards_queued_audio_without_committing_unsent_history(acknowledged_ms):
+    """Regression for the 36k/2-user diagnostic's four queued tail chunks.
+
+    Source: 486 chars / 28.84s; wire: 414 chars / 24.84s. A completed
+    Code2Wav chunk and playback.sent_ms (currently advanced at enqueue) do
+    not prove a successful WebSocket write, let alone client playback.
+    """
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    session = DuplexSession(
+        session_id="queued-cancel",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    session.begin_response(turn_id=0)
+    ws = TimedWebSocket()
+    actor = DuplexWebSocketActor(ws, current_epoch=lambda: session.epoch)
+    writer = asyncio.create_task(actor.writer_loop())
+
+    async def emit(text: str, duration_ms: int) -> None:
+        await handler._send_one_native_duplex_event(
+            actor.send_json,
+            {
+                "supported": True,
+                "stage_role": "tts",
+                "is_listen": False,
+                "text": text,
+                "audio_data": base64.b64encode(bytes(48 * duration_ms)).decode(),
+                "audio_format": "pcm16",
+                "sample_rate_hz": 24000,
+                "audio_duration_ms": duration_ms,
+                "end_of_turn": False,
+                "model_turn_id": 0,
+            },
+            session=session,
+        )
+
+    try:
+        # Collapse only the already-delivered prefix for a compact fixture;
+        # retain the real tail's four separate 1s/18-char domain payloads.
+        await emit("0" * 414, 24840)
+        await actor.output_queue.join()
+        session.acknowledge_playback(played_ms=acknowledged_ms, committed_ms=acknowledged_ms)
+        for _ in range(4):
+            await emit("0" * 18, 1000)
+        assert actor.output_queue.qsize() == 4
+        assert session.playback.sent_ms == session.playback.generated_ms == 28840
+
+        # Cancellation commits ACK_ONLY and changes the epoch before the
+        # writer consumes the queued suffix. No source/model behavior changes.
+        actor.closing = True
+        assert await handler._cancel_active_response(session, None, actor.send_json, reason="session_close")
+        await actor.close_writer()
+        await writer
+    finally:
+        if not writer.done():
+            writer.cancel()
+            await asyncio.gather(writer, return_exceptions=True)
+
+    audio = [event for event in ws.sent if event["type"] == "response.output_audio.delta"]
+    assert len(audio) == 1
+    assert sum(len(base64.b64decode(event["audio"])) for event in audio) // 48 == 24840
+    assert "".join(event["text"] for event in audio) == "0" * 414
+    assert actor.stale_output_dropped == 4
+    cancel = next(event for event in ws.sent if event["type"] == "audio.cancelled")
+    assert cancel["reason"] == "session_close"
+    assert (cancel["cancelled_epoch"], cancel["epoch"]) == (0, 1)
+    assert cancel["playback"]["sent_ms"] == 28840  # Enqueued, NOT wire-delivered.
+    assert cancel["playback"]["played_ms"] == cancel["committed_ms"] == acknowledged_ms
+    expected_history = ({"role": "assistant", "content": "0" * 414},) if acknowledged_ms else ()
+    assert session.history == expected_history
+    assert not session.pending_history_item_ids
+
+
+@pytest.mark.asyncio
 async def test_cancel_active_native_data_plane_request_aborts_stage_request_id():
     engine = FakeEngineClient()
     chat_service = FakeChatService(engine)
@@ -5465,10 +5625,7 @@ async def test_native_audio_append_waits_for_sidecar_and_falls_back_without_meta
             return [
                 {
                     "supported": True,
-                    "job_results": {
-                        job["audio_preencode_id"]: preencode_succeeds
-                        for job in jobs
-                    },
+                    "job_results": {job["audio_preencode_id"]: preencode_succeeds for job in jobs},
                 }
             ]
 
@@ -5502,23 +5659,24 @@ async def test_native_audio_append_waits_for_sidecar_and_falls_back_without_meta
     await asyncio.wait_for(handler_task, timeout=2)
 
     assert len(engine.preencode_jobs) == (1 if preencode_succeeds else 2)
-    assert len(
-        {
-            (
-                job["audio_preencode_seq"],
-                job["audio_preencode_id"],
-            )
-            for job in engine.preencode_jobs
-        }
-    ) == 1
+    assert (
+        len(
+            {
+                (
+                    job["audio_preencode_seq"],
+                    job["audio_preencode_id"],
+                )
+                for job in engine.preencode_jobs
+            }
+        )
+        == 1
+    )
     assert len(engine.appended) == 1
     formal_payload = engine.appended[0][2]
     assert isinstance(formal_payload, dict)
     if preencode_succeeds:
         assert formal_payload["audio_preencode_seq"] == 1
-        assert formal_payload["audio_preencode_id"] == engine.preencode_jobs[0][
-            "audio_preencode_id"
-        ]
+        assert formal_payload["audio_preencode_id"] == engine.preencode_jobs[0]["audio_preencode_id"]
     else:
         assert "audio_preencode_seq" not in formal_payload
         assert "audio_preencode_id" not in formal_payload
@@ -5551,9 +5709,7 @@ async def test_stale_silence_continuation_does_not_consume_audio_preencode_seq(
             return [
                 {
                     "supported": True,
-                    "job_results": {
-                        job["audio_preencode_id"]: True for job in jobs
-                    },
+                    "job_results": {job["audio_preencode_id"]: True for job in jobs},
                 }
             ]
 
@@ -5561,10 +5717,7 @@ async def test_stale_silence_continuation_does_not_consume_audio_preencode_seq(
             kwargs.pop("expected_epoch", None)
             payload = kwargs.get("payload")
             assert isinstance(payload, dict)
-            assert (
-                payload.get("audio")
-                != OmniDuplexSessionHandler._NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO
-            )
+            assert payload.get("audio") != OmniDuplexSessionHandler._NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO
             result = await super().append_duplex_input_async(session_id, **kwargs)
             self.real_append_count += 1
             if self.real_append_count == 1:
@@ -5607,17 +5760,20 @@ async def test_stale_silence_continuation_does_not_consume_audio_preencode_seq(
 
     silence_payload = handler._native_silence_unit_payload()
     silence_payload["duplex_turn_id"] = session.turn_id
-    assert await scheduler(
-        silence_payload,
-        request_id=request_id,
-        owner_id=f"response:{response_id}",
-        response_id=response_id,
-        response_owned=True,
-        expected_epoch=session.epoch,
-        expected_incarnation=session.incarnation,
-        expected_model_turn_id=None,
-        send_json=ws.send_json,
-    ) is True
+    assert (
+        await scheduler(
+            silence_payload,
+            request_id=request_id,
+            owner_id=f"response:{response_id}",
+            response_id=response_id,
+            response_owned=True,
+            expected_epoch=session.epoch,
+            expected_incarnation=session.incarnation,
+            expected_model_turn_id=None,
+            send_json=ws.send_json,
+        )
+        is True
+    )
     assert native.pending_silence_owner_id == f"response:{response_id}"
 
     # This later real input supersedes the queued silence while the latter is
@@ -5655,9 +5811,7 @@ async def test_stale_silence_continuation_does_not_consume_audio_preencode_seq(
     assert engine.real_append_count == 2
     assert [job["audio_preencode_seq"] for job in engine.preencode_jobs] == [1, 2]
     assert all(
-        job["audio"]
-        != OmniDuplexSessionHandler._NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO
-        for job in engine.preencode_jobs
+        job["audio"] != OmniDuplexSessionHandler._NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO for job in engine.preencode_jobs
     )
 
 
@@ -6583,7 +6737,7 @@ async def test_minicpmo_auto_response_restarts_drain_when_append_races_idle_exit
 async def test_minicpmo_native_duplex_ignores_outputs_after_data_plane_turn_done():
     request_id = "duplex-sid-native-post-done-e0-stage0-s1"
 
-    def _stage_output(samples: int, *, turn_end: bool = False):
+    def _stage_output(samples: int, *, turn_end: bool = False, chunk_seq: int = 0):
         return SimpleNamespace(
             request_id=request_id,
             finished=False,
@@ -6597,6 +6751,9 @@ async def test_minicpmo_native_duplex_ignores_outputs_after_data_plane_turn_done
                             "turn_end": turn_end,
                             "duplex_turn_id": 0,
                             "duplex_epoch": 0,
+                            "cache_epoch": 0,
+                            "chunk_seq": chunk_seq,
+                            "llm_output_text_is_delta": True,
                         },
                     },
                 )
@@ -6627,8 +6784,8 @@ async def test_minicpmo_native_duplex_ignores_outputs_after_data_plane_turn_done
     engine = FakeEngineClient(
         append_result=control_result,
         collect_outputs=[
-            [_stage_output(20, turn_end=True)],
-            [_stage_output(30)],
+            [_stage_output(20, turn_end=True, chunk_seq=1)],
+            [_stage_output(30, chunk_seq=2)],
         ],
     )
     chat_service = FakeChatService(engine)
@@ -6925,6 +7082,9 @@ async def test_minicpmo_native_auto_response_keeps_request_bound_for_segment_con
         tts_is_last_chunk=True,
         token_ids=[151645],
     )
+    terminal_segment.multimodal_output.update(
+        {"meta.cache_epoch": 0, "meta.chunk_seq": 0, "meta.llm_output_text_is_delta": True}
+    )
     engine = FakeEngineClient(
         control_result=control_result,
         collect_outputs=[[terminal_segment], [], []],
@@ -7100,6 +7260,9 @@ async def test_minicpmo_native_auto_response_real_input_waits_for_submitted_sile
                 finished=True,
                 tts_is_last_chunk=True,
                 token_ids=[151645],
+            )
+            terminal_segment.multimodal_output.update(
+                {"meta.cache_epoch": 0, "meta.chunk_seq": 0, "meta.llm_output_text_is_delta": True}
             )
             super().__init__(
                 control_result=control_result,
@@ -7300,6 +7463,16 @@ async def test_minicpmo_native_auto_response_preserves_silence_continuations_acr
     next_schedule = asyncio.create_task(scheduler(payload, **kwargs))
     await asyncio.sleep(0.05)
     assert not next_schedule.done()
+
+    # Retiring a background scheduling decision must not cancel an existing
+    # silence append or its real-input predecessor already sent to Engine.
+    submitted_silence = native.pending_silence_task
+    retired_schedule = asyncio.create_task(scheduler(payload, **kwargs))
+    await asyncio.sleep(0.01)
+    retired_schedule.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await retired_schedule
+    assert submitted_silence is not None and not submitted_silence.done()
 
     engine.release_real_append.set()
     await asyncio.wait_for(engine.first_silence_started.wait(), timeout=1)
@@ -7575,7 +7748,7 @@ async def test_projected_output_does_not_embed_completion_observer():
                     "completed_epoch_s": 100.125,
                     "stage_gen_time_ms": 125.0,
                     "vllm_itls_ms": list(range(1_000)),
-                }
+                },
             },
         },
         session=session,
@@ -7676,22 +7849,10 @@ async def test_physical_d_witness_bypasses_projector_and_emits_one_event_per_seq
     ]
     assert [witness["arrival_audio_units"] for witness in completion_witnesses] == [1, 0]
     assert [witness["audio_fallback_units"] for witness in completion_witnesses] == [0, 0]
-    assert [
-        witness["kv_transfer_selected_blocks"]
-        for witness in completion_witnesses
-    ] == [11, 12]
-    assert [
-        witness["kv_transfer_selected_tokens"]
-        for witness in completion_witnesses
-    ] == [11_801, 11_802]
-    assert [
-        witness["kv_transfer_selected_bytes"]
-        for witness in completion_witnesses
-    ] == [11 * 4096, 12 * 4096]
-    assert [
-        witness["kv_transfer_write_submit_to_d_ready_ms"]
-        for witness in completion_witnesses
-    ] == [-1.0, -1.0]
+    assert [witness["kv_transfer_selected_blocks"] for witness in completion_witnesses] == [11, 12]
+    assert [witness["kv_transfer_selected_tokens"] for witness in completion_witnesses] == [11_801, 11_802]
+    assert [witness["kv_transfer_selected_bytes"] for witness in completion_witnesses] == [11 * 4096, 12 * 4096]
+    assert [witness["kv_transfer_write_submit_to_d_ready_ms"] for witness in completion_witnesses] == [-1.0, -1.0]
     assert handler._data_plane_outputs_finished(result) is False
 
 

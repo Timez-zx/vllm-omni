@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+import queue
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -15,12 +17,166 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_scheduler import (
 from vllm.v1.metrics.stats import PrefillStats
 
 from vllm_omni.engine.nixl_delta_push_connector import (
-    NixlDeltaPushConnectorWorker,
     NixlDeltaPushConnectorScheduler,
+    NixlDeltaPushConnectorWorker,
     _delta_registration_fields,
     _delta_transfer_evidence,
+    _select_delta_source_blocks,
 )
 from vllm_omni.worker.gpu_ar_worker import GPUARWorker
+
+
+def _progress_worker():
+    worker = object.__new__(NixlDeltaPushConnectorWorker)
+    worker.shutdown = lambda: None  # No actual registered native resources.
+    worker._recving_metadata = {}
+    worker._sending_transfers = {}
+    worker._sending_transfers_lock = threading.Lock()
+    worker._push_writer_stop = threading.Event()
+    worker._push_writer_wake = threading.Event()
+    worker._reg_send_inbox = queue.Queue()
+    worker._finished_blocks_inbox = queue.Queue()
+    worker._evict_finished_inbox = queue.Queue()
+    worker._push_finished_blocks = {}
+    worker._pending_d_registrations = {}
+    worker._pending_completion_notifs = queue.Queue()
+    worker.nixl_wrapper = MagicMock()
+    worker.nixl_wrapper.get_new_notifs.return_value = {}
+    return worker
+
+
+@pytest.mark.parametrize("wait_for_completion", [False, True])
+def test_direct_poll_only_waits_when_core_has_no_model_work(wait_for_completion):
+    worker = _progress_worker()
+    worker._ensure_direct_progress_state()
+    worker._direct_cache_sync_req_ids = {"import"}
+    worker._direct_cache_sync_finished = set()
+    worker._partition_finished = MagicMock()
+    with patch.object(worker._completion_notif_available, "wait", return_value=False) as wait:
+        assert worker.poll_direct_cache_sync(wait_for_completion) == set()
+        if wait_for_completion:
+            wait.assert_called_once_with(.001)
+        else:
+            wait.assert_not_called()
+    # A nonblocking miss leaves ownership intact; the later completion is
+    # consumed once, not dropped when the Core resumes a decode step.
+    assert worker._direct_cache_sync_req_ids == {"import"}
+    worker._direct_cache_sync_finished.add("import")
+    with patch.object(worker._completion_notif_available, "wait") as wait:
+        assert worker.poll_direct_cache_sync(False) == {"import"}
+        assert worker.poll_direct_cache_sync(False) == set()
+        wait.assert_not_called()
+
+
+def test_idle_direct_poll_retries_notification_in_same_core_step():
+    worker = _progress_worker()
+    worker._ensure_direct_progress_state()
+    worker._direct_cache_sync_req_ids = {"import"}
+    worker._direct_cache_sync_finished = set()
+    calls = []
+    def partition():
+        calls.append(1)
+        if len(calls) == 2:
+            worker._direct_cache_sync_finished.add("import")
+    worker._partition_finished = partition
+    with patch.object(worker._completion_notif_available, "wait", return_value=True):
+        assert worker.poll_direct_cache_sync() == {"import"}
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize('pending', [None, 'send', 'recv', 'unmatched'])
+def test_writer_only_self_polls_with_pending_work(pending):
+    worker = _progress_worker()
+    if pending == 'send':
+        worker._sending_transfers['r'] = [object()]
+    elif pending == 'recv':
+        worker._recving_metadata['r'] = object()
+    elif pending == 'unmatched':
+        worker._push_finished_blocks['r'] = [1]
+    with patch.object(worker._push_writer_wake, 'wait',
+                      side_effect=lambda timeout: worker._push_writer_stop.set()) as wait:
+        worker._push_writer_loop()
+    wait.assert_called_once_with(.001 if pending else None)
+
+
+@pytest.mark.parametrize('pending', ['send', 'recv'])
+def test_writer_completes_handoff_without_an_engine_step(pending):
+    worker = _progress_worker()
+    handle = object()
+    if pending == 'send':
+        worker._sending_transfers['r'] = [handle]
+    else:
+        worker._recving_metadata['r'] = object()
+    calls = []
+    def check(h):
+        assert h is handle
+        assert worker._sending_transfers_lock.locked()
+        calls.append(1)
+        return 'DONE' if len(calls) >= 3 else 'PROC'
+    def poll():
+        if pending == 'recv':
+            calls.append(1)
+        return {'peer': [b'r:1']} if len(calls) >= 3 else {}
+    worker.nixl_wrapper.check_xfer_state.side_effect = check
+    worker.nixl_wrapper.get_new_notifs.side_effect = poll
+    thread = threading.Thread(target=worker._push_writer_loop)
+    thread.start()
+    try:
+        assert worker._pending_completion_notifs.get(timeout=2) == b'r:1'
+        assert len(calls) >= 3
+    finally:
+        worker._push_writer_stop.set()
+        worker._push_writer_wake.set()
+        thread.join(timeout=2)
+    assert not thread.is_alive()
+    worker.nixl_wrapper.release_xfer_handle.assert_not_called()
+    worker.nixl_wrapper.get_xfer_telemetry.assert_not_called()
+    if pending == 'send':
+        # Only the Core may consume completion and release the original handle.
+        assert worker._sending_transfers == {'r': [handle]}
+        worker.xfer_stats = MagicMock()
+        with worker._sending_transfers_lock:
+            assert worker._pop_done_transfers(worker._sending_transfers) == {'r'}
+            assert worker._pop_done_transfers(worker._sending_transfers) == set()
+        worker.nixl_wrapper.release_xfer_handle.assert_called_once_with(handle)
+
+
+def test_progress_leaves_failed_handle_for_native_core_cleanup():
+    worker = _progress_worker()
+    handle = object()
+    worker._sending_transfers['r'] = [handle]
+    worker.nixl_wrapper.check_xfer_state.return_value = 'ERR'
+    worker._progress_pending_writes()
+    assert worker._sending_transfers == {'r': [handle]}
+    worker.nixl_wrapper.release_xfer_handle.assert_not_called()
+    worker._handle_failed_transfer = MagicMock()
+    worker._log_failure = MagicMock()
+    assert worker._pop_done_transfers(worker._sending_transfers) == {'r'}
+    worker._handle_failed_transfer.assert_called_once_with('r', handle)
+
+
+def test_window_delta_uses_absolute_positions_with_evicted_prefix():
+    assert _select_delta_source_blocks(
+        ([0, 0, 31, 32, 33, 34],), ([71, 72],),
+        source_block_offset=0, source_block_size=16, decode_block_size=16,
+        source_block_indices=[[4, 5]],
+    ) == ([33, 34],)
+    # A cold D window miss copies the resident window, not the null prefix.
+    assert _select_delta_source_blocks(
+        ([0, 0, 31, 32, 33, 34],), ([71, 72, 73, 74],),
+        source_block_offset=0, source_block_size=16, decode_block_size=16,
+        source_block_indices=[[2, 3, 4, 5]],
+    ) == ([31, 32, 33, 34],)
+
+
+@pytest.mark.parametrize("indices", [[[1, 2]], [[3, 2]], [[2, 2]], [[2, 6]]])
+def test_window_delta_fails_closed_on_invalid_or_freed_positions(indices):
+    with pytest.raises(ValueError):
+        _select_delta_source_blocks(
+            ([0, 0, 31, 32, 33, 34],), ([71, 72],),
+            source_block_offset=0, source_block_size=16, decode_block_size=16,
+            source_block_indices=indices,
+        )
 
 
 def test_explicit_remote_boundary_full_local_hit_does_not_include_decode_token() -> None:

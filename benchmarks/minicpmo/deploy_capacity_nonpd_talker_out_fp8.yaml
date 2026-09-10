@@ -1,0 +1,5 @@
+# Leave-one-out diagnostic: only Talker moves off the shared GPU.
+base_config: deploy_capacity_nonpd_colocated_fp8.yaml
+stages:
+  - stage_id: 1
+    devices: "1"

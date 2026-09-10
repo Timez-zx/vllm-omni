@@ -23,7 +23,14 @@ logger = init_logger(__name__)
 # arrive as 0-d torch.Tensors — from_dict routes all tensors into .tensors,
 # so we relocate them to .metadata before consolidation to avoid a bogus
 # torch.cat attempt and its warn-and-keep-last fallback.
-_METADATA_TENSOR_KEYS: frozenset[str] = frozenset({"sr", "sample_rate", "audio_sample_rate"})
+_METADATA_TENSOR_KEYS: frozenset[str] = frozenset({
+    "sr", "sample_rate", "audio_sample_rate",
+    # These MiniCPM control fields describe the latest segment snapshot, not
+    # new media chunks. Concatenating segment IDs duplicates its growing
+    # prefix and breaks the Talker's token/hidden-state alignment.
+    "duplex_prompt_len", "duplex_last_prompt_token_id", "duplex_segment_token_ids",
+    "meta.duplex_sampling_state",
+})
 
 
 def _cat_tensors(

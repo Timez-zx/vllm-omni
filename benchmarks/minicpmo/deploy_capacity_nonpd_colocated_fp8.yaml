@@ -1,0 +1,44 @@
+# Matched non-P/D placement experiment, A: all modules on physical GPU 0.
+# B inherits every setting and changes only placement. Explicit KV budgets
+# prevent colocation-dependent free-memory profiling from changing KV capacity.
+base_config: deploy_capacity_3gpu.yaml
+stages:
+  - stage_id: 0
+    devices: "0"
+    quantization: fp8
+    max_model_len: 40960
+    max_num_batched_tokens: 32768
+    max_num_seqs: 64
+    async_scheduling: false
+    gpu_memory_utilization: 0.65
+    env:
+      MINICPMO45_VISION_ENCODER_DEVICE: "cuda:0"
+      MINICPMO45_AUDIO_ENCODER_DEVICE: "cuda:0"
+      MINICPMO45_VISION_ENCODER_BATCH_SIZE: "16"
+      MINICPMO45_AUDIO_ENCODER_BATCH_SIZE: "16"
+      MINICPMO45_MAX_ARRIVAL_VISION_CACHE_ENTRIES: "0"
+      MINICPMO45_MAX_ARRIVAL_AUDIO_CACHE_ENTRIES: "0"
+    engine_extras:
+      kv_cache_dtype: fp8
+      calculate_kv_scales: false
+      kv_cache_memory_bytes: 34359738368
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      seed: 42
+      repetition_penalty: 1.1
+      max_tokens: 2048
+      detokenize: true
+  - stage_id: 1
+    devices: "0"
+    quantization: fp8
+    max_model_len: 4096
+    gpu_memory_utilization: 0.18
+    engine_extras:
+      kv_cache_dtype: fp8
+      calculate_kv_scales: false
+      kv_cache_memory_bytes: 2147483648
+  - stage_id: 2
+    devices: "0"
+    gpu_memory_utilization: 0.12

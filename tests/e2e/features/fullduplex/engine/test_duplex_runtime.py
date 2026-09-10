@@ -208,6 +208,80 @@ def test_minicpmo_extension_owns_stage_sampling_overrides():
     assert 151645 not in (defaults[1].stop_token_ids or [])
 
 
+@pytest.mark.parametrize("stage_count", [3, 4])
+def test_native_thinker_uses_only_model_unit_boundaries_not_inherited_chat_stops(stage_count):
+    from vllm.v1.core.sched.utils import check_stop
+
+    unit_ends = [151705, 151718, 151721]
+    chat_eos, extra_eos, turn_eos, old_stop = 151645, 151643, 151717, 9999
+    defaults = tuple(
+        SamplingParams(max_tokens=64, stop=["legacy stop"], stop_token_ids=[turn_eos, old_stop], min_tokens=3)
+        for _ in range(stage_count)
+    )
+    for params in defaults:
+        params.update_from_generation_config({"eos_token_id": [chat_eos, extra_eos]}, chat_eos)
+    configured = MiniCPMO45DuplexRuntimeExtension().configure_sampling_params(
+        runtime_config={
+            "duplex_stage_max_tokens": {"0": 20, "1": 8192},
+            "duplex_stage_sampling_params": {"0": {"stop_token_ids": unit_ends}},
+        },
+        defaults=defaults,
+    )
+    thinker_idx = 1 if stage_count == 4 else 0
+    params = configured[thinker_idx]
+    assert params.ignore_eos is True
+    assert params.eos_token_id is None
+    assert params.stop == []
+    assert params.output_text_buffer_length == 0
+    assert params.stop_token_ids == unit_ends
+    assert params.all_stop_token_ids == set(unit_ends)
+    assert params.min_tokens == 0
+    # Engine input processing updates generation config once more after the
+    # runtime override. This must not reintroduce chat EOS as a stopping rule.
+    params.update_from_generation_config({"eos_token_id": [chat_eos, extra_eos]}, chat_eos)
+    assert params.eos_token_id is None
+    assert params.stop_token_ids == unit_ends
+    for token in [*unit_ends, chat_eos, extra_eos, turn_eos, old_stop, 123]:
+        request = SimpleNamespace(
+            pooling_params=None,
+            sampling_params=params,
+            num_output_tokens=1,
+            output_token_ids=[token],
+            num_tokens=280,
+            max_tokens=params.max_tokens,
+        )
+        assert check_stop(request, 262144) is (token in unit_ends)
+    if stage_count == 4:
+        assert configured[0].max_tokens == 1
+        assert configured[0].stop_token_ids == []
+        assert configured[0].eos_token_id is None
+    for params in configured[thinker_idx + 1 :]:
+        assert params.ignore_eos is False
+        assert params.eos_token_id == chat_eos
+        assert params.stop == ["legacy stop"]
+        assert turn_eos in params.stop_token_ids
+    for params in defaults:
+        assert params.ignore_eos is False
+        assert params.eos_token_id == chat_eos
+        assert params.stop == ["legacy stop"]
+
+
+def test_native_adapter_explicitly_disables_chat_eos_and_stop_strings(monkeypatch):
+    from vllm_omni.experimental.fullduplex.minicpmo45.adapter import MiniCPMO45NativeDuplexServingAdapter as Adapter
+
+    monkeypatch.setattr(Adapter, "_native_stage0_stop_token_ids", staticmethod(lambda _: [1, 3, 4]))
+    monkeypatch.setattr(Adapter, "_native_scheduler_token_id", staticmethod(lambda _: 0))
+    runtime_config = {}
+    Adapter._apply_default_scheduler_policy(
+        runtime_config, config=SimpleNamespace(max_tokens=20, temperature=0.7), model_config=None
+    )
+    params = runtime_config["duplex_stage_sampling_params"]["0"]
+    assert params["ignore_eos"] is True
+    assert params["stop"] == []
+    assert params["min_tokens"] == 0
+    assert params["stop_token_ids"] == [1, 3, 4]
+
+
 def test_minicpmo_output_decision_uses_raw_streaming_token_snapshot():
     decision = _decide_minicpmo_output(
         SimpleNamespace(outputs=[SimpleNamespace()]),
@@ -574,6 +648,37 @@ def test_minicpmo_context_window_starts_fresh_lineage_with_one_retained_unit():
     assert len(rollover["prompt_token_ids"]) == 72
     rollover_duplex = rollover["model_intermediate_buffer"]["duplex"]
     assert rollover_duplex["compact_rebase_prefix_tokens"] == 0
+
+
+def test_minicpmo_engine_window_never_recycles_prompt_after_limit():
+    extension = MiniCPMO45DuplexRuntimeExtension()
+    fence = DuplexFence("sid-engine-window")
+    payload = {
+        "audio": base64.b64encode(np.zeros(16_000, dtype=np.float32).tobytes()).decode(),
+        "format": "pcm_f32le",
+    }
+    for seq in range(1, 150):
+        plan = extension.plan_append(
+            request_id="req-engine-window",
+            fence=fence,
+            session_config={},
+            runtime_config={
+                "duplex_first_append_context_tokens": 48,
+                "duplex_context_window_trigger_tokens": 1024,
+                "duplex_kv_window_tokens": 1024,
+            },
+            seq=seq,
+            turn_seq=seq,
+            mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+            payload=payload,
+            final=False,
+            sampling_params=SamplingParams(max_tokens=20),
+        )
+        buffer = plan.prompt["model_intermediate_buffer"]
+        assert not buffer.get("meta", {}).get("replace_streaming_prompt")
+        assert buffer["duplex"]["context_generation"] == 0
+        if seq > 1:
+            assert len(plan.prompt["prompt_token_ids"]) == 13
 
 
 def test_minicpmo_steady_append_declares_exact_lazy_preemption_rebase_prefix():

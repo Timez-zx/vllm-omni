@@ -21,7 +21,7 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver, TensorIpcSender
-from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+from vllm.v1.serial_utils import MsgpackEncoder
 
 from vllm_omni.distributed.omni_connectors.utils.config import (
     TRANSFER_ENGINE_CONNECTOR_NAMES,
@@ -238,14 +238,13 @@ class StageEngineCoreClientBase(StageClientBase):
                     self.replica_id,
                 )
             if output_tensor_queue is not None:
-                # AsyncMPClient starts its output task lazily, so replacing the
-                # decoder here is race-free. Tensor handles in the ZMQ frame
-                # are resolved through the reverse torch-shm queue.
+                # Recent AsyncMPClient versions start the reader in __init__
+                # and capture this decoder in a closure. Configure that same
+                # object; replacing self.decoder leaves the reader holding a
+                # decoder without a tensor provider. No task can run between
+                # these synchronous initialization statements.
                 self._output_tensor_ipc_receiver = TensorIpcReceiver(output_tensor_queue)
-                self.decoder = MsgpackDecoder(
-                    OmniEngineCoreOutputs,
-                    oob_tensor_provider=self._output_tensor_ipc_receiver,
-                )
+                self.decoder.oob_tensor_provider = self._output_tensor_ipc_receiver
                 logger.info(
                     "[%s] stage-%s [rep-%s] reverse tensor IPC enabled",
                     client_name,

@@ -8,9 +8,22 @@ import json
 import math
 import re
 import statistics
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from benchmarks.minicpmo.capacity_audit import (
+    pd_inherited_backlog,
+    pd_input_backlog,
+    pd_input_budget_rtf,
+    pd_sliding_window_backlog,
+    sender_timing_audit,
+    sliding_window_engine_audit,
+)
 
 ADMIT = re.compile(
     r"\[duplex_cadence\] stage=(\d+) ADMIT req=(\S+) generation=(\d+) "
@@ -289,6 +302,8 @@ def _pd_long_horizon_summary(
         "expected_units_per_session": input_units_per_session,
         "completed_units_per_session": _latency_summary(completed_units),
         "per_session_stream_rtf": _rtf_summary(stream_rtfs),
+        # Rounded display values must not turn 0.9996 into a capacity pass.
+        "min_stream_rtf_unrounded": min(stream_rtfs, default=None),
         "completion_cadence_rtf": _rtf_summary(cadence_rtfs),
         "terminal_stream_backlog_ms": _latency_summary(terminal_stream_backlog_ms),
         "mean_latency_budget_rtf": (round(latency_budget_rtf, 4) if latency_budget_rtf is not None else None),
@@ -1043,12 +1058,11 @@ def _physical_d_kv_transfer_summary(
                     reasons.append("full_hit_selected_nonzero_bytes")
             else:
                 non_full_hits += 1
-                # Direct cache-sync imports P's complete prefix. D then
-                # deliberately replays the final imported token before its
-                # first decode step, so PrefillStats counts one fewer token as
-                # external cache than NIXL physically selected and wrote.
-                if replay_tokens != 1:
-                    reasons.append("selected_tokens_not_external_plus_one_replay")
+                # Native duplex imports every selected prefix token. The
+                # one uncached D prompt token is P's newly sampled token,
+                # whose KV has not been computed/transferred by P.
+                if replay_tokens != 0:
+                    reasons.append("selected_tokens_not_external_cached_tokens")
                 if blocks_valid and blocks == 0:
                     reasons.append("non_full_hit_missing_selected_blocks")
                 if bytes_valid and byte_count == 0:
@@ -1083,12 +1097,11 @@ def _physical_d_kv_transfer_summary(
             )
 
     return {
+        "contract": "native_P_sampled_token_v1",
         "definition": {
-            "selected_tokens": (
-                "exact semantic P-to-D delta tokens, including the final remote token that D deliberately replays"
-            ),
+            "selected_tokens": "exact semantic P-to-D KV delta; equals external_cached_tokens",
             "remote_replay_tokens": (
-                "selected_tokens - external_cached_tokens; 1 for a delta import and 0 for a full D-local hit"
+                "selected_tokens - external_cached_tokens; must be 0 for both delta imports and full D-local hits"
             ),
             "selected_blocks": "block-granular WRITE selection including tail padding",
             "selected_bytes": "WRITE bytes aggregated across D tensor-parallel ranks",
@@ -1220,6 +1233,7 @@ def _formal_capacity_workload_validity(run: dict[str, Any]) -> dict[str, Any]:
         valid_phase_bounds and (len(users) == 1 or len({round(phase, 6) for phase in numeric_phases}) > 1)
     )
     checks = {
+        "capacity_measurement_requested": run.get("measurement_purpose") != "serving_contract_validation",
         "production_workload_profile": config.get("workload_profile") == "production",
         "duration_at_least_180s": bool(
             isinstance(duration_s, int | float) and not isinstance(duration_s, bool) and duration_s >= 180
@@ -1227,6 +1241,7 @@ def _formal_capacity_workload_validity(run: dict[str, Any]) -> dict[str, Any]:
         "force_listen_disabled": config.get("force_listen_count") is None,
         "randomized_session_phases": phases_dispersed,
         "server_trace_diagnostics_not_requested": (config.get("server_trace_frame_audit_requested") is not True),
+        "sender_timing_valid": sender_timing_audit(run)["valid"],
     }
     violations = [name for name, passed in checks.items() if not passed]
     diagnostic_control = bool(
@@ -1237,7 +1252,9 @@ def _formal_capacity_workload_validity(run: dict[str, Any]) -> dict[str, Any]:
     return {
         "valid": not violations,
         "classification": (
-            "formal_capacity"
+            "serving_contract_validation"
+            if run.get("measurement_purpose") == "serving_contract_validation"
+            else "formal_capacity"
             if not violations
             else "diagnostic_control"
             if diagnostic_control
@@ -1322,7 +1339,7 @@ def _benchmark_cleanliness(
         logged_prefix_records += 1
         hit_tokens = int(match.group(2))
         prompt_tokens = int(match.group(3))
-        if prompt_tokens - hit_tokens != 2:
+        if prompt_tokens - hit_tokens != 1:
             logged_prefix_mismatches.append(
                 {
                     "session_id": session_id,
@@ -1426,16 +1443,11 @@ def _benchmark_cleanliness(
                 and isinstance(computed_tokens, int)
                 and local_cached_tokens + external_cached_tokens == cached_tokens
                 and computed_tokens + cached_tokens == prompt_tokens
-                # D always replays the final imported P token. Most slots
-                # also append P's sampled token, while valid EOS/control
-                # boundaries can omit that append. Both leave a bounded
-                # one- or two-token suffix and preserve exact accounting.
-                and computed_tokens in (1, 2)
+                # The complete P prefix is cached; only P's sampled token
+                # is computed by D, including LISTEN/unit boundaries.
+                and computed_tokens == 1
             )
-            legacy_split_valid = bool(
-                not has_exact_split and prompt_tokens >= 0 and cached_tokens >= 0 and prompt_tokens - cached_tokens == 2
-            )
-            if not (exact_split_valid or legacy_split_valid):
+            if not exact_split_valid:
                 client_prefix_mismatches.append(
                     {
                         "session_id": str(user.get("session_id", "")),
@@ -1551,8 +1563,8 @@ def _benchmark_cleanliness(
             "source": prefix_source,
             "records": prefix_records,
             "expected_records": expected_prefix_records,
-            "expected_uncached_suffix_tokens": [1, 2],
-            "expected_locally_computed_tokens": [1, 2],
+            "expected_uncached_suffix_tokens": [1],
+            "expected_locally_computed_tokens": [1],
             "mismatches": len(prefix_mismatches),
             "mismatch_examples": prefix_mismatches[:5],
             "instrumented_log_records": logged_prefix_records,
@@ -1897,6 +1909,8 @@ def main() -> None:
         help="provenance emitted by clean_server.py; required for a valid formal result",
     )
     parser.add_argument("--run-json", required=True)
+    parser.add_argument("--max-backlog-ms", type=float,
+                        help="Override per-user inherited-backlog limit; otherwise run config or 500 ms")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
@@ -2075,11 +2089,43 @@ def main() -> None:
     long_horizon_rtf_pass = bool(
         pd_long_horizon
         and pd_long_horizon.get("per_session_stream_rtf")
-        and float(pd_long_horizon.get("per_session_stream_rtf", {}).get("min") or 0.0) >= 1.0
+        and float(pd_long_horizon.get("min_stream_rtf_unrounded") or 0.0) >= 1.0
         and int(pd_long_horizon.get("complete_sessions", 0)) == expected_sessions
     )
+    input_backlog_audit = pd_input_backlog(run) if is_pd else None
+    input_long_horizon_rtf = pd_input_budget_rtf(run) if is_pd else None
+    max_backlog_ms = args.max_backlog_ms if args.max_backlog_ms is not None else run.get("config", {}).get(
+        "max_backlog_ms", 500.0
+    )
+    if not isinstance(max_backlog_ms, int | float) or not math.isfinite(max_backlog_ms) or max_backlog_ms < 0:
+        parser.error("--max-backlog-ms must be finite and nonnegative")
+    bounded_backlog = pd_inherited_backlog(run, max_backlog_ms=max_backlog_ms) if is_pd else None
+    expected_window = run.get("config", {}).get("expected_kv_window_tokens", 0)
+    window_audit = (pd_sliding_window_backlog(
+        run, window_tokens=expected_window,
+        min_post_window_units=run.get("config", {}).get("min_post_window_units", 120),
+        max_backlog_ms=max_backlog_ms,
+    ) if is_pd and expected_window else None)
+    # Long RTF cannot hide a recovered backlog above the explicit bound.
+    # Current-unit execution is not inherited backlog. Scope is Thinker input.
     primary_capacity_pass = (
-        long_horizon_rtf_pass and measurement_complete if is_pd else rtf_pass and measurement_complete
+        input_long_horizon_rtf["capacity_pass"] and bounded_backlog["capacity_pass"] and measurement_complete
+        if is_pd else rtf_pass and measurement_complete
+    )
+    if window_audit is not None:
+        bounded_backlog = window_audit["bounded_backlog"]
+        import yaml
+
+        deploy_path = Path(args.run_json).resolve().parent / "deploy.yaml"
+        deployment = yaml.safe_load(deploy_path.read_text()) if deploy_path.exists() else {}
+        window_engine_audit = sliding_window_engine_audit(
+            server_log.read_text(errors="replace"), deployment,
+            window_tokens=expected_window, users=expected_sessions,
+        )
+        window_audit["engine"] = window_engine_audit
+        primary_capacity_pass = measurement_complete and window_audit["capacity_pass"] and window_engine_audit["valid"]
+    primary_long_horizon_rtf = (
+        window_audit["long_horizon_rtf"] if window_audit is not None else input_long_horizon_rtf
     )
     cleanliness = _benchmark_cleanliness(
         server_log,
@@ -2096,13 +2142,31 @@ def main() -> None:
         *(f"workload:{name}" for name in workload_validity["violations"]),
     ]
     result = {
+        "capacity_scope": (
+            "Thinker input consumption; downstream audio requires separate evidence" if is_pd else "stage service"
+        ),
+        "end_to_end_capacity_pass": None,
+        "audio_delivery_observations": [
+            {"session_id": user.get("session_id"), "audio": user.get("audio")}
+            for user in run.get("users", [])
+        ],
+        "input_backlog_audit": input_backlog_audit,
+        "sliding_window_audit": window_audit,
+        "input_long_horizon_rtf": input_long_horizon_rtf,
+        "bounded_backlog_audit": bounded_backlog,
+        "capacity_policy_version": "per_user_strict_rtf_bounded_backlog_v1" if is_pd else None,
+        "capacity_metric": "post_window_rtf_and_bounded_backlog" if window_audit is not None else
+        "whole_run_rtf_and_bounded_backlog" if is_pd else "strict_stage_unit_rtf",
+        "sender_timing_audit": sender_timing_audit(run),
         "run_json": str(Path(args.run_json).resolve()),
-        "definition": "RTF = 1 second model unit / stage service time; RTF >= 1 is real-time",
+        "definition": primary_long_horizon_rtf["definition"] if is_pd else
+        "RTF = 1 second model unit / stage service time; RTF >= 1 is real-time",
         "capacity_slo": (
+            window_audit["definition"] if window_audit is not None else
             "the complete long-session input set finishes without errors and "
-            "every session's stream RTF is >= 1 from first media arrival through "
-            "last D completion; per-unit P/D/Talker RTF remains a tail "
-            "diagnostic; setup "
+            "every session's input-budget RTF is > 1 from first complete input through "
+            f"last D completion AND maximum inherited backlog is <= {max_backlog_ms:g} ms; "
+            "per-unit P/D/Talker RTF remains diagnostic; setup "
             "and post-stream autonomous continuations are excluded; Code2Wav "
             "persistent-session wall time is excluded"
             if is_pd
@@ -2112,8 +2176,13 @@ def main() -> None:
         ),
         "rtf_capacity_pass": rtf_pass,
         "strict_unit_rtf_capacity_pass": rtf_pass and measurement_complete and benchmark_valid,
-        "long_horizon_rtf_capacity_pass": (long_horizon_rtf_pass and measurement_complete and benchmark_valid),
+        "legacy_media_start_rtf_capacity_pass": long_horizon_rtf_pass and measurement_complete and benchmark_valid,
+        "long_horizon_rtf_capacity_pass": (
+            primary_long_horizon_rtf["capacity_pass"] and measurement_complete and benchmark_valid if is_pd else None
+        ),
         "capacity_pass": primary_capacity_pass and benchmark_valid,
+        "input_capacity_pass": primary_capacity_pass,
+        "input_deadline_pass": measurement_complete and input_backlog_audit["no_backlog"] if is_pd else None,
         "p95_capacity_pass": p95_pass and measurement_complete and benchmark_valid,
         "measurement_complete": measurement_complete,
         "measurement_completion_witness": (
@@ -2183,6 +2252,12 @@ def main() -> None:
                 0,
             ),
         }
+    result["measurement_purpose"] = run.get("measurement_purpose", "capacity_exploration")
+    if result["measurement_purpose"] == "serving_contract_validation":
+        result["capacity_pass"] = False
+        result["input_capacity_pass"] = False
+        result["end_to_end_capacity_pass"] = False
+        result["capacity_exclusion_reason"] = "functional-only run; representative dialogue load not certified"
     output = Path(args.out)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")

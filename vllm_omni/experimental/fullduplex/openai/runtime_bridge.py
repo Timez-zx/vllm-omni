@@ -137,10 +137,23 @@ class NativeRuntimeBridgeMixin:
                 append_kwargs["collect_outputs"] = False
             result = await append_input(session.session_id, **append_kwargs)
         except Exception as exc:
-            logger.exception("Failed to append duplex runtime input: %s", exc)
+            limited = isinstance(exc, DuplexControlRequestError) and exc.code == "context_limit_exceeded"
+            if limited:
+                logger.info("Duplex logical context limit reached for %s: %s", session.session_id, exc)
+            else:
+                logger.exception("Failed to append duplex runtime input: %s", exc)
             await self._send_runtime_error(send_json, "runtime_append_failed", exc, session=session)
+            if limited:
+                await self._close_context_limited_session(session, send_json)
             return False, False
         if isinstance(result, dict) and self._runtime_control_failed(result):
+            error = result.get("error")
+            if isinstance(error, dict) and error.get("code") == "context_limit_exceeded":
+                await self._send_runtime_error(
+                    send_json, "context_limit_exceeded", DuplexControlRequestError(result), session=session
+                )
+                await self._close_context_limited_session(session, send_json)
+                return False, False
             await self._send_runtime_control_error(
                 send_json,
                 "runtime_append_failed",
@@ -186,6 +199,13 @@ class NativeRuntimeBridgeMixin:
             )
             return False, emitted_response
         return True, emitted_response
+
+    async def _close_context_limited_session(self, session: DuplexSession, send_json) -> None:
+        """Explicitly end only this session; no implicit history/KV reset."""
+        reason = "context_limit_exceeded"
+        if await self._close_runtime_session(session, reason=reason, send_json=send_json):
+            session.close()
+            await send_json({"type": "session.closed", "session_id": session.session_id, "reason": reason})
 
     @staticmethod
     def _callable_accepts_keyword(fn, name: str) -> bool:
@@ -408,27 +428,61 @@ class NativeRuntimeBridgeMixin:
         scheduler = native.silence_continuation_scheduler
         if scheduler is None:
             return
-        try:
-            scheduled = await scheduler(
-                payload,
-                request_id=request_id,
-                owner_id=owner_id,
-                response_id=response_id,
-                response_owned=response_owned,
-                expected_epoch=expected_epoch,
-                expected_incarnation=session.incarnation,
-                expected_model_turn_id=expected_model_turn_id,
-                send_json=send_json,
-            )
-        except Exception as exc:
-            logger.exception("Failed to schedule duplex native response continuation: %s", exc)
-            scheduled = False
-        if scheduled:
-            native.continuation_owner_id = owner_id
-            native.continuation_units = count + 1
+        pending = native.continuation_schedule_task
+        if pending is not None and not pending.done():
+            if native.continuation_schedule_owner_id == owner_id:
+                return
+            pending.cancel()
+        incarnation = session.incarnation
+
+        async def schedule_in_background() -> None:
+            try:
+                # The scheduler may wait a whole input period or an existing
+                # silence append. Neither wait belongs in the output drain:
+                # D witnesses and already-produced audio must keep flowing.
+                scheduled = await scheduler(
+                    payload,
+                    request_id=request_id,
+                    owner_id=owner_id,
+                    response_id=response_id,
+                    response_owned=response_owned,
+                    expected_epoch=expected_epoch,
+                    expected_incarnation=incarnation,
+                    expected_model_turn_id=expected_model_turn_id,
+                    send_json=send_json,
+                )
+                if (
+                    scheduled
+                    and native.continuation_schedule_task is asyncio.current_task()
+                    and not self._native_silence_continuation_is_stale(
+                        session,
+                        request_id=request_id,
+                        response_id=response_id,
+                        response_owned=response_owned,
+                        expected_epoch=expected_epoch,
+                        expected_incarnation=incarnation,
+                        expected_model_turn_id=expected_model_turn_id,
+                    )
+                ):
+                    native.continuation_owner_id = owner_id
+                    native.continuation_units = count + 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("Failed to schedule duplex native response continuation: %s", exc)
+            finally:
+                if native.continuation_schedule_task is asyncio.current_task():
+                    native.continuation_schedule_task = None
+                    native.continuation_schedule_owner_id = None
+
+        native.continuation_schedule_owner_id = owner_id
+        native.continuation_schedule_task = asyncio.create_task(
+            schedule_in_background(), name=f"duplex-silence-schedule:{owner_id}"
+        )
 
     async def _cancel_native_data_plane_stream(self, session: DuplexSession) -> bool:
         native = self._runtime_session_state(session)
+        native.clear_continuation()
         task = native.data_plane_task
         native.data_plane_task = None
         native.data_plane_restart_requested = False

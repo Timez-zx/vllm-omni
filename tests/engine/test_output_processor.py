@@ -70,6 +70,41 @@ def test_init_empty_dict():
     assert _make_state(RequestOutputKind.DELTA).mm_accumulated == {}
 
 
+@pytest.mark.parametrize("output_kind", [RequestOutputKind.DELTA, RequestOutputKind.CUMULATIVE])
+def test_native_audio_payload_identity_is_a_scalar_snapshot_not_accumulated(output_kind):
+    state = _make_no_detok_state(output_kind)
+    prior_outputs = []
+    for cache_epoch, chunk_seq in ((2, 0), (2, 1), (3, 0)):
+        state.add_multimodal_tensor(
+            {
+                "audio": torch.ones(3),
+                "meta.cache_epoch": torch.tensor(cache_epoch, dtype=torch.int64),
+                "meta.chunk_seq": torch.tensor(chunk_seq, dtype=torch.int64),
+                "meta.llm_output_text_is_delta": torch.tensor(True),
+                "meta.llm_output_text_utf8": torch.tensor(list("重复".encode()), dtype=torch.uint8),
+            },
+            mm_type=AUDIO,
+        )
+        output = state.make_request_output([], None, None, None)
+        assert output is not None
+        meta = output.outputs[0].multimodal_output["meta"]
+        assert meta["cache_epoch"].ndim == 0
+        assert meta["chunk_seq"].ndim == 0
+        assert meta["cache_epoch"].item() == cache_epoch
+        assert meta["chunk_seq"].item() == chunk_seq
+        assert meta["llm_output_text_is_delta"].item() is True
+        assert meta["llm_output_text_utf8"].tolist() == list("重复".encode())
+        prior_outputs.append(meta)
+        if output_kind == RequestOutputKind.DELTA:
+            for key in ("cache_epoch", "chunk_seq", "llm_output_text_is_delta", "llm_output_text_utf8"):
+                assert f"meta.{key}" not in state.mm_accumulated
+    assert [(meta["cache_epoch"].item(), meta["chunk_seq"].item()) for meta in prior_outputs] == [
+        (2, 0),
+        (2, 1),
+        (3, 0),
+    ]
+
+
 def test_streaming_update_resets_native_text_metrics_for_next_segment():
     state = _make_state(RequestOutputKind.DELTA)
     state.native_text_stats.num_generation_tokens = 12

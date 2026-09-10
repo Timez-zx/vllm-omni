@@ -24,6 +24,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.experimental.fullduplex.engine.contracts import (
     DuplexAppendPlan,
+    DuplexContextLimitError,
     DuplexInputMode,
     DuplexOutputContext,
     DuplexOutputDecision,
@@ -962,6 +963,9 @@ class DuplexControlPlane:
         message = str(error)
         if isinstance(error, DuplexFenceMismatchError):
             code = "stale_fence"
+            retryable = False
+        elif isinstance(error, DuplexContextLimitError):
+            code = "context_limit_exceeded"
             retryable = False
         elif "unknown duplex input mode" in message:
             code = "invalid_capability"

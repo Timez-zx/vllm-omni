@@ -16,6 +16,7 @@ import numpy as np
 from vllm.logger import init_logger
 
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import MiniCPMO45DuplexPolicy
+from vllm_omni.experimental.fullduplex.minicpmo45.sampling_state import restore_sampling_state, unpack_sampling_state
 
 logger = init_logger(__name__)
 
@@ -203,6 +204,14 @@ class MiniCPMO45Stage0DuplexRuntime:
             if state.streaming_processor is not None:
                 return state.streaming_processor
             processor = copy.copy(processor)
+            # set_streaming_mode below rebuilds Mel with audio_processor,
+            # discarding the copied Mel object's extractor. Its fixed/dynamic
+            # log normalization is mutable (including snapshot restoration),
+            # so sharing it races across sessions and with reference encoding.
+            # This copies only the CPU feature extractor, never model weights.
+            shared_audio = getattr(self.processor, "audio_processor", None)
+            if shared_audio is not None:
+                processor.audio_processor = copy.deepcopy(shared_audio)
             shared_mel = getattr(self.processor, "_streaming_mel_processor", None)
             if shared_mel is not None:
                 processor._streaming_mel_processor = copy.deepcopy(shared_mel)
@@ -258,6 +267,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                 state.context_embeds.extend(cached_embeds)
                 state.context_token_ids.extend(cached_token_ids)
                 self._session_context_cache.move_to_end(context_cache_key)
+                self._validate_pinned_session_context(state)
                 return
         # Matches MiniCPMODuplex.prepare() in the released checkpoint's
         # modeling_minicpmo.py: the <|audio_start|>/<|audio_end|> markers are
@@ -280,6 +290,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         for token_id in self._encode_text(suffix):
             state.context_embeds.append(self._embed_token(token_id))
             state.context_token_ids.append(token_id)
+        self._validate_pinned_session_context(state)
         if context_cache_key is not None:
             self._session_context_cache[context_cache_key] = (
                 tuple(state.context_embeds),
@@ -288,6 +299,15 @@ class MiniCPMO45Stage0DuplexRuntime:
             self._session_context_cache.move_to_end(context_cache_key)
             while len(self._session_context_cache) > 16:
                 self._session_context_cache.popitem(last=False)
+
+    def _validate_pinned_session_context(self, state) -> None:
+        config = getattr(self.stage_model, "config", None)
+        pin = int(getattr(config, "vllm_omni_pinned_prefix_tokens", 0))
+        if pin and len(state.context_token_ids) > pin:
+            raise ValueError(
+                f"System/reference context has {len(state.context_token_ids)} tokens, "
+                f"exceeding pinned prefix {pin}; increase the block-aligned prefix"
+            )
 
     def _session_context_cache_key(
         self,
@@ -1487,6 +1507,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         epoch: int | None,
         seq: int,
         force_listen: bool = False,
+        sampling_state: list[int] | None = None,
     ) -> None:
         """Align P's next prompt with the authoritative D segment.
 
@@ -1498,6 +1519,11 @@ class MiniCPMO45Stage0DuplexRuntime:
         identity = (epoch, seq)
         if state.pd_feedback_append_identity == identity:
             return
+        if sampling_state is not None:
+            decoded_state, _ = unpack_sampling_state(sampling_state)
+            if decoded_state.current_segment_output_tokens != token_ids:
+                raise ValueError("D sampling state and feedback tokens disagree")
+            restore_sampling_state(state, decoded_state)
         state.pd_feedback_append_identity = identity
         state.pd_feedback_token_ids = [int(token_id) for token_id in token_ids]
         state.current_segment_output_tokens = list(state.pd_feedback_token_ids)
@@ -1505,6 +1531,11 @@ class MiniCPMO45Stage0DuplexRuntime:
             return
 
         terminator = state.pd_feedback_token_ids[-1]
+        if sampling_state is not None:
+            # Keep D's authoritative turn/repetition state; the *next* input's
+            # force_listen flag must not reinterpret the previous D decision.
+            state.pending_terminator_token = terminator
+            return
         terminators = {
             self.listen_token_id,
             self.chunk_eos_token_id,
@@ -1518,7 +1549,11 @@ class MiniCPMO45Stage0DuplexRuntime:
                 state.current_turn_ended = True
                 state.pending_speech_response_open = False
             return
-        state.pending_terminator_token = None
+        # A finite D segment can finish on a non-native boundary (e.g. model
+        # EOS or an output budget). Its last sampled token still has no KV on
+        # P. Preserve that real token before </unit>, just as for a native
+        # terminator; silently dropping it loses one reserved embedding row.
+        state.pending_terminator_token = terminator
         state.last_terminator_token = None
         state.current_turn_ended = False
 

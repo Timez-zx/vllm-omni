@@ -1,0 +1,6 @@
+# Leave-one-out diagnostic: move only both input encoders away from GPU 0.
+# Inherit the separated encoder env; put Code2Wav back on GPU 0.
+base_config: deploy_capacity_nonpd_separated_fp8.yaml
+stages:
+  - stage_id: 2
+    devices: "0"

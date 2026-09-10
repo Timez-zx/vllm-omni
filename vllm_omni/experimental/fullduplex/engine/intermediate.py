@@ -96,6 +96,21 @@ def set_native_prompt_handoff_metadata(
 
 def set_tts_handoff(buffer: dict[str, object], token_ids: object | None, hidden_states: object | None) -> None:
     """Store the AR-to-TTS handoff used by the full-duplex stage bridge."""
+    if buffer.get("native_duplex") and hidden_states is not None:
+        from msgspec.structs import asdict
+        from torch import Tensor, bfloat16
+
+        from vllm_omni.data_entry_keys import _serialize_tensor
+
+        if isinstance(hidden_states, Tensor):
+            # model_intermediate_buffer is untyped on the wire. Use the
+            # existing owned bytes/shape/dtype envelope, not a raw Tensor
+            # (which needs a typed decoder) or per-element Python floats.
+            # NumPy does not support BF16. The previous list handoff also
+            # reconstructed these exactly representable values as FP32.
+            if hidden_states.dtype == bfloat16:
+                hidden_states = hidden_states.float()
+            hidden_states = asdict(_serialize_tensor(hidden_states))
     if token_ids is not None:
         buffer.setdefault("ids", {})["tts"] = token_ids
     if hidden_states is not None:
@@ -108,6 +123,11 @@ def get_tts_handoff(info: dict[str, object]) -> tuple[object | None, object | No
     hidden_info = info.get("hidden_states")
     token_ids = ids_info.get("tts") if isinstance(ids_info, dict) else None
     hidden_states = hidden_info.get("tts") if isinstance(hidden_info, dict) else None
+    if isinstance(hidden_states, dict) and hidden_states.get("tensor_data") is not None:
+        from vllm_omni.data_entry_keys import _deserialize_tensor
+        from vllm_omni.engine import AdditionalInformationEntry
+
+        hidden_states = _deserialize_tensor(AdditionalInformationEntry(**hidden_states))
     return (
         info.get("tts_token_ids") if token_ids is None else token_ids,
         info.get("tts_hidden_states") if hidden_states is None else hidden_states,

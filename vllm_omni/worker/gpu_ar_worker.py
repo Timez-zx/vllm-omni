@@ -157,7 +157,7 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         worker.start_direct_cache_sync(metadata)
         return True
 
-    def poll_pd_cache_sync(self) -> set[str]:
+    def poll_pd_cache_sync(self, wait_for_completion: bool = True) -> set[str]:
         """Poll cache-only imports without consuming inference completions."""
         from vllm_omni.engine.nixl_delta_push_connector import (
             NixlDeltaPushConnectorWorker,
@@ -167,7 +167,7 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         worker = getattr(connector, "connector_worker", None)
         if not isinstance(worker, NixlDeltaPushConnectorWorker):
             raise RuntimeError("Direct P/D cache sync requires NixlDeltaPushConnectorWorker")
-        return worker.poll_direct_cache_sync()
+        return worker.poll_direct_cache_sync(wait_for_completion=wait_for_completion)
 
     def publish_pd_finished_blocks(self, metadata) -> bool:
         """Wake P's NIXL writer without waiting for another model batch."""
@@ -195,7 +195,7 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         preencode = getattr(model, "preencode_duplex_vision", None)
         if not callable(preencode):
             return {"supported": False, "encoded_frames": 0}
-        return preencode(jobs)
+        return self._run_minicpmo_encoder("vision", preencode, jobs)
 
     @torch.inference_mode()
     def preencode_minicpmo45_audio(
@@ -211,4 +211,32 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
                 "encoded_jobs": 0,
                 "job_results": {},
             }
-        return preencode(jobs)
+        return self._run_minicpmo_encoder("audio", preencode, jobs)
+
+    def _run_minicpmo_encoder(self, modality, preencode, jobs):
+        """One private CUDA stream per ordered encoder executor.
+
+        A background CPU thread alone does not select a new CUDA stream.
+        Fence only this encoder's work before acknowledging cache readiness;
+        never synchronize the whole device (which would also wait for P).
+        """
+        raw_device = os.environ.get(f"MINICPMO45_{modality.upper()}_ENCODER_DEVICE", "").strip()
+        device = torch.device(f"cuda:{raw_device}" if raw_device.isdigit() else raw_device or self.device)
+        if device.type != "cuda":
+            return preencode(jobs)
+        attr = f"_minicpmo_{modality}_cuda_stream"
+        stream = getattr(self, attr, None)
+        if stream is None:
+            stream = torch.cuda.Stream(device=device)
+            # Loaded weights precede sidecar serving. Make their default-stream
+            # initialization visible on the new stream exactly once.
+            stream.wait_stream(torch.cuda.default_stream(device))
+            setattr(self, attr, stream)
+        with torch.cuda.device(device), torch.cuda.stream(stream):
+            try:
+                return preencode(jobs)
+            finally:
+                # Also fence failed work before this executor accepts a retry.
+                ready = torch.cuda.Event()
+                ready.record(stream)
+                ready.synchronize()

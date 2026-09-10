@@ -7,9 +7,10 @@ import math
 from base64 import b64decode
 from binascii import Error as BinasciiError
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from io import BytesIO
 from typing import Any
+from uuid import uuid4
 
 from PIL import Image
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -21,6 +22,7 @@ from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
     DuplexOutputDecision,
 )
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
+from vllm_omni.experimental.fullduplex.minicpmo45.policy import MiniCPMO45DuplexPolicy
 
 _DUPLEX_CHUNK_SAMPLES = 16000
 _DUPLEX_SAMPLES_PER_AUDIO_TOKEN = 1600
@@ -223,7 +225,7 @@ def duplex_first_append_context_reserve(runtime_config: object) -> int:
         except (BinasciiError, ValueError):
             raw = b""
         if raw:
-            reserve += max(0, (len(raw) // 4) // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN + 8)
+            reserve += MiniCPMO45DuplexPolicy.audio_token_count(len(raw) // 4) + 8
     return reserve
 
 
@@ -250,6 +252,7 @@ def build_duplex_data_plane_prompt(
     retained_unit_tokens: int = 0,
     compact_rebase_prefix_tokens: int = 0,
     context_generation: int = 0,
+    cache_namespace: str | None = None,
     _payload_shape: _DuplexPayloadShape | None = None,
 ) -> dict[str, Any]:
     payload_shape = _duplex_payload_shape(payload) if _payload_shape is None else _payload_shape
@@ -324,15 +327,19 @@ def build_duplex_data_plane_prompt(
             "context_generation": context_generation,
         },
     }
+    # Scheduler token IDs are placeholders, NOT hashes of the AV embeddings.
+    # Scope reuse to one immutable session lineage, including every P/D path.
+    cache_salt = f"minicpmo45:{cache_namespace or request_id}:context-{context_generation}"
     if replace_streaming_prompt:
         model_intermediate_buffer["meta"] = {
             "replace_streaming_prompt": True,
             "retain_streaming_output_tokens": True,
             "retained_output_insert_offset": context_reserve + max(0, int(retained_unit_tokens)),
-            "streaming_cache_salt": (f"minicpmo45:{fence.session_id}:{fence.incarnation}:context-{context_generation}"),
+            "streaming_cache_salt": cache_salt,
         }
     return {
         "prompt_token_ids": [token_id] * token_budget,
+        "cache_salt": cache_salt,
         "model_intermediate_buffer": model_intermediate_buffer,
     }
 
@@ -340,6 +347,7 @@ def build_duplex_data_plane_prompt(
 @dataclass
 class _ContextWindowState:
     epoch: int
+    cache_namespace: str = field(default_factory=lambda: uuid4().hex)
     last_seq: int = 0
     estimated_tokens: int = 0
     retained_unit_tokens: int = 0
@@ -467,12 +475,16 @@ class MiniCPMO45DuplexRuntimeExtension:
                 # connector observes a deterministic segment boundary.  Stop
                 # tokens belong to D, where the model decision is authoritative.
                 overrides.pop("stop_token_ids", None)
-            if not isinstance(default, SamplingParams) or (not overrides and (max_tokens is None or max_tokens <= 0)):
+            if not isinstance(default, SamplingParams) or (
+                policy_stage_id != 0 and not overrides and (max_tokens is None or max_tokens <= 0)
+            ):
                 configured.append(default)
                 continue
             params = default.clone()
-            if pd_stage_policy is not None and stage_id in (0, 1):
-                # P and D expose one complete model-unit boundary at a time.
+            if stage_id == 0 or (pd_stage_policy is not None and stage_id == 1):
+                # Native Thinker (including unsplit P+D) exposes a complete
+                # model-unit boundary at a time, not cumulative per-token
+                # hidden-state snapshots that the Talker cannot consume yet.
                 # Keeping the cumulative latent rows until that boundary is
                 # required for MiniCPM's synchronous Thinker->Talker bridge.
                 params.output_kind = RequestOutputKind.FINAL_ONLY
@@ -486,6 +498,20 @@ class MiniCPMO45DuplexRuntimeExtension:
                     all_stop_token_ids = getattr(params, "_all_stop_token_ids", None)
                     if isinstance(all_stop_token_ids, set):
                         all_stop_token_ids.update(int(token_id) for token_id in value)
+            if policy_stage_id == 0:
+                # MiniCPM's native loop treats chat EOS/TURN_EOS as ordinary
+                # model outputs and continues until LISTEN/CHUNK_(TTS_)EOS.
+                # Cloned chat defaults may already contain both explicit
+                # stops and derived EOS state. Merely setting ignore_eos does
+                # not clear _eos_token_id on an already-configured clone.
+                params.ignore_eos = True
+                params._eos_token_id = None
+                params.stop = []
+                params.output_text_buffer_length = 0
+                params.stop_token_ids = list(overrides.get("stop_token_ids", []))
+                params._all_stop_token_ids = set(params.stop_token_ids)
+                params.min_tokens = 0
+                params.repetition_detection = None
             configured.append(params)
         return tuple(configured)
 
@@ -550,7 +576,10 @@ class MiniCPMO45DuplexRuntimeExtension:
         if seq > window.last_seq:
             compact_rebase_retained_unit_tokens = window.retained_unit_tokens
             replace_streaming_prompt = bool(
-                window.last_seq > 0 and window.retained_unit_tokens > 0 and window.estimated_tokens >= trigger_tokens
+                not runtime_config.get("duplex_kv_window_tokens")
+                and window.last_seq > 0
+                and window.retained_unit_tokens > 0
+                and window.estimated_tokens >= trigger_tokens
             )
             retained_unit_tokens = window.retained_unit_tokens if replace_streaming_prompt else 0
             if replace_streaming_prompt:
@@ -595,6 +624,7 @@ class MiniCPMO45DuplexRuntimeExtension:
                 retained_unit_tokens=retained_unit_tokens,
                 compact_rebase_prefix_tokens=compact_rebase_prefix_tokens,
                 context_generation=window.context_generation,
+                cache_namespace=window.cache_namespace,
                 _payload_shape=payload_shape,
             )
         )

@@ -21,6 +21,8 @@ class MiniCPMO45DuplexPolicy:
     SAMPLE_RATE_HZ = 16000
     CHUNK_SAMPLES = 16000
     SAMPLES_PER_AUDIO_TOKEN = 1600
+    AUDIO_FEATURE_HOP_SAMPLES = 160
+    AUDIO_POOL_STEP = 5
     # Vision framing contract (omni duplex). Every source image or HD crop is
     # compressed to one 64-row resampler block. The source uses
     # <image>...</image>; additional crops use <slice>...</slice>.
@@ -30,7 +32,6 @@ class MiniCPMO45DuplexPolicy:
     VISION_EMBEDS_PER_FRAME = VISION_EMBEDS_PER_BLOCK
     VISION_TOKENS_PER_FRAME = VISION_TOKENS_PER_BLOCK
     DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK = 20
-    DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK = 28
     DEFAULT_MIN_NEW_SPEAK_TOKENS_BEFORE_CHUNK_BOUNDARY = 8
     REPETITION_HISTORY_SIZE = 512
 
@@ -38,11 +39,16 @@ class MiniCPMO45DuplexPolicy:
     def audio_token_count(cls, sample_count: int) -> int:
         """Audio embedding count for a clip of ``sample_count`` samples.
 
-        Matches the whole-clip encoder math (hop 160 mel frames -> CNN stride 2
-        -> avg-pool 5) for any multiple of ``SAMPLES_PER_AUDIO_TOKEN``; serving
-        normalizes clips to that boundary before this is used for budgets.
+        Matches the official processor's attention-mask length and
+        ``get_audio_placeholder``: ceil(samples / 160) mel frames, a padded
+        stride-2 CNN, then stride-5 average pooling. Partial final frames must
+        remain in the waveform; flooring the sample count to 100 ms changes
+        reference conditioning even when the embedding count is unchanged.
         """
-        return max(0, int(sample_count) // cls.SAMPLES_PER_AUDIO_TOKEN)
+        sample_count = max(0, int(sample_count))
+        feature_frames = (sample_count + cls.AUDIO_FEATURE_HOP_SAMPLES - 1) // cls.AUDIO_FEATURE_HOP_SAMPLES
+        cnn_frames = (feature_frames + 1) // 2
+        return cnn_frames // cls.AUDIO_POOL_STEP
 
     @staticmethod
     def session_context_texts(instructions: object, has_ref_audio: bool) -> tuple[str, str]:

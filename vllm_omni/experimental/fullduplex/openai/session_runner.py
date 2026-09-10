@@ -747,7 +747,7 @@ class DuplexSessionRunnerMixin:
                 if pending_silence is asyncio.current_task():
                     return False
                 try:
-                    if not await pending_silence:
+                    if not await asyncio.shield(pending_silence):
                         return False
                 except asyncio.CancelledError:
                     current = asyncio.current_task()

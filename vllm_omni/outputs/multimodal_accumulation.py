@@ -8,9 +8,13 @@ from vllm_omni.outputs.output_modality import DRAINABLE_MODALITIES
 CHUNK_METADATA_KEYS: frozenset[str] = frozenset(
     {
         "audio_text_total_chars",
+        "cache_epoch",
+        "chunk_seq",
         "duplex_epoch",
         "duplex_turn_id",
+        "duplex_sampling_state",
         "llm_output_text_utf8",
+        "llm_output_text_is_delta",
         "segment_end",
         "tts_is_last_chunk",
         "turn_end",
@@ -33,6 +37,21 @@ def replace_snapshot_keys(
         if _is_chunk_metadata_key(key):
             accumulated.tensors.pop(key, None)
             accumulated.metadata.pop(key, None)
+
+
+def release_native_segment_content(payload: MultimodalPayload) -> None:
+    """Drop consumed native hidden rows, never the engine's KV/history.
+
+    The compact segment-ID contract makes the current unit self-contained.
+    After the immutable output has been emitted, older latent rows are not
+    needed by the next Thinker-to-Talker handoff. Ordinary cumulative outputs
+    without that contract retain their existing behavior.
+    """
+    if "duplex_segment_token_ids" not in payload:
+        return
+    for key in ("latent", "hidden", "duplex_segment_token_ids"):
+        payload.tensors.pop(key, None)
+        payload.metadata.pop(key, None)
 
 
 def drain_delta_payload(payload: MultimodalPayload) -> None:

@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn as nn
@@ -60,6 +62,135 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker._codec_min_tokens = 50
     talker._codec_seed = 42
     return talker
+
+
+def test_wrapper_propagates_incomplete_prefill_sampling_mask(mocker):
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.model_stage = "tts"
+    model.talker = _make_talker()
+    sample = mocker.patch.object(model.talker, "_sample_audio_code", return_value=torch.tensor(2))
+    info = {"request_id": "physical-a", "audio_state": {"step": 0, "max_tokens": 26}}
+    assert model.requires_request_sample_eligibility is True
+    output = model.make_omni_output(
+        torch.ones(1, 2), model_intermediate_buffer=[info],
+        request_token_spans=[(0, 1)], request_sample_eligible=[False],
+    )
+    sample.assert_not_called()
+    assert model.talker._request_audio_states["physical-a"]["step"] == 0
+    assert output.multimodal_outputs["codes"]["audio"][0].numel() == 0
+    model.model_stage = "thinker"
+    assert model.requires_request_sample_eligibility is False
+
+
+def test_speech_probe_reads_pre_graph_positions_and_codec_delta(tmp_path, monkeypatch, mocker):
+    import json
+
+    from vllm_omni.experimental.fullduplex.minicpmo45 import speech_probe
+
+    monkeypatch.setattr(speech_probe, "ENABLED", True)
+    monkeypatch.setattr(speech_probe, "DIRECTORY", str(tmp_path))
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.model_stage = "tts"
+    model.talker = _make_talker()
+    mocker.patch.object(model.talker, "_sample_audio_code", return_value=torch.tensor(2))
+    positions = torch.tensor([17, 18])
+    model.update_decode_step_metadata(positions=positions)
+    positions.fill_(999)  # Captured CPU positions must not alias replay storage.
+    info = {"request_id": "physical-a", "audio_state": {"step": 0, "max_tokens": 1}}
+    model.make_omni_output(
+        torch.ones(2, 2), model_intermediate_buffer=[info],
+        request_token_spans=[(0, 2)], request_sample_eligible=[True],
+    )
+    records = [json.loads(line) for line in next(tmp_path.glob("speech-*.jsonl")).read_text().splitlines()]
+    assert records[0]["positions"] == [17, 18]
+    assert records[1]["finish_reason"] == "limit"
+    assert records[1]["sampled_id"] == 2
+    assert records[1]["emitted_codes"] == []
+
+
+def test_speech_probe_prefill_records_placeholder_overlap(tmp_path, monkeypatch, mocker):
+    import json
+
+    from vllm_omni.experimental.fullduplex.minicpmo45 import speech_probe
+
+    monkeypatch.setattr(speech_probe, "ENABLED", True)
+    monkeypatch.setattr(speech_probe, "DIRECTORY", str(tmp_path))
+    monkeypatch.setattr(speech_probe, "SAVE_TENSORS", True)
+    talker = _make_talker()
+    talker.emb_text = nn.Embedding(1, 2)
+    mocker.patch.object(talker, "_build_condition_embeddings", return_value=torch.ones(3, 2))
+    talker.preprocess(
+        torch.zeros(2, dtype=torch.long), None, _omni_is_prefill=True,
+        _omni_num_computed_tokens=4, _omni_prompt_len=8,
+        request_id="physical-a", native_duplex=True, meta={"turn_start": False},
+        tts_token_ids=torch.tensor([1, 2]), tts_hidden_states=torch.ones(2, 2),
+    )
+    record = json.loads(next(tmp_path.glob("speech-*.jsonl")).read_text())
+    assert record["prefix_len"] == 5
+    assert record["placeholder_tokens_scheduled"] == 1
+    assert record["condition_file"]
+
+
+def test_speech_probe_identifies_actual_multi_request_talker_batch(tmp_path, monkeypatch, mocker):
+    import json
+
+    from vllm_omni.experimental.fullduplex.minicpmo45 import speech_probe
+
+    monkeypatch.setattr(speech_probe, "ENABLED", True)
+    monkeypatch.setattr(speech_probe, "DIRECTORY", str(tmp_path))
+    talker = _make_talker()
+    talker._speech_probe_positions = torch.tensor([10, 20])
+    mocker.patch.object(talker, "_sample_audio_code", return_value=torch.tensor(2))
+    infos = [
+        {"request_id": request_id, "audio_state": {"step": 0, "max_tokens": 26}}
+        for request_id in ("user-a", "user-b")
+    ]
+    for _ in range(2):
+        talker.make_omni_output(
+            torch.ones(2, 2), model_intermediate_buffer=infos,
+            request_token_spans=[(0, 1), (1, 2)], request_sample_eligible=[True, True],
+        )
+    records = [json.loads(line) for line in next(tmp_path.glob("speech-*.jsonl")).read_text().splitlines()]
+    assert len(records) == 8
+    assert len({row["batch_id"] for row in records[:4]}) == 1
+    assert len({row["batch_id"] for row in records[4:]}) == 1
+    assert records[0]["batch_id"] != records[4]["batch_id"]
+    assert all(row["batch_size"] == 2 for row in records)
+    assert [row["row_index"] for row in records[:4]] == [0, 0, 1, 1]
+    assert {row["request_id"] for row in records[:4]} == {"user-a", "user-b"}
+
+
+def test_talker_window_reaches_every_llama_attention_layer(mocker) -> None:
+    talker = _make_talker()
+    talker.config = SimpleNamespace(vllm_omni_minicpmo_talker_sliding_window_tokens=4096)
+    talker._tts_config = SimpleNamespace(
+        hidden_size=8, intermediate_size=16, num_hidden_layers=2,
+        num_attention_heads=2, num_key_value_heads=2,
+        max_position_embeddings=4096, num_text_tokens=16,
+        llm_dim=8, num_audio_tokens=8, num_vq=1,
+    )
+    seen = []
+
+    def with_config(config, **kwargs):
+        seen.append(config)
+        return SimpleNamespace(model_config=SimpleNamespace(hf_text_config=config))
+
+    talker.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=65536), with_hf_config=with_config,
+    )
+    backbone = nn.Identity()
+    backbone.make_empty_intermediate_tensors = None
+    mocker.patch(
+        "vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts.LlamaModel",
+        return_value=backbone,
+    )
+    talker._init_native_talker("")
+
+    assert seen[0].layer_types == ["sliding_attention", "sliding_attention"]
+    assert seen[0].sliding_window == 4096
+    assert seen[0].max_position_embeddings == 65536
 
 
 def _routed(output, index: int):
@@ -440,6 +571,50 @@ def test_native_duplex_condition_matches_official_text_plus_audio_bos() -> None:
     )
     assert torch.equal(condition, expected)
     assert condition.shape[0] == token_ids.shape[0] + 1
+
+
+@pytest.mark.parametrize("turn_end", [False, True])
+def test_native_empty_condition_still_generates_continuation_or_flush(mocker, turn_end) -> None:
+    talker = _make_talker()
+    talker.emb_text = nn.Embedding(8, 4)
+    talker._text_eos_id = 5
+    talker._tts_bos_id = 6
+    sample = mocker.patch.object(talker, "_sample_audio_code", return_value=torch.tensor(2))
+    info = {
+        "request_id": "req-audio-only", "native_duplex": True,
+        "duplex": {"epoch": 0, "turn_id": 2},
+        "meta": {"native_duplex_audio_only": True, "turn_end": turn_end},
+        "tts_token_ids": [], "tts_hidden_states": [],
+    }
+    _, embeddings, updates = talker.preprocess(
+        torch.zeros(1, dtype=torch.long), None, _omni_is_prefill=True, **info,
+    )
+    assert torch.equal(embeddings, talker.emb_text(torch.tensor([6])))
+    assert updates["audio_state"]["finished"] is False
+    assert updates["audio_state"]["max_tokens"] == 26
+    assert updates["audio_state"]["min_tokens"] == (0 if turn_end else 26)
+    info.update(updates)
+    output = talker.make_omni_output(
+        torch.ones(1, 4), model_intermediate_buffer=[info], request_token_spans=[(0, 1)],
+    )
+    assert sample.call_count == 1
+    assert _routed(output, 0)["codes"]["audio"].tolist() == [[2]]
+    assert output.multimodal_outputs["meta"]["turn_end"][0].item() is turn_end
+
+
+@pytest.mark.parametrize("ids,turn_end", [([99, 41], False), ([], True)])
+def test_talker_uses_explicit_final_unit_turn_state_not_any_turn_eos(mocker, ids, turn_end):
+    talker = _make_talker()
+    mocker.patch.object(talker, "_sample_audio_code", return_value=torch.tensor(2))
+    info = {
+        "request_id": "req-final-state", "native_duplex": True,
+        "duplex": {"epoch": 0, "turn_id": 2}, "ids": {"tts": ids},
+        "meta": {"turn_eos_token_id": 99, "turn_end": turn_end},
+    }
+    output = talker.make_omni_output(
+        torch.ones(1, 2), model_intermediate_buffer=[info], request_token_spans=[(0, 1)],
+    )
+    assert output.multimodal_outputs["meta"]["turn_end"][0].item() is turn_end
 
 
 def test_request_cleanup_evicts_ar_rng_and_decode_state() -> None:

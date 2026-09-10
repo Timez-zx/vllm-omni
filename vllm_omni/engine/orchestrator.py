@@ -75,6 +75,11 @@ from vllm_omni.experimental.fullduplex.engine.intermediate import (
     NATIVE_PROMPT_TOKEN_IDS_KEY,
     NATIVE_SEGMENT_TOKEN_IDS_KEY,
 )
+from vllm_omni.experimental.fullduplex.minicpmo45.sampling_state import (
+    SAMPLING_STATE_KEY,
+    SAMPLING_STATE_WIRE_KEY,
+    unpack_sampling_state,
+)
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
@@ -408,7 +413,9 @@ class _OrchestratorDuplexStagePort:
         previous = bridge.get("pd_duplex_remote_prompt_token_ids")
         if not isinstance(previous, (list, tuple)):
             return delta_ids
-        return [*(int(token_id) for token_id in previous), *delta_ids]
+        # P's typed token IDs are already normalized. Copy the list, not a
+        # Python int() loop over the full session history on every unit.
+        return [*previous, *delta_ids]
 
     @property
     def stage_count(self) -> int:
@@ -465,6 +472,28 @@ class _OrchestratorDuplexStagePort:
         )
         self._sync_bridge_state(request_state, context)
 
+    def _validate_native_pd_logical_context(self, context: DuplexStageRequestContext, prompt_tokens: int) -> None:
+        """Reject one session before ingress; never recycle its history/KV.
+
+        The P seed becomes D's last prompt token. Reserve it and D's complete
+        finite generation budget so a unit cannot be truncated by the logical
+        limit. With the default D budget of 20, this conservatively reserves 21
+        tokens. Physical sliding-window bounds do not extend this limit.
+        """
+        from vllm_omni.experimental.fullduplex.engine.contracts import DuplexContextLimitError
+
+        assert self._pd_pair is not None
+        p_stage, d_stage = self._pd_pair
+        limit = min(self._stage_pools[i].stage_vllm_config.model_config.max_model_len for i in (p_stage, d_stage))
+        decode_budget = getattr(context.sampling_params[d_stage], "max_tokens", None)
+        if not isinstance(decode_budget, int) or isinstance(decode_budget, bool) or decode_budget < 1:
+            raise ValueError("Native P/D context admission requires a positive finite D max_tokens")
+        generation_tokens = 1 + decode_budget
+        if prompt_tokens + generation_tokens > limit:
+            raise DuplexContextLimitError(
+                prompt_tokens=prompt_tokens, generation_tokens=generation_tokens, max_model_len=limit
+            )
+
     async def submit(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult:
         from vllm_omni.experimental.fullduplex.engine.contracts import DuplexStageSubmissionResult
 
@@ -489,10 +518,26 @@ class _OrchestratorDuplexStagePort:
                     raise RuntimeError(f"previous native P/D route failed for {context.request_id}: {route_error}")
                 if self._request_states.get(context.request_id) is not request_state:
                     raise RuntimeError(f"duplex request was closed while waiting for D: {context.request_id}")
-                feedback = bridge.pop("pd_duplex_feedback_token_ids", [])
+                feedback = bridge.get("pd_duplex_feedback_token_ids", [])
                 if feedback:
                     prompt = copy.deepcopy(original_prompt)
                     _extend_native_pd_feedback_budget(prompt, list(feedback))
+                    policy_state = bridge.get("pd_duplex_feedback_sampling_state")
+                    if policy_state is None:
+                        raise RuntimeError("Native D feedback is missing sampling state")
+                    prompt["model_intermediate_buffer"]["duplex"]["pd_feedback_sampling_state"] = policy_state
+            pd_predicted_prompt_token_ids = self._native_pd_prefix_prediction(
+                prompt,
+                bridge,
+                already_submitted=submission.already_submitted,
+            )
+            # This exception stays in handle_append's per-operation error
+            # path. Do not defer the check to the GPU runner: its fixed-size
+            # token buffer would otherwise raise and kill unrelated sessions.
+            self._validate_native_pd_logical_context(context, len(pd_predicted_prompt_token_ids))
+            if submission.already_submitted and feedback:
+                bridge.pop("pd_duplex_feedback_token_ids", None)
+                bridge.pop("pd_duplex_feedback_sampling_state", None)
             # One request per session may be in P→D flight.  This is the
             # model's recurrence dependency, not a global admission gate:
             # unrelated sessions continue independently.
@@ -549,11 +594,6 @@ class _OrchestratorDuplexStagePort:
             bridge["pd_duplex_decode_sequence"] = int(seq)
             bridge["pd_decode_engine_request_id"] = decode_engine_req_id
             bridge["pd_decode_transfer_id"] = f"xfer-{decode_engine_req_id}"
-            pd_predicted_prompt_token_ids = self._native_pd_prefix_prediction(
-                prompt,
-                bridge,
-                already_submitted=submission.already_submitted,
-            )
             request_state.pd_early_cache_sync_task = None
             request_state.pd_early_cache_sync_result = None
             request_state.pd_early_cache_sync_error = None
@@ -1530,6 +1570,12 @@ class Orchestrator:
                                             ),
                                             *segment_tokens,
                                         ]
+                                        if bridge.get("pd_duplex_terminal_replay", False):
+                                            if (len(segment_tokens) != 1
+                                                    or bridge["pd_duplex_feedback_token_ids"] != segment_tokens * 2):
+                                                raise RuntimeError("Invalid native P terminal replay on D")
+                                            bridge["pd_duplex_feedback_token_ids"] = list(segment_tokens)
+                                        self._capture_native_pd_sampling_feedback(eco, req_state)
                                         segment_tokens.clear()
                                         active_slot = bridge.pop(
                                             "pd_duplex_active_slot",
@@ -2383,25 +2429,7 @@ class Orchestrator:
             if kv_params is not None:
                 self._pd_kv_params[req_id] = kv_params if isinstance(kv_params, dict) else dict(kv_params)
                 if self._is_duplex_session_request(req_state):
-                    remote_prompt_token_ids = self._pd_kv_params[req_id].get("remote_prompt_token_ids")
-                    if isinstance(remote_prompt_token_ids, (list, tuple)):
-                        remote_ids = [int(token_id) for token_id in remote_prompt_token_ids]
-                        p_sampled_ids = list(req_state.streaming.segment_token_ids)
-                        decode_prompt: dict[str, Any] = {
-                            "prompt_token_ids": remote_ids + p_sampled_ids,
-                        }
-                        source_prompt = req_state.prompt
-                        if isinstance(source_prompt, dict):
-                            for key in (
-                                "additional_information",
-                                "model_intermediate_buffer",
-                                "cache_salt",
-                            ):
-                                if key in source_prompt:
-                                    decode_prompt[key] = copy.deepcopy(source_prompt[key])
-                        bridge = req_state.streaming.bridge_states
-                        bridge["pd_decode_prompt"] = decode_prompt
-                        bridge["pd_duplex_prefill_sample_token_ids"] = p_sampled_ids
+                    self._prepare_native_duplex_pd_decode(output, req_state)
             # Raw EngineCore outputs are accumulated above because a chunked
             # prefill exposes only one hidden-state slice per engine step.  A
             # processed-only backend may not expose those raw slices, so keep
@@ -2513,9 +2541,8 @@ class Orchestrator:
                     await self._cleanup_request_ids([req_id])
                 return
 
-        # In P/D mode stage P samples one throw-away boundary token only to
-        # finish the prefill segment. D owns the authoritative listen/speak
-        # decision and response, so P must never emit a client-visible result.
+        # P samples the first native token; D continues it (or acknowledges a
+        # P terminator). Only the assembled D boundary is client-visible.
         thinker_output_stage = self._duplexomni_thinker_output_stage()
         duplex_output_decision = (
             self._duplex_output_decision(stage_id, output, req_state) if stage_id == thinker_output_stage else None
@@ -3389,11 +3416,12 @@ class Orchestrator:
             "remote_prompt_token_ids",
             None,
         )
+        remote_prompt_offset = kv_prefill_params.pop("remote_prompt_token_offset", 0)
         decode_kv_params: dict[str, Any] = {
             "transfer_id": f"xfer-{req_id}",
         }
         if isinstance(remote_prompt_token_ids, (list, tuple)):
-            decode_kv_params["remote_prompt_tokens"] = len(remote_prompt_token_ids)
+            decode_kv_params["remote_prompt_tokens"] = remote_prompt_offset + len(remote_prompt_token_ids)
 
         if self._pd_bootstrap_addr:
             decode_kv_params["remote_bootstrap_addr"] = self._pd_bootstrap_addr
@@ -3433,13 +3461,35 @@ class Orchestrator:
         if not isinstance(remote_prompt_token_ids, (list, tuple)):
             raise RuntimeError(f"[Orchestrator][PD] native P boundary lacks remote prompt tokens for req={req_id}")
 
+        offset = kv_params.get("remote_prompt_token_offset", 0)
+        if type(offset) is not int or offset < 0:
+            raise RuntimeError(f"Invalid native P prompt offset for req={req_id}: {offset!r}")
+        if offset:
+            previous = req_state.streaming.bridge_states.get("pd_duplex_remote_prompt_token_ids")
+            if not isinstance(previous, (list, tuple)) or len(previous) != offset:
+                raise RuntimeError(f"Native P prompt delta has no matching prefix for req={req_id}: offset={offset}")
+            remote_prompt_token_ids = [*previous, *remote_prompt_token_ids]
+
         self._pd_kv_params[req_id] = dict(kv_params)
         actual_prefix_ids = (
             remote_prompt_token_ids
             if isinstance(remote_prompt_token_ids, list)
             else [int(token_id) for token_id in remote_prompt_token_ids]
         )
-        p_sampled_ids = list(req_state.streaming.segment_token_ids)
+        # This route runs in a detached task. The shared streaming scratchpad
+        # can already describe a later Talker/Code2Wav poll when we get here.
+        # Read the immutable P boundary itself, never another stage's tokens.
+        raw_ids = getattr(output, "new_token_ids", None)
+        if raw_ids is None:
+            completions = getattr(output, "outputs", None)
+            if isinstance(completions, (list, tuple)) and len(completions) == 1:
+                raw_ids = getattr(completions[0], "token_ids", None)
+        p_sampled_ids = self._coerce_int_list(raw_ids)
+        if len(p_sampled_ids) != 1:
+            raise RuntimeError(
+                f"Native P boundary must own exactly one sampled token for req={req_id}; "
+                f"boundary_tokens={p_sampled_ids[:21]}"
+            )
         decode_prompt: dict[str, Any] = {
             "prompt_token_ids": [
                 *actual_prefix_ids,
@@ -3464,6 +3514,10 @@ class Orchestrator:
                 if isinstance(source_duplex, dict):
                     decode_model_buffer["duplex"] = {
                         key: copy.deepcopy(value) for key, value in source_duplex.items() if key != "payload"
+                    }
+                    source_payload = source_duplex.get("payload") or {}
+                    decode_model_buffer["duplex"]["payload"] = {
+                        key: source_payload[key] for key in ("force_listen", "is_speech") if key in source_payload
                     }
                 decode_prompt["model_intermediate_buffer"] = decode_model_buffer
         bridge = req_state.streaming.bridge_states
@@ -3498,6 +3552,31 @@ class Orchestrator:
         if isinstance(active_slot, dict):
             active_slot["prompt_tokens"] = len(decode_prompt["prompt_token_ids"])
         p_mm_output = self._completion_multimodal_output(output, None)
+        policy_snapshot = p_mm_output.get(SAMPLING_STATE_WIRE_KEY)
+        if policy_snapshot is None:
+            nested_meta = p_mm_output.get("meta")
+            policy_snapshot = nested_meta.get(SAMPLING_STATE_KEY) if isinstance(nested_meta, dict) else None
+        policy_state, identity = unpack_sampling_state(policy_snapshot)
+        decode_duplex = decode_prompt["model_intermediate_buffer"]["duplex"]
+        decode_duplex["pd_media_prefix_tokens"] = len(actual_prefix_ids)
+        expected_identity = (
+            int(decode_duplex.get("incarnation", 0)),
+            decode_duplex.get("epoch"),
+            decode_duplex.get("seq"),
+        )
+        if identity != expected_identity or policy_state.current_segment_output_tokens != p_sampled_ids:
+            raise RuntimeError(
+                "Native P sampling state does not match the KV handoff boundary: "
+                f"expected_identity={expected_identity} actual_identity={identity} "
+                f"boundary_tokens={p_sampled_ids} "
+                f"state_tokens={policy_state.current_segment_output_tokens[:21]}"
+            )
+        # The full prompt is released immediately after D submission. Only
+        # retain the small identity needed to validate its later completion.
+        bridge["pd_duplex_sampling_identity"] = expected_identity
+        decode_duplex["payload"][SAMPLING_STATE_KEY] = (
+            policy_snapshot.tolist() if isinstance(policy_snapshot, torch.Tensor) else list(policy_snapshot)
+        )
         if p_mm_output:
             p_mm_output = unflatten_payload(dict(p_mm_output))
             if isinstance(active_slot, dict):
@@ -3536,6 +3615,26 @@ class Orchestrator:
                     special_ids[key.removeprefix("meta.")] = value
             if special_ids:
                 bridge["pd_duplex_special_token_ids"] = special_ids
+        special_ids = bridge.get("pd_duplex_special_token_ids", {})
+        bridge["pd_duplex_terminal_replay"] = len(p_sampled_ids) == 1 and p_sampled_ids[0] in {
+            special_ids.get(key, -1) for key in (
+                "listen_token_id", "chunk_eos_token_id", "chunk_tts_eos_token_id")
+        }
+
+    @staticmethod
+    def _capture_native_pd_sampling_feedback(output: Any, req_state: OrchestratorRequestState) -> None:
+        """Require D's exact post-sample policy state before admitting the next P unit."""
+        metadata = Orchestrator._completion_multimodal_output(output, None)
+        value = metadata.get(SAMPLING_STATE_WIRE_KEY)
+        if value is None:
+            nested = metadata.get("meta")
+            value = nested.get(SAMPLING_STATE_KEY) if isinstance(nested, dict) else None
+        state, identity = unpack_sampling_state(value)
+        bridge = req_state.streaming.bridge_states
+        expected = bridge["pd_duplex_sampling_identity"]
+        if identity != expected or state.current_segment_output_tokens != bridge["pd_duplex_feedback_token_ids"]:
+            raise RuntimeError("Native D sampling state does not match completed segment")
+        bridge["pd_duplex_feedback_sampling_state"] = value.tolist() if isinstance(value, torch.Tensor) else list(value)
 
     @staticmethod
     def _ensure_native_duplex_pd_talker_metadata(
@@ -3570,6 +3669,7 @@ class Orchestrator:
             last_prompt_token = int(prompt_ids[-1]) if prompt_ids else None
         if prompt_len < 0:
             return
+        metadata["duplex_pd_decode"] = True
         metadata.pop(NATIVE_PROMPT_TOKEN_IDS_KEY, None)
         metadata.setdefault(NATIVE_PROMPT_LEN_KEY, prompt_len)
         metadata.setdefault(
@@ -3969,6 +4069,12 @@ class Orchestrator:
             if prompt_token_ids is not None
             else self._pd_decode_inputs(req_state)
         )
+        if prompt_token_ids is not None and isinstance(req_state.prompt, dict):
+            # Predicted native P prompts contain AV placeholders. Dropping
+            # their salt here would import another session's KV during early
+            # registration even if the later formal D request is salted.
+            if cache_salt := req_state.prompt.get("cache_salt"):
+                decode_inputs[0]["cache_salt"] = cache_salt
         if len(decode_inputs) != 1:
             # The current Thinker path creates exactly one finite request.  Do
             # not silently pre-register only part of a batched prompt.

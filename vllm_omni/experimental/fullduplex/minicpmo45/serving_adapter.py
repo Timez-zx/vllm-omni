@@ -90,6 +90,7 @@ class MiniCPMO45ServingRuntimeAdapter:
             active_response_turn_id=active_response_turn_id,
             active_response_id=active_response_id,
             auto_responds=auto_responds,
+            require_native_audio_chunk_identity=auto_responds,
             response_format=response_format,
             speed=speed,
             modalities=modalities,

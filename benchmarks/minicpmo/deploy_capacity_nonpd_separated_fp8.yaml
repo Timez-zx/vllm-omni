@@ -1,0 +1,15 @@
+# Matched experiment B: Encoder GPU 1; Thinker + Talker GPU 0; Code2Wav GPU 2.
+# No P/D split. Both modalities retain their asynchronous arrival sidecars.
+base_config: deploy_capacity_nonpd_colocated_fp8.yaml
+stages:
+  - stage_id: 0
+    env:
+      VLLM_OMNI_AUX_VISIBLE_DEVICES: "1"
+      MINICPMO45_VISION_ENCODER_DEVICE: "cuda:1"
+      MINICPMO45_AUDIO_ENCODER_DEVICE: "cuda:1"
+      MINICPMO45_VISION_ENCODER_BATCH_SIZE: "16"
+      MINICPMO45_AUDIO_ENCODER_BATCH_SIZE: "16"
+      MINICPMO45_MAX_ARRIVAL_VISION_CACHE_ENTRIES: "0"
+      MINICPMO45_MAX_ARRIVAL_AUDIO_CACHE_ENTRIES: "0"
+  - stage_id: 2
+    devices: "2"

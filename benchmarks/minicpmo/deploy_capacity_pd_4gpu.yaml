@@ -1,6 +1,6 @@
 # Formal MiniCPM-o 4.5 native-duplex P/D capacity topology:
-# GPU 0 Thinker-P, GPU 1 Thinker-D, GPU 2 Vision Encoder,
-# GPU 3 Audio Encoder + Talker + Code2Wav.
+# GPU 0 Thinker-P, GPU 1 Thinker-D, GPU 2 Vision + Audio Encoders,
+# GPU 3 Talker + Code2Wav.
 base_config: ../../vllm_omni/deploy/minicpmo_4_5_pd_4gpu.yaml
 pipeline: minicpmo_4_5_pd
 session_mode: duplex
@@ -16,3 +16,60 @@ duplex_session:
   max_pending_turns_per_session: 4
   max_sessions: 64
   completed_append_cache_size: 256
+
+stages:
+  - stage_id: 0
+    # Logical session coordinates keep growing; resident attention/KV stays
+    # bounded to 36k. This is token-level SWA, not prompt recycling or a
+    # claim of equivalence to MiniCPM's full-attention/whole-unit policy.
+    max_model_len: 262144
+    hf_overrides:
+      vllm_omni_minicpmo_pd_prefill: true
+      vllm_omni_minicpmo_sliding_window_tokens: 36000
+      use_sliding_window: true
+      sliding_window: 36000
+      max_window_layers: 32
+      max_position_embeddings: 262144
+    engine_extras:
+      # Fixed across placement A/B. Do not derive KV capacity from free VRAM.
+      kv_cache_memory_bytes: 68719476736
+    env:
+      # Stage 0 sees physical GPU 0 as cuda:0 and physical GPU 2 as
+      # cuda:1. Keep both modality encoders on the dedicated encoder GPU.
+      VLLM_NIXL_SIDE_CHANNEL_PORT: "5600"
+      VLLM_OMNI_AUX_VISIBLE_DEVICES: "2"
+      MINICPMO45_VISION_ENCODER_DEVICE: "cuda:1"
+      MINICPMO45_VISION_ENCODER_BATCH_SIZE: "16"
+      MINICPMO45_AUDIO_ENCODER_DEVICE: "cuda:1"
+      MINICPMO45_AUDIO_ENCODER_BATCH_SIZE: "16"
+      MINICPMO45_MAX_ARRIVAL_VISION_CACHE_ENTRIES: "0"
+      MINICPMO45_MAX_ARRIVAL_AUDIO_CACHE_ENTRIES: "0"
+
+  - stage_id: 1
+    max_model_len: 262144
+    hf_overrides:
+      vllm_omni_minicpmo_pd_decode: true
+      vllm_omni_minicpmo_sliding_window_tokens: 36000
+      use_sliding_window: true
+      sliding_window: 36000
+      max_window_layers: 32
+      max_position_embeddings: 262144
+    engine_extras:
+      kv_cache_memory_bytes: 68719476736
+
+  - stage_id: 2
+    # Talker can keep speaking across enough units to exceed its original
+    # 4096-position input buffer even when Thinker has already slid safely.
+    max_model_len: 65536
+    # Talker inputs are projected hidden rows and privately sampled codec
+    # IDs, not its binary scheduler tokens. No cross-request APC identity
+    # can be inferred from those placeholders. Live-session KV and SWA
+    # remain enabled; only lookup/reuse across requests is disabled here.
+    enable_prefix_caching: false
+    hf_overrides:
+      vllm_omni_minicpmo_talker_sliding_window_tokens: 4096
+    engine_extras:
+      # 2 GiB holds only 34,944 native Talker tokens in total. Long speaking
+      # turns across 16 sessions can exhaust that independently of P/D SWA.
+      # Keep the budget fixed across capacity points and audit preemptions.
+      kv_cache_memory_bytes: 8589934592

@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import queue
 import threading
+from collections import OrderedDict
 from time import monotonic
 from typing import TYPE_CHECKING, Any
 
@@ -29,6 +30,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
     NixlPushConnector,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    PUSH_REG_NOTIF_PREFIX,
     NixlConnectorMetadata,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_scheduler import (
@@ -38,6 +40,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
     NixlPushConnectorWorker,
 )
 from vllm.logger import init_logger
+from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -111,11 +114,13 @@ def _select_delta_source_blocks(
     source_block_offset: int,
     source_block_size: int,
     decode_block_size: int,
+    source_block_indices: list[list[int]] | None = None,
 ) -> BlockIds:
     """Select P blocks corresponding exactly to D's cache-miss suffix.
 
-    The current Thinker P/D deployment uses identical logical block sizes and
-    full-attention cache groups on both sides.  Explicitly reject a different
+    P/D must use identical logical block sizes. Full-attention groups use a
+    suffix offset; uniform sliding-window groups use absolute logical indices
+    because expired prefix positions contain null blocks. Reject a different
     layout instead of falling back to upstream's front-truncation, which could
     silently install KV for the wrong token positions.
     """
@@ -130,8 +135,21 @@ def _select_delta_source_blocks(
         raise ValueError(f"P/D KV cache group count differs: P={len(source_block_ids)}, D={len(destination_block_ids)}")
 
     selected: list[list[int]] = []
+    if source_block_indices is not None and len(source_block_indices) != len(source_block_ids):
+        raise ValueError("P/D positional block index group count differs")
     for group_idx, (source_group, destination_group) in enumerate(zip(source_block_ids, destination_block_ids)):
         count = len(destination_group)
+        if source_block_indices is not None:
+            indices = source_block_indices[group_idx]
+            if len(indices) != count or indices != sorted(set(indices)):
+                raise ValueError("P/D window indices must be unique, ordered and match destination blocks")
+            if any(i < 0 or i >= len(source_group) for i in indices):
+                raise ValueError("D requested window blocks outside P's completed prompt")
+            # Block zero is vLLM's null/padding block, never transferable KV.
+            if any(source_group[i] == 0 for i in indices):
+                raise ValueError("D requested KV already outside P's retained window")
+            selected.append([source_group[i] for i in indices])
+            continue
         end = source_block_offset + count
         if end > len(source_group):
             raise ValueError(
@@ -211,8 +229,26 @@ class NixlDeltaPushConnectorScheduler(NixlPushConnectorScheduler):
         kv_cache_config: KVCacheConfig,
     ):
         super().__init__(vllm_config, engine_id, kv_cache_config)
-        if self._is_hma_required:
-            raise NotImplementedError("NixlDeltaPushConnector currently supports full-attention cache groups only.")
+        self._numerical_transfer_probe = None
+        numerical_probe_dir = os.environ.get("MINICPMO45_NUMERICAL_PROBE_DIR", "")
+        if numerical_probe_dir:
+            from vllm_omni.engine.kv_transfer_probe import TransferProbe
+
+            self._numerical_transfer_probe = TransferProbe(numerical_probe_dir, role="scheduler")
+        specs = [g.kv_cache_spec for g in kv_cache_config.kv_cache_groups]
+        self._windowed_kv = bool(specs) and all(isinstance(s, SlidingWindowSpec) for s in specs)
+        if self._is_hma_required and not self._windowed_kv:
+            raise NotImplementedError("Delta push supports uniform full-attention or sliding-window KV only.")
+        if self._windowed_kv and len({(s.sliding_window, s.block_size) for s in specs}) != 1:
+            raise NotImplementedError("Delta push requires identical sliding windows and block sizes across groups.")
+        self._window_audit_bucket: OrderedDict[str, int] = OrderedDict()
+
+    def get_sw_clipped_blocks(self, block_ids: BlockIds) -> BlockIds:
+        if getattr(self, "_windowed_kv", False):
+            # Preserve absolute logical indices on P, including null holes.
+            # D explicitly names only its live, unhashed destination positions.
+            return block_ids
+        return super().get_sw_clipped_blocks(block_ids)
 
     def _bytes_per_block_by_group(self) -> tuple[int, ...] | None:
         """Return request-level bytes per logical block for each cache group.
@@ -305,6 +341,16 @@ class NixlDeltaPushConnectorScheduler(NixlPushConnectorScheduler):
         )
         registration.update(evidence)
         params.update(evidence)
+        probe = getattr(self, "_numerical_transfer_probe", None)
+        if probe is not None:
+            from vllm_omni.engine.kv_transfer_probe import WIRE_KEY
+
+            identity = probe.registration(
+                request,
+                layer_names=[group.layer_names for group in self.kv_cache_config.kv_cache_groups],
+            )
+            if identity is not None:
+                registration[WIRE_KEY] = identity
 
     def update_state_after_alloc(
         self,
@@ -374,6 +420,15 @@ class NixlDeltaPushConnectorScheduler(NixlPushConnectorScheduler):
             if registration is None:
                 raise RuntimeError(f"NIXL delta push registration was not staged for {request.request_id}")
             registration.update(fields)
+            if getattr(self, "_windowed_kv", False):
+                source_indices = [
+                    [i for i, block in enumerate(group) if block.block_hash is None and not block.is_null]
+                    for group in blocks.blocks
+                ]
+                destination = registration["local_block_ids"]
+                if [len(group) for group in source_indices] != [len(group) for group in destination]:
+                    raise RuntimeError("Windowed delta destination/index count mismatch")
+                registration["source_block_indices"] = source_indices
             self._attach_transfer_evidence(
                 request,
                 registration,
@@ -455,6 +510,27 @@ class NixlDeltaPushConnectorScheduler(NixlPushConnectorScheduler):
             request,
             block_ids,
         )
+        if getattr(self, "_windowed_kv", False):
+            window = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec.sliding_window
+            logical = request.num_computed_tokens
+            # Low-frequency physical residency evidence, outside GPU timing.
+            logical_id = request.request_id if request.resumable else request.request_id.rsplit("-", 1)[0]
+            bucket = max(0, logical - window) // (self.block_size * 512)
+            if logical > window and self._window_audit_bucket.get(logical_id, -1) != bucket:
+                self._window_audit_bucket[logical_id] = bucket
+                self._window_audit_bucket.move_to_end(logical_id)
+                if len(self._window_audit_bucket) > 4096:
+                    self._window_audit_bucket.popitem(last=False)
+                logger.info(
+                    "[kv-window] request=%s logical_tokens=%d window_tokens=%d resident_blocks=%s "
+                    "pinned_prefix_tokens=%d pinned_resident_blocks=%s",
+                    request.request_id, logical, window,
+                    [sum(block != 0 for block in group) for group in block_ids],
+                    getattr(self.kv_cache_config.kv_cache_groups[0].kv_cache_spec, "pinned_prefix_tokens", 0),
+                    [sum(block != 0 for block in group[:getattr(
+                        self.kv_cache_config.kv_cache_groups[0].kv_cache_spec,
+                        "pinned_prefix_tokens", 0) // self.block_size]) for group in block_ids],
+                )
         if (
             _LOG_CONNECTOR_DIAG
             and _is_formal_handoff_diagnostic(request.request_id)
@@ -498,6 +574,12 @@ class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        self._numerical_transfer_probe = None
+        numerical_probe_dir = os.environ.get("MINICPMO45_NUMERICAL_PROBE_DIR", "")
+        if numerical_probe_dir:
+            from vllm_omni.engine.kv_transfer_probe import TransferProbe
+
+            self._numerical_transfer_probe = TransferProbe(numerical_probe_dir, role="worker")
         self._delta_load_started: dict[str, float] = {}
         self._delta_registration_enqueued: dict[str, float] = {}
         # Cache-only D imports are driven by an EngineCore control operation,
@@ -510,14 +592,70 @@ class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
         self._deferred_regular_finished_recving: set[str] = set()
         self._completion_notif_seen: dict[str, float] = {}
         self._completion_notif_lock = threading.Lock()
-        # The inherited writer parks when it has no unmatched P blocks.  A
-        # get_finished() call wakes it and may race its notification drain.
-        # The callback/event below lets the same Core poll wait at most 1 ms
-        # and retry, avoiding both an extra model step and continuous polling.
+        # Core can still race the independently progressing writer's drain.
+        # Let a cache-only control poll wait at most 1 ms for its callback and
+        # retry here instead of deferring activation to another model step.
         self._completion_notif_available = threading.Event()
         self._pending_completion_notifs = _TimestampedNotifQueue(
             self._record_completion_notification
         )
+
+    def _progress_pending_writes(self) -> None:
+        # UCX/NIXL 1.4 sends a deferred completion notification in checkXfer,
+        # not just in its native progress thread. Waiting for get_finished()
+        # here would hold D behind P's next model batch even after DMA ended.
+        # Only progress status: Core retains telemetry, failure handling,
+        # handle release and block/lease ownership. Use the same lifetime lock.
+        with self._sending_transfers_lock:
+            for handles in self._sending_transfers.values():
+                for handle in handles:
+                    self.nixl_wrapper.check_xfer_state(handle)
+
+    def _push_writer_loop(self) -> None:
+        """Native inbox protocol with independent send/receive progress."""
+        while not self._push_writer_stop.is_set():
+            try:
+                while True:
+                    try:
+                        rid, registration = self._reg_send_inbox.get_nowait()
+                    except queue.Empty:
+                        break
+                    self._send_registration_to_p(rid, registration)
+                while True:
+                    try:
+                        rid, blocks = self._finished_blocks_inbox.get_nowait()
+                    except queue.Empty:
+                        break
+                    registration = self._pop_matching_registration(rid)
+                    if registration is None:
+                        self._push_finished_blocks[rid] = blocks
+                    else:
+                        self._do_start_push_kv(rid, blocks, registration)
+                while True:
+                    try:
+                        rid = self._evict_finished_inbox.get_nowait()
+                    except queue.Empty:
+                        break
+                    self._push_finished_blocks.pop(rid, None)
+                    self._pending_d_registrations.pop(rid, None)
+                self._progress_pending_writes()
+                for notifications in self.nixl_wrapper.get_new_notifs().values():
+                    for notification in notifications:
+                        if notification.startswith(PUSH_REG_NOTIF_PREFIX):
+                            self._handle_push_reg_notif(notification)
+                        else:
+                            self._pending_completion_notifs.put(notification)
+            except Exception:
+                logger.exception("nixl-delta-push-writer error; continuing")
+            pending = (
+                self._push_finished_blocks
+                or self._sending_transfers
+                or self._recving_metadata
+            )
+            self._push_writer_wake.wait(
+                _DIRECT_COMPLETION_WAKE_TIMEOUT_S if pending else None
+            )
+            self._push_writer_wake.clear()
 
     def _record_completion_notification(self, notification: bytes) -> None:
         if notification.startswith(b"HB:"):
@@ -554,6 +692,10 @@ class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
 
     def start_load_kv(self, metadata: NixlConnectorMetadata) -> None:
         """Timestamp D registration through completed KV installation."""
+        probe = getattr(self, "_numerical_transfer_probe", None)
+        if probe is not None:
+            for registration in metadata.push_registrations.values():
+                probe.register_receiver(registration)
         if not hasattr(self, "_delta_registration_enqueued"):
             self._delta_registration_enqueued = {}
         if _LOG_CONNECTOR_DIAG:
@@ -640,6 +782,9 @@ class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
             self._deferred_regular_finished_recving = set()
         self._ensure_direct_progress_state()
         done_sending, done_recving = super().get_finished()
+        probe = getattr(self, "_numerical_transfer_probe", None)
+        if probe is not None:
+            probe.receive_ready(done_recving)
         if _LOG_CONNECTOR_DIAG:
             now = monotonic()
             for req_id in done_recving:
@@ -680,7 +825,7 @@ class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
         self._direct_cache_sync_req_ids.update(metadata.reqs_to_recv)
         self.start_load_kv(metadata)
 
-    def poll_direct_cache_sync(self) -> set[str]:
+    def poll_direct_cache_sync(self, wait_for_completion: bool = True) -> set[str]:
         """Return only cache-only completions, preserving normal completions."""
         self._ensure_direct_progress_state()
         self._completion_notif_available.clear()
@@ -691,7 +836,8 @@ class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
         # and retry inside this same Core step instead of deferring activation
         # until another potentially long model batch completes.
         if (
-            not self._direct_cache_sync_finished
+            wait_for_completion
+            and not self._direct_cache_sync_finished
             and self._direct_cache_sync_req_ids
             and self._completion_notif_available.wait(
                 _DIRECT_COMPLETION_WAKE_TIMEOUT_S
@@ -710,6 +856,32 @@ class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
         self._deferred_regular_finished_sending.clear()
         self._deferred_regular_finished_recving.clear()
         return done_sending, done_recving
+
+    def _xfer_blocks(self, *args: Any, **kwargs: Any):
+        handle = super()._xfer_blocks(*args, **kwargs)
+        probe = getattr(self, "_numerical_transfer_probe", None)
+        if probe is not None:
+            # Upstream calls this with named arguments. The handle exists
+            # only after NIXL transfer(handle) returned successfully.
+            probe.submitted(kwargs["request_id"], handle)
+        return handle
+
+    def _handle_failed_transfer(self, req_id: str, handle: int | None):
+        probe = getattr(self, "_numerical_transfer_probe", None)
+        if probe is not None:
+            probe.failed(req_id)
+        return super()._handle_failed_transfer(req_id, handle)
+
+    def _pop_done_transfers(self, transfers):
+        # This method consumes actual NIXL handle states. get_finished()'s
+        # broader done_sending also includes expired leases and is NOT proof
+        # of successful transfer. Failed handles are tracked by the hook above.
+        is_write = transfers is getattr(self, "_sending_transfers", None)
+        done = super()._pop_done_transfers(transfers)
+        probe = getattr(self, "_numerical_transfer_probe", None)
+        if probe is not None and is_write:
+            probe.completed(done)
+        return done
 
     def _do_start_push_kv(
         self,
@@ -730,6 +902,7 @@ class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
 
         source_groups = self._as_grouped_block_ids(local_block_ids)
         destination_groups = self._as_grouped_block_ids(registration_data["local_block_ids"])
+        probe = getattr(self, "_numerical_transfer_probe", None)
         if not any(destination_groups):
             evidence_blocks = registration_data.get(
                 _KV_TRANSFER_SELECTED_BLOCKS,
@@ -745,6 +918,10 @@ class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
             # as done and release P's request-scoped block lease.
             with self._sending_transfers_lock:
                 self._sending_transfers[request_id] = []
+            if probe is not None and probe.begin(
+                request_id, registration_data, (), block_size=self.block_size
+            ):
+                probe.seal(request_id, no_write=True)
             if _LOG_CONNECTOR_DIAG:
                 logger.info(
                     "[nixl-delta-push] request=%s prefix_tokens=%d full_hit=true",
@@ -758,6 +935,7 @@ class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
             source_block_offset=int(registration_data["source_block_offset"]),
             source_block_size=self.block_size,
             decode_block_size=int(registration_data["decode_block_size"]),
+            source_block_indices=registration_data.get("source_block_indices"),
         )
         selected_block_count = sum(len(group) for group in selected_source)
         evidence_blocks = int(
@@ -780,11 +958,17 @@ class NixlDeltaPushConnectorWorker(NixlPushConnectorWorker):
                 total_source_blocks,
                 delta_source_blocks,
             )
+        if probe is not None:
+            probe.begin(request_id, registration_data, selected_source, block_size=self.block_size)
         super()._do_start_push_kv(
             request_id,
             selected_source,
             registration_data,
         )
+        if probe is not None:
+            # A concurrent Core poll may finish all handles before the writer
+            # returns here. The probe waits for both sealing and completion.
+            probe.seal(request_id)
         if _LOG_CONNECTOR_DIAG:
             diag_end = monotonic()
             logger.info(

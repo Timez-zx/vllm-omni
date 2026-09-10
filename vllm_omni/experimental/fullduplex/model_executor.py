@@ -6,6 +6,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from vllm.v1.outputs import SamplerOutput
+
+
+@dataclass
+class DuplexSamplerOutput(SamplerOutput):
+    """Rows deliberately not sampled must not trigger a generic RNG rewind."""
+
+    skipped_sampling_request_ids: tuple[str, ...] = ()
+
 
 @dataclass(frozen=True, slots=True)
 class DuplexSamplingRow:
@@ -18,6 +27,8 @@ class DuplexSamplingRow:
     seq: int | None
     payload: dict[str, object] | None
     max_tokens: int | None
+    epoch: int | None = None
+    should_sample: bool = True
 
 
 class DuplexSamplingHelper:
@@ -58,6 +69,7 @@ class DuplexSamplingHelper:
         rows: list[DuplexSamplingRow] = []
         req_ids = [str(req_id) for req_id in getattr(runner.input_batch, "req_ids", [])]
         requests = getattr(runner, "requests", {})
+        discard_mask = getattr(getattr(runner, "discard_request_mask", None), "np", None)
         for row_idx, req_id in enumerate(req_ids):
             if req_id not in self.active_request_ids:
                 continue
@@ -79,6 +91,8 @@ class DuplexSamplingHelper:
             payload = duplex.get("payload")
             if not isinstance(payload, dict):
                 payload = None
+            raw_epoch = duplex.get("epoch")
+            epoch = int(raw_epoch) if raw_epoch is not None else None
             request = requests.get(req_id) if isinstance(requests, dict) else None
             sampling_params = getattr(request, "sampling_params", None)
             try:
@@ -94,6 +108,8 @@ class DuplexSamplingHelper:
                     seq=seq,
                     payload=payload,
                     max_tokens=max_tokens if max_tokens > 0 else None,
+                    epoch=epoch,
+                    should_sample=discard_mask is None or not bool(discard_mask[row_idx]),
                 )
             )
         return tuple(rows)
@@ -103,4 +119,4 @@ class DuplexSamplingHelper:
         self.hook_active = False
 
 
-__all__ = ["DuplexSamplingHelper", "DuplexSamplingRow"]
+__all__ = ["DuplexSamplerOutput", "DuplexSamplingHelper", "DuplexSamplingRow"]

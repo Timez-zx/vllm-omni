@@ -26,6 +26,20 @@ from benchmarks.minicpmo.clean_server import main as clean_server_main
 from benchmarks.minicpmo.continuous_av import _pd_completion_records
 
 
+def test_looped_av_tracks_share_one_boundary_without_resampling():
+    from benchmarks.minicpmo.continuous_av import _align_loop_media
+
+    pcm = bytes(range(256)) * 4415  # 35.32 s at 16 kHz PCM16
+    frames = [str(i) for i in range(35)]
+    trimmed, kept, duration = _align_loop_media(pcm, frames)
+    assert duration == 35.0
+    assert trimmed == pcm[:35 * 32000]
+    assert kept == frames
+    assert _align_loop_media(pcm[:64000], frames)[1:] == (frames[:2], 2.0)
+    with pytest.raises(ValueError, match="complete second"):
+        _align_loop_media(pcm[:30000], frames)
+
+
 def _request_id(session_id: str, sequence: int) -> str:
     encoded = base64.urlsafe_b64encode(session_id.encode()).decode().rstrip("=")
     return f"duplex-s.{encoded}.i.0.e.0.r.stage0-{sequence:08x}"
@@ -117,19 +131,30 @@ def test_deploy_config_provenance_resolves_and_hashes_exact_yaml(tmp_path) -> No
     }
 
 
-def test_formal_capacity_workload_requires_long_randomized_production_run() -> None:
+@pytest.mark.parametrize("functional_only", [False, True])
+def test_formal_capacity_workload_requires_long_randomized_production_run(functional_only) -> None:
     run = {
         "config": {
             "duration_s": 180,
+            "max_send_drift_ms": 10,
             "workload_profile": "production",
             "phase_window_s": 1.0,
             "force_listen_count": None,
             "server_trace_frame_audit_requested": False,
         },
-        "users": [{"phase_s": 0.1}, {"phase_s": 0.7}],
+        "users": [{"phase_s": phase, "units_sent": 180, "send_drift_ms": {"count": 900, "max": 2}}
+                  for phase in (0.1, 0.7)],
     }
 
+    if functional_only:
+        run["measurement_purpose"] = "serving_contract_validation"
     result = _formal_capacity_workload_validity(run)
+
+    if functional_only:
+        assert result["valid"] is False
+        assert result["classification"] == "serving_contract_validation"
+        assert result["violations"] == ["capacity_measurement_requested"]
+        return
 
     assert result["valid"] is True
     assert result["classification"] == "formal_capacity"
@@ -253,7 +278,8 @@ def test_diagnostic_server_preserves_cli_flags_in_provenance(
     assert provenance["diagnostics"]["all_disabled"] is False
 
 
-def test_cleanliness_accepts_complete_clean_prefix_lineage(tmp_path) -> None:
+@pytest.mark.parametrize("extra_remote_replay", [False, True])
+def test_cleanliness_accepts_complete_clean_prefix_lineage(tmp_path, extra_remote_replay) -> None:
     repo = str(tmp_path / "repo")
     log = tmp_path / "server.log"
     log.write_text(
@@ -276,10 +302,10 @@ def test_cleanliness_accepts_complete_clean_prefix_lineage(tmp_path) -> None:
                             {
                                 "sequence": 4,
                                 "prompt_tokens": 1000,
-                                "cached_tokens": 998,
+                                "cached_tokens": 999 - int(extra_remote_replay),
                                 "local_cached_tokens": 500,
-                                "external_cached_tokens": 498,
-                                "computed_tokens": 2,
+                                "external_cached_tokens": 499 - int(extra_remote_replay),
+                                "computed_tokens": 1 + int(extra_remote_replay),
                                 "kv_transfer_selected_blocks": 32,
                                 "kv_transfer_selected_tokens": 499,
                                 "kv_transfer_selected_bytes": 262_144,
@@ -293,7 +319,7 @@ def test_cleanliness_accepts_complete_clean_prefix_lineage(tmp_path) -> None:
                                 "external_cached_tokens": 9,
                                 "computed_tokens": 1,
                                 "kv_transfer_selected_blocks": 1,
-                                "kv_transfer_selected_tokens": 10,
+                                "kv_transfer_selected_tokens": 9,
                                 "kv_transfer_selected_bytes": 8192,
                                 "kv_transfer_write_submit_to_d_ready_ms": -1.0,
                             },
@@ -308,6 +334,11 @@ def test_cleanliness_accepts_complete_clean_prefix_lineage(tmp_path) -> None:
         _provenance(repo),
     )
 
+    if extra_remote_replay:
+        assert result["valid"] is False
+        assert result["decode_prefix_cache"]["mismatches"] == 1
+        assert result["physical_d_kv_transfer"]["valid"] is False
+        return
     assert result["valid"] is True
     assert result["decode_prefix_cache"]["records"] == 2
     assert (
@@ -315,6 +346,8 @@ def test_cleanliness_accepts_complete_clean_prefix_lineage(tmp_path) -> None:
         == "client_physical_completion_witness"
     )
     assert result["decode_prefix_cache"]["mismatches"] == 0
+    assert result["decode_prefix_cache"]["expected_uncached_suffix_tokens"] == [1]
+    assert result["decode_prefix_cache"]["expected_locally_computed_tokens"] == [1]
     assert result["checks"]["physical_d_kv_transfer_evidence_complete"] is True
     assert result["physical_d_kv_transfer"]["valid"] is True
     assert (
@@ -646,10 +679,10 @@ def test_audio_sidecar_fallback_invalidates_cleanliness(tmp_path) -> None:
     record = {
         "sequence": 1,
         "prompt_tokens": 1000,
-        "cached_tokens": 998,
+        "cached_tokens": 999,
         "local_cached_tokens": 500,
-        "external_cached_tokens": 498,
-        "computed_tokens": 2,
+        "external_cached_tokens": 499,
+        "computed_tokens": 1,
         "kv_transfer_selected_blocks": 32,
         "kv_transfer_selected_tokens": 499,
         "kv_transfer_selected_bytes": 262_144,
@@ -688,7 +721,8 @@ def test_audio_sidecar_fallback_invalidates_cleanliness(tmp_path) -> None:
     assert result["client_audio_sidecar_audit"]["audio_fallback_units"] == 1
 
 
-def test_clean_formal_analysis_needs_no_per_request_server_log(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("functional_only", [False, True])
+def test_clean_formal_analysis_needs_no_per_request_server_log(tmp_path, monkeypatch, functional_only) -> None:
     log = tmp_path / "server.log"
     run_path = tmp_path / "run.json"
     provenance_path = tmp_path / "provenance.json"
@@ -702,10 +736,10 @@ def test_clean_formal_analysis_needs_no_per_request_server_log(tmp_path, monkeyp
             "done_at_s": 10.4,
             "e2e_ms": 400.0,
             "prompt_tokens": 1000,
-            "cached_tokens": 998,
+            "cached_tokens": 999,
             "local_cached_tokens": 500,
-            "external_cached_tokens": 498,
-            "computed_tokens": 2,
+            "external_cached_tokens": 499,
+            "computed_tokens": 1,
             "kv_transfer_selected_blocks": 32,
             "kv_transfer_selected_tokens": 499,
             "kv_transfer_selected_bytes": 262_144,
@@ -728,7 +762,7 @@ def test_clean_formal_analysis_needs_no_per_request_server_log(tmp_path, monkeyp
             "external_cached_tokens": 9,
             "computed_tokens": 1,
             "kv_transfer_selected_blocks": 1,
-            "kv_transfer_selected_tokens": 10,
+            "kv_transfer_selected_tokens": 9,
             "kv_transfer_selected_bytes": 8192,
             "kv_transfer_write_submit_to_d_ready_ms": -1.0,
             "input_video_frames": 1,
@@ -741,6 +775,7 @@ def test_clean_formal_analysis_needs_no_per_request_server_log(tmp_path, monkeyp
     run_path.write_text(
         json.dumps(
             {
+                "measurement_purpose": "serving_contract_validation" if functional_only else "capacity_exploration",
                 "started_epoch_s": 1.0,
                 "ended_epoch_s": 2.0,
                 "failed_users": 0,
@@ -822,11 +857,15 @@ def test_clean_formal_analysis_needs_no_per_request_server_log(tmp_path, monkeyp
     assert result["benchmark_valid"] is False
     assert result["capacity_pass"] is False
     assert result["formal_capacity_validity"]["classification"] == (
-        "development_screening"
+        "serving_contract_validation" if functional_only else "development_screening"
     )
-    assert result["benchmark_invalid_reasons"] == [
-        "workload:duration_at_least_180s"
+    assert result["benchmark_invalid_reasons"] == (["workload:capacity_measurement_requested"] if functional_only else []) + [
+        "workload:duration_at_least_180s", "workload:sender_timing_valid"
     ]
+    if functional_only:
+        assert result["input_capacity_pass"] is False
+        assert result["end_to_end_capacity_pass"] is False
+        assert result["capacity_exclusion_reason"]
     assert result["frame_audit"]["source"] == "client_physical_completion_witness"
     assert result["frame_audit"]["complete"] is True
     assert result["audio_sidecar_audit"]["arrival_audio_units"] == 2

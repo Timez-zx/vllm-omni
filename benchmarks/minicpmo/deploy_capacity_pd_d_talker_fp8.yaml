@@ -1,0 +1,12 @@
+# Four-stage native duplex pipeline with D and Talker sharing GPU 1 under MPS.
+# GPU 0: Thinker-P; GPU 1: Thinker-D + Talker;
+# GPU 2: Vision + Audio Encoder; GPU 3: Code2Wav.
+base_config: deploy_capacity_pd_4gpu_fp8.yaml
+
+stages:
+  - stage_id: 2
+    devices: "1"
+    # D has already allocated its fixed 64 GiB KV pool when Talker starts.
+    # The startup free-memory check must fit the remaining VRAM; the actual
+    # Talker KV budget stays at the inherited, explicit 8 GiB.
+    gpu_memory_utilization: 0.1

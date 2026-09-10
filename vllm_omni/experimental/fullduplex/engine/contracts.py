@@ -39,6 +39,20 @@ class DuplexOutputAction(str, Enum):
     DIRECT_RESPONSE = "direct_response"
 
 
+class DuplexContextLimitError(ValueError):
+    """Request-local safety limit, not window compression or KV continuation."""
+
+    def __init__(self, *, prompt_tokens: int, generation_tokens: int, max_model_len: int) -> None:
+        self.prompt_tokens = prompt_tokens
+        self.generation_tokens = generation_tokens
+        self.max_model_len = max_model_len
+        super().__init__(
+            f"Logical session context limit reached: {prompt_tokens} prompt tokens + "
+            f"{generation_tokens} reserved generation tokens exceeds max_model_len={max_model_len}. "
+            "This session must end; sliding KV residency does not provide unlimited logical positions."
+        )
+
+
 @dataclass
 class DuplexRuntimeCapabilities:
     input_modes: set[DuplexInputMode] = field(default_factory=lambda: {DuplexInputMode.TURN_COMMIT_ONLY})
@@ -257,6 +271,7 @@ def duplex_resource_request_belongs_to_session(request_id: str, session_id: str)
 __all__ = [
     "CorrelatedRpcTransport",
     "DuplexAppendPlan",
+    "DuplexContextLimitError",
     "DuplexControlPlanePort",
     "DuplexInputMode",
     "DuplexOutputAction",

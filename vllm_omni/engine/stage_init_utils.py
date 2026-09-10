@@ -1050,7 +1050,26 @@ def acquire_device_locks(
 
         if visible_devices_str:
             try:
-                physical_devices = [int(x.strip()) for x in visible_devices_str.split(",") if x.strip()]
+                visible_ids = [x.strip() for x in visible_devices_str.split(",") if x.strip()]
+                if any(device.startswith("GPU-") for device in visible_ids):
+                    import pynvml
+
+                    # UUID-based visibility must lock the same physical GPU
+                    # as ordinal-based visibility. Falling back to range(n)
+                    # aliases every single-GPU stage to GPU 0 and can deadlock
+                    # concurrent initialization while the spawn lock is held.
+                    pynvml.nvmlInit()
+                    try:
+                        physical_devices = [
+                            pynvml.nvmlDeviceGetIndex(pynvml.nvmlDeviceGetHandleByUUID(device))
+                            if device.startswith("GPU-")
+                            else int(device)
+                            for device in visible_ids
+                        ]
+                    finally:
+                        pynvml.nvmlShutdown()
+                else:
+                    physical_devices = [int(device) for device in visible_ids]
             except (ValueError, IndexError):
                 pass
 

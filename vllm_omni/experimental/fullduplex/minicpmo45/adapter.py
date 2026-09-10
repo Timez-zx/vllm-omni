@@ -35,6 +35,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
             "duplex_scheduler_token_id",
             "duplex_first_append_context_tokens",
             "duplex_context_window_trigger_tokens",
+            "duplex_kv_window_tokens",
             "ref_audio_data",
             "ref_audio_format",
             "ref_audio_sample_rate_hz",
@@ -92,6 +93,10 @@ class MiniCPMO45NativeDuplexServingAdapter:
             raise ValueError("ref_audio_path is not accepted by native duplex; use ref_audio URI instead")
         cls.validate_client_config(config)
         runtime_config: dict[str, object] = {"instructions": config.instructions}
+        hf_config = getattr(model_config, "hf_config", None)
+        window = getattr(hf_config, "vllm_omni_minicpmo_sliding_window_tokens", 0)
+        if isinstance(window, int) and not isinstance(window, bool) and window > 0:
+            runtime_config["duplex_kv_window_tokens"] = window
         cls._apply_default_scheduler_policy(runtime_config, config=config, model_config=model_config)
         cls._apply_context_window_policy(runtime_config, extra_body)
 
@@ -119,12 +124,14 @@ class MiniCPMO45NativeDuplexServingAdapter:
             wav_np, sr = await cls.resolve_ref_audio(ref_audio, model_config=model_config)
 
         wav_np = cls.normalize_ref_audio(wav_np, int(sr), target_sr=16000)
-        # Trim to a whole number of pooled audio embeddings (100 ms frames) so
-        # the first-append scheduler reserve can count them exactly.
-        usable = (len(wav_np) // MiniCPMO45DuplexPolicy.SAMPLES_PER_AUDIO_TOKEN) * (
-            MiniCPMO45DuplexPolicy.SAMPLES_PER_AUDIO_TOKEN
-        )
-        wav_np = wav_np[:usable]
+        if MiniCPMO45DuplexPolicy.audio_token_count(len(wav_np)) == 0:
+            raise MiniCPMO45ClientRuntimeConfigError(
+                "ref_audio is too short to produce a native audio embedding (requires at least 1281 samples at 16 kHz)",
+                code="ref_audio_too_short",
+            )
+        # Preserve the complete reference, including a partial final 100 ms.
+        # Count the actual processor rows for the scheduler instead of changing
+        # the media to fit an approximate token budget.
         ref_audio_bytes = np.ascontiguousarray(wav_np, dtype=np.float32).tobytes()
         runtime_config["ref_audio_data"] = base64.b64encode(ref_audio_bytes).decode("ascii")
         runtime_config["ref_audio_format"] = "pcm_f32le"
@@ -170,6 +177,11 @@ class MiniCPMO45NativeDuplexServingAdapter:
             "top_p": 0.8,
             "top_k": 20,
             "repetition_penalty": 1.05,
+            # Native streaming_generate ends units on its three model control
+            # tokens, not the chat backbone's EOS or stop strings.
+            "ignore_eos": True,
+            "stop": [],
+            "min_tokens": 0,
         }
         stop_token_ids = cls._native_stage0_stop_token_ids(model_config)
         if stop_token_ids:
@@ -224,7 +236,6 @@ class MiniCPMO45NativeDuplexServingAdapter:
             "chunk_eos_token_id",
             "chunk_tts_eos_token_id",
             "listen_token_id",
-            "turn_eos_token_id",
         )
         for field in stop_token_fields:
             token = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS[field]

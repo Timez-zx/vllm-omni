@@ -10,6 +10,35 @@ import torch
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_pinned_prefix_must_cover_entire_system_and_reference_context():
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import MiniCPMO45Stage0DuplexRuntime
+
+    helper = SimpleNamespace(stage_model=SimpleNamespace(config=SimpleNamespace(vllm_omni_pinned_prefix_tokens=128)))
+    state = SimpleNamespace(context_token_ids=[1] * 128)
+    validate = MiniCPMO45Stage0DuplexRuntime._validate_pinned_session_context
+    validate(helper, state)
+    state.context_token_ids.append(1)
+    with pytest.raises(ValueError, match="exceeding pinned prefix"):
+        validate(helper, state)
+    helper.stage_model.config.vllm_omni_pinned_prefix_tokens = 0
+    validate(helper, state)
+
+
+def test_pd_feedback_preserves_last_sample_even_without_native_terminator():
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import MiniCPMO45Stage0DuplexRuntime
+
+    helper = SimpleNamespace(listen_token_id=1, chunk_eos_token_id=2,
+                             chunk_tts_eos_token_id=3, turn_eos_token_id=4)
+    state = SimpleNamespace(pd_feedback_append_identity=None)
+    MiniCPMO45Stage0DuplexRuntime.apply_pd_decode_feedback(helper, state, [99, 100], epoch=0, seq=278)
+    assert state.pd_feedback_token_ids == [99, 100]
+    assert state.pending_terminator_token == 100
+    assert state.last_terminator_token is None
+    # The replay prefix plus the last sampled token accounts for all feedback,
+    # even if a finite request ended on a budget or a different EOS token.
+    assert state.pd_feedback_token_ids[:-1] + [state.pending_terminator_token] == [99, 100]
+
+
 @pytest.mark.parametrize(
     ("feedback", "delta_len"),
     [
@@ -409,6 +438,7 @@ def test_gpu_ar_worker_routes_minicpmo_vision_preencode_to_loaded_model():
     worker = GPUARWorker.__new__(GPUARWorker)
     worker.model_runner = SimpleNamespace(model=model)
     jobs = [{"preencode_ids": ["frame-a"]}]
+    worker.device = torch.device("cpu")
 
     result = worker.preencode_minicpmo45_vision(jobs)
 
@@ -431,6 +461,7 @@ def test_gpu_ar_worker_routes_minicpmo_audio_preencode_to_loaded_model():
     worker = GPUARWorker.__new__(GPUARWorker)
     worker.model_runner = SimpleNamespace(model=model)
     jobs = [{"session_id": "sid-audio", "audio": [0.0, 0.5]}]
+    worker.device = torch.device("cpu")
 
     result = worker.preencode_minicpmo45_audio(jobs)
 
@@ -576,21 +607,99 @@ def test_minicpmo_model_hook_owns_duplex_sampling_rows_and_force_listen():
     assert torch.isneginf(logits[0, listen_id + 1 :]).all()
 
 
-def test_minicpmo_model_hook_turn_end_latch_forces_silence_to_listen():
+@pytest.mark.parametrize("payload", [{"is_speech": False}, {"is_speech": None}, {}, {"force_listen": False}])
+def test_minicpmo_model_hook_silence_does_not_override_native_decision(payload):
     state = SimpleNamespace(
         current_turn_ended=True,
         last_terminator_token=9,
         pending_terminator_token=None,
     )
-    model, row = _minicpmo_duplex_policy_case(state, {"is_speech": False})
+    model, row = _minicpmo_duplex_policy_case(state, payload)
     logits = torch.zeros((1, 16), dtype=torch.float32)
     logits[0, 10] = 20.0
+    original_logits = logits.clone()
+    original_state = vars(state).copy()
 
     model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
 
+    # Official streaming_generate allows a new reply even over silence; only
+    # an explicit force-listen instruction may replace the model logits.
+    assert torch.equal(logits, original_logits)
+    assert vars(state) == original_state
+
+
+@pytest.mark.parametrize("is_speech", [False, None, True])
+def test_minicpmo_model_hook_explicit_force_listen_only_applies_to_first_sample(is_speech):
+    from dataclasses import replace
+
+    state = SimpleNamespace(current_turn_ended=True, last_terminator_token=9, pending_terminator_token=9)
+    model, row = _minicpmo_duplex_policy_case(state, {"force_listen": True, "is_speech": is_speech})
+    original_state = vars(state).copy()
+    logits = torch.arange(16, dtype=torch.float32).reshape(1, 16)
+    model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
+    assert torch.isfinite(logits).sum().item() == 1
     assert logits[0, 7].item() == 0.0
-    assert torch.isneginf(logits[0, :7]).all()
-    assert torch.isneginf(logits[0, 8:]).all()
+    assert vars(state) == original_state
+
+    # A duplicate hook or continuation inside the unit is not another force.
+    next_logits = torch.arange(16, dtype=torch.float32).reshape(1, 16)
+    model.prepare_duplex_sampling(next_logits, SimpleNamespace(), (row,))
+    assert torch.equal(next_logits, torch.arange(16, dtype=torch.float32).reshape(1, 16))
+    state.current_segment_output_tokens = [9]
+    model.prepare_duplex_sampling(next_logits, SimpleNamespace(), (replace(row, seq=4),))
+    assert torch.equal(next_logits, torch.arange(16, dtype=torch.float32).reshape(1, 16))
+
+    # A new unit can independently request force-listen again.
+    state.current_segment_output_tokens = []
+    model.prepare_duplex_sampling(next_logits, SimpleNamespace(), (replace(row, seq=4),))
+    assert torch.isfinite(next_logits).sum().item() == 1
+    assert next_logits[0, 7].item() == 0.0
+
+
+def test_minicpmo_model_hook_mixed_rows_only_force_explicit_request():
+    from dataclasses import replace
+
+    states = [
+        SimpleNamespace(current_turn_ended=True, last_terminator_token=9, pending_terminator_token=9)
+        for _ in range(4)
+    ]
+    payloads = [{"force_listen": True}, {"is_speech": False}, {}, {"is_speech": True}]
+    model, template = _minicpmo_duplex_policy_case(states[0], payloads[0])
+    rows = tuple(
+        replace(template, row_idx=i, request_id=f"req-{i}", session_id=f"session-{i}", payload=payload)
+        for i, payload in enumerate(payloads)
+    )
+    model._minicpmo45_duplex_data_plane_helper.sessions = {
+        (row.session_id, row.incarnation): state for row, state in zip(rows, states)
+    }
+    logits = torch.arange(64, dtype=torch.float32).reshape(4, 16)
+    original_logits = logits.clone()
+    original_states = [vars(state).copy() for state in states]
+    model.prepare_duplex_sampling(logits, SimpleNamespace(), rows)
+    assert torch.isfinite(logits[0]).sum().item() == 1
+    assert logits[0, 7].item() == 0.0
+    assert torch.equal(logits[1:], original_logits[1:])
+    assert [vars(state) for state in states] == original_states
+
+
+def test_minicpmo_model_hook_decode_does_not_reapply_p_force_listen():
+    from vllm_omni.experimental.fullduplex.minicpmo45.sampling_state import (
+        SAMPLING_STATE_KEY,
+        DecodeSamplingState,
+        pack_sampling_state,
+    )
+
+    state = DecodeSamplingState(current_segment_output_tokens=[7])
+    snapshot = pack_sampling_state(state, incarnation=1, epoch=None, seq=3)
+    model, row = _minicpmo_duplex_policy_case(
+        state, {"force_listen": True, "is_speech": False, SAMPLING_STATE_KEY: snapshot}
+    )
+    model._minicpmo_pd_decode = True
+    logits = torch.arange(16, dtype=torch.float32).reshape(1, 16)
+    original_logits = logits.clone()
+    model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
+    assert torch.equal(logits, original_logits)
+    assert model._minicpmo45_pd_sampling_states[row.request_id].current_segment_output_tokens == [7]
 
 
 def test_minicpmo_model_hook_pending_speech_after_turn_eos_allows_silence_sampling():
@@ -612,7 +721,7 @@ def test_minicpmo_model_hook_pending_speech_after_turn_eos_allows_silence_sampli
     assert state.pending_speech_context is True
 
 
-def test_minicpmo_model_hook_speech_row_does_not_create_pending_context():
+def test_minicpmo_model_hook_speech_row_does_not_rewrite_model_state():
     state = SimpleNamespace(
         current_turn_ended=True,
         last_terminator_token=9,
@@ -629,7 +738,7 @@ def test_minicpmo_model_hook_speech_row_does_not_create_pending_context():
     model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
 
     assert state.current_turn_ended is True
-    assert state.last_terminator_token is None
+    assert state.last_terminator_token == 9
     assert state.pending_speech_context is False
     assert torch.equal(logits, original_logits)
 
@@ -814,7 +923,7 @@ def test_minicpmo_model_hook_ignores_serving_new_user_turn_marker():
     model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
 
     assert state.current_turn_ended is False
-    assert state.last_terminator_token is None
+    assert state.last_terminator_token == 8
     assert torch.equal(logits, original_logits)
 
 
@@ -852,6 +961,9 @@ def test_generic_ar_runner_builds_typed_duplex_sampling_rows():
     assert rows[0].incarnation == 4
     assert rows[0].seq == 4
     assert rows[0].payload == {"is_speech": True}
+    assert rows[0].should_sample is True
+    runner.discard_request_mask = SimpleNamespace(np=[True, False])
+    assert helper.rows(runner)[0].should_sample is False
     assert rows[0].max_tokens == 32
 
 
@@ -1032,8 +1144,8 @@ def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
     fallback_audio_rows = output.multimodal_outputs["duplex_audio_fallback_units"]
     assert to_payload_element(prompt_rows, 0, 0, 2) == [101, 102]
     assert to_payload_element(prompt_rows, 1, 2, 4) == [201, 202, 203]
-    assert int(to_payload_element(listen_rows, 0, 0, 2).reshape(-1)[0]) == 701
-    assert int(to_payload_element(listen_rows, 1, 2, 4).reshape(-1)[0]) == 702
+    assert to_payload_element(listen_rows, 0, 0, 2) == (701,)
+    assert to_payload_element(listen_rows, 1, 2, 4) == (702,)
     assert to_payload_element(input_frame_rows, 0, 0, 2) == 1
     assert to_payload_element(input_frame_rows, 1, 2, 4) == 1
     assert to_payload_element(arrival_frame_rows, 0, 0, 2) == 1
@@ -1044,6 +1156,24 @@ def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
     assert to_payload_element(arrival_audio_rows, 1, 2, 4) == 0
     assert to_payload_element(fallback_audio_rows, 0, 0, 2) == 0
     assert to_payload_element(fallback_audio_rows, 1, 2, 4) == 0
+
+    # Exercise the actual tensor-only worker wire, not only the row splitter.
+    # Metadata stays off CUDA but its encoded dtype/shape/value are unchanged.
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+    from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
+        _special_token_ids_from_mm_output,
+    )
+    from vllm_omni.worker.gpu_ar_model_runner import _ensure_tensor_values
+
+    for i, expected in enumerate((701, 702)):
+        value = to_payload_element(listen_rows, i, i * 2, i * 2 + 2)
+        wire = _ensure_tensor_values({"meta.listen_token_id": value})
+        buffers = MsgpackEncoder().encode(wire)
+        original = {"meta.listen_token_id": torch.tensor([expected], dtype=torch.int64)}
+        assert [bytes(b) for b in buffers] == [bytes(b) for b in MsgpackEncoder().encode(original)]
+        restored = MsgpackDecoder(dict[str, torch.Tensor]).decode(buffers)
+        assert _special_token_ids_from_mm_output(restored) == {"listen_token_id": expected}
 
 
 def test_minicpmo_stage0_rejects_invalid_resolved_ref_audio():
@@ -3569,10 +3699,7 @@ def test_minicpmo_stage0_native_sampler_cuts_before_request_length_cap():
     assert sampled.sampled_token_ids.tolist() == [[151718]]
 
 
-def test_minicpmo_stage0_native_sampler_cuts_on_decoded_text_length():
-    from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
-        MiniCPMO45DuplexPolicy,
-    )
+def test_minicpmo_stage0_native_sampler_does_not_cut_on_decoded_text_length():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,
     )
@@ -3626,9 +3753,8 @@ def test_minicpmo_stage0_native_sampler_cuts_on_decoded_text_length():
 
     sampled = model.sample(logits, sampling_metadata)
 
-    assert MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK == 28
     assert sampled is not None
-    assert sampled.sampled_token_ids.tolist() == [[151718]]
+    assert sampled.sampled_token_ids.tolist() == [[candidate]]
 
 
 def test_minicpmo_stage0_native_sampler_ignores_pending_placeholders():

@@ -1,5 +1,7 @@
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
+from threading import Lock
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -18,6 +20,62 @@ from vllm_omni.engine import (
     OmniPDPrefillPayload,
     PromptEmbedsPayload,
 )
+
+
+class TokenBlockHashPrefixCache:
+    """Bounded CPU hash memoization; never owns or changes physical KV blocks."""
+
+    def __init__(self, delegate: Callable, block_size: int, capacity: int):
+        self.delegate = delegate
+        self.block_size = block_size
+        self.capacity = max(1, capacity)
+        self._entries = OrderedDict()
+        self._lock = Lock()
+
+    def __call__(self, request: Request):
+        # Existing requests already use vLLM's incremental hasher. Restrict
+        # cross-request reuse to salted plain-token requests: other
+        # inputs have additional native hash keys and keep their original path.
+        if (
+            request.block_hashes
+            or not isinstance(request.cache_salt, str)
+            or not request.cache_salt
+            or request.mm_features
+            or request.lora_request is not None
+            or request.prompt_embeds is not None
+            or getattr(request, "cache_token_ids", None) is not None
+            or getattr(request, "kv_lineage_id", None)
+        ):
+            return self.delegate(request)
+        # Cache-only P/D import and formal local decode have different transfer
+        # params, but share the same native hash inputs. Never key by request ID.
+        key = request.cache_salt
+        with self._lock:
+            previous = self._entries.get(key)
+            if previous is not None:
+                self._entries.move_to_end(key)
+        prefix = []
+        if previous is not None:
+            tokens, hashes = previous
+            count = min(len(tokens), request.num_tokens // self.block_size * self.block_size)
+            # Check actual token IDs, not a client-supplied length or cache hit.
+            if request.all_token_ids[:count] == tokens[:count]:
+                prefix = list(hashes[: count // self.block_size])
+        original = request.block_hashes
+        try:
+            request.block_hashes = prefix
+            hashes = [*prefix, *self.delegate(request)]
+        finally:
+            # The caller extends its own original list with our return value.
+            request.block_hashes = original
+        request._omni_reused_hash_tokens = len(prefix) * self.block_size
+        entry = (request.all_token_ids[: len(hashes) * self.block_size], tuple(hashes))
+        with self._lock:
+            self._entries[key] = entry
+            self._entries.move_to_end(key)
+            while len(self._entries) > self.capacity:
+                self._entries.popitem(last=False)
+        return hashes
 
 
 class OmniRequest(Request):

@@ -687,6 +687,7 @@ def test_runner_assisted_full_attention_metadata_refresh_pads_buffers():
 @pytest.mark.parametrize("query_start_loc_attr", ["method", "tensor_attr"])
 def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monkeypatch, query_start_loc_attr):
     runner = object.__new__(GPUARModelRunner)
+    runner.model = SimpleNamespace()
     runner.execute_model_state = ExecuteModelState(
         SimpleNamespace(
             total_num_scheduled_tokens=3,

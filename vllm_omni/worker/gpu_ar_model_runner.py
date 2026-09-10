@@ -1960,6 +1960,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         logits: torch.Tensor | None,
         spec_decode_metadata: Any,
     ):
+        diag_sampling = _runner_diag_enabled(self)
+        if diag_sampling:
+            diag_start = time.monotonic()
+            self._model_sampler_diag_ms = (-1.0, -1.0)
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
             model_sample = getattr(self.model, "sample", None)
@@ -1984,7 +1988,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         prepare_duplex_sampling(logits, prepared_sampling_metadata, rows)
                     if helper is not None:
                         helper.hook_active = bool(rows)
+                diag_model_start = time.monotonic() if diag_sampling else 0.0
                 sampler_output = model_sample(logits, prepared_sampling_metadata)
+                if diag_sampling:
+                    self._model_sampler_diag_ms = (
+                        (diag_model_start - diag_start) * 1000.0,
+                        (time.monotonic() - diag_model_start) * 1000.0,
+                    )
                 if sampler_output is not None:
                     return sampler_output
             return self.sampler(
@@ -1993,6 +2003,31 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             )
 
         return super()._sample(logits, spec_decode_metadata)
+
+    def _bookkeeping_sync(self, scheduler_output, sampler_output, logits, hidden_states, num_scheduled_tokens):
+        # A model sampler can explicitly skip an intermediate prefill row.
+        # Upstream assumes it drew random numbers and rewinds that generator.
+        # Hide only explicitly unsampled generators during bookkeeping, while
+        # leaving the discard mask/output cleanup and all other models intact.
+        skipped = getattr(sampler_output, "skipped_sampling_request_ids", ())
+        if not skipped:
+            return super()._bookkeeping_sync(
+                scheduler_output, sampler_output, logits, hidden_states, num_scheduled_tokens
+            )
+        removed_generators = {}
+        try:
+            for request_id in skipped:
+                row_idx = self.input_batch.req_id_to_index[request_id]
+                if not self.discard_request_mask.np[row_idx]:
+                    raise RuntimeError("Model skipped sampling a non-discarded request")
+                generator = self.input_batch.generators.pop(row_idx, None)
+                if generator is not None:
+                    removed_generators[row_idx] = generator
+            return super()._bookkeeping_sync(
+                scheduler_output, sampler_output, logits, hidden_states, num_scheduled_tokens
+            )
+        finally:
+            self.input_batch.generators.update(removed_generators)
 
     @staticmethod
     def _resolve_req_hidden_states(
@@ -2496,6 +2531,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        diag_sampler_end = time.monotonic() if diag_state is not None else 0.0
+        diag_model_sampler_ms = getattr(self, "_model_sampler_diag_ms", (-1.0, -1.0))
+
+        snapshot_sampling = getattr(self.model, "snapshot_duplex_sampling_outputs", None)
+        if callable(snapshot_sampling):
+            sampling_outputs = snapshot_sampling(list(self.input_batch.req_ids))
+            if sampling_outputs:
+                multimodal_outputs = {**(multimodal_outputs or {}), **sampling_outputs}
+        diag_policy_snapshot_end = time.monotonic() if diag_state is not None else 0.0
 
         # Freeze these decisions while the request is still present in the
         # live input batch. Async output construction can run after bookkeeping
@@ -2512,6 +2556,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             list(self.input_batch.req_ids)
         )
         self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
+        diag_state_update_end = time.monotonic() if diag_state is not None else 0.0
 
         self._draft_token_ids = None
         self._draft_token_req_ids = None
@@ -2568,6 +2613,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             else:
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
+        diag_bookkeep_start = time.monotonic() if diag_state is not None else 0.0
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -2691,6 +2737,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 "[RUNNER-DIAG] stage=%s mono=%.6f reqs=%s computed=%s scheduled=%s "
                 "prepare_ms=%.3f forward_wall_ms=%.3f forward_gpu_ms=%.3f "
                 "execute_post_ms=%.3f sample_pre_snapshot_ms=%.3f "
+                "sampler_ms=%.3f policy_snapshot_ms=%.3f state_update_ms=%.3f "
+                "pre_bookkeep_ms=%.3f bookkeep_ms=%.3f "
+                "model_sampler_prepare_ms=%.3f model_sampler_ms=%.3f "
                 "snapshot_ms=%.3f output_wait_ms=%.3f output_build_ms=%.3f total_ms=%.3f",
                 getattr(self.vllm_config.model_config, "stage_id", "?"),
                 execute_start,
@@ -2702,6 +2751,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 gpu_ms,
                 (execute_end - forward_end) * 1000.0,
                 (diag_bookkeep_end - diag_sample_start) * 1000.0,
+                (diag_sampler_end - diag_sample_start) * 1000.0,
+                (diag_policy_snapshot_end - diag_sampler_end) * 1000.0,
+                (diag_state_update_end - diag_policy_snapshot_end) * 1000.0,
+                (diag_bookkeep_start - diag_state_update_end) * 1000.0,
+                (diag_bookkeep_end - diag_bookkeep_start) * 1000.0,
+                *diag_model_sampler_ms,
                 (diag_snapshot_end - diag_snapshot_start) * 1000.0,
                 output_wait_ms,
                 (output_build_end - output_build_start) * 1000.0,

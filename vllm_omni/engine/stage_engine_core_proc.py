@@ -40,11 +40,12 @@ from vllm.v1.engine import (
 from vllm.v1.engine.core import EngineCoreProc, EngineShutdownState
 from vllm.v1.engine.tensor_ipc import TensorIpcSender
 from vllm.v1.engine.utils import EngineZmqAddresses, SignalCallback
-from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+from vllm.v1.serial_utils import MsgpackDecoder
 from vllm.version import __version__ as VLLM_VERSION
 
 from vllm_omni.distributed.omni_coordinator import create_stage_coord_client
 from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine.serialization import CPUOutputMsgpackEncoder as MsgpackEncoder
 from vllm_omni.engine.stage_init_utils import (
     make_forward_context_thread_local,
     make_workspace_manager_colocation_safe,
@@ -90,6 +91,23 @@ _AUXILIARY_PREENCODE_RPC_CONFIG = {
 }
 
 
+def _batch_output_ready(future: Future) -> bool:
+    """Check readiness without joining an output builder or waiting on CUDA."""
+    if future.done():
+        return True
+    output = getattr(future, "async_output", None)
+    if output is None:
+        return False
+    thread = getattr(output, "_background_thread", None)
+    if thread is not None and thread.is_alive():
+        return False
+    if (getattr(output, "_model_runner_output", None) is None
+            and getattr(output, "_background_exception", None) is None):
+        return False
+    event = getattr(output, "async_copy_ready_event", None)
+    return event is not None and event.query()
+
+
 class _StageInputQueue(queue.Queue[tuple[EngineCoreRequestType, Any]]):
     """FIFO for data requests with direct auxiliary-sidecar dispatch."""
 
@@ -113,18 +131,7 @@ class _StageInputQueue(queue.Queue[tuple[EngineCoreRequestType, Any]]):
             if method_name != "collective_rpc" or not args:
                 return False
             rpc_method = args[0]
-            if rpc_method == "preencode_minicpmo45_vision":
-                # Preserve the existing vision admission behavior. The
-                # collective RPC itself only uses the executor when the
-                # vision sidecar device is configured.
-                return True
-            if rpc_method != "preencode_minicpmo45_audio":
-                return False
-            # Audio remains on the ordinary Core path unless its model-owned
-            # sidecar state has explicitly been placed on another device.
-            return bool(
-                os.environ.get("MINICPMO45_AUDIO_ENCODER_DEVICE", "").strip()
-            )
+            return rpc_method in _AUXILIARY_PREENCODE_RPC_CONFIG
         except (TypeError, ValueError, IndexError):
             return False
 
@@ -284,11 +291,19 @@ class StageEngineCoreProc(EngineCoreProc):
         self._vision_preencode_executor: ThreadPoolExecutor | None = None
         self._audio_preencode_executor: ThreadPoolExecutor | None = None
         super().__init__(*args, **kwargs)
+        if self.request_block_hasher is not None:
+            from vllm_omni.request import TokenBlockHashPrefixCache
+
+            self.request_block_hasher = TokenBlockHashPrefixCache(
+                self.request_block_hasher,
+                self.scheduler.kv_cache_manager.block_pool.hash_block_size,
+                self.vllm_config.scheduler_config.max_num_seqs,
+            )
         # The input thread resolves ``self.input_queue`` for each message. Swap
         # the still-unconsumed startup queue so auxiliary vision RPCs can be
         # admitted directly instead of waiting behind the Thinker-P ADD
-        # backlog. Ordinary data ordering is unchanged. Audio uses this bypass
-        # only when its dedicated device is explicitly configured.
+        # backlog. Placement never changes this dispatch policy: colocated
+        # encoders must not run on either the IO or the Core scheduling thread.
         old_queue = self.input_queue
         sidecar_queue = _StageInputQueue(
             lambda item: self._handle_client_request(*item),
@@ -387,13 +402,7 @@ class StageEngineCoreProc(EngineCoreProc):
     @staticmethod
     def _is_auxiliary_preencode_method(method: Any) -> bool:
         """Return whether this RPC should use direct sidecar plumbing."""
-        if method == "preencode_minicpmo45_vision":
-            return True
-        if method != "preencode_minicpmo45_audio":
-            return False
-        return bool(
-            os.environ.get("MINICPMO45_AUDIO_ENCODER_DEVICE", "").strip()
-        )
+        return isinstance(method, str) and method in _AUXILIARY_PREENCODE_RPC_CONFIG
 
     @staticmethod
     def _auxiliary_vision_frame_count(args: Any) -> int:
@@ -415,21 +424,18 @@ class StageEngineCoreProc(EngineCoreProc):
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
     ) -> Any:
-        """Keep auxiliary-GPU encoder RPCs out of the P scheduling loop.
+        """Keep both encoder RPCs off the IO/Core threads on every placement.
 
-        vLLM utility calls normally execute synchronously on the EngineCore
-        thread. That is correct when an encoder shares the P GPU, but defeats
-        auxiliary placement: a slower call on a dedicated Encoder GPU would
-        still stop P from admitting and scheduling LLM work. EngineCore
-        already understands ``Future`` utility results, so run each enabled
-        single-flight sidecar RPC on its dedicated host thread.
+        Each modality has one ordered host executor; its worker owns a private
+        CUDA stream. Device placement must not silently select a synchronous
+        control path. The returned Future still means cache-ready, not queued.
         """
         config = (
             _AUXILIARY_PREENCODE_RPC_CONFIG.get(method)
             if isinstance(method, str)
             else None
         )
-        if config is not None and os.environ.get(config[0], "").strip():
+        if config is not None:
             _, executor_attr, thread_name_prefix = config
             executor = getattr(self, executor_attr, None)
             if executor is None:
@@ -783,6 +789,7 @@ class StageEngineCoreProc(EngineCoreProc):
             prefix_matches = (
                 len(request_prompt) >= len(prepared_prompt)
                 and request_prompt[: len(prepared_prompt)] == prepared_prompt
+                and getattr(request, "cache_salt", None) == getattr(prepared_request, "cache_salt", None)
             )
             if not prefix_matches:
                 if prepared.get("owns_blocks", False):
@@ -823,14 +830,15 @@ class StageEngineCoreProc(EngineCoreProc):
             # block table under this request id. A full local hit owns no
             # private table and should be matched by normal prefix caching.
             if prepared.get("owns_blocks", False):
-                request.num_computed_tokens = prepared_request.num_computed_tokens
+                request.num_computed_tokens = min(
+                    prepared_request.num_computed_tokens, max(0, request.num_tokens - 1)
+                )
                 # The direct cache-sync request never enters the ordinary
                 # scheduler admission path.  Its connector-populated stats
                 # therefore have to follow the imported block table into the
-                # formal D request.  The cursor may be one token shorter than
-                # the imported prefix because D intentionally replays the last
-                # P token before sampling; preserve the local-prefix-first
-                # split while accounting for that replay.
+                # formal D request. Only an identical full-prompt hit needs
+                # replay; a D prompt with an appended sampled token retains
+                # the entire imported prefix, including media embeddings.
                 prefill_stats = getattr(request, "prefill_stats", None)
                 prepared_stats = getattr(
                     prepared_request,
@@ -942,7 +950,7 @@ class StageEngineCoreProc(EngineCoreProc):
         if not future.done():
             future.set_exception(exc)
 
-    def _progress_pd_cache_sync_jobs(self) -> bool:
+    def _progress_pd_cache_sync_jobs(self, *, wait_for_completion: bool = True) -> bool:
         if not self._pd_cache_sync_jobs:
             return False
         progressed = False
@@ -1041,7 +1049,9 @@ class StageEngineCoreProc(EngineCoreProc):
         self._pd_cache_sync_last_poll = now
 
         try:
-            rank_results = self.model_executor.collective_rpc("poll_pd_cache_sync")
+            rank_results = self.model_executor.collective_rpc(
+                "poll_pd_cache_sync", kwargs={"wait_for_completion": wait_for_completion}
+            )
             finished_by_rank = [set(result or ()) for result in rank_results]
             finished = (
                 set.intersection(*finished_by_rank) if finished_by_rank else set()
@@ -1118,13 +1128,45 @@ class StageEngineCoreProc(EngineCoreProc):
         )
         return True
 
+    def step_with_batch_queue(self) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
+        """Retire ready P outputs before another inline UniProc batch runs.
+
+        Keep D/ordinary async scheduling unchanged. This is the native result
+        retirement path, not an early KV-ready notification: scheduler/abort
+        processing still precedes the existing exact-once KV publisher.
+        """
+        kv_config = self.vllm_config.kv_transfer_config
+        if not (
+            kv_config is not None and kv_config.is_kv_producer
+            and callable(getattr(self.scheduler.connector, "take_immediate_push_metadata", None))
+            and self.batch_queue and _batch_output_ready(self.batch_queue[-1][0])
+        ):
+            return super().step_with_batch_queue()
+
+        future, scheduler_output, exec_future = self.batch_queue.pop()
+        with (
+            self.capture_iteration_details(scheduler_output) as iteration_details,
+            self.log_error_detail(scheduler_output),
+        ):
+            model_output = future.result()
+            if model_output is None:
+                exec_future.result()
+                raise RuntimeError("unexpected error")
+        self._process_aborts_queue()
+        outputs = self.scheduler.update_from_output(scheduler_output, model_output)
+        self._attach_iteration_details(outputs, iteration_details)
+        return outputs, False
+
     def _process_engine_step(self) -> bool:
         # Preserve ordinary inference priority. Cache-only work is progressed
         # between scheduler/model steps and when D would otherwise be idle.
         base_has_work = super().has_work()
         model_executed = super()._process_engine_step() if base_has_work else False
         push_published = self._publish_finished_pd_blocks()
-        cache_progressed = self._progress_pd_cache_sync_jobs()
+        # An active decode batch must not pay an extra notification wait for
+        # other requests' imports. The existing writer progresses them in the
+        # background; keep the event wait only when no model work was issued.
+        cache_progressed = self._progress_pd_cache_sync_jobs(wait_for_completion=not model_executed)
         if not base_has_work and not cache_progressed and self._pd_cache_sync_jobs:
             time.sleep(0.001)
         return model_executed or push_published or cache_progressed
@@ -1415,7 +1457,7 @@ class StageEngineCoreProc(EngineCoreProc):
             ingress_done = time.monotonic()
             logger.info(
                 "[INGRESS-DIAG] event=core-preprocess stage=%s wall=%.6f req=%s "
-                "prompt=%d lineage_ms=%.3f request_build_ms=%.3f total_ms=%.3f",
+                "prompt=%d lineage_ms=%.3f request_build_ms=%.3f total_ms=%.3f hash_reused_tokens=%d",
                 stage_id,
                 time.time(),
                 request.request_id,
@@ -1423,6 +1465,7 @@ class StageEngineCoreProc(EngineCoreProc):
                 (lineage_done - ingress_start) * 1000.0,
                 (ingress_done - lineage_done) * 1000.0,
                 (ingress_done - ingress_start) * 1000.0,
+                getattr(scheduler_request, "_omni_reused_hash_tokens", 0),
             )
         return scheduler_request, current_wave
 
